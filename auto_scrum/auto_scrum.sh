@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
 # auto_scrum: dispara conversas Claude Code a partir de templates por tipo
-# (PO, Tech Leader, Desenvolvimento, Review). Ver incio_projeto.md na raiz
-# do repo para o plano completo.
+# (PO, Tech Leader, Desenvolvimento, Review).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

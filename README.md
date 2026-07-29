@@ -12,8 +12,6 @@ um fluxo de trabalho: **PO** (avaliar/criar ticket), **Tech Leader** (criar plan
 template e preencher os dados na mão toda vez, o script pergunta os dados daquela
 etapa, monta o prompt final e já abre o `claude` com ele.
 
-Ver o plano completo (motivação, decisões e rationale) em [`incio_projeto.md`](incio_projeto.md).
-
 #### Requisitos
 
 - [`claude`](https://claude.ai/code) no PATH.
@@ -47,7 +45,7 @@ livremente sem tocar no script.
 
 #### Stack por projeto
 
-Tech Leader e Desenvolvimento usam a stack técnica de um projeto (ex: "Django, DRF,
+Tech Leader, Desenvolvimento e Review usam a stack técnica de um projeto (ex: "Django, DRF,
 PostgreSQL" ou "Rust, Actix"). Cada projeto é um arquivo em `auto_scrum/projetos/<nome>.sh`:
 
 ```bash

@@ -17,7 +17,7 @@ Análise obrigatória, independente do resultado:
 
 Se válido, escreva o texto para abrir um ticket no Jira, neste formato. Título e
 descrição devem ser escritos por você a partir da sua análise — não copie o pedido
-original, incorpore os critérios de aceite na descrição:
+original:
 
 ## Título
 ## Descrição

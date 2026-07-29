@@ -18,6 +18,7 @@ PLANO_PATH=""
 STACK_DESC=""
 STACK_BLOCK_DEV=""
 STACK_BLOCK_TL=""
+STACK_BLOCK_REVIEW=""
 TIPO=""
 
 check_requirements() {
@@ -143,17 +144,19 @@ resolve_stack() {
   done
 }
 
-# build_stack_blocks: monta STACK_BLOCK_DEV/STACK_BLOCK_TL a partir de STACK_DESC.
-# Se STACK_DESC estiver vazio (nenhum projeto escolhido), os blocos viram só um ponto
-# final — a frase de stack some inteira do prompt, em vez de aparecer com texto
+# build_stack_blocks: monta STACK_BLOCK_DEV/STACK_BLOCK_TL/STACK_BLOCK_REVIEW a partir de
+# STACK_DESC. Se STACK_DESC estiver vazio (nenhum projeto escolhido), os blocos viram só
+# um ponto final — a frase de stack some inteira do prompt, em vez de aparecer com texto
 # genérico. Feito aqui (bash), não no template, porque envsubst não tem condicional.
 build_stack_blocks() {
   if [ -n "$STACK_DESC" ]; then
     printf -v STACK_BLOCK_DEV ', com habilidades principais em:\n%s.' "$STACK_DESC"
     printf -v STACK_BLOCK_TL ', especialista em %s.' "$STACK_DESC"
+    printf -v STACK_BLOCK_REVIEW ', especialista em %s.' "$STACK_DESC"
   else
     STACK_BLOCK_DEV="."
     STACK_BLOCK_TL="."
+    STACK_BLOCK_REVIEW="."
   fi
 }
 
@@ -243,14 +246,15 @@ main() {
     review) ask_questions_review ;;
   esac
 
-  export TITULO DESCRICAO EXTRA ID_JIRA PLANO_PATH STACK_BLOCK_DEV STACK_BLOCK_TL
+  export TITULO DESCRICAO EXTRA ID_JIRA PLANO_PATH STACK_BLOCK_DEV STACK_BLOCK_TL \
+    STACK_BLOCK_REVIEW
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
   timestamp="$(date +%Y%m%d_%H%M%S)"
   log_file="$LOGS_DIR/${TIPO}_${timestamp}.md"
 
-  envsubst '$TITULO $DESCRICAO $EXTRA $ID_JIRA $PLANO_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL' \
+  envsubst '$TITULO $DESCRICAO $EXTRA $ID_JIRA $PLANO_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW' \
     < "$TEMPLATES_DIR/$TIPO.md" > "$log_file"
 
   echo
@@ -263,7 +267,12 @@ main() {
   read -r -p "Confirma o envio para o claude? (s/N): " confirm
   case "$confirm" in
     s|S|sim|Sim|SIM)
-      exec claude "$(cat "$log_file")"
+      local claude_args=()
+      # Só a etapa de Desenvolvimento sobe em modo auto — é a única em que o
+      # agente de fato edita código/roda comandos sem intervir a cada passo;
+      # PO/Tech Leader/Review são conversas de texto, sem motivo pra soltar a mão.
+      [ "$TIPO" = "desenvolvimento" ] && claude_args+=(--permission-mode auto)
+      exec claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)
       echo "Cancelado. O prompt gerado continua salvo em: $log_file"

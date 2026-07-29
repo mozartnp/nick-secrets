@@ -12,8 +12,7 @@ Análise obrigatória, independente do resultado:
 - É necessário adicionar uma nova permissão para esse fluxo?
 - Existe impacto em produção?
 - Quais são os impactos negativos possíveis?
-- Se o pedido tiver relação com Sentry ou outro link de erro externo, referencie-o no
-  ticket (ou na explicação de rejeição, se for o caso).
+${SENTRY_BLOCK_PO}
 
 Se válido, escreva o texto para abrir um ticket no Jira, neste formato. Título e
 descrição devem ser escritos por você a partir da sua análise — não copie o pedido
@@ -29,6 +28,6 @@ isso para um pedido válido (menor escopo, mais informação, etc.).
 
 ---
 PEDIDO ORIGINAL (como foi recebido — não é o texto final do ticket)
-Título do pedido: ${TITULO}
-Descrição do pedido: ${DESCRICAO}
-Link do Sentry / erro externo: ${EXTRA}
+Título do pedido: ${TITLE}
+Descrição do pedido: ${DESCRIPTION}
+${SENTRY_LINE_EXTRA}

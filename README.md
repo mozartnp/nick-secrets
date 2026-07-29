@@ -46,10 +46,10 @@ livremente sem tocar no script.
 #### Stack por projeto
 
 Tech Leader, Desenvolvimento e Review usam a stack técnica de um projeto (ex: "Django, DRF,
-PostgreSQL" ou "Rust, Actix"). Cada projeto é um arquivo em `auto_scrum/projetos/<nome>.sh`:
+PostgreSQL" ou "Rust, Actix"). Cada projeto é um arquivo em `auto_scrum/projects/<nome>.sh`:
 
 ```bash
-STACK_DESC="Django avançado, django-tenants, Django ORM, Django CBV, Django auth, Bootstrap 5, PostgreSQL, JavaScript, pytest e TDD"
+STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, Django CBV, Django auth, Bootstrap 5, PostgreSQL, JavaScript, pytest e TDD"
 ```
 
 - Passe o nome direto: `./auto_scrum/auto_scrum.sh --projeto=meuprojeto` (erro claro se
@@ -57,11 +57,11 @@ STACK_DESC="Django avançado, django-tenants, Django ORM, Django CBV, Django aut
 - Sem argumento: o script mostra um menu com os projetos encontrados + a opção
   "Nenhum" (usa uma stack genérica).
 - Pra criar um projeto novo: `./auto_scrum/auto_scrum.sh --init` — pergunta o nome e
-  cria `auto_scrum/projetos/<nome>.sh` com as variáveis vazias (`STACK_DESC=""`) e um
+  cria `auto_scrum/projects/<nome>.sh` com as variáveis vazias (`STACK_DESCRIPTION=""`) e um
   comentário de exemplo. Abre e preenche depois. Se o projeto já existir, pergunta antes
   de sobrescrever.
 - Só `--projeto=` (singular) e `--init` são reconhecidos — qualquer outra flag (ex:
   `--projetos=` com "s") dá erro claro em vez de ser ignorada silenciosamente.
 
-`auto_scrum/projetos/*.sh` é gitignorado — é configuração local, específica de cada
+`auto_scrum/projects/*.sh` é gitignorado — é configuração local, específica de cada
 máquina/projeto, não faz parte do repositório.

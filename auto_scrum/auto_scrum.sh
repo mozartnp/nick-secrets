@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 #
 # auto_scrum: dispara conversas Claude Code a partir de templates por tipo
-# (PO, Tech Leader, Desenvolvimento, Review).
+# (PO, Tech Leader, Development, Review).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
-PROJETOS_DIR="$SCRIPT_DIR/projetos"
+PROJECTS_DIR="$SCRIPT_DIR/projects"
 
-TITULO=""
-DESCRICAO=""
+TITLE=""
+DESCRIPTION=""
 EXTRA=""
-ID_JIRA=""
-PLANO_PATH=""
-STACK_DESC=""
+JIRA_ID=""
+PLAN_PATH=""
+REVIEW_PATH=""
+STACK_DESCRIPTION=""
 STACK_BLOCK_DEV=""
 STACK_BLOCK_TL=""
 STACK_BLOCK_REVIEW=""
-TIPO=""
+SENTRY_ENABLED=""
+SENTRY_BLOCK_PO=""
+SENTRY_BLOCK_TL=""
+SENTRY_LINE_EXTRA=""
+TYPE=""
 
 check_requirements() {
   local missing=()
@@ -34,7 +39,7 @@ check_requirements() {
   fi
 }
 
-# read_required <prompt> <nome_da_variavel>
+# read_required <prompt> <variable_name>
 read_required() {
   local prompt="$1" __resultvar="$2" value=""
   while [ -z "$value" ]; do
@@ -44,17 +49,17 @@ read_required() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
-# read_optional <prompt> <nome_da_variavel>
+# read_optional <prompt> <variable_name>
 read_optional() {
   local prompt="$1" __resultvar="$2" value=""
   read -r -p "$prompt" value
   printf -v "$__resultvar" '%s' "$value"
 }
 
-# read_via_editor <prompt> <nome_da_variavel>
-# Abre $EDITOR (fallback: nano) num arquivo temporário para o texto ser
-# digitado/colado lá, em vez de ler linha a linha no terminal — cola grande
-# de texto direto no read trava/buga o terminal.
+# read_via_editor <prompt> <variable_name>
+# Opens $EDITOR (fallback: nano) on a temp file so the text can be typed/pasted
+# there instead of read line-by-line in the terminal — pasting a large block of
+# text straight into read locks up/glitches the terminal.
 read_via_editor() {
   local prompt="$1" __resultvar="$2"
   local editor="${EDITOR:-nano}"
@@ -74,84 +79,86 @@ read_via_editor() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
-choose_tipo() {
-  local opcoes=("PO - Criar ticket" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
-  local chaves=("po" "tech_leader" "desenvolvimento" "review")
+choose_type() {
+  local options=("PO - Criar ticket" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
+  local keys=("po" "tech_leader" "development" "review")
   local opt
   echo "Qual tipo de conversa você quer iniciar?"
-  select opt in "${opcoes[@]}"; do
+  select opt in "${options[@]}"; do
     if [ -n "${opt:-}" ]; then
-      TIPO="${chaves[$((REPLY - 1))]}"
+      TYPE="${keys[$((REPLY - 1))]}"
       break
     fi
     echo "Opção inválida, tente novamente."
   done
 }
 
-listar_projetos() {
-  local f encontrou=0
-  echo "Projetos disponíveis em $PROJETOS_DIR/:"
-  for f in "$PROJETOS_DIR"/*.sh; do
+list_projects() {
+  local f found=0
+  echo "Projetos disponíveis em $PROJECTS_DIR/:"
+  for f in "$PROJECTS_DIR"/*.sh; do
     [ -e "$f" ] || continue
-    encontrou=1
+    found=1
     echo "  - $(basename "$f" .sh)"
   done
-  [ "$encontrou" -eq 0 ] && echo "  (nenhum)"
+  [ "$found" -eq 0 ] && echo "  (nenhum)"
 }
 
-# resolve_stack <nome_projeto_via_argv_ou_vazio>
-# Define STACK_DESC a partir de auto_scrum/projetos/<nome>.sh (source). Se um nome vier
-# por argumento, usa direto (erro se não existir). Senão, mostra um select com os
-# projetos encontrados + uma opção "Nenhum" (deixa STACK_DESC vazio — quem monta o texto
-# condicional pra sumir a menção de stack quando vazio é build_stack_blocks(), no main).
+# resolve_stack <project_name_via_argv_or_empty>
+# Sets STACK_DESCRIPTION from auto_scrum/projects/<name>.sh (source). If a name is
+# passed as an argument, uses it directly (error if it doesn't exist). Otherwise, shows
+# a select with the projects found + a "Nenhum" option (leaves STACK_DESCRIPTION empty —
+# build_stack_blocks(), in main, is what assembles the conditional text that makes the
+# stack mention disappear when empty).
 resolve_stack() {
-  local projeto_arg="$1"
-  local arquivo
+  local project_arg="$1"
+  local file
 
-  if [ -n "$projeto_arg" ]; then
-    arquivo="$PROJETOS_DIR/$projeto_arg.sh"
-    if [ ! -f "$arquivo" ]; then
-      echo "Erro: projeto '$projeto_arg' não encontrado." >&2
-      listar_projetos >&2
+  if [ -n "$project_arg" ]; then
+    file="$PROJECTS_DIR/$project_arg.sh"
+    if [ ! -f "$file" ]; then
+      echo "Erro: projeto '$project_arg' não encontrado." >&2
+      list_projects >&2
       exit 1
     fi
     # shellcheck disable=SC1090
-    source "$arquivo"
+    source "$file"
     return
   fi
 
-  local nomes=() f opt
-  for f in "$PROJETOS_DIR"/*.sh; do
+  local names=() f opt
+  for f in "$PROJECTS_DIR"/*.sh; do
     [ -e "$f" ] || continue
-    nomes+=("$(basename "$f" .sh)")
+    names+=("$(basename "$f" .sh)")
   done
-  nomes+=("Nenhum")
+  names+=("Nenhum")
 
   echo "Qual projeto (define a stack usada no prompt)?"
-  select opt in "${nomes[@]}"; do
+  select opt in "${names[@]}"; do
     if [ -z "${opt:-}" ]; then
       echo "Opção inválida, tente novamente."
       continue
     fi
     if [ "$opt" = "Nenhum" ]; then
-      STACK_DESC=""
+      STACK_DESCRIPTION=""
     else
       # shellcheck disable=SC1090
-      source "$PROJETOS_DIR/$opt.sh"
+      source "$PROJECTS_DIR/$opt.sh"
     fi
     break
   done
 }
 
-# build_stack_blocks: monta STACK_BLOCK_DEV/STACK_BLOCK_TL/STACK_BLOCK_REVIEW a partir de
-# STACK_DESC. Se STACK_DESC estiver vazio (nenhum projeto escolhido), os blocos viram só
-# um ponto final — a frase de stack some inteira do prompt, em vez de aparecer com texto
-# genérico. Feito aqui (bash), não no template, porque envsubst não tem condicional.
+# build_stack_blocks: assembles STACK_BLOCK_DEV/STACK_BLOCK_TL/STACK_BLOCK_REVIEW from
+# STACK_DESCRIPTION. If STACK_DESCRIPTION is empty (no project chosen), the blocks become
+# just a period — the stack sentence disappears entirely from the prompt, instead of
+# showing generic text. Done here (bash), not in the template, because envsubst has no
+# conditionals.
 build_stack_blocks() {
-  if [ -n "$STACK_DESC" ]; then
-    printf -v STACK_BLOCK_DEV ', com habilidades principais em:\n%s.' "$STACK_DESC"
-    printf -v STACK_BLOCK_TL ', especialista em %s.' "$STACK_DESC"
-    printf -v STACK_BLOCK_REVIEW ', especialista em %s.' "$STACK_DESC"
+  if [ -n "$STACK_DESCRIPTION" ]; then
+    printf -v STACK_BLOCK_DEV ', com habilidades principais em:\n%s.' "$STACK_DESCRIPTION"
+    printf -v STACK_BLOCK_TL ', especialista em %s.' "$STACK_DESCRIPTION"
+    printf -v STACK_BLOCK_REVIEW ', especialista em %s.' "$STACK_DESCRIPTION"
   else
     STACK_BLOCK_DEV="."
     STACK_BLOCK_TL="."
@@ -159,17 +166,35 @@ build_stack_blocks() {
   fi
 }
 
-# init_projeto: pergunta o nome do projeto e cria um esqueleto em
-# auto_scrum/projetos/<nome>.sh, só com as variáveis (vazias) que os templates esperam.
-# O usuário abre e preenche depois.
-init_projeto() {
-  mkdir -p "$PROJETOS_DIR"
-  local nome arquivo confirm
-  read_required "Nome do projeto: " nome
-  arquivo="$PROJETOS_DIR/$nome.sh"
+# build_sentry_blocks: assembles SENTRY_BLOCK_PO/SENTRY_BLOCK_TL from SENTRY_ENABLED
+# (set in the project file, opt-in — empty/"false" is the default). When the project
+# doesn't use Sentry, the mention disappears entirely from the PO and Tech Leader
+# prompts, instead of showing generic text. SENTRY_LINE_EXTRA (the line with the link
+# itself) is assembled separately, in ask_questions_po, since it depends on the EXTRA
+# value typed by the user.
+build_sentry_blocks() {
+  if [ "$SENTRY_ENABLED" = "true" ]; then
+    SENTRY_BLOCK_PO='- Se o pedido tiver relação com Sentry ou outro link de erro externo, referencie-o no
+  ticket (ou na explicação de rejeição, se for o caso).'
+    SENTRY_BLOCK_TL='Se o ticket tiver relação com Sentry ou outro link de erro externo, inclua a referência
+no plano.'
+  else
+    SENTRY_BLOCK_PO=""
+    SENTRY_BLOCK_TL=""
+  fi
+}
 
-  if [ -f "$arquivo" ]; then
-    read -r -p "Já existe um projeto '$nome'. Sobrescrever? (s/N): " confirm
+# init_project: asks for the project name and creates a skeleton in
+# auto_scrum/projects/<name>.sh, with just the (empty) variables the templates expect.
+# The user opens it and fills it in afterwards.
+init_project() {
+  mkdir -p "$PROJECTS_DIR"
+  local name file confirm
+  read_required "Nome do projeto: " name
+  file="$PROJECTS_DIR/$name.sh"
+
+  if [ -f "$file" ]; then
+    read -r -p "Já existe um projeto '$name'. Sobrescrever? (s/N): " confirm
     case "$confirm" in
       s|S|sim|Sim|SIM) ;;
       *)
@@ -179,46 +204,57 @@ init_projeto() {
     esac
   fi
 
-  cat > "$arquivo" <<'EOF'
+  cat > "$file" <<'EOF'
 # Config do projeto pro auto_scrum. Preencha as variáveis abaixo e salve.
-# STACK_DESC: stack técnica usada no prompt do Tech Leader/Desenvolvimento
+# STACK_DESCRIPTION: stack técnica usada no prompt do Tech Leader/Desenvolvimento
 # (texto livre, sem ponto final no fim — o template já adiciona).
-# Exemplo: STACK_DESC="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"
-STACK_DESC=""
+# Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"
+STACK_DESCRIPTION=""
+# SENTRY_ENABLED: "true" se esse projeto usa Sentry (ou outro link de erro externo) nos
+# tickets/planos — os prompts de PO e Tech Leader passam a perguntar e mencionar isso.
+# Padrão é opt-in: vazio ou "false" faz a menção a Sentry sumir dos prompts.
+SENTRY_ENABLED="false"
 EOF
 
-  echo "Projeto criado em $arquivo — edite antes de usar."
+  echo "Projeto criado em $file — edite antes de usar."
 }
 
 ask_questions_po() {
-  read_required "Título do pedido: " TITULO
-  read_via_editor "Descrição do pedido" DESCRICAO
-  read_optional "Link do Sentry / erro externo (opcional, Enter para pular): " EXTRA
+  read_required "Título do pedido: " TITLE
+  read_via_editor "Descrição do pedido" DESCRIPTION
+  if [ "$SENTRY_ENABLED" = "true" ]; then
+    read_optional "Link do Sentry / erro externo (opcional, Enter para pular): " EXTRA
+    SENTRY_LINE_EXTRA="Link do Sentry / erro externo: ${EXTRA}"
+  fi
 }
 
 ask_questions_tech_leader() {
-  read_required "ID do Jira (ex: SC-123): " ID_JIRA
-  read_required "Título da tarefa: " TITULO
-  read_via_editor "Descrição / contexto" DESCRICAO
+  read_required "ID do Jira (ex: SC-123): " JIRA_ID
+  read_required "Título da tarefa: " TITLE
+  read_via_editor "Descrição / contexto" DESCRIPTION
 }
 
-ask_questions_desenvolvimento() {
-  read_required "ID do Jira / branch (ex: SC-123): " ID_JIRA
-  read_optional "Arquivo do plano (opcional, Enter para usar @docs/plans/${ID_JIRA}.md): " PLANO_PATH
-  PLANO_PATH="${PLANO_PATH:-@docs/plans/${ID_JIRA}.md}"
+ask_questions_development() {
+  read_required "ID do Jira / branch (ex: SC-123): " JIRA_ID
+  read_optional "Arquivo do plano (opcional, Enter para usar docs/plans/${JIRA_ID}_*.md): " PLAN_PATH
+  PLAN_PATH="${PLAN_PATH:-docs/plans/${JIRA_ID}_*.md}"
 }
 
+# ask_questions_review: besides the plan (same glob pattern as Dev, since the exact name
+# has the summary chosen by the Tech Leader), computes REVIEW_PATH — a fixed path, not
+# asked of the user, since it's always the same kind of content (review result).
 ask_questions_review() {
-  read_required "ID do Jira / branch (ex: SC-123): " ID_JIRA
-  read_optional "Arquivo do plano (opcional, Enter para usar @docs/plans/${ID_JIRA}.md): " PLANO_PATH
-  PLANO_PATH="${PLANO_PATH:-@docs/plans/${ID_JIRA}.md}"
+  read_required "ID do Jira / branch (ex: SC-123): " JIRA_ID
+  read_optional "Arquivo do plano (opcional, Enter para usar docs/plans/${JIRA_ID}_*.md): " PLAN_PATH
+  PLAN_PATH="${PLAN_PATH:-docs/plans/${JIRA_ID}_*.md}"
+  REVIEW_PATH="docs/plans/${JIRA_ID}_review.md"
 }
 
 main() {
-  local projeto_arg="" arg init_flag=0
+  local project_arg="" arg init_flag=0
   for arg in "$@"; do
     case "$arg" in
-      --projeto=*) projeto_arg="${arg#--projeto=}" ;;
+      --projeto=*) project_arg="${arg#--projeto=}" ;;
       --init) init_flag=1 ;;
       *)
         echo "Erro: argumento desconhecido: '$arg'" >&2
@@ -229,32 +265,36 @@ main() {
   done
 
   if [ "$init_flag" -eq 1 ]; then
-    init_projeto
+    init_project
     exit 0
   fi
 
   check_requirements
-  resolve_stack "$projeto_arg"
+  resolve_stack "$project_arg"
   build_stack_blocks
-  choose_tipo
+  build_sentry_blocks
+  choose_type
 
-  case "$TIPO" in
+  case "$TYPE" in
     po) ask_questions_po ;;
     tech_leader) ask_questions_tech_leader ;;
-    desenvolvimento) ask_questions_desenvolvimento ;;
+    development) ask_questions_development ;;
     review) ask_questions_review ;;
   esac
 
-  export TITULO DESCRICAO EXTRA ID_JIRA PLANO_PATH STACK_BLOCK_DEV STACK_BLOCK_TL \
-    STACK_BLOCK_REVIEW
+  export TITLE DESCRIPTION EXTRA JIRA_ID PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
+    STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
   timestamp="$(date +%Y%m%d_%H%M%S)"
-  log_file="$LOGS_DIR/${TIPO}_${timestamp}.md"
+  log_file="$LOGS_DIR/${TYPE}_${timestamp}.md"
 
-  envsubst '$TITULO $DESCRICAO $EXTRA $ID_JIRA $PLANO_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW' \
-    < "$TEMPLATES_DIR/$TIPO.md" > "$log_file"
+  # shellcheck disable=SC2016
+  # Intentional single quotes: this is the variable list for envsubst to expand, we
+  # don't want bash expanding it first.
+  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA' \
+    < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo
   echo "----- Prompt final (salvo em $log_file) -----"
@@ -267,10 +307,10 @@ main() {
   case "$confirm" in
     s|S|sim|Sim|SIM)
       local claude_args=()
-      # Só a etapa de Desenvolvimento sobe em modo auto — é a única em que o
-      # agente de fato edita código/roda comandos sem intervir a cada passo;
-      # PO/Tech Leader/Review são conversas de texto, sem motivo pra soltar a mão.
-      [ "$TIPO" = "desenvolvimento" ] && claude_args+=(--permission-mode auto)
+      # Only the Development stage runs in auto mode — it's the only one where the
+      # agent actually edits code/runs commands without stepping in at every turn;
+      # PO/Tech Leader/Review are text conversations, no reason to let go of the wheel.
+      [ "$TYPE" = "development" ] && claude_args+=(--permission-mode auto)
       exec claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)

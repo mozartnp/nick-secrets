@@ -172,10 +172,23 @@ build_stack_blocks() {
 # prompts, instead of showing generic text. SENTRY_LINE_EXTRA (the line with the link
 # itself) is assembled separately, in ask_questions_po, since it depends on the EXTRA
 # value typed by the user.
+#
+# SENTRY_BLOCK_PO also instructs the PO to use the Sentry MCP tool (attached in main(),
+# only for TYPE=po, see MCP_DIR) to fetch the issue itself when a link is given instead
+# of a typed description — the analyst reporting a Sentry error often doesn't know which
+# flow produced it, so asking them to narrate it is asking for info they don't have. If
+# the fetch fails, the instruction tells the PO to fall back to asking the analyst for a
+# manually pasted traceback (treated from then on like a normal ticket).
 build_sentry_blocks() {
   if [ "$SENTRY_ENABLED" = "true" ]; then
     SENTRY_BLOCK_PO='- Se o pedido tiver relação com Sentry ou outro link de erro externo, referencie-o no
-  ticket (ou na explicação de rejeição, se for o caso).'
+  ticket (ou na explicação de rejeição, se for o caso).
+- Se um link do Sentry foi informado e não há descrição escrita pelo analista, use a
+  tool do Sentry (MCP) disponível para buscar os detalhes do issue (erro, stack trace,
+  frequência, usuários afetados) e baseie sua análise e a descrição do ticket nisso.
+- Se não conseguir acessar o Sentry (falha de autenticação, issue não encontrado, MCP
+  indisponível), avise o analista e peça que ele descreva o problema manualmente,
+  colando o traceback, para seguir como um pedido normal.'
     SENTRY_BLOCK_TL='Se o ticket tiver relação com Sentry ou outro link de erro externo, inclua a referência
 no plano.'
   else
@@ -219,12 +232,20 @@ EOF
   echo "Projeto criado em $file — edite antes de usar."
 }
 
+# ask_questions_po: pergunta o link do Sentry antes da descrição (quando o projeto usa
+# Sentry) porque a resposta muda o que se pede depois — com link, a descrição vira
+# opcional e curta, já que o PO vai buscar os detalhes reais via MCP (ver
+# build_sentry_blocks); sem link, continua exigindo a descrição completa via editor.
 ask_questions_po() {
   read_required "Título do pedido: " TITLE
-  read_via_editor "Descrição do pedido" DESCRIPTION
   if [ "$SENTRY_ENABLED" = "true" ]; then
     read_optional "Link do Sentry / erro externo (opcional, Enter para pular): " EXTRA
+  fi
+  if [ -n "$EXTRA" ]; then
     SENTRY_LINE_EXTRA="Link do Sentry / erro externo: ${EXTRA}"
+    read_optional "Descrição adicional (opcional, Enter para pular — o PO vai buscar os detalhes no Sentry): " DESCRIPTION
+  else
+    read_via_editor "Descrição do pedido" DESCRIPTION
   fi
 }
 
@@ -311,6 +332,10 @@ main() {
       # agent actually edits code/runs commands without stepping in at every turn;
       # PO/Tech Leader/Review are text conversations, no reason to let go of the wheel.
       [ "$TYPE" = "development" ] && claude_args+=(--permission-mode auto)
+      # Nothing to wire here for Sentry: the MCP server itself lives in the target
+      # project's own .mcp.json (Claude Code auto-loads it from the cwd), not in
+      # auto_scrum. SENTRY_ENABLED only gates the prompt instruction (build_sentry_blocks)
+      # telling the PO to use that tool when a link is given.
       exec claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)

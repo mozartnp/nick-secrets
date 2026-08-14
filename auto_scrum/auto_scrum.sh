@@ -23,6 +23,8 @@ SENTRY_ENABLED=""
 SENTRY_BLOCK_PO=""
 SENTRY_BLOCK_TL=""
 SENTRY_LINE_EXTRA=""
+PO_VALIDATION_BLOCK=""
+PO_TICKET_FORMAT_BLOCK=""
 TYPE=""
 
 check_requirements() {
@@ -80,8 +82,8 @@ read_via_editor() {
 }
 
 choose_type() {
-  local options=("PO - Criar ticket" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
-  local keys=("po" "tech_leader" "development" "review")
+  local options=("PO - Criar ticket" "PO - Conversar para definir ticket" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
+  local keys=("po" "po_discussion" "tech_leader" "development" "review")
   local opt
   echo "Qual tipo de conversa você quer iniciar?"
   select opt in "${options[@]}"; do
@@ -173,12 +175,13 @@ build_stack_blocks() {
 # itself) is assembled separately, in ask_questions_po, since it depends on the EXTRA
 # value typed by the user.
 #
-# SENTRY_BLOCK_PO also instructs the PO to use the Sentry MCP tool (attached in main(),
-# only for TYPE=po, see MCP_DIR) to fetch the issue itself when a link is given instead
-# of a typed description — the analyst reporting a Sentry error often doesn't know which
-# flow produced it, so asking them to narrate it is asking for info they don't have. If
-# the fetch fails, the instruction tells the PO to fall back to asking the analyst for a
-# manually pasted traceback (treated from then on like a normal ticket).
+# SENTRY_BLOCK_PO also instructs the PO to use the Sentry MCP tool (the target project's
+# own .mcp.json — auto_scrum doesn't configure or attach anything) to fetch the issue
+# itself when a link is given instead of a typed description — the analyst reporting a
+# Sentry error often doesn't know which flow produced it, so asking them to narrate it is
+# asking for info they don't have. If the fetch fails, the instruction tells the PO to
+# fall back to asking the analyst for a manually pasted traceback (treated from then on
+# like a normal ticket).
 build_sentry_blocks() {
   if [ "$SENTRY_ENABLED" = "true" ]; then
     SENTRY_BLOCK_PO='- Se o pedido tiver relação com Sentry ou outro link de erro externo, referencie-o no
@@ -195,6 +198,32 @@ no plano.'
     SENTRY_BLOCK_PO=""
     SENTRY_BLOCK_TL=""
   fi
+}
+
+# build_po_blocks: assembles PO_VALIDATION_BLOCK/PO_TICKET_FORMAT_BLOCK — the parts of
+# po.md and po_discussion.md that must stay identical no matter which entry point
+# triggered the PO (same role, same validity criteria), built once here instead of
+# duplicated in both templates. Must run after build_sentry_blocks, since the already-
+# resolved SENTRY_BLOCK_PO value gets embedded inside PO_VALIDATION_BLOCK.
+build_po_blocks() {
+  printf -v PO_VALIDATION_BLOCK '%s' "Considere o pedido válido quando, ao mesmo tempo:
+- resolve um problema real de usuário ou de negócio;
+- está dentro do propósito/escopo atual do sistema;
+- o esforço e o risco envolvidos parecem proporcionais ao benefício.
+
+Se faltar informação essencial para decidir (pedido vago, sem contexto suficiente),
+pergunte antes de concluir — não presuma.
+
+Análise obrigatória, independente do resultado:
+- É necessário adicionar uma nova permissão para esse fluxo?
+- Existe impacto em produção?
+- Quais são os impactos negativos possíveis?
+${SENTRY_BLOCK_PO}"
+
+  printf -v PO_TICKET_FORMAT_BLOCK '%s' '## Título
+## Descrição
+## Critérios de aceite
+- [ ] ...'
 }
 
 # init_project: asks for the project name and creates a skeleton in
@@ -249,6 +278,14 @@ ask_questions_po() {
   fi
 }
 
+# ask_questions_po_discussion: sem título/descrição prontos — só um assunto solto pra
+# puxar a conversa. O template (po_discussion.md) instrui o PO a discutir antes de
+# aplicar os critérios de validade, então não faz sentido exigir aqui o que a conversa
+# ainda vai construir.
+ask_questions_po_discussion() {
+  read_required "Assunto para discutir: " TITLE
+}
+
 ask_questions_tech_leader() {
   read_required "ID do Jira (ex: SC-123): " JIRA_ID
   read_required "Título da tarefa: " TITLE
@@ -294,17 +331,20 @@ main() {
   resolve_stack "$project_arg"
   build_stack_blocks
   build_sentry_blocks
+  build_po_blocks
   choose_type
 
   case "$TYPE" in
     po) ask_questions_po ;;
+    po_discussion) ask_questions_po_discussion ;;
     tech_leader) ask_questions_tech_leader ;;
     development) ask_questions_development ;;
     review) ask_questions_review ;;
   esac
 
   export TITLE DESCRIPTION EXTRA JIRA_ID PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
-    STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA
+    STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA \
+    PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
@@ -314,7 +354,7 @@ main() {
   # shellcheck disable=SC2016
   # Intentional single quotes: this is the variable list for envsubst to expand, we
   # don't want bash expanding it first.
-  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA' \
+  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo

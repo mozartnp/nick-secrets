@@ -71,6 +71,29 @@ conteúdo). Esse mesmo path é o que `review.md` instrui a ignorar ao procurar o
 pelo padrão `${JIRA_ID}_*.md` numa segunda rodada — senão o review anterior seria
 confundido com o plano.
 
+## PO - Conversar para definir ticket (`po_discussion`)
+
+Segunda forma de ativar o PO, além de `po` — mesmo papel/critérios de validade, entrada
+diferente: em vez de chegar com título+descrição prontos, começa só com um assunto solto
+(`ask_questions_po_discussion`, um `read_required` só). O template
+`templates/po_discussion.md` instrui o PO a conversar e explorar antes de aplicar os
+critérios de validade, só fechando o formato de ticket quando a conversa convergir.
+
+Não existe encadeamento automático daqui pro Tech Leader — igual ao resto do projeto, o
+ticket que sai no final da conversa é copiado manualmente pro Jira, e o Tech Leader é
+acionado depois, à parte, com o `JIRA_ID` já existente.
+
+**Por quê:** é o mesmo PO, não uma persona nova — a diferença está em quando a validação
+acontece (antes da conversa, com pedido já formado, vs. depois, quando ela converge), não
+em quem avalia nem nos critérios usados. Por isso é um `TYPE` novo com template próprio
+(a abertura muda de "avalie o pedido abaixo" pra "descubra o pedido junto com o
+analista"), mas a parte que precisa ficar idêntica nos dois — critérios de validade,
+análise obrigatória, bloco de Sentry, formato do ticket — vem de `build_po_blocks()`
+(`PO_VALIDATION_BLOCK`/`PO_TICKET_FORMAT_BLOCK`, mesmo mecanismo de `build_sentry_blocks`/
+`build_stack_blocks`), não de texto duplicado nos dois `.md`. Editar um critério em
+`build_po_blocks()` já vale pros dois pontos de entrada — não tem como os dois divergirem
+por esquecimento.
+
 ## Flags booleanas por projeto (ex: SENTRY_ENABLED)
 
 Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa Sentry).

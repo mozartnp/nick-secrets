@@ -23,6 +23,8 @@ SENTRY_ENABLED=""
 SENTRY_BLOCK_PO=""
 SENTRY_BLOCK_TL=""
 SENTRY_LINE_EXTRA=""
+PERMISSION_ENABLED=""
+PERMISSION_BLOCK_PO=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TYPE=""
@@ -200,11 +202,24 @@ no plano.'
   fi
 }
 
+# build_permission_blocks: assembles PERMISSION_BLOCK_PO from PERMISSION_ENABLED (set in
+# the project file, opt-in — empty/"false" is the default), same mechanism as
+# build_sentry_blocks(). Not every target project has a permission system, so the
+# question only shows up in the PO prompt when the project opts in.
+build_permission_blocks() {
+  if [ "$PERMISSION_ENABLED" = "true" ]; then
+    printf -v PERMISSION_BLOCK_PO '\n- É necessário adicionar uma nova permissão para esse fluxo?'
+  else
+    PERMISSION_BLOCK_PO=""
+  fi
+}
+
 # build_po_blocks: assembles PO_VALIDATION_BLOCK/PO_TICKET_FORMAT_BLOCK — the parts of
 # po.md and po_discussion.md that must stay identical no matter which entry point
 # triggered the PO (same role, same validity criteria), built once here instead of
-# duplicated in both templates. Must run after build_sentry_blocks, since the already-
-# resolved SENTRY_BLOCK_PO value gets embedded inside PO_VALIDATION_BLOCK.
+# duplicated in both templates. Must run after build_sentry_blocks/build_permission_blocks,
+# since the already-resolved SENTRY_BLOCK_PO/PERMISSION_BLOCK_PO values get embedded
+# inside PO_VALIDATION_BLOCK.
 build_po_blocks() {
   printf -v PO_VALIDATION_BLOCK '%s' "Considere o pedido válido quando, ao mesmo tempo:
 - resolve um problema real de usuário ou de negócio;
@@ -214,8 +229,7 @@ build_po_blocks() {
 Se faltar informação essencial para decidir (pedido vago, sem contexto suficiente),
 pergunte antes de concluir — não presuma.
 
-Análise obrigatória, independente do resultado:
-- É necessário adicionar uma nova permissão para esse fluxo?
+Análise obrigatória, independente do resultado:${PERMISSION_BLOCK_PO}
 - Existe impacto em produção?
 - Quais são os impactos negativos possíveis?
 ${SENTRY_BLOCK_PO}"
@@ -256,6 +270,10 @@ STACK_DESCRIPTION=""
 # tickets/planos — os prompts de PO e Tech Leader passam a perguntar e mencionar isso.
 # Padrão é opt-in: vazio ou "false" faz a menção a Sentry sumir dos prompts.
 SENTRY_ENABLED="false"
+# PERMISSION_ENABLED: "true" se esse projeto tem um sistema de permissões — o PO passa a
+# avaliar, pra cada pedido, se será necessário adicionar uma nova permissão. Padrão é
+# opt-in: vazio ou "false" tira essa pergunta do prompt do PO.
+PERMISSION_ENABLED="false"
 EOF
 
   echo "Projeto criado em $file — edite antes de usar."
@@ -331,6 +349,7 @@ main() {
   resolve_stack "$project_arg"
   build_stack_blocks
   build_sentry_blocks
+  build_permission_blocks
   build_po_blocks
   choose_type
 
@@ -344,7 +363,7 @@ main() {
 
   export TITLE DESCRIPTION EXTRA JIRA_ID PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
     STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA \
-    PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK
+    PERMISSION_BLOCK_PO PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
@@ -354,7 +373,7 @@ main() {
   # shellcheck disable=SC2016
   # Intentional single quotes: this is the variable list for envsubst to expand, we
   # don't want bash expanding it first.
-  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK' \
+  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PERMISSION_BLOCK_PO $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo

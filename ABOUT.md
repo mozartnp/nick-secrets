@@ -94,6 +94,59 @@ análise obrigatória, bloco de Sentry, formato do ticket — vem de `build_po_b
 `build_po_blocks()` já vale pros dois pontos de entrada — não tem como os dois divergirem
 por esquecimento.
 
+## PO - Criar ticket a partir do Jira (`po_jira`)
+
+Terceiro ponto de entrada do PO, além de `po` e `po_discussion` — mesmo papel, mesmos
+critérios de validade (`PO_VALIDATION_BLOCK`/`PO_TICKET_FORMAT_BLOCK` de
+`build_po_blocks()`, sem duplicar texto), entrada diferente: em vez de título+descrição
+prontos ou uma conversa, o analista informa só o link de um ticket que já existe no Jira
+(`ask_questions_po_jira`, `read_required` pro link) mais uma descrição extra opcional
+(`read_optional`). A variável é `JIRA_LINK`, não `JIRA_ID` — `JIRA_ID` já é usado por
+`tech_leader`/`development`/`review` com semântica de chave curta (`SC-123`, nome de
+branch, path de plano), enquanto aqui o dado de entrada é uma URL e o ID real só é
+conhecido depois que o PO busca o ticket.
+
+O template `po_jira.md` instrui o PO a buscar o ticket via MCP do Jira do projeto alvo, a
+partir do link: título, ID, descrição e anexos de imagem — considerando o conteúdo desses
+anexos na análise. Anexos de vídeo ficam fora de escopo, não são buscados nem tratados. Se
+a busca falhar por qualquer motivo (link inválido, ticket não encontrado, MCP indisponível
+ou não configurado no projeto alvo), o PO avisa o analista e pede que ele resolva o
+link/acesso antes de continuar; só se isso não for possível, o PO encerra esse fluxo e
+orienta o analista a recomeçar pela opção "PO - Criar ticket" (`po`) — não tenta coletar a
+descrição completa dentro desta mesma conversa, nem presume que a descrição extra digitada
+(se houver — é só um complemento opcional) seja suficiente sozinha, já que o analista pode
+não ter preenchido esse campo por contar que tudo viria do Jira. Diferente do fallback do
+Sentry, que recupera dentro da própria sessão do `po`/`po_discussion` pedindo o traceback
+colado manualmente, aqui o fallback redireciona pro entry point certo em vez de tentar
+reconstituir o fluxo de título+descrição dentro de uma sessão pensada só pro caminho via
+Jira. Igual ao Sentry, `auto_scrum` não configura nem anexa o MCP do Jira: isso vive no
+`.mcp.json` do próprio projeto alvo, carregado sozinho pelo Claude Code a partir do cwd.
+
+Não existe `JIRA_ENABLED` nem flag opt-in por projeto equivalente à `SENTRY_ENABLED`:
+`po_jira` é um `TYPE` escolhido explicitamente no menu, e essa escolha já é o opt-in — não
+há nada condicional que precise ficar escondido de um projeto que não usa Jira. Igual aos
+outros dois pontos de entrada do PO, não existe encadeamento automático daqui pro Tech
+Leader.
+
+**Por quê:** um ticket que já existe no Jira não deveria precisar ser reescrito à mão pelo
+analista, perdendo os anexos de imagem (prints de bug) que não têm como entrar no fluxo
+via texto digitado. `JIRA_LINK` fica separada de `JIRA_ID` porque misturar as duas
+criaria ambiguidade entre uma URL de entrada e uma chave curta usada depois, no plano e no
+código. A ausência de flag opt-in é deliberada: diferente do Sentry, que se injeta dentro
+de um fluxo já existente (`po`) e por isso precisa de uma flag pra não vazar menção a uma
+ferramenta que o projeto alvo não usa, aqui quem abre `po_jira` já está escolhendo usar o
+Jira — criar `JIRA_ENABLED` seria abstração sem uso real. O fallback pede correção antes
+de seguir porque a falha mais comum de busca (link errado, MCP sem autenticar) é algo que
+o próprio analista consegue resolver na hora — pedir isso primeiro evita abrir mão do
+ticket original por um problema temporário e resolvível. Quando não dá pra resolver (MCP
+indisponível/não configurado no projeto), o PO não tenta virar um `po` improvisado dentro
+da mesma sessão — encerra e manda o analista recomeçar pelo fluxo certo, que já existe
+pronto pra coletar título+descrição via editor. Isso evita duplicar,
+dentro do template do `po_jira`, a lógica de coleta de descrição que o `po` já resolve, e
+evita presumir que o campo de descrição extra (pensado como complemento, não como pedido
+autossuficiente) supre a falta do ticket — se o analista contava com a busca funcionando,
+pode muito bem ter deixado esse campo vazio, e nesse caso não haveria nada pra analisar.
+
 ## Flags booleanas por projeto (ex: SENTRY_ENABLED)
 
 Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa Sentry).

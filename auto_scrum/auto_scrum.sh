@@ -13,6 +13,7 @@ TITLE=""
 DESCRIPTION=""
 EXTRA=""
 JIRA_ID=""
+JIRA_LINK=""
 PLAN_PATH=""
 REVIEW_PATH=""
 STACK_DESCRIPTION=""
@@ -84,8 +85,8 @@ read_via_editor() {
 }
 
 choose_type() {
-  local options=("PO - Criar ticket" "PO - Conversar para definir ticket" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
-  local keys=("po" "po_discussion" "tech_leader" "development" "review")
+  local options=("PO - Criar ticket" "PO - Conversar para definir ticket" "PO - Criar ticket a partir do Jira" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
+  local keys=("po" "po_discussion" "po_jira" "tech_leader" "development" "review")
   local opt
   echo "Qual tipo de conversa você quer iniciar?"
   select opt in "${options[@]}"; do
@@ -304,6 +305,15 @@ ask_questions_po_discussion() {
   read_required "Assunto para discutir: " TITLE
 }
 
+# ask_questions_po_jira: o pedido já existe como ticket no Jira — pede só o link
+# (obrigatório) e uma descrição extra opcional. O PO (po_jira.md) é quem busca título,
+# ID, descrição e anexos via MCP do Jira a partir do link; a descrição extra aqui serve
+# de complemento manual do analista, não substitui a busca.
+ask_questions_po_jira() {
+  read_required "Link do ticket no Jira: " JIRA_LINK
+  read_optional "Descrição extra (opcional, Enter para pular): " DESCRIPTION
+}
+
 ask_questions_tech_leader() {
   read_required "ID do Jira (ex: SC-123): " JIRA_ID
   read_required "Título da tarefa: " TITLE
@@ -356,12 +366,13 @@ main() {
   case "$TYPE" in
     po) ask_questions_po ;;
     po_discussion) ask_questions_po_discussion ;;
+    po_jira) ask_questions_po_jira ;;
     tech_leader) ask_questions_tech_leader ;;
     development) ask_questions_development ;;
     review) ask_questions_review ;;
   esac
 
-  export TITLE DESCRIPTION EXTRA JIRA_ID PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
+  export TITLE DESCRIPTION EXTRA JIRA_ID JIRA_LINK PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
     STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA \
     PERMISSION_BLOCK_PO PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK
 
@@ -373,7 +384,7 @@ main() {
   # shellcheck disable=SC2016
   # Intentional single quotes: this is the variable list for envsubst to expand, we
   # don't want bash expanding it first.
-  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PERMISSION_BLOCK_PO $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK' \
+  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $JIRA_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PERMISSION_BLOCK_PO $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo
@@ -404,4 +415,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

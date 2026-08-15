@@ -122,28 +122,31 @@ reconstituir o fluxo de título+descrição dentro de uma sessão pensada só pr
 Jira. Igual ao Sentry, `auto_scrum` não configura nem anexa o MCP do Jira: isso vive no
 `.mcp.json` do próprio projeto alvo, carregado sozinho pelo Claude Code a partir do cwd.
 
-Não existe `JIRA_ENABLED` nem flag opt-in por projeto equivalente à `SENTRY_ENABLED`:
-`po_jira` é um `TYPE` escolhido explicitamente no menu, e essa escolha já é o opt-in — não
-há nada condicional que precise ficar escondido de um projeto que não usa Jira. Igual aos
-outros dois pontos de entrada do PO, não existe encadeamento automático daqui pro Tech
-Leader.
+`JIRA_ENABLED` ("true"/"false", opt-in — igual `SENTRY_ENABLED`/`PERMISSION_ENABLED`)
+controla se a opção "PO - Criar ticket a partir do Jira" aparece no menu de
+`choose_type()`: só entra na lista quando o projeto tem o MCP do Jira configurado. Foge um
+pouco do mecanismo padrão dessas flags (`build_*_blocks()` montando um bloco de texto pro
+`envsubst`, ver seção "Flags booleanas por projeto" abaixo) porque aqui o efeito não é
+texto num prompt — é a própria opção do menu sumir; por isso é lida direto dentro de
+`choose_type()`, sem passar por um `build_jira_blocks()`. Igual aos outros dois pontos de
+entrada do PO, não existe encadeamento automático daqui pro Tech Leader.
 
 **Por quê:** um ticket que já existe no Jira não deveria precisar ser reescrito à mão pelo
 analista, perdendo os anexos de imagem (prints de bug) que não têm como entrar no fluxo
 via texto digitado. `JIRA_LINK` fica separada de `JIRA_ID` porque misturar as duas
 criaria ambiguidade entre uma URL de entrada e uma chave curta usada depois, no plano e no
-código. A ausência de flag opt-in é deliberada: diferente do Sentry, que se injeta dentro
-de um fluxo já existente (`po`) e por isso precisa de uma flag pra não vazar menção a uma
-ferramenta que o projeto alvo não usa, aqui quem abre `po_jira` já está escolhendo usar o
-Jira — criar `JIRA_ENABLED` seria abstração sem uso real. O fallback pede correção antes
-de seguir porque a falha mais comum de busca (link errado, MCP sem autenticar) é algo que
-o próprio analista consegue resolver na hora — pedir isso primeiro evita abrir mão do
-ticket original por um problema temporário e resolvível. Quando não dá pra resolver (MCP
-indisponível/não configurado no projeto), o PO não tenta virar um `po` improvisado dentro
-da mesma sessão — encerra e manda o analista recomeçar pelo fluxo certo, que já existe
-pronto pra coletar título+descrição via editor. Isso evita duplicar,
-dentro do template do `po_jira`, a lógica de coleta de descrição que o `po` já resolve, e
-evita presumir que o campo de descrição extra (pensado como complemento, não como pedido
+código. `JIRA_ENABLED` existe porque nem todo projeto alvo tem o MCP do Jira configurado —
+sem a flag, a opção apareceria pra todo mundo no menu e falharia de cara pra quem não tem
+o `.mcp.json` certo; escondê-la por padrão (opt-in) evita oferecer um caminho que não vai
+funcionar. O fallback pede correção antes de seguir porque a falha mais comum de busca
+(link errado, MCP sem autenticar) é algo que o próprio analista consegue resolver na hora
+— pedir isso primeiro evita abrir mão do ticket original por um problema temporário e
+resolvível. Quando não dá pra resolver (MCP indisponível/não configurado no projeto), o PO
+não tenta virar um `po` improvisado dentro da mesma sessão — encerra e manda o analista
+recomeçar pelo fluxo certo, que já existe pronto pra coletar título+descrição via editor.
+Isso evita duplicar, dentro do template do `po_jira`, a lógica de coleta de descrição que
+o `po` já resolve, e evita presumir que o campo de descrição extra (pensado como
+complemento, não como pedido
 autossuficiente) supre a falta do ticket — se o analista contava com a busca funcionando,
 pode muito bem ter deixado esse campo vazio, e nesse caso não haveria nada pra analisar.
 

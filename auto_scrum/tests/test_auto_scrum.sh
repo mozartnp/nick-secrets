@@ -56,13 +56,24 @@ timeout 2 bash -c "source '$AUTO_SCRUM_SH' < /dev/null; declare -F choose_type >
 assert_eq "0" "$smoke_result" "source não roda main() nem trava esperando input"
 
 echo
-echo "== choose_type: nova opção po_jira entra na posição certa =="
+echo "== choose_type: po_jira só aparece com JIRA_ENABLED=true (opt-in por projeto) =="
 type_result=""
-type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; choose_type <<< '3' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
-assert_eq "po_jira" "$type_result" "opção 3 seleciona TYPE=po_jira"
+type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED=true; choose_type <<< '3' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
+assert_eq "po_jira" "$type_result" "com JIRA_ENABLED=true, opção 3 seleciona TYPE=po_jira"
 
-type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; choose_type <<< '4' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
-assert_eq "tech_leader" "$type_result" "opção 4 continua selecionando TYPE=tech_leader (não empurrado)"
+type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED=true; choose_type <<< '4' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
+assert_eq "tech_leader" "$type_result" "com JIRA_ENABLED=true, opção 4 continua tech_leader"
+
+type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; choose_type <<< '3' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
+assert_eq "tech_leader" "$type_result" "sem JIRA_ENABLED (padrão false), po_jira some do menu — opção 3 vira tech_leader"
+
+type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED=false; choose_type <<< '3' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
+assert_eq "tech_leader" "$type_result" "com JIRA_ENABLED=false explícito, po_jira também some do menu"
+
+echo
+echo "== init_project: skeleton de projeto novo inclui JIRA_ENABLED (opt-in, padrão false) =="
+init_skeleton_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; PROJECTS_DIR=\"\$(mktemp -d)\"; printf 'projeto-teste\n' | init_project >/dev/null 2>&1; cat \"\$PROJECTS_DIR/projeto-teste.sh\"")"
+assert_contains "$init_skeleton_result" 'JIRA_ENABLED="false"' "skeleton de init_project() declara JIRA_ENABLED=\"false\" por padrão"
 
 echo
 echo "== ask_questions_po_jira: pede link (obrigatório) e descrição extra (opcional) =="

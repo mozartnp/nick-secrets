@@ -26,6 +26,7 @@ SENTRY_BLOCK_TL=""
 SENTRY_LINE_EXTRA=""
 PERMISSION_ENABLED=""
 PERMISSION_BLOCK_PO=""
+JIRA_ENABLED=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TYPE=""
@@ -84,9 +85,19 @@ read_via_editor() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
+# choose_type: monta o menu principal. A opção "po_jira" só entra na lista quando
+# JIRA_ENABLED="true" (setado no arquivo do projeto, opt-in — igual SENTRY_ENABLED/
+# PERMISSION_ENABLED) — nem todo projeto alvo tem o MCP do Jira configurado, então não
+# faz sentido oferecer uma opção que vai falhar de cara pra quem não tem.
 choose_type() {
-  local options=("PO - Criar ticket" "PO - Conversar para definir ticket" "PO - Criar ticket a partir do Jira" "Tech Leader - Criar plano" "Desenvolvimento" "Review")
-  local keys=("po" "po_discussion" "po_jira" "tech_leader" "development" "review")
+  local options=("PO - Criar ticket" "PO - Conversar para definir ticket")
+  local keys=("po" "po_discussion")
+  if [ "$JIRA_ENABLED" = "true" ]; then
+    options+=("PO - Criar ticket a partir do Jira")
+    keys+=("po_jira")
+  fi
+  options+=("Tech Leader - Criar plano" "Desenvolvimento" "Review")
+  keys+=("tech_leader" "development" "review")
   local opt
   echo "Qual tipo de conversa você quer iniciar?"
   select opt in "${options[@]}"; do
@@ -275,6 +286,10 @@ SENTRY_ENABLED="false"
 # avaliar, pra cada pedido, se será necessário adicionar uma nova permissão. Padrão é
 # opt-in: vazio ou "false" tira essa pergunta do prompt do PO.
 PERMISSION_ENABLED="false"
+# JIRA_ENABLED: "true" se esse projeto tem o MCP do Jira configurado (.mcp.json do
+# projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
+# principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.
+JIRA_ENABLED="false"
 EOF
 
   echo "Projeto criado em $file — edite antes de usar."

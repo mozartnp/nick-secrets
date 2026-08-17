@@ -29,6 +29,7 @@ PERMISSION_BLOCK_PO=""
 JIRA_ENABLED=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
+TECH_LEADER_PLAN_RULES_BLOCK=""
 TYPE=""
 
 check_requirements() {
@@ -85,10 +86,12 @@ read_via_editor() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
-# choose_type: monta o menu principal. A opção "po_jira" só entra na lista quando
-# JIRA_ENABLED="true" (setado no arquivo do projeto, opt-in — igual SENTRY_ENABLED/
-# PERMISSION_ENABLED) — nem todo projeto alvo tem o MCP do Jira configurado, então não
-# faz sentido oferecer uma opção que vai falhar de cara pra quem não tem.
+# choose_type: monta o menu principal. As opções "po_jira" e "tech_leader_jira" só entram
+# na lista quando JIRA_ENABLED="true" (setado no arquivo do projeto, opt-in — igual
+# SENTRY_ENABLED/PERMISSION_ENABLED) — nem todo projeto alvo tem o MCP do Jira
+# configurado, então não faz sentido oferecer uma opção que vai falhar de cara pra quem
+# não tem. Cada uma entra logo após o par manual do seu papel (po_jira depois de
+# po_discussion, tech_leader_jira depois de tech_leader).
 choose_type() {
   local options=("PO - Criar ticket" "PO - Conversar para definir ticket")
   local keys=("po" "po_discussion")
@@ -96,8 +99,14 @@ choose_type() {
     options+=("PO - Criar ticket a partir do Jira")
     keys+=("po_jira")
   fi
-  options+=("Tech Leader - Criar plano" "Desenvolvimento" "Review")
-  keys+=("tech_leader" "development" "review")
+  options+=("Tech Leader - Criar plano")
+  keys+=("tech_leader")
+  if [ "$JIRA_ENABLED" = "true" ]; then
+    options+=("Tech Leader - Criar plano a partir do Jira")
+    keys+=("tech_leader_jira")
+  fi
+  options+=("Desenvolvimento" "Review")
+  keys+=("development" "review")
   local opt
   echo "Qual tipo de conversa você quer iniciar?"
   select opt in "${options[@]}"; do
@@ -252,6 +261,32 @@ ${SENTRY_BLOCK_PO}"
 - [ ] ...'
 }
 
+# build_tech_leader_blocks: assembles TECH_LEADER_PLAN_RULES_BLOCK — a parte de
+# tech_leader.md e tech_leader_jira.md que precisa ficar idêntica não importa qual ponto
+# de entrada acionou o Tech Leader (mesmo papel, mesmas regras de plano), montada uma vez
+# aqui em vez de duplicada nos dois templates. Mesmo mecanismo de build_po_blocks()/
+# PO_VALIDATION_BLOCK. Só entra aqui o que é igual nos dois templates — partes que
+# dependem do dado de entrada específico (ex: a seção "DADOS DE ENTRADA" de cada um, ou a
+# frase que cita o nome do arquivo do plano, que em tech_leader_jira.md não pode usar
+# ${JIRA_ID} — ver comentário em tech_leader_jira.md) continuam com texto próprio em cada
+# arquivo.
+build_tech_leader_blocks() {
+  printf -v TECH_LEADER_PLAN_RULES_BLOCK '%s' 'Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
+não presuma.
+
+O plano deve ser pensado para ser executado usando a metodologia TDD. Quem vai executar o
+plano é um(a) desenvolvedor(a) IA em outra sessão — não é você.
+
+O plano deve terminar com estas duas seções:
+## Critérios de aceite
+Se o ticket já trouxer critérios de aceite na descrição, não copie cegamente: avalie
+cada um à luz do plano técnico. Se algum não fizer mais sentido, remova e explique o
+porquê; se faltar algo que o plano exige, adicione. Essa seção é obrigatória — a etapa
+de review usa ela para validar o trabalho feito.
+## Habilidades necessárias
+As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço.'
+}
+
 # init_project: asks for the project name and creates a skeleton in
 # auto_scrum/projects/<name>.sh, with just the (empty) variables the templates expect.
 # The user opens it and fills it in afterwards.
@@ -335,6 +370,18 @@ ask_questions_tech_leader() {
   read_via_editor "Descrição / contexto" DESCRIPTION
 }
 
+# ask_questions_tech_leader_jira: o ticket já existe no Jira — pede só o link
+# (obrigatório) e um contexto extra opcional. Reaproveita JIRA_LINK/DESCRIPTION (mesmas
+# variáveis de ask_questions_po_jira) em vez de criar variáveis novas: JIRA_LINK já tem a
+# semântica certa de URL de entrada, e DESCRIPTION já serve de complemento opcional nesse
+# padrão. O Tech Leader (tech_leader_jira.md) é quem busca título, ID, descrição e anexos
+# via MCP do Jira a partir do link — JIRA_ID não é pedido aqui, só é conhecido depois,
+# dentro da própria sessão do Claude.
+ask_questions_tech_leader_jira() {
+  read_required "Link do ticket no Jira: " JIRA_LINK
+  read_optional "Contexto extra (opcional, Enter para pular): " DESCRIPTION
+}
+
 ask_questions_development() {
   read_required "ID do Jira / branch (ex: SC-123): " JIRA_ID
   read_optional "Arquivo do plano (opcional, Enter para usar docs/plans/${JIRA_ID}_*.md): " PLAN_PATH
@@ -376,6 +423,7 @@ main() {
   build_sentry_blocks
   build_permission_blocks
   build_po_blocks
+  build_tech_leader_blocks
   choose_type
 
   case "$TYPE" in
@@ -383,13 +431,14 @@ main() {
     po_discussion) ask_questions_po_discussion ;;
     po_jira) ask_questions_po_jira ;;
     tech_leader) ask_questions_tech_leader ;;
+    tech_leader_jira) ask_questions_tech_leader_jira ;;
     development) ask_questions_development ;;
     review) ask_questions_review ;;
   esac
 
   export TITLE DESCRIPTION EXTRA JIRA_ID JIRA_LINK PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
     STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA \
-    PERMISSION_BLOCK_PO PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK
+    PERMISSION_BLOCK_PO PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK TECH_LEADER_PLAN_RULES_BLOCK
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
@@ -399,7 +448,7 @@ main() {
   # shellcheck disable=SC2016
   # Intentional single quotes: this is the variable list for envsubst to expand, we
   # don't want bash expanding it first.
-  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $JIRA_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PERMISSION_BLOCK_PO $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK' \
+  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $JIRA_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PERMISSION_BLOCK_PO $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo

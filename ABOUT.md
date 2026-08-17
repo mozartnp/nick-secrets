@@ -150,6 +150,55 @@ complemento, não como pedido
 autossuficiente) supre a falta do ticket — se o analista contava com a busca funcionando,
 pode muito bem ter deixado esse campo vazio, e nesse caso não haveria nada pra analisar.
 
+## Tech Leader - Criar plano a partir do Jira (`tech_leader_jira`)
+
+Segundo ponto de entrada do Tech Leader, além de `tech_leader` — mesmo papel, mesmas
+regras de plano (metodologia TDD, seções finais obrigatórias `## Critérios de aceite`/
+`## Habilidades necessárias`, convenção `docs/plans/<ID>_<resumo-curto>.md`), entrada
+diferente: em vez de `JIRA_ID`/título/descrição digitados manualmente, o analista informa
+só o link de um ticket que já existe no Jira (`ask_questions_tech_leader_jira`,
+`read_required` pro link) mais um contexto extra opcional (`read_optional`), reaproveitando
+`JIRA_LINK`/`DESCRIPTION` — as mesmas variáveis já usadas por `po_jira`, sem criar
+`EXTRA_CONTEXT` nem equivalente.
+
+O template `tech_leader_jira.md` instrui o Tech Leader a buscar o ticket via MCP do Jira
+do projeto alvo, a partir do link: título, ID, descrição e anexos de imagem — visualizando
+e considerando o conteúdo desses anexos no plano técnico (ex: diagrama de arquitetura,
+print de comportamento esperado). Anexos de vídeo ficam fora de escopo, mesma regra do
+`po_jira.md`. O fallback também segue o mesmo padrão em duas etapas: se a busca falhar
+(link inválido, ticket não encontrado, MCP indisponível ou não configurado), avisa o
+analista e pede que resolva o link/acesso; só se isso não for possível, encerra o fluxo e
+orienta a recomeçar pela opção "Tech Leader - Criar plano" (`tech_leader`, manual) — sem
+tentar coletar ID/título/descrição dentro desta mesma sessão, pensada só pro caminho via
+Jira.
+
+**`JIRA_ID` não é usado no template — nem como `${JIRA_ID}`.** Diferente de `tech_leader`
+(onde `JIRA_ID` é digitado antes e exportado com valor real), aqui o ID do ticket só é
+conhecido *depois* que o Tech Leader busca via MCP, dentro da própria sessão do Claude. O
+script continua exportando `JIRA_ID` (fica vazio, já que `ask_questions_tech_leader_jira`
+não a define) e continua na lista de variáveis do `envsubst` — outros `TYPE`s dependem
+disso. O risco é usar `${JIRA_ID}` dentro de `tech_leader_jira.md`: como a variável está
+na lista do `envsubst`, isso não geraria erro nem sobra de `${...}` — só substituiria
+silenciosamente por uma string vazia, quebrando a instrução de nome de arquivo sem deixar
+rastro. Por isso o template usa texto literal (`<ID-do-ticket>`, "o ID do Jira que você
+acabou de buscar") em vez de `${JIRA_ID}`, e um teste estrutural (grep) garante que essa
+string nunca entre no arquivo.
+
+`JIRA_ENABLED` (a mesma flag que já controla `po_jira`) também controla se "Tech Leader -
+Criar plano a partir do Jira" aparece no menu de `choose_type()`, posicionada logo após
+"Tech Leader - Criar plano" e antes de "Desenvolvimento" — mesmo racional de
+posicionamento de `po_jira` (logo após o par manual do seu papel). Igual ao restante do
+projeto, não existe encadeamento automático daqui pro `development`.
+
+**Por quê:** mesmo racional de `po_jira` — um ticket que já existe no Jira não deveria
+precisar ser retranscrito à mão pelo Tech Leader, perdendo anexos de imagem (diagramas,
+prints) que informariam o plano técnico. Reaproveitar `JIRA_LINK`/`DESCRIPTION` em vez de
+criar variáveis novas evita duplicar um mecanismo que `po_jira` já resolveu pro mesmo tipo
+de entrada (URL + complemento opcional). `JIRA_ID` fica de fora do template porque, nesse
+`TYPE`, ele nunca tem valor real vindo do script — usá-lo seria uma falha silenciosa
+(string vazia), não um erro visível, daí a decisão explícita de texto literal e o teste
+estrutural que protege contra reintrodução do problema.
+
 ## Flags booleanas por projeto (ex: SENTRY_ENABLED)
 
 Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa Sentry).
@@ -163,6 +212,40 @@ texto fixo — nunca um `if` dentro do `.md`, porque `envsubst` não suporta con
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
 criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer.
+
+## DRY entre templates do mesmo papel (texto compartilhado vira `build_*_blocks()`)
+
+Variação do mecanismo acima ("Flags booleanas por projeto"), pro caso em que o texto não é
+condicional — é sempre montado, só não pode ficar duplicado literalmente em mais de um
+`.md`. Quando dois ou mais templates do mesmo papel (pontos de entrada diferentes, ex:
+`tech_leader`/`tech_leader_jira`, ou `po`/`po_discussion`/`po_jira`) compartilham um
+trecho que precisa ficar idêntico entre eles, esse trecho vira uma variável de bloco
+(`${PO_VALIDATION_BLOCK}`, `${TECH_LEADER_PLAN_RULES_BLOCK}`) montada uma vez, numa função
+`build_*_blocks()` em `auto_scrum.sh` — `build_po_blocks()` pro PO,
+`build_tech_leader_blocks()` pro Tech Leader —, exportada e adicionada à lista do
+`envsubst`. O template referencia a variável; nunca repete o texto.
+
+Exemplo: `TECH_LEADER_PLAN_RULES_BLOCK` (regra de perguntar se faltar informação técnica,
+metodologia TDD, as duas seções finais obrigatórias) é montada em
+`build_tech_leader_blocks()` e usada tanto em `tech_leader.md` quanto em
+`tech_leader_jira.md` — antes da extração, esse parágrafo existia duplicado, palavra por
+palavra, nos dois arquivos.
+
+**O que não entra num bloco compartilhado:** partes que dependem do dado de entrada
+específico daquele ponto de entrada, mesmo que pareçam parecidas à primeira vista — ex: a
+seção "DADOS DE ENTRADA" de cada template (campos diferentes: `JIRA_ID`/`TITLE` em
+`tech_leader.md` vs `JIRA_LINK`/`DESCRIPTION` em `tech_leader_jira.md`), ou a frase que
+cita o nome do arquivo do plano, que em `tech_leader.md` usa `${JIRA_ID}` mas em
+`tech_leader_jira.md` precisa ser texto literal (`<ID-do-ticket>`, ver seção
+`tech_leader_jira` acima) — forçar essas partes a compartilhar uma variável recriaria, por
+outro caminho, o mesmo risco de `${JIRA_ID}` vazando como string vazia que a decisão
+anterior evitou.
+
+**Por quê:** editar a regra compartilhada em um lugar só (a função) já vale pra todos os
+templates que a usam — texto duplicado diverge com o tempo, quando alguém edita um `.md` e
+esquece do outro. É o mesmo racional de `build_po_blocks()`/`PO_VALIDATION_BLOCK`
+(documentado em "PO - Conversar para definir ticket" acima), generalizado pra qualquer
+papel com mais de um ponto de entrada.
 
 ## auto_scrum roda com o cwd dentro do projeto alvo
 

@@ -43,14 +43,29 @@ O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
   `LOGS_DIR`), `minusculo` para variáveis locais e nomes de função.
 - Antes de considerar um script pronto, rodar `shellcheck` nele manualmente
   (`sudo pacman -S shellcheck` se ainda não instalado). Quando um aviso for
-  falso positivo intencional (ex: `source` de arquivo dinâmico), suprimir com
-  `# shellcheck disable=SCxxxx` acompanhado do porquê, como já feito em
-  `resolve_stack()`.
+  falso positivo intencional (ex: aspas simples de propósito numa lista de variáveis),
+  suprimir com `# shellcheck disable=SCxxxx` acompanhado do porquê, como já feito no
+  `SC2016` da linha do `envsubst` em `main()`.
 
 **Por quê:** essas regras evitam as três classes de bug mais comuns em bash —
 variável não citada que quebra com espaço/glob, variável de função vazando pro
 escopo global, e falha de comando ignorada silenciosamente por causa do
 `set -e` ausente.
+
+## README genérico: sem repetir detalhe que muda com o código
+
+O `README.md` descreve uso e comportamento estável: como rodar, de onde vem a configuração
+e em que ordem, a regra de formato, o que é versionado onde, notas de migração. Listas que
+crescem a cada ticket — chaves de configuração, quais etapas usam cada flag, opções de
+menu — **não** vão pro README: ficam no código, neste `ABOUT.md` ou nos comentários do
+esqueleto gerado por `--init` (`print_project_skeleton()`), que é a fonte única da lista de
+chaves da configuração do projeto (protegida pelo teste de consistência com
+`PROJECT_CONFIG_KEYS`). O README remete a essas fontes em vez de copiá-las.
+
+**Por quê:** o README não tem teste que pegue desatualização, e cada flag nova exigiria
+lembrar de editá-lo. O ticket 8 já mostrou isso acontecendo: uma frase do passo 1 de "Uso"
+("só é usado de fato por Tech Leader/Desenvolvimento") foi mexida e continuou errada, já que
+`JIRA_ENABLED`/`SENTRY_ENABLED`/`PERMISSION_ENABLED` afetam o menu e o prompt do PO.
 
 ## Convenção do arquivo de plano (Tech Leader → Dev/Review)
 
@@ -202,12 +217,20 @@ estrutural que protege contra reintrodução do problema.
 ## Flags booleanas por projeto (ex: SENTRY_ENABLED)
 
 Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa Sentry).
-Esse tipo de coisa vira uma variável booleana no arquivo `auto_scrum/projects/<name>.sh`
-(`SENTRY_ENABLED="true"/"false"`, opt-in — vazio conta como `"false"`), lida por uma função
+Esse tipo de coisa vira uma variável booleana no arquivo de configuração do projeto
+(`.nick.conf` no cwd ou `auto_scrum/projects/<name>.conf` — ver seção "Configuração do
+projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
+`SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`), lida por uma função
 `build_*_blocks()` em `auto_scrum.sh` (mesmo padrão de `build_stack_blocks()`/
 `STACK_DESCRIPTION`) que monta o bloco de texto correspondente só quando a flag está ativa. O
 template usa a variável de bloco (`${SENTRY_BLOCK_PO}`, `${SENTRY_BLOCK_TL}`) no lugar do
 texto fixo — nunca um `if` dentro do `.md`, porque `envsubst` não suporta condicional.
+
+Toda flag nova precisa entrar também em `PROJECT_CONFIG_KEYS` (topo do `auto_scrum.sh`) e no
+esqueleto de `print_project_skeleton()`: o leitor `load_project_config` ignora qualquer chave
+fora dessa lista, então uma flag só escrita no arquivo nunca chegaria ao script. Um teste
+compara as chaves do esqueleto com `PROJECT_CONFIG_KEYS` pra pegar o esquecimento de um dos
+dois lados.
 
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
@@ -262,10 +285,113 @@ diretório qualquer.
 de PO" abaixo — sem o `auto_scrum` precisar saber nada sobre ele) e o `CLAUDE.md`/
 `ABOUT.md` daquele projeto. Também é o que permite a etapa de Desenvolvimento editar o
 código de verdade: ela roda `claude --permission-mode auto` no mesmo cwd, então as
-mudanças caem no repositório certo. `--projeto=<nome>` (flag do `auto_scrum.sh`) escolhe
-só a *stack descrita no prompt* (`STACK_DESCRIPTION`/`SENTRY_ENABLED` de
-`projects/<name>.sh`) — não tem relação com em qual diretório o comando roda, são coisas
-independentes que coincidentemente usam o mesmo nome de projeto.
+mudanças caem no repositório certo.
+
+O cwd também decide a configuração do projeto (`STACK_DESCRIPTION`/`*_ENABLED`) quando
+existe um `.nick.conf` na raiz dele: nesse caso `--projeto=<nome>` é ignorado (com aviso) e o
+menu de projetos não aparece — ver seção "Configuração do projeto: cwd primeiro, projects/
+como fallback" abaixo. Sem `.nick.conf` no cwd, `--projeto=<nome>` (flag do
+`auto_scrum.sh`) escolhe a configuração em `auto_scrum/projects/<name>.conf`, e aí sim não
+tem relação com em qual diretório o comando roda — são coisas independentes que
+coincidentemente usam o mesmo nome de projeto.
+
+## Configuração do projeto: cwd primeiro, projects/ como fallback
+
+A configuração de cada projeto alvo (`STACK_DESCRIPTION`, `SENTRY_ENABLED`,
+`PERMISSION_ENABLED`, `JIRA_ENABLED`) pode morar em dois lugares, e `resolve_stack()`
+procura nesta ordem:
+
+1. **`.nick.conf` na raiz do cwd** (`$PWD/.nick.conf`, constante `CWD_CONFIG_NAME`). Se
+   existir, vence tudo: é carregado, o script imprime no stdout
+   `Configuração do projeto carregada de: <caminho absoluto>` e retorna — sem menu de
+   projetos e sem aviso de `.sh` legado. Se `--projeto=<nome>` também foi passado, sai no
+   stderr `Aviso: --projeto=<nome> ignorado — a configuração do diretório atual (<caminho>)
+   tem precedência.`, e o nome **não é validado** (`--projeto=inexistente` não dá `exit 1`,
+   já que a flag nem é usada).
+2. **`--projeto=<nome>`** → `auto_scrum/projects/<nome>.conf` (erro se não existir).
+3. **Menu** com `auto_scrum/projects/*.conf` + "Nenhum".
+
+A linha "carregada de" só existe no caminho do cwd; nos caminhos 2 e 3 a saída é a de
+sempre, exceto pelo aviso de `.sh` legado (abaixo).
+
+**Nome `.nick.conf`, só no cwd.** O arquivo vai ser versionado dentro do repositório de outro
+time, então não pode ser apanhado pelo lint/pre-commit/CI desse time: dotfile (não polui a
+listagem); sem `.sh` (fora de `shellcheck $(git ls-files '*.sh')`, `find -name '*.sh'` e dos
+hooks que filtram tipo shell); sem shebang (o `identify` do pre-commit detecta shell por
+shebang em arquivo sem extensão conhecida); sem `.env` (não é carregado por
+`python-dotenv`/`django-environ`/`docker compose` nem tratado como segredo por scanners); sem
+`.yml`/`.json`/`.toml`/`.ini` (fora de `check-yaml`/`check-json`/prettier). Os hooks genéricos
+de texto (`trailing-whitespace`, `end-of-file-fixer`, `mixed-line-ending`) valem pra qualquer
+arquivo, então o esqueleto do `--init` sai sem espaço no fim de linha, com LF e terminando em
+`\n` — coberto por teste. A busca é só no `$PWD`, sem subir pra diretórios pais ou pra raiz
+do git: a convenção já é rodar da raiz do projeto alvo, e subir criaria ambiguidade (qual
+arquivo vence num monorepo?) sem pedido concreto.
+
+**Leitura por `CHAVE="valor"` (`load_project_config`), sem `source` nem `eval`.** O mesmo
+leitor vale pro cwd e pra `projects/` — um mecanismo de carga só. Gramática: depois de tirar
+espaços/tabs do começo e do fim da linha (o que também remove o `\r` de CRLF), só é aplicada
+uma linha `CHAVE="valor"` com `CHAVE` em `PROJECT_CONFIG_KEYS` (comparação exata) e `valor`
+sem aspas duplas dentro. O valor é atribuído **literalmente** com `printf -v` — sem expansão
+de `$VAR`, `$(...)`, crase ou escape —, e o nome da variável vem sempre de
+`PROJECT_CONFIG_KEYS`, nunca do arquivo. Todo o resto é ignorado em silêncio: comentários,
+linhas em branco, comandos e chaves desconhecidas (inclusive globais do script como `PATH` e
+`TYPE`, que um `source` sobrescreveria). A exceção é uma linha de chave conhecida que foge do
+formato: tanto a que começa com `CHAVE=` (`JIRA_ENABLED=true`, `JIRA_ENABLED="true" && touch
+x`, `JIRA_ENABLED="true" # comentário`) quanto as formas "quase certas" `export CHAVE=...` e
+`CHAVE = ...`/`CHAVE ="..."` (espaço logo depois do nome — `STACK_DESCRIPTION_EXTRA = "x"`
+continua sendo chave desconhecida, sem aviso). Ela é ignorada com um único aviso no stderr,
+com arquivo e número da linha (texto único em `warn_malformed_config_line`); essas formas
+continuam **não** sendo aceitas, só deixam de ser descartadas em silêncio. Aspas simples, valores sem aspas e comentário no fim da linha ficam de fora de
+propósito, pra gramática ser pequena e fácil de testar. Variáveis locais da função precisam
+ficar em minúsculo — uma local com o nome de uma chave faria o `printf -v` alterar a local
+em vez da global.
+
+**`projects/` passou de `.sh` pra `.conf`.** Os arquivos deixaram de ser executados, e manter
+`.sh` passaria a ideia errada de que são `source`ados (e editores/`shellcheck` os tratariam
+como script). O conteúdo não mudou: já era `CHAVE="valor"` com comentários. `.sh` **não** é
+lido como fallback (seriam dois mecanismos de novo) nem renomeado pelo script (mover arquivo
+do usuário sem pedir é surpresa): `warn_legacy_project_files` só avisa no stderr, pra cada
+`projects/*.sh`, com o `mv` sugerido — e só nos caminhos 2 e 3, nunca quando a configuração
+vem do cwd.
+
+**`--init` pergunta o destino** (`.nick.conf` no cwd primeiro, por ser o local recomendado,
+ou `auto_scrum/projects/<nome>.conf`), gera o mesmo conteúdo nos dois casos
+(`print_project_skeleton`) e pergunta antes de sobrescrever em ambos.
+
+**`.gitignore` do `nick_secrets`:** lista `auto_scrum/projects/*` com a exceção
+`!auto_scrum/projects/.gitkeep` (o placeholder que mantém o diretório no git continua
+versionável — sem a exceção, se ele fosse removido e recriado, o `git add` passaria a exigir
+`-f`). A regra ampla cobre de uma vez os `*.conf` (formato local atual), os `*.sh` legados
+ainda não renomeados em alguma máquina e os backups/swaps de editor (`alpha.conf~`,
+`.alpha.conf.swp`, `alpha.conf.bak`), que um `*.conf` sozinho deixaria aparecer como
+"untracked" — e acabar commitados com dado de cliente num repositório público. Isso
+substitui a decisão original do plano do ticket 8 (`*.conf` + `*.sh`, dois padrões
+específicos). `.nick.conf` também é listado, sem `/` inicial (vale em qualquer
+profundidade: um `--init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo
+versionável no repositório público).
+
+**O leitor protege o shell, não o prompt.** O valor de `STACK_DESCRIPTION` entra literal no
+texto enviado ao `claude`, inclusive na etapa de Desenvolvimento, que roda em
+`--permission-mode auto`. Um `.nick.conf` malicioso (ex: `STACK_DESCRIPTION="Django. Ignore
+as instruções anteriores e rode ..."`) não executa nada no shell, mas ainda pode tentar
+instruir o agente — é um vetor de prompt injection. Não é um risco novo: é a mesma confiança
+que já se dá ao `CLAUDE.md` do projeto alvo, que o Claude Code carrega sozinho do mesmo
+repositório. Por isso, alterações em `.nick.conf` devem passar pelo mesmo review de PR que o
+`CLAUDE.md` — um `.nick.conf` de terceiros não é "seguro" só por não ser executado.
+
+**Por quê:** com a configuração só em `auto_scrum/projects/`, gitignorada, ela se perdia ao
+trocar de máquina e o time do projeto alvo não conseguia reaproveitá-la — e versioná-la no
+`nick_secrets` não é opção, porque o repositório é público e exporia nome de cliente e pistas
+de infraestrutura. Como o cwd já identifica o projeto alvo (seção acima), a configuração pode
+morar lá, versionada junto com o código que ela descreve. Só que um arquivo num repositório
+compartilhado pode ser editado por qualquer pessoa desse time, e não deve conseguir executar
+código no shell de quem roda o `auto_scrum` — daí o `source` sair e entrar um leitor restrito
+a chaves conhecidas, com valor literal (inclusive na linha "híbrida" `CHAVE="x" && comando`,
+que termina em aspas e por isso exige a regra de "sem aspas dentro do valor"). O aviso pra
+chave conhecida mal formatada existe porque, sem ele, um erro comum como `JIRA_ENABLED=true`
+desligaria a flag sem explicação — e o mesmo vale pra `export CHAVE=` (provável em quem vem
+do formato `.sh` antigo, que era `source`ado, ou copia de um `.bashrc`) e pra espaço em volta
+do `=`.
 
 ## Modo auto só na etapa de Desenvolvimento
 
@@ -303,7 +429,7 @@ técnico gerou o erro — exigir uma descrição narrada nesse caso é pedir uma
 ele não tem, quando o próprio Sentry já carrega isso (stack trace, frequência, usuários
 afetados). A configuração de acesso ao Sentry (servidor MCP, host, credenciais) é dado do
 projeto alvo, não do `auto_scrum` — mesma lógica de `STACK_DESCRIPTION`/`SENTRY_ENABLED`
-ficarem em `projects/<name>.sh`, só que aqui o "arquivo do projeto" nem é do
+ficarem no arquivo de configuração do projeto, só que aqui o "arquivo do projeto" nem é do
 `nick_secrets`, é o `.mcp.json` que já mora no repositório do projeto alvo. O MCP fica
 restrito à etapa de PO porque é ali que a análise do pedido acontece; o Tech Leader
 trabalha em cima do texto já produzido, sem necessidade de acesso próprio ao Sentry.

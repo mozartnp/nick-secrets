@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
+CWD_CONFIG_NAME=".nick.conf"
+PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED)
 
 TITLE=""
 DESCRIPTION=""
@@ -121,40 +123,129 @@ choose_type() {
 list_projects() {
   local f found=0
   echo "Projetos disponíveis em $PROJECTS_DIR/:"
-  for f in "$PROJECTS_DIR"/*.sh; do
+  for f in "$PROJECTS_DIR"/*.conf; do
     [ -e "$f" ] || continue
     found=1
-    echo "  - $(basename "$f" .sh)"
+    echo "  - $(basename "$f" .conf)"
   done
   [ "$found" -eq 0 ] && echo "  (nenhum)"
 }
 
+# warn_legacy_project_files: projects/ files used to be <name>.sh (sourced); they are now
+# <name>.conf, read by load_project_config. .sh files are deliberately not read as a
+# fallback (that would bring back a second loading mechanism) nor renamed automatically
+# (moving the user's files without asking is a surprise) — this only warns on stderr, with
+# the mv to run, so a machine still holding old files doesn't lose its config silently.
+warn_legacy_project_files() {
+  local f
+  for f in "$PROJECTS_DIR"/*.sh; do
+    [ -e "$f" ] || continue
+    echo "Aviso: $f não é mais lido — renomeie para .conf: mv '$f' '${f%.sh}.conf'" >&2
+  done
+}
+
+# load_project_config <file>
+# Reads a project config file without source/eval: the file may live in the target
+# project's repository, where anyone on that team can edit it, so it must never run code
+# in the shell of whoever runs auto_scrum. Only lines KEY="value" whose KEY is in
+# PROJECT_CONFIG_KEYS (exact match) are applied, and the value is assigned literally via
+# printf -v (no $VAR, $(...), backtick or escape expansion). Surrounding spaces/tabs (and
+# the \r of CRLF files) are trimmed first. Everything else — comments, blank lines,
+# unknown keys, commands — is ignored; a line for a known key that doesn't follow the
+# format (no quotes, quotes inside the value, trailing comment/command, but also the
+# "almost right" `export KEY=...` and `KEY = ...`) is ignored with a warning on stderr, so
+# a typo doesn't silently turn a flag off.
+# Local variables must stay lowercase: an uppercase local named like a key would make
+# printf -v set the local instead of the global.
+load_project_config() {
+  local file="$1"
+  local line="" line_number=0 key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    for key in "${PROJECT_CONFIG_KEYS[@]}"; do
+      case "$line" in
+        "$key"=*) ;;
+        # Only a space right after the name counts, so a lookalike key such as
+        # STACK_DESCRIPTION_EXTRA = "x" stays silently ignored.
+        "export $key"=* | "export $key"[[:space:]]* | "$key"[[:space:]]*=*)
+          warn_malformed_config_line "$file:$line_number" "$key"
+          continue 2
+          ;;
+        *) continue ;;
+      esac
+      value="${line#"$key"=}"
+      case "$value" in
+        \"*\")
+          value="${value#\"}"
+          value="${value%\"}"
+          case "$value" in
+            *\"*) ;;
+            *)
+              printf -v "$key" '%s' "$value"
+              continue 2
+              ;;
+          esac
+          ;;
+      esac
+      warn_malformed_config_line "$file:$line_number" "$key"
+    done
+  done < "$file"
+}
+
+# warn_malformed_config_line <file:line_number> <key>: the single warning text for a
+# known-key line that load_project_config ignores for not following KEY="value". The
+# location comes already joined — passing the bare "$file" here makes shellcheck think
+# the function writes to the file load_project_config is reading (SC2094).
+warn_malformed_config_line() {
+  local location="$1" key="$2"
+  echo "Aviso: $location: linha de $key ignorada (formato esperado: $key=\"valor\", sem aspas duplas dentro do valor)" >&2
+}
+
 # resolve_stack <project_name_via_argv_or_empty>
-# Sets STACK_DESCRIPTION from auto_scrum/projects/<name>.sh (source). If a name is
-# passed as an argument, uses it directly (error if it doesn't exist). Otherwise, shows
-# a select with the projects found + a "Nenhum" option (leaves STACK_DESCRIPTION empty —
-# build_stack_blocks(), in main, is what assembles the conditional text that makes the
-# stack mention disappear when empty).
+# Sets the project config (STACK_DESCRIPTION and the *_ENABLED flags) via
+# load_project_config, searching in this order:
+#   1. $PWD/.nick.conf (CWD_CONFIG_NAME) — only the cwd itself, no parent directories.
+#      When present it wins: no menu, no legacy warning, and a --projeto= name is ignored
+#      (with a warning on stderr, and not validated — the flag isn't used at all);
+#   2. auto_scrum/projects/<name>.conf, with the name passed as an argument (error if it
+#      doesn't exist);
+#   3. a select with the projects found + a "Nenhum" option (leaves STACK_DESCRIPTION
+#      empty — build_stack_blocks(), in main, is what assembles the conditional text that
+#      makes the stack mention disappear when empty).
+# Old projects/*.sh files are only warned about (warn_legacy_project_files), in steps 2/3.
 resolve_stack() {
   local project_arg="$1"
   local file
+  local cwd_config="$PWD/$CWD_CONFIG_NAME"
+
+  if [ -f "$cwd_config" ]; then
+    if [ -n "$project_arg" ]; then
+      echo "Aviso: --projeto=$project_arg ignorado — a configuração do diretório atual ($cwd_config) tem precedência." >&2
+    fi
+    load_project_config "$cwd_config"
+    echo "Configuração do projeto carregada de: $cwd_config"
+    return
+  fi
+
+  warn_legacy_project_files
 
   if [ -n "$project_arg" ]; then
-    file="$PROJECTS_DIR/$project_arg.sh"
+    file="$PROJECTS_DIR/$project_arg.conf"
     if [ ! -f "$file" ]; then
       echo "Erro: projeto '$project_arg' não encontrado." >&2
       list_projects >&2
       exit 1
     fi
-    # shellcheck disable=SC1090
-    source "$file"
+    load_project_config "$file"
     return
   fi
 
   local names=() f opt
-  for f in "$PROJECTS_DIR"/*.sh; do
+  for f in "$PROJECTS_DIR"/*.conf; do
     [ -e "$f" ] || continue
-    names+=("$(basename "$f" .sh)")
+    names+=("$(basename "$f" .conf)")
   done
   names+=("Nenhum")
 
@@ -167,8 +258,7 @@ resolve_stack() {
     if [ "$opt" = "Nenhum" ]; then
       STACK_DESCRIPTION=""
     else
-      # shellcheck disable=SC1090
-      source "$PROJECTS_DIR/$opt.sh"
+      load_project_config "$PROJECTS_DIR/$opt.conf"
     fi
     break
   done
@@ -287,28 +377,15 @@ de review usa ela para validar o trabalho feito.
 As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço.'
 }
 
-# init_project: asks for the project name and creates a skeleton in
-# auto_scrum/projects/<name>.sh, with just the (empty) variables the templates expect.
-# The user opens it and fills it in afterwards.
-init_project() {
-  mkdir -p "$PROJECTS_DIR"
-  local name file confirm
-  read_required "Nome do projeto: " name
-  file="$PROJECTS_DIR/$name.sh"
-
-  if [ -f "$file" ]; then
-    read -r -p "Já existe um projeto '$name'. Sobrescrever? (s/N): " confirm
-    case "$confirm" in
-      s|S|sim|Sim|SIM) ;;
-      *)
-        echo "Cancelado. Nada foi alterado."
-        return
-        ;;
-    esac
-  fi
-
-  cat > "$file" <<'EOF'
+# print_project_skeleton: prints (stdout) the project config skeleton, with just the
+# (empty/"false") keys of PROJECT_CONFIG_KEYS. Both init_project destinations write this
+# same output, so they can't drift apart. The file must stay friendly to the target team's
+# generic text hooks (pre-commit trailing-whitespace/end-of-file-fixer/mixed-line-ending):
+# no shebang, no trailing spaces, LF, ending with a newline — covered by tests.
+print_project_skeleton() {
+  cat <<'EOF'
 # Config do projeto pro auto_scrum. Preencha as variáveis abaixo e salve.
+# Não é executado: o auto_scrum lê só linhas CHAVE="valor" (aspas duplas, sem aspas dentro do valor nem comentário no fim da linha) das chaves abaixo.
 # STACK_DESCRIPTION: stack técnica usada no prompt do Tech Leader/Desenvolvimento
 # (texto livre, sem ponto final no fim — o template já adiciona).
 # Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"
@@ -326,6 +403,56 @@ PERMISSION_ENABLED="false"
 # principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.
 JIRA_ENABLED="false"
 EOF
+}
+
+# init_project: asks where to create the project config and writes the skeleton
+# (print_project_skeleton) there. The user opens it and fills it in afterwards.
+#   1. $PWD/.nick.conf — listed first since it's the recommended place: versioned with
+#      the target project, shared with its team. No name is asked;
+#   2. auto_scrum/projects/<name>.conf — local to this machine (gitignored). PROJECTS_DIR
+#      is only created in this branch, so option 1 doesn't create a directory for nothing.
+# Either way, an existing file is only overwritten after confirmation.
+init_project() {
+  local options=(
+    "Diretório atual ($PWD/$CWD_CONFIG_NAME) — versionado junto com o projeto"
+    "auto_scrum/projects/<nome>.conf — só nesta máquina"
+  )
+  local opt name file="" confirm
+  echo "Onde criar a configuração do projeto?"
+  select opt in "${options[@]}"; do
+    if [ -z "${opt:-}" ]; then
+      echo "Opção inválida, tente novamente."
+      continue
+    fi
+    if [ "$opt" = "${options[0]}" ]; then
+      file="$PWD/$CWD_CONFIG_NAME"
+    else
+      mkdir -p "$PROJECTS_DIR"
+      read_required "Nome do projeto: " name
+      file="$PROJECTS_DIR/$name.conf"
+    fi
+    break
+  done
+
+  # stdin closed during the select (Ctrl+D, or an invalid option followed by EOF): no
+  # destination was chosen, so stop here instead of failing on a redirect to "".
+  if [ -z "$file" ]; then
+    echo "Cancelado. Nada foi alterado." >&2
+    return 1
+  fi
+
+  if [ -f "$file" ]; then
+    read -r -p "Já existe $file. Sobrescrever? (s/N): " confirm
+    case "$confirm" in
+      s|S|sim|Sim|SIM) ;;
+      *)
+        echo "Cancelado. Nada foi alterado."
+        return
+        ;;
+    esac
+  fi
+
+  print_project_skeleton > "$file"
 
   echo "Projeto criado em $file — edite antes de usar."
 }

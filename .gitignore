@@ -1,3 +1,5 @@
 auto_scrum/logs/*.md
-auto_scrum/projects/*.sh
+auto_scrum/projects/*
+!auto_scrum/projects/.gitkeep
+.nick.conf
 docs/plans/*

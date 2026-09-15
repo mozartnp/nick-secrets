@@ -542,6 +542,206 @@ assert_not_contains "$e2e_output" "Qual projeto" "main() não mostra o menu de p
 assert_contains "$e2e_output" "Aviso: --projeto=inexistente ignorado" "main() avisa que --projeto=inexistente foi ignorado"
 
 echo
+echo "== choose_type: po_sentry só aparece com SENTRY_ENABLED=true, depois dos outros pontos de entrada do PO =="
+# run_choose_type <setup> <option>: dá source num bash separado, roda <setup> (ajuste das
+# flags), alimenta choose_type com <option> e imprime o TYPE escolhido.
+run_choose_type() {
+  local setup="$1" option="$2"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $setup; choose_type <<< '$option' >/dev/null 2>&1; printf '%s' \"\$TYPE\"" 2>/dev/null || true
+}
+
+assert_eq "po_sentry" "$(run_choose_type "SENTRY_ENABLED=true" 3)" "com SENTRY_ENABLED=true (Jira desligado), opção 3 seleciona TYPE=po_sentry"
+assert_eq "tech_leader" "$(run_choose_type "SENTRY_ENABLED=true" 4)" "com SENTRY_ENABLED=true (Jira desligado), opção 4 é tech_leader"
+assert_eq "review" "$(run_choose_type "SENTRY_ENABLED=true" 6)" "com SENTRY_ENABLED=true (Jira desligado), opção 6 é review"
+
+assert_eq "po_jira" "$(run_choose_type "SENTRY_ENABLED=true; JIRA_ENABLED=true" 3)" "com SENTRY_ENABLED=true e JIRA_ENABLED=true, opção 3 é po_jira"
+assert_eq "po_sentry" "$(run_choose_type "SENTRY_ENABLED=true; JIRA_ENABLED=true" 4)" "com SENTRY_ENABLED=true e JIRA_ENABLED=true, opção 4 é po_sentry"
+assert_eq "tech_leader" "$(run_choose_type "SENTRY_ENABLED=true; JIRA_ENABLED=true" 5)" "com SENTRY_ENABLED=true e JIRA_ENABLED=true, opção 5 é tech_leader"
+assert_eq "tech_leader_jira" "$(run_choose_type "SENTRY_ENABLED=true; JIRA_ENABLED=true" 6)" "com SENTRY_ENABLED=true e JIRA_ENABLED=true, opção 6 é tech_leader_jira"
+assert_eq "review" "$(run_choose_type "SENTRY_ENABLED=true; JIRA_ENABLED=true" 8)" "com SENTRY_ENABLED=true e JIRA_ENABLED=true, opção 8 é review"
+
+assert_eq "tech_leader" "$(run_choose_type ":" 3)" "sem SENTRY_ENABLED (padrão vazio), po_sentry some do menu — opção 3 é tech_leader"
+assert_eq "tech_leader" "$(run_choose_type "SENTRY_ENABLED=false" 3)" "com SENTRY_ENABLED=false explícito, po_sentry também some do menu"
+
+# O select imprime o menu no stderr mesmo sem terminal, então dá pra checar a label.
+sentry_menu_label="PO - Criar ticket a partir do Sentry"
+sentry_menu="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; SENTRY_ENABLED=true; choose_type <<< '1' 2>&1" 2>/dev/null || true)"
+assert_contains "$sentry_menu" "$sentry_menu_label" "com SENTRY_ENABLED=true, o menu mostra a label do po_sentry"
+sentry_menu="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; choose_type <<< '1' 2>&1" 2>/dev/null || true)"
+assert_not_contains "$sentry_menu" "$sentry_menu_label" "sem SENTRY_ENABLED (padrão vazio), o menu não mostra a label do po_sentry"
+sentry_menu="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; SENTRY_ENABLED=false; choose_type <<< '1' 2>&1" 2>/dev/null || true)"
+assert_not_contains "$sentry_menu" "$sentry_menu_label" "com SENTRY_ENABLED=false, o menu não mostra a label do po_sentry"
+
+echo
+echo "== ask_questions_po_sentry: pede link (obrigatório) e descrição extra (opcional), sem título =="
+# O read -p não imprime o prompt fora de terminal, então o teste é pelo efeito nas variáveis:
+# se houvesse uma pergunta de título, o link cairia em TITLE.
+sentry_link="https://sentry.example.com/organizations/acme/issues/42/"
+run_ask_po_sentry() {
+  local input="$1"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; ask_questions_po_sentry >/dev/null 2>&1; printf '%s|%s|%s' \"\$SENTRY_LINK\" \"\$DESCRIPTION\" \"\$TITLE\"" <<< "$input" 2>/dev/null || true
+}
+assert_eq "$sentry_link||" "$(run_ask_po_sentry "$sentry_link"$'\n')" "link setado em SENTRY_LINK, DESCRIPTION e TITLE vazios quando a descrição não é informada"
+assert_eq "$sentry_link||" "$(run_ask_po_sentry $'\n'"$sentry_link"$'\n')" "read_required repete quando a primeira linha vem vazia, só aceita a segunda"
+assert_eq "$sentry_link|descrição extra de exemplo|" "$(run_ask_po_sentry "$sentry_link"$'\ndescrição extra de exemplo')" "link e descrição setados, TITLE vazio (não há pergunta de título)"
+
+# template_vars <file>: imprime, numa linha só e separadas por espaço, as variáveis
+# referenciadas no fonte de um template ($VAR ou ${VAR}), ordenadas e sem repetição.
+template_vars() {
+  local file="$1"
+  # shellcheck disable=SC2016
+  # Aspas simples intencionais: '${}' é a lista de caracteres pro tr apagar, não expansão.
+  { grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' "$file" 2>/dev/null || true; } | tr -d '${}' | LC_ALL=C sort -u | paste -sd ' ' -
+}
+
+echo
+echo "== template po_sentry.md: renderização via envsubst e conjunto exato de variáveis =="
+PO_SENTRY_TEMPLATE="$SCRIPT_DIR/../templates/po_sentry.md"
+if [ -f "$PO_SENTRY_TEMPLATE" ]; then
+  # shellcheck disable=SC2016
+  # Aspas simples intencionais: é a lista de variáveis pro envsubst expandir, não
+  # queremos que o bash expanda antes (mesmo padrão dos outros templates).
+  rendered_po_sentry="$(PO_VALIDATION_BLOCK="[validação de exemplo]" PO_TICKET_FORMAT_BLOCK="[formato de exemplo]" SENTRY_LINK="$sentry_link" DESCRIPTION="descrição extra de exemplo" envsubst '$PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $SENTRY_LINK $DESCRIPTION' < "$PO_SENTRY_TEMPLATE")"
+  assert_contains "$rendered_po_sentry" "$sentry_link" "SENTRY_LINK de exemplo aparece literalmente no output"
+  assert_contains "$rendered_po_sentry" "descrição extra de exemplo" "DESCRIPTION de exemplo aparece literalmente no output"
+  assert_contains "$rendered_po_sentry" "[validação de exemplo]" "PO_VALIDATION_BLOCK de exemplo aparece literalmente no output"
+  assert_contains "$rendered_po_sentry" "[formato de exemplo]" "PO_TICKET_FORMAT_BLOCK de exemplo aparece literalmente no output"
+  # shellcheck disable=SC2016
+  # Aspas simples intencionais: '${' é o texto literal buscado no output renderizado.
+  assert_not_contains "$rendered_po_sentry" '${' "nenhuma variável \${...} sobra sem substituir no output"
+
+  # Uma variável que ask_questions_po_sentry não preenche (ex: TITLE) passaria no teste de
+  # consistência genérico, mas seria substituída silenciosamente por vazio neste TYPE.
+  assert_eq "DESCRIPTION PO_TICKET_FORMAT_BLOCK PO_VALIDATION_BLOCK SENTRY_LINK" "$(template_vars "$PO_SENTRY_TEMPLATE")" "po_sentry.md referencia exatamente as variáveis preenchidas pra esse TYPE"
+
+  po_sentry_src="$(cat "$PO_SENTRY_TEMPLATE")"
+  assert_not_contains "$po_sentry_src" "Considere o pedido válido quando" "po_sentry.md não duplica os critérios de validade (vêm de PO_VALIDATION_BLOCK)"
+  assert_not_contains "$po_sentry_src" "## Critérios de aceite" "po_sentry.md não duplica o formato do ticket (vem de PO_TICKET_FORMAT_BLOCK)"
+else
+  echo "  FAIL: templates/po_sentry.md não existe"
+  failures=$((failures + 1))
+fi
+
+# run_main <case_dir> <nick_conf_line> <stdin> [setup]: roda main() de ponta a ponta num
+# bash separado, com cwd em <case_dir>/cwd contendo um .nick.conf de uma linha,
+# check_requirements stubado e LOGS_DIR/PROJECTS_DIR temporários (nada é gravado em
+# auto_scrum/logs/ nem lido de auto_scrum/projects/). [setup] roda antes de main (ex:
+# apontar EDITOR). stdout+stderr vão pra <case_dir>/output; imprime o código de saída.
+run_main() {
+  local case_dir="$1" conf_line="$2" input="$3" setup="${4:-:}" rc=0
+  mkdir -p "$case_dir/cwd" "$case_dir/projects"
+  printf '%s\n' "$conf_line" > "$case_dir/cwd/.nick.conf"
+  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$case_dir/logs'; PROJECTS_DIR='$case_dir/projects'; $setup; main" <<< "$input" > "$case_dir/output" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+
+echo
+echo "== main(): po_sentry de ponta a ponta (menu, case, export, envsubst e prompt renderizado) =="
+e2e_sentry_dir="$TEST_TMP/main_e2e_po_sentry"
+# stdin: opção 3 (po_sentry, com Jira desligado), o link, descrição vazia e N pra recusar.
+e2e_sentry_rc="$(run_main "$e2e_sentry_dir" 'SENTRY_ENABLED="true"' "3"$'\n'"$sentry_link"$'\n\nN')"
+e2e_sentry_output="$(cat "$e2e_sentry_dir/output")"
+assert_eq "0" "$e2e_sentry_rc" "main() termina com código 0 ao recusar o envio"
+assert_contains "$e2e_sentry_output" "Cancelado." "main() cancela ao receber N na confirmação"
+assert_contains "$e2e_sentry_output" "$sentry_menu_label" "SENTRY_ENABLED=\"true\" do .nick.conf mostra a opção po_sentry no menu"
+assert_contains "$e2e_sentry_output" "Link do issue no Sentry: $sentry_link" "prompt renderizado contém o link informado"
+assert_contains "$e2e_sentry_output" "## Critérios de aceite" "prompt renderizado contém o formato do ticket (PO_TICKET_FORMAT_BLOCK)"
+assert_contains "$e2e_sentry_output" "link de erro externo" "prompt renderizado contém a referência a link de erro externo (SENTRY_BLOCK_PO)"
+# shellcheck disable=SC2016
+# Aspas simples intencionais: '${' é o texto literal buscado no output renderizado.
+assert_not_contains "$e2e_sentry_output" '${' "nenhuma variável \${...} sobra sem substituir no prompt"
+
+echo
+echo "== ask_questions_po: só título e descrição pelo editor, com ou sem SENTRY_ENABLED =="
+# Editor falso: read_via_editor chama "$EDITOR" "$tmpfile", então EDITOR precisa ser o
+# caminho de um executável sem argumentos. Grava um texto fixo no arquivo e toca um
+# marcador, que prova que o editor foi de fato chamado.
+fake_editor_dir="$TEST_TMP/fake_editor"
+fake_editor="$fake_editor_dir/editor"
+fake_editor_marker="$fake_editor_dir/called"
+fake_editor_text="descrição vinda do editor falso"
+mkdir -p "$fake_editor_dir"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s\n' '$fake_editor_text' > \"\$1\"" "touch '$fake_editor_marker'" > "$fake_editor"
+chmod +x "$fake_editor"
+
+# A 2ª linha do stdin é um link: no fluxo antigo ela virava a resposta da pergunta do
+# Sentry e o read da descrição curta encontrava EOF, sem chamar o editor. Uma 2ª linha
+# vazia faria o fluxo antigo cair no editor e o teste passaria sem provar nada.
+po_input=$'Título de teste\nhttps://sentry.example.com/issues/42/'
+for po_flag_setup in "SENTRY_ENABLED=true" "SENTRY_ENABLED="; do
+  po_flag_label="$po_flag_setup"
+  if [ "$po_flag_setup" = "SENTRY_ENABLED=" ]; then
+    po_flag_label="SENTRY_ENABLED vazio"
+  fi
+  rm -f "$fake_editor_marker"
+  po_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $po_flag_setup; EDITOR='$fake_editor'; ask_questions_po >/dev/null 2>&1; printf '%s|%s' \"\$TITLE\" \"\$DESCRIPTION\"" <<< "$po_input" 2>/dev/null || true)"
+  assert_eq "Título de teste|$fake_editor_text" "$po_result" "$po_flag_label: TITLE vem da 1ª linha e DESCRIPTION do editor"
+  assert_exists "$fake_editor_marker" "$po_flag_label: o editor é chamado pra descrição"
+done
+
+echo
+echo "== main(): po de ponta a ponta com SENTRY_ENABLED=\"true\" (título + editor, sem link) =="
+rm -f "$fake_editor_marker"
+e2e_po_dir="$TEST_TMP/main_e2e_po"
+e2e_po_rc="$(run_main "$e2e_po_dir" 'SENTRY_ENABLED="true"' $'1\nTítulo de teste\nN' "EDITOR='$fake_editor'")"
+e2e_po_output="$(cat "$e2e_po_dir/output")"
+assert_eq "0" "$e2e_po_rc" "main() termina com código 0 ao recusar o envio"
+assert_contains "$e2e_po_output" "Cancelado." "main() cancela ao receber N na confirmação"
+assert_contains "$e2e_po_output" "Título do pedido: Título de teste" "prompt renderizado contém o título"
+assert_contains "$e2e_po_output" "Descrição do pedido: $fake_editor_text" "prompt renderizado contém a descrição vinda do editor"
+assert_exists "$fake_editor_marker" "main() chama o editor pra descrição do po"
+# shellcheck disable=SC2016
+# Aspas simples intencionais: '${' é o texto literal buscado no output renderizado.
+assert_not_contains "$e2e_po_output" '${' "nenhuma variável \${...} sobra sem substituir no prompt"
+
+echo
+echo "== po.md e auto_scrum.sh: sem EXTRA/SENTRY_LINE_EXTRA =="
+PO_TEMPLATE="$SCRIPT_DIR/../templates/po.md"
+assert_eq "DESCRIPTION PO_TICKET_FORMAT_BLOCK PO_VALIDATION_BLOCK TITLE" "$(template_vars "$PO_TEMPLATE")" "po.md referencia exatamente as variáveis preenchidas pra esse TYPE"
+# -w não casa STACK_DESCRIPTION_EXTRA (o _ conta como caractere de palavra).
+extra_lines="$(grep -nwE 'EXTRA|SENTRY_LINE_EXTRA' "$AUTO_SCRUM_SH" "$SCRIPT_DIR"/../templates/*.md || true)"
+assert_eq "" "$extra_lines" "nenhuma referência a EXTRA/SENTRY_LINE_EXTRA no script nem nos templates"
+
+echo
+echo "== build_sentry_blocks: SENTRY_BLOCK_PO só referencia o link (MCP e fallback vivem em po_sentry.md) =="
+sentry_block_po="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; SENTRY_ENABLED=true; build_sentry_blocks; printf '%s' \"\$SENTRY_BLOCK_PO\"" 2>/dev/null || true)"
+assert_contains "$sentry_block_po" "link de erro externo, referencie-o" "com SENTRY_ENABLED=true, SENTRY_BLOCK_PO instrui a referenciar o link de erro externo"
+assert_not_contains "$sentry_block_po" "MCP" "SENTRY_BLOCK_PO não fala de MCP"
+assert_not_contains "$sentry_block_po" "traceback" "SENTRY_BLOCK_PO não fala de traceback"
+
+# po_validation_block <setup>: PO_VALIDATION_BLOCK real, montado na mesma ordem de main().
+po_validation_block() {
+  local setup="$1"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $setup; build_sentry_blocks; build_permission_blocks; build_po_blocks; printf '%s' \"\$PO_VALIDATION_BLOCK\"" 2>/dev/null || true
+}
+po_validation_sentry="$(po_validation_block "SENTRY_ENABLED=true")"
+for po_shared_tpl in po_discussion po_jira; do
+  # shellcheck disable=SC2016
+  # Aspas simples intencionais: é a lista de variáveis pro envsubst expandir, não
+  # queremos que o bash expanda antes (mesmo padrão dos outros templates).
+  rendered_po_shared="$(PO_VALIDATION_BLOCK="$po_validation_sentry" PO_TICKET_FORMAT_BLOCK="[formato de exemplo]" TITLE="assunto de exemplo" JIRA_LINK="https://jira.example.com/browse/SC-999" DESCRIPTION="descrição de exemplo" envsubst '$PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TITLE $JIRA_LINK $DESCRIPTION' < "$SCRIPT_DIR/../templates/$po_shared_tpl.md")"
+  assert_contains "$rendered_po_shared" "link de erro externo" "$po_shared_tpl.md com SENTRY_ENABLED=true continua instruindo a referenciar link de erro externo"
+  assert_not_contains "$rendered_po_shared" "traceback" "$po_shared_tpl.md com SENTRY_ENABLED=true não recebe o fallback de traceback"
+done
+assert_not_contains "$(po_validation_block "SENTRY_ENABLED=false")" "Sentry" "com SENTRY_ENABLED=false, PO_VALIDATION_BLOCK não menciona Sentry"
+
+echo
+echo "== consistência: variáveis dos templates = lista do envsubst = lista do export =="
+# Variável de template fora do envsubst sobra como \${...} literal no prompt; variável no
+# envsubst/export sem uso em template é código morto; export e envsubst divergentes fazem o
+# valor não chegar ao envsubst. Os três conjuntos saem ordenados, um por linha.
+# shellcheck disable=SC2016
+# Aspas simples intencionais: '${}' é a lista de caracteres pro tr apagar, não expansão.
+vars_templates="$(grep -ohE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' "$SCRIPT_DIR"/../templates/*.md | tr -d '${}' | LC_ALL=C sort -u)"
+vars_envsubst="$(grep -F "envsubst '" "$AUTO_SCRUM_SH" | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | tr -d '$' | LC_ALL=C sort -u)"
+# Do "  export" até a primeira linha que não termina em "\" (inclusive a própria linha do
+# export, se ela for única). Não usa grep -A3: com um export mais curto, pegaria linhas
+# seguintes do main().
+vars_export="$(awk '/^  export /{found=1} found{print} found && !/\\$/{exit}' "$AUTO_SCRUM_SH" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | grep -E '^[A-Z_][A-Z0-9_]*$' | LC_ALL=C sort -u)"
+assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates são exatamente as da lista do envsubst"
+assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
+
+echo
 echo "== auto_scrum.sh: nenhuma linha source/. (config lida só por load_project_config) =="
 source_lines="$(grep -nE '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 assert_eq "" "$source_lines" "auto_scrum.sh não tem nenhuma linha source/."

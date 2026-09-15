@@ -13,9 +13,9 @@ PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_EN
 
 TITLE=""
 DESCRIPTION=""
-EXTRA=""
 JIRA_ID=""
 JIRA_LINK=""
+SENTRY_LINK=""
 PLAN_PATH=""
 REVIEW_PATH=""
 STACK_DESCRIPTION=""
@@ -25,7 +25,6 @@ STACK_BLOCK_REVIEW=""
 SENTRY_ENABLED=""
 SENTRY_BLOCK_PO=""
 SENTRY_BLOCK_TL=""
-SENTRY_LINE_EXTRA=""
 PERMISSION_ENABLED=""
 PERMISSION_BLOCK_PO=""
 JIRA_ENABLED=""
@@ -88,18 +87,24 @@ read_via_editor() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
-# choose_type: monta o menu principal. As opções "po_jira" e "tech_leader_jira" só entram
-# na lista quando JIRA_ENABLED="true" (setado no arquivo do projeto, opt-in — igual
-# SENTRY_ENABLED/PERMISSION_ENABLED) — nem todo projeto alvo tem o MCP do Jira
-# configurado, então não faz sentido oferecer uma opção que vai falhar de cara pra quem
-# não tem. Cada uma entra logo após o par manual do seu papel (po_jira depois de
-# po_discussion, tech_leader_jira depois de tech_leader).
+# choose_type: builds the main menu. Two project flags (opt-in, empty/"false" by default)
+# gate entry points that depend on an MCP server from the target project's .mcp.json, so
+# a project without it isn't offered an option that would fail right away:
+#   - JIRA_ENABLED="true" adds "po_jira" and "tech_leader_jira";
+#   - SENTRY_ENABLED="true" adds "po_sentry".
+# Each one goes right after the manual entry points of its role: po_jira after
+# po_discussion, po_sentry after po_jira (or after po_discussion when Jira is off) and
+# always before tech_leader, tech_leader_jira after tech_leader.
 choose_type() {
   local options=("PO - Criar ticket" "PO - Conversar para definir ticket")
   local keys=("po" "po_discussion")
   if [ "$JIRA_ENABLED" = "true" ]; then
     options+=("PO - Criar ticket a partir do Jira")
     keys+=("po_jira")
+  fi
+  if [ "$SENTRY_ENABLED" = "true" ]; then
+    options+=("PO - Criar ticket a partir do Sentry")
+    keys+=("po_sentry")
   fi
   options+=("Tech Leader - Criar plano")
   keys+=("tech_leader")
@@ -284,27 +289,20 @@ build_stack_blocks() {
 # build_sentry_blocks: assembles SENTRY_BLOCK_PO/SENTRY_BLOCK_TL from SENTRY_ENABLED
 # (set in the project file, opt-in — empty/"false" is the default). When the project
 # doesn't use Sentry, the mention disappears entirely from the PO and Tech Leader
-# prompts, instead of showing generic text. SENTRY_LINE_EXTRA (the line with the link
-# itself) is assembled separately, in ask_questions_po, since it depends on the EXTRA
-# value typed by the user.
-#
-# SENTRY_BLOCK_PO also instructs the PO to use the Sentry MCP tool (the target project's
-# own .mcp.json — auto_scrum doesn't configure or attach anything) to fetch the issue
-# itself when a link is given instead of a typed description — the analyst reporting a
-# Sentry error often doesn't know which flow produced it, so asking them to narrate it is
-# asking for info they don't have. If the fetch fails, the instruction tells the PO to
-# fall back to asking the analyst for a manually pasted traceback (treated from then on
-# like a normal ticket).
+# prompts, instead of showing generic text.
+#   - SENTRY_BLOCK_PO only tells the PO to reference a Sentry/external error link in the
+#     ticket. It is embedded in PO_VALIDATION_BLOCK (build_po_blocks), so it reaches every
+#     PO entry point — which is why it must not carry anything that only makes sense when a
+#     Sentry link was given.
+#   - SENTRY_BLOCK_TL tells the Tech Leader to carry that reference into the plan.
+# The instructions to fetch the issue via the Sentry MCP and the fallback when that fails
+# live as fixed text in po_sentry.md, the only template that has a Sentry link as input.
+# SENTRY_ENABLED's other effect, showing that entry point in the menu, is read directly in
+# choose_type().
 build_sentry_blocks() {
   if [ "$SENTRY_ENABLED" = "true" ]; then
     SENTRY_BLOCK_PO='- Se o pedido tiver relação com Sentry ou outro link de erro externo, referencie-o no
-  ticket (ou na explicação de rejeição, se for o caso).
-- Se um link do Sentry foi informado e não há descrição escrita pelo analista, use a
-  tool do Sentry (MCP) disponível para buscar os detalhes do issue (erro, stack trace,
-  frequência, usuários afetados) e baseie sua análise e a descrição do ticket nisso.
-- Se não conseguir acessar o Sentry (falha de autenticação, issue não encontrado, MCP
-  indisponível), avise o analista e peça que ele descreva o problema manualmente,
-  colando o traceback, para seguir como um pedido normal.'
+  ticket (ou na explicação de rejeição, se for o caso).'
     SENTRY_BLOCK_TL='Se o ticket tiver relação com Sentry ou outro link de erro externo, inclua a referência
 no plano.'
   else
@@ -390,9 +388,10 @@ print_project_skeleton() {
 # (texto livre, sem ponto final no fim — o template já adiciona).
 # Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"
 STACK_DESCRIPTION=""
-# SENTRY_ENABLED: "true" se esse projeto usa Sentry (ou outro link de erro externo) nos
-# tickets/planos — os prompts de PO e Tech Leader passam a perguntar e mencionar isso.
-# Padrão é opt-in: vazio ou "false" faz a menção a Sentry sumir dos prompts.
+# SENTRY_ENABLED: "true" se esse projeto usa Sentry — a opção "PO - Criar ticket a partir
+# do Sentry" aparece no menu principal (o PO busca o issue pelo MCP do Sentry do .mcp.json
+# do projeto alvo), e os prompts de PO e Tech Leader passam a mencionar links de erro
+# externo. Padrão é opt-in: vazio ou "false" esconde a opção e tira a menção dos prompts.
 SENTRY_ENABLED="false"
 # PERMISSION_ENABLED: "true" se esse projeto tem um sistema de permissões — o PO passa a
 # avaliar, pra cada pedido, se será necessário adicionar uma nova permissão. Padrão é
@@ -457,21 +456,11 @@ init_project() {
   echo "Projeto criado em $file — edite antes de usar."
 }
 
-# ask_questions_po: pergunta o link do Sentry antes da descrição (quando o projeto usa
-# Sentry) porque a resposta muda o que se pede depois — com link, a descrição vira
-# opcional e curta, já que o PO vai buscar os detalhes reais via MCP (ver
-# build_sentry_blocks); sem link, continua exigindo a descrição completa via editor.
+# ask_questions_po: always the same two questions, whatever the project flags — a request
+# that starts from a Sentry issue has its own entry point (ask_questions_po_sentry).
 ask_questions_po() {
   read_required "Título do pedido: " TITLE
-  if [ "$SENTRY_ENABLED" = "true" ]; then
-    read_optional "Link do Sentry / erro externo (opcional, Enter para pular): " EXTRA
-  fi
-  if [ -n "$EXTRA" ]; then
-    SENTRY_LINE_EXTRA="Link do Sentry / erro externo: ${EXTRA}"
-    read_optional "Descrição adicional (opcional, Enter para pular — o PO vai buscar os detalhes no Sentry): " DESCRIPTION
-  else
-    read_via_editor "Descrição do pedido" DESCRIPTION
-  fi
+  read_via_editor "Descrição do pedido" DESCRIPTION
 }
 
 # ask_questions_po_discussion: sem título/descrição prontos — só um assunto solto pra
@@ -488,6 +477,15 @@ ask_questions_po_discussion() {
 # de complemento manual do analista, não substitui a busca.
 ask_questions_po_jira() {
   read_required "Link do ticket no Jira: " JIRA_LINK
+  read_optional "Descrição extra (opcional, Enter para pular): " DESCRIPTION
+}
+
+# ask_questions_po_sentry: the request starts from a Sentry issue — asks only for the link
+# (required) and an optional extra description. The PO (po_sentry.md) fetches the error
+# details itself via the target project's Sentry MCP; the extra description is the
+# analyst's complement, not a replacement for that fetch.
+ask_questions_po_sentry() {
+  read_required "Link do issue no Sentry: " SENTRY_LINK
   read_optional "Descrição extra (opcional, Enter para pular): " DESCRIPTION
 }
 
@@ -557,15 +555,16 @@ main() {
     po) ask_questions_po ;;
     po_discussion) ask_questions_po_discussion ;;
     po_jira) ask_questions_po_jira ;;
+    po_sentry) ask_questions_po_sentry ;;
     tech_leader) ask_questions_tech_leader ;;
     tech_leader_jira) ask_questions_tech_leader_jira ;;
     development) ask_questions_development ;;
     review) ask_questions_review ;;
   esac
 
-  export TITLE DESCRIPTION EXTRA JIRA_ID JIRA_LINK PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
-    STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINE_EXTRA \
-    PERMISSION_BLOCK_PO PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK TECH_LEADER_PLAN_RULES_BLOCK
+  export TITLE DESCRIPTION JIRA_ID JIRA_LINK SENTRY_LINK PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
+    STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_TL PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK \
+    TECH_LEADER_PLAN_RULES_BLOCK
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
@@ -575,7 +574,7 @@ main() {
   # shellcheck disable=SC2016
   # Intentional single quotes: this is the variable list for envsubst to expand, we
   # don't want bash expanding it first.
-  envsubst '$TITLE $DESCRIPTION $EXTRA $JIRA_ID $JIRA_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_PO $SENTRY_BLOCK_TL $SENTRY_LINE_EXTRA $PERMISSION_BLOCK_PO $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK' \
+  envsubst '$TITLE $DESCRIPTION $JIRA_ID $JIRA_LINK $SENTRY_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_TL $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo
@@ -595,8 +594,9 @@ main() {
       [ "$TYPE" = "development" ] && claude_args+=(--permission-mode auto)
       # Nothing to wire here for Sentry: the MCP server itself lives in the target
       # project's own .mcp.json (Claude Code auto-loads it from the cwd), not in
-      # auto_scrum. SENTRY_ENABLED only gates the prompt instruction (build_sentry_blocks)
-      # telling the PO to use that tool when a link is given.
+      # auto_scrum. On the MCP side, SENTRY_ENABLED just shows the po_sentry entry point
+      # in the menu (choose_type), whose template (po_sentry.md) tells the PO to use that
+      # tool.
       exec claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)

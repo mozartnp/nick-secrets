@@ -131,11 +131,12 @@ orienta o analista a recomeçar pela opção "PO - Criar ticket" (`po`) — não
 descrição completa dentro desta mesma conversa, nem presume que a descrição extra digitada
 (se houver — é só um complemento opcional) seja suficiente sozinha, já que o analista pode
 não ter preenchido esse campo por contar que tudo viria do Jira. Diferente do fallback do
-Sentry, que recupera dentro da própria sessão do `po`/`po_discussion` pedindo o traceback
-colado manualmente, aqui o fallback redireciona pro entry point certo em vez de tentar
-reconstituir o fluxo de título+descrição dentro de uma sessão pensada só pro caminho via
-Jira. Igual ao Sentry, `auto_scrum` não configura nem anexa o MCP do Jira: isso vive no
-`.mcp.json` do próprio projeto alvo, carregado sozinho pelo Claude Code a partir do cwd.
+`po_sentry`, que recupera dentro da própria sessão pedindo o traceback colado na conversa
+(ver seção "Sentry via MCP na etapa de PO"), aqui o fallback redireciona pro entry point
+certo em vez de tentar reconstituir o fluxo de título+descrição dentro de uma sessão
+pensada só pro caminho via Jira. Igual ao Sentry, `auto_scrum` não configura nem anexa o
+MCP do Jira: isso vive no `.mcp.json` do próprio projeto alvo, carregado sozinho pelo
+Claude Code a partir do cwd.
 
 `JIRA_ENABLED` ("true"/"false", opt-in — igual `SENTRY_ENABLED`/`PERMISSION_ENABLED`)
 controla se a opção "PO - Criar ticket a partir do Jira" aparece no menu de
@@ -223,8 +224,22 @@ projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
 `SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`), lida por uma função
 `build_*_blocks()` em `auto_scrum.sh` (mesmo padrão de `build_stack_blocks()`/
 `STACK_DESCRIPTION`) que monta o bloco de texto correspondente só quando a flag está ativa. O
-template usa a variável de bloco (`${SENTRY_BLOCK_PO}`, `${SENTRY_BLOCK_TL}`) no lugar do
-texto fixo — nunca um `if` dentro do `.md`, porque `envsubst` não suporta condicional.
+template usa a variável de bloco (ex: `${SENTRY_BLOCK_TL}`) no lugar do texto fixo — nunca
+um `if` dentro do `.md`, porque `envsubst` não suporta condicional. Quando o bloco precisa
+valer pra vários templates de um mesmo papel, o bash o embute dentro de um bloco
+compartilhado em vez de o template referenciá-lo direto: `SENTRY_BLOCK_PO` e
+`PERMISSION_BLOCK_PO` entram em `PO_VALIDATION_BLOCK` via `build_po_blocks()`, e só o bloco
+de fora é exportado e passado ao `envsubst` (que não expande recursivamente).
+
+Toda variável do `envsubst`/`export` em `main()` precisa ser usada em algum template, e toda
+variável usada em template precisa estar nas duas listas — um teste estrutural compara os
+três conjuntos. Isso vale pra qualquer variável nova: uma variável de template fora do
+`envsubst` sobraria como `${...}` literal no prompt, e uma variável exportada sem uso em
+template é código morto. O teste genérico não pega uma variável de outro `TYPE` usada num
+template cujo `TYPE` não a preenche: ela está nas listas, então seria substituída
+silenciosamente por vazio. Pra isso existe um teste de conjunto exato por template (via
+`template_vars` em `test_auto_scrum.sh`), mas hoje só `po.md` e `po_sentry.md` o têm.
+Template novo, ou que ganhe variável nova, deve ganhar o seu.
 
 Toda flag nova precisa entrar também em `PROJECT_CONFIG_KEYS` (topo do `auto_scrum.sh`) e no
 esqueleto de `print_project_skeleton()`: o leitor `load_project_config` ignora qualquer chave
@@ -241,10 +256,10 @@ criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer.
 Variação do mecanismo acima ("Flags booleanas por projeto"), pro caso em que o texto não é
 condicional — é sempre montado, só não pode ficar duplicado literalmente em mais de um
 `.md`. Quando dois ou mais templates do mesmo papel (pontos de entrada diferentes, ex:
-`tech_leader`/`tech_leader_jira`, ou `po`/`po_discussion`/`po_jira`) compartilham um
-trecho que precisa ficar idêntico entre eles, esse trecho vira uma variável de bloco
-(`${PO_VALIDATION_BLOCK}`, `${TECH_LEADER_PLAN_RULES_BLOCK}`) montada uma vez, numa função
-`build_*_blocks()` em `auto_scrum.sh` — `build_po_blocks()` pro PO,
+`tech_leader`/`tech_leader_jira`, ou `po`/`po_discussion`/`po_jira`/`po_sentry`)
+compartilham um trecho que precisa ficar idêntico entre eles, esse trecho vira uma
+variável de bloco (`${PO_VALIDATION_BLOCK}`, `${TECH_LEADER_PLAN_RULES_BLOCK}`) montada
+uma vez, numa função `build_*_blocks()` em `auto_scrum.sh` — `build_po_blocks()` pro PO,
 `build_tech_leader_blocks()` pro Tech Leader —, exportada e adicionada à lista do
 `envsubst`. O template referencia a variável; nunca repete o texto.
 
@@ -409,27 +424,65 @@ só `allow`. Vale definir uma deny list antes de confiar demais no modo `auto`.
 
 ## Sentry via MCP na etapa de PO
 
-Quando `SENTRY_ENABLED="true"`, `ask_questions_po` pergunta o link do Sentry antes da
-descrição. Se um link for informado, a descrição vira opcional (campo curto, não
-editor) — o `po.md` (bloco `SENTRY_BLOCK_PO`, montado em `build_sentry_blocks()`)
-instrui o PO a buscar o issue via MCP em vez de depender de descrição digitada; se a
-busca falhar, instrui a pedir ao analista que cole o traceback manualmente, seguindo
-como um pedido normal.
+O Sentry entra no PO por um ponto de entrada próprio, `po_sentry` ("PO - Criar ticket a
+partir do Sentry") — o quarto do PO, além de `po`, `po_discussion` e `po_jira`. Mesmo papel
+e mesmos critérios (`PO_VALIDATION_BLOCK`/`PO_TICKET_FORMAT_BLOCK` de `build_po_blocks()`,
+sem duplicar texto), entrada diferente: o analista informa só o link do issue
+(`ask_questions_po_sentry`, `read_required` pra `SENTRY_LINK`) mais uma descrição extra
+opcional (`read_optional` pra `DESCRIPTION`), sem título. O template `po_sentry.md` instrui
+o PO a buscar o issue via MCP do Sentry do projeto alvo antes de analisar (erro, stack
+trace, frequência, usuários afetados) e a tratar a descrição extra como complemento, nunca
+como substituta da busca. Igual aos outros pontos de entrada do PO, não existe
+encadeamento automático daqui pro Tech Leader. O `po` voltou a ter um comportamento só:
+título obrigatório e descrição pelo editor, com ou sem `SENTRY_ENABLED`.
 
-O `auto_scrum` não configura nem anexa o MCP do Sentry — isso vive no `.mcp.json` do
-próprio projeto alvo (ex: `siga-construcao/.mcp.json`), que o Claude Code já carrega
-sozinho a partir do diretório onde `auto_scrum.sh` é executado. `SENTRY_ENABLED` só liga
-a instrução no prompt; não precisa (nem deve) existir nenhum `--mcp-config` ou config de
-MCP dentro do `nick_secrets`. Só a etapa de PO recebe essa instrução — o Tech Leader não
-acessa o Sentry diretamente, só recebe o ticket já escrito pelo PO (`SENTRY_BLOCK_TL`
-continua igual, só carrega a referência adiante).
+A variável é `SENTRY_LINK`, não `JIRA_LINK` reaproveitada — mesmo racional que separou
+`JIRA_LINK` de `JIRA_ID`: cada variável com uma semântica só, e uma URL do Sentry numa
+variável chamada `JIRA_LINK` seria ambígua. `DESCRIPTION` é reaproveitada porque já faz o
+papel de complemento opcional em `po_jira`/`tech_leader_jira`. `SENTRY_LINK` é dado de
+entrada, não chave de configuração: não entra em `PROJECT_CONFIG_KEYS`.
 
-**Por quê:** um analista reportando um erro do Sentry muitas vezes não sabe qual fluxo
-técnico gerou o erro — exigir uma descrição narrada nesse caso é pedir uma informação que
-ele não tem, quando o próprio Sentry já carrega isso (stack trace, frequência, usuários
-afetados). A configuração de acesso ao Sentry (servidor MCP, host, credenciais) é dado do
-projeto alvo, não do `auto_scrum` — mesma lógica de `STACK_DESCRIPTION`/`SENTRY_ENABLED`
-ficarem no arquivo de configuração do projeto, só que aqui o "arquivo do projeto" nem é do
-`nick_secrets`, é o `.mcp.json` que já mora no repositório do projeto alvo. O MCP fica
-restrito à etapa de PO porque é ali que a análise do pedido acontece; o Tech Leader
-trabalha em cima do texto já produzido, sem necessidade de acesso próprio ao Sentry.
+`SENTRY_ENABLED` tem dois efeitos:
+1. **Menu:** a opção `po_sentry` só aparece com `"true"`, lida direto em `choose_type()`
+   (igual `JIRA_ENABLED`), logo depois dos outros pontos de entrada do PO (depois de
+   `po_jira` quando ele existe, senão depois de `po_discussion`) e antes de "Tech Leader -
+   Criar plano".
+2. **Texto nos prompts:** `build_sentry_blocks()` monta `SENTRY_BLOCK_PO` e
+   `SENTRY_BLOCK_TL`. `SENTRY_BLOCK_PO` só instrui a referenciar no ticket um link do Sentry
+   ou de erro externo — ele entra em `PO_VALIDATION_BLOCK`, então vale pros quatro pontos
+   de entrada do PO (inclusive o `po`, já que o analista pode colar um link na descrição).
+   As instruções de buscar via MCP e de fallback **não** ficam nesse bloco: são texto fixo
+   em `po_sentry.md`, o único template com um link do Sentry como entrada. Deixá-las no
+   bloco compartilhado mantinha um caminho condicional do Sentry dentro de `po`,
+   `po_discussion` e `po_jira`, que nunca recebem esse link.
+
+O fallback tem duas etapas: se a busca falhar (link inválido, issue não encontrado, falha
+de autenticação, MCP indisponível ou não configurado), o PO avisa o analista e pede que ele
+corrija o link ou o acesso; se não der, pede o traceback ou os detalhes do erro colados na
+própria conversa e segue com eles como um pedido normal, **sem** mandar recomeçar por outra
+opção do menu. Isso diverge de propósito do `po_jira`, que encerra e redireciona pro `po`:
+no Jira, o que faltaria (descrição completa, anexos de imagem) não se reconstitui colando
+texto, e o `po` já existe pra coletar título e descrição pelo editor; no Sentry, o dado
+essencial é o traceback, que é texto e basta pra análise. A colagem acontece na conversa do
+Claude Code, não num `read` do `auto_scrum`, então não esbarra no problema de colar texto
+grande no terminal que motivou o `read_via_editor`.
+
+O que não mudou: o `auto_scrum` não configura nem anexa o MCP do Sentry — isso vive no
+`.mcp.json` do próprio projeto alvo (ex: `siga-construcao/.mcp.json`), que o Claude Code já
+carrega sozinho a partir do diretório onde `auto_scrum.sh` é executado. Não precisa (nem
+deve) existir nenhum `--mcp-config` ou config de MCP dentro do `nick_secrets`. Só o PO
+acessa o Sentry — o Tech Leader só recebe o ticket já escrito pelo PO, e `SENTRY_BLOCK_TL`
+continua só carregando a referência adiante.
+
+**Por quê:** um analista reportando um erro do Sentry muitas vezes só tem o link — não sabe
+qual fluxo técnico gerou o erro nem como dar título e descrição a ele, e o próprio Sentry já
+carrega isso (stack trace, frequência, usuários afetados). Antes, esse caso era um desvio
+dentro do `po`: um campo opcional de link que, se preenchido, mudava a pergunta seguinte
+(descrição curta em vez do editor) e o texto do prompt. Um fluxo único que muda de
+comportamento conforme um campo opcional é confuso pra quem usa e pra quem mantém — é o
+mesmo racional de tratar o Jira como ponto de entrada próprio. A configuração de acesso ao
+Sentry (servidor MCP, host, credenciais) é dado do projeto alvo, não do `auto_scrum` — mesma
+lógica de `STACK_DESCRIPTION`/`SENTRY_ENABLED` ficarem no arquivo de configuração do
+projeto, só que aqui o "arquivo do projeto" nem é do `nick_secrets`, é o `.mcp.json` que já
+mora no repositório do projeto alvo. O MCP fica restrito ao PO porque é ali que a análise
+do pedido acontece; o Tech Leader trabalha em cima do texto já produzido.

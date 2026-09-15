@@ -15,4 +15,3 @@ isso para um pedido válido (menor escopo, mais informação, etc.).
 PEDIDO ORIGINAL (como foi recebido — não é o texto final do ticket)
 Título do pedido: ${TITLE}
 Descrição do pedido: ${DESCRIPTION}
-${SENTRY_LINE_EXTRA}

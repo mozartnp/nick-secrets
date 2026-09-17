@@ -112,6 +112,63 @@ run_init_project() {
   printf '%s' "$rc"
 }
 
+# config_keys_blank [except_key]: imprime uma linha CHAVE="" pra cada chave de
+# PROJECT_CONFIG_KEYS (lida do próprio script), menos <except_key>. Serve pra montar
+# fixtures completas, que não disparam o aviso de chave ausente.
+config_keys_blank() {
+  local except_key="${1:-}"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; for key in \"\${PROJECT_CONFIG_KEYS[@]}\"; do [ \"\$key\" = '$except_key' ] || printf '%s=\"\"\n' \"\$key\"; done"
+}
+
+# Nota de PRODUCTION_ENABLED: é a única chave com texto próprio nos avisos, porque o padrão
+# desligado dela tira do prompt do PO uma pergunta que já existia.
+production_note='a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.'
+production_note_line="# PRODUCTION_ENABLED: $production_note"
+# "Aviso de chave ausente" é o bloco do stderr cuja 1ª linha contém missing_marker.
+missing_marker="não tem todas as chaves da configuração"
+
+# missing_warning <file> [linha...]: imprime, sem \n final, o texto exato do aviso de chave
+# ausente pra <file>, com uma linha "  <linha>" pra cada argumento.
+missing_warning() {
+  local file="$1" line
+  shift
+  printf '%s' "Aviso: $file não tem todas as chaves da configuração — cada chave ausente vale como vazia (as opções \"true\"/\"false\" ficam desligadas). Adicione ao arquivo:"
+  for line in "$@"; do
+    printf '\n  %s' "$line"
+  done
+}
+
+# count_missing_warnings <file>: imprime quantos avisos de chave ausente há em <file>
+# (nada, se o arquivo não existir).
+count_missing_warnings() {
+  local file="$1"
+  grep -cF "$missing_marker" "$file" 2>/dev/null || true
+}
+
+# count_warnings <file>: imprime quantos avisos há em <file> (linhas que começam com
+# "Aviso:"; nada, se o arquivo não existir). No menu de projetos, o select deixa o prompt
+# "#? " sem \n logo antes do aviso, na mesma linha — por isso o prefixo opcional.
+count_warnings() {
+  local file="$1"
+  grep -cE '^(#\? )?Aviso:' "$file" 2>/dev/null || true
+}
+
+# Fim padrão do aviso de valor inválido, pra chave sem nota própria.
+default_off_note="a opção está desligada."
+
+# value_warning <arquivo:linha> <chave> <valor> <desligada>: imprime, sem \n final, o texto
+# exato do aviso de valor inválido.
+value_warning() {
+  local location="$1" key="$2" value="$3" off="$4"
+  printf '%s' "Aviso: $location: valor \"$value\" inválido para $key (valores aceitos: \"true\", \"false\" ou \"\") — $off"
+}
+
+# loaded_value <arquivo> <chave>: imprime o valor que load_project_config atribui a <chave>.
+loaded_value() {
+  local file="$1" key="$2"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; load_project_config '$file' 2>/dev/null; loaded_key='$key'; printf '%s' \"\${!loaded_key}\"" 2>/dev/null || true
+}
+
 echo "== source guard: sourcing auto_scrum.sh não deve disparar main() =="
 smoke_result=0
 timeout 2 bash -c "source '$AUTO_SCRUM_SH' < /dev/null; declare -F choose_type >/dev/null" \
@@ -149,6 +206,7 @@ assert_exists "$init_cwd_file" "destino cwd (opção 1): cria .nick.conf no dire
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'JIRA_ENABLED="false"' "destino cwd: esqueleto declara JIRA_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'PRODUCTION_ENABLED="false"' "destino cwd: esqueleto declara PRODUCTION_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'Ligue ("true") quando o projeto entrar em produção.' "destino cwd: comentário do esqueleto manda ligar PRODUCTION_ENABLED quando o projeto entrar em produção"
+assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino cwd: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
 assert_not_exists "$init_projects_unused" "destino cwd: PROJECTS_DIR não é criado"
 
 init_rc="$(run_init_project "$init_projects_dest" "$init_projects" $'2\nprojeto-teste' "$init_dir/projects_dest.log")"
@@ -158,6 +216,7 @@ assert_exists "$init_projects_file" "destino projects/ (opção 2): cria \$PROJE
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'JIRA_ENABLED="false"' "destino projects/: esqueleto declara JIRA_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'PRODUCTION_ENABLED="false"' "destino projects/: esqueleto declara PRODUCTION_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'Ligue ("true") quando o projeto entrar em produção.' "destino projects/: comentário do esqueleto manda ligar PRODUCTION_ENABLED quando o projeto entrar em produção"
+assert_contains "$(cat "$init_projects_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino projects/: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
 assert_not_exists "$init_projects/projeto-teste.sh" "destino projects/: não cria projeto-teste.sh"
 assert_not_exists "$init_projects_dest/.nick.conf" "destino projects/: não cria .nick.conf no diretório atual"
 
@@ -177,6 +236,24 @@ printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_projects/projeto-teste.conf"
 run_init_project "$init_projects_dest" "$init_projects" $'2\nprojeto-teste\nN' "$init_dir/overwrite_projects_no.log" >/dev/null
 assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_projects/projeto-teste.conf")" "destino projects/ com <nome>.conf existente e resposta N: arquivo inalterado"
 assert_contains "$(cat "$init_dir/overwrite_projects_no.log")" "Cancelado." "destino projects/ com <nome>.conf existente e resposta N: cancela"
+
+# init_project não chama o leitor, então não avisa — nem nos casos de sobrescrita, em que o
+# arquivo que já existia é incompleto e um aviso seria um erro real.
+for init_log in cwd_dest projects_dest overwrite_no overwrite_yes overwrite_projects_no; do
+  assert_not_contains "$(cat "$init_dir/$init_log.log" 2>/dev/null || true)" "Aviso:" "init_project ($init_log.log): nenhum aviso"
+done
+
+init_main="$init_dir/main_init"
+mkdir -p "$init_main/cwd"
+printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_main/cwd/.nick.conf"
+init_main_rc=0
+# stdin: destino 1 (cwd) e N pra não sobrescrever. LOGS_DIR e PROJECTS_DIR temporários pra
+# não gravar em auto_scrum/logs/ nem ler auto_scrum/projects/.
+init_main_output="$(timeout 5 bash -c "cd '$init_main/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$init_main/logs'; PROJECTS_DIR='$init_main/projects'; main --init" <<< $'1\nN' 2>&1)" || init_main_rc=$?
+assert_eq "0" "$init_main_rc" "main --init sobre .nick.conf incompleto, resposta N: termina com código 0"
+assert_contains "$init_main_output" "Cancelado." "main --init sobre .nick.conf incompleto, resposta N: cancela"
+assert_not_contains "$init_main_output" "Aviso:" "main --init sobre .nick.conf incompleto: nenhum aviso"
+assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_main/cwd/.nick.conf")" "main --init sobre .nick.conf incompleto, resposta N: arquivo inalterado"
 
 init_eof="$init_dir/eof"
 mkdir -p "$init_eof"
@@ -202,6 +279,82 @@ assert_eq "" "$(cat "$init_dir/skeleton_loader.err" 2>/dev/null || echo 'sem std
 skeleton_keys="$(grep -oE '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null | tr -d '=' | sort || true)"
 config_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${PROJECT_CONFIG_KEYS[@]}\" | sort")"
 assert_eq "$config_keys" "$skeleton_keys" "chaves atribuídas no esqueleto são exatamente as de PROJECT_CONFIG_KEYS"
+
+# Testes-guarda da regra liga/desliga (is_toggle_config_key): o esqueleto é o modelo, então
+# toda chave com "false" nele precisa passar pela checagem de valor, e toda chave com "" não.
+skeleton_guard_dir="$init_dir/skeleton_guard"
+mkdir -p "$skeleton_guard_dir"
+skeleton_toggle_keys=()
+skeleton_text_keys=()
+skeleton_other_lines=""
+while IFS= read -r skeleton_line; do
+  skeleton_key="${skeleton_line%%=*}"
+  if [ "$skeleton_line" = "$skeleton_key=\"false\"" ]; then
+    skeleton_toggle_keys+=("$skeleton_key")
+  elif [ "$skeleton_line" = "$skeleton_key=\"\"" ]; then
+    skeleton_text_keys+=("$skeleton_key")
+  else
+    skeleton_other_lines+="$skeleton_line"$'\n'
+  fi
+done < <(grep -E '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null || true)
+assert_eq "" "$skeleton_other_lines" "toda chave do esqueleto é liga/desliga (=\"false\") ou texto (=\"\")"
+assert_eq "true" "$([ "${#skeleton_toggle_keys[@]}" -gt 0 ] && [ "${#skeleton_text_keys[@]}" -gt 0 ] && echo true || echo false)" "o esqueleto tem pelo menos uma chave liga/desliga e uma de texto"
+
+for skeleton_key in "${skeleton_toggle_keys[@]}"; do
+  skeleton_copy="$skeleton_guard_dir/toggle_$skeleton_key.conf"
+  sed "s/^$skeleton_key=\"false\"\$/$skeleton_key=\"sim\"/" "$init_cwd_file" > "$skeleton_copy"
+  run_loader "$skeleton_copy" "$skeleton_guard_dir/toggle_$skeleton_key" >/dev/null
+  assert_eq "1" "$(count_warnings "$skeleton_guard_dir/toggle_$skeleton_key.err")" "esqueleto com $skeleton_key=\"sim\": exatamente um aviso (toda liga/desliga do modelo é checada)"
+  assert_contains "$(cat "$skeleton_guard_dir/toggle_$skeleton_key.err" 2>/dev/null || true)" "valor \"sim\" inválido para $skeleton_key" "esqueleto com $skeleton_key=\"sim\": o aviso é o de valor inválido"
+done
+
+for skeleton_key in "${skeleton_text_keys[@]}"; do
+  skeleton_copy="$skeleton_guard_dir/text_$skeleton_key.conf"
+  sed "s/^$skeleton_key=\"\"\$/$skeleton_key=\"sim\"/" "$init_cwd_file" > "$skeleton_copy"
+  run_loader "$skeleton_copy" "$skeleton_guard_dir/text_$skeleton_key" >/dev/null
+  assert_eq "true" "$(grep -qxF "$skeleton_key=\"sim\"" "$skeleton_copy" && echo true || echo false)" "esqueleto com $skeleton_key=\"sim\": a cópia tem a linha trocada"
+  assert_eq "0" "$(count_warnings "$skeleton_guard_dir/text_$skeleton_key.err")" "esqueleto com $skeleton_key=\"sim\": nenhum aviso (chave de texto não é checada)"
+done
+
+# Linhas sugeridas pelo aviso de chave ausente, sem os dois espaços do começo.
+: > "$skeleton_guard_dir/empty.conf"
+run_loader "$skeleton_guard_dir/empty.conf" "$skeleton_guard_dir/empty" >/dev/null
+skeleton_suggested_keys=""
+skeleton_unmatched_lines=""
+while IFS= read -r skeleton_line; do
+  skeleton_line="${skeleton_line#  }"
+  skeleton_suggested_keys+="${skeleton_line%%=*}"$'\n'
+  if ! grep -qxF "$skeleton_line" "$init_cwd_file"; then
+    skeleton_unmatched_lines+="$skeleton_line"$'\n'
+  fi
+done <<< "$(grep -E '^  [A-Z_]+=' "$skeleton_guard_dir/empty.err" 2>/dev/null || true)"
+assert_eq "" "$skeleton_unmatched_lines" "cada linha sugerida pelo aviso de chave ausente é idêntica à linha do esqueleto"
+config_keys_ordered="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${PROJECT_CONFIG_KEYS[@]}\"")"
+assert_eq "$config_keys_ordered" "$(printf '%s' "$skeleton_suggested_keys")" "as chaves sugeridas pelo aviso de chave ausente são exatamente as de PROJECT_CONFIG_KEYS, na mesma ordem"
+
+# Ida e volta: o bloco sugerido (o aviso menos a 1ª linha, inclusive as linhas de nota),
+# colado como está num arquivo novo, carrega sem nenhum aviso.
+tail -n +2 "$skeleton_guard_dir/empty.err" > "$skeleton_guard_dir/pasted.conf" 2>/dev/null || true
+skeleton_pasted_result="$(run_loader "$skeleton_guard_dir/pasted.conf" "$skeleton_guard_dir/pasted" "STACK_DESCRIPTION=antes")"
+assert_eq "|false|false|false|false" "$skeleton_pasted_result" "bloco do aviso de chave ausente colado num arquivo: as chaves carregam com o padrão do esqueleto"
+assert_eq "" "$(cat "$skeleton_guard_dir/pasted.err" 2>/dev/null || echo 'sem stderr')" "bloco do aviso de chave ausente colado num arquivo: carrega sem nenhum aviso"
+
+# Chave nova só em PROJECT_CONFIG_KEYS: entra nas duas checagens sem mudar a lógica.
+skeleton_new_setup='PROJECT_CONFIG_KEYS+=(NEW_FLAG_ENABLED NEW_TEXT)'
+skeleton_new_file="$skeleton_guard_dir/new_keys.conf"
+{ cat "$init_cwd_file"; printf '%s\n' 'NEW_FLAG_ENABLED="sim"' 'NEW_TEXT="sim"'; } > "$skeleton_new_file"
+skeleton_new_line="$(grep -nxF 'NEW_FLAG_ENABLED="sim"' "$skeleton_new_file" | cut -d: -f1)"
+run_loader "$skeleton_new_file" "$skeleton_guard_dir/new_keys" "$skeleton_new_setup" >/dev/null
+assert_eq "1" "$(count_warnings "$skeleton_guard_dir/new_keys.err")" "chaves novas NEW_FLAG_ENABLED/NEW_TEXT com \"sim\": exatamente um aviso"
+assert_eq "$(value_warning "$skeleton_new_file:$skeleton_new_line" NEW_FLAG_ENABLED sim "$default_off_note")" "$(cat "$skeleton_guard_dir/new_keys.err" 2>/dev/null || true)" "chaves novas com \"sim\": só NEW_FLAG_ENABLED recebe o aviso de valor"
+
+run_loader "$init_cwd_file" "$skeleton_guard_dir/new_keys_missing" "$skeleton_new_setup" >/dev/null
+assert_eq "1" "$(count_warnings "$skeleton_guard_dir/new_keys_missing.err")" "chaves novas ausentes do esqueleto: exatamente um aviso"
+assert_eq "$(missing_warning "$init_cwd_file" 'NEW_FLAG_ENABLED="false"' 'NEW_TEXT=""')" "$(cat "$skeleton_guard_dir/new_keys_missing.err" 2>/dev/null || true)" "chaves novas ausentes do esqueleto: o aviso de chave ausente lista as duas, com o padrão de cada tipo"
+
+config_keys_blank > "$skeleton_guard_dir/blank.conf"
+run_loader "$skeleton_guard_dir/blank.conf" "$skeleton_guard_dir/blank" >/dev/null
+assert_eq "" "$(cat "$skeleton_guard_dir/blank.err" 2>/dev/null || echo 'sem stderr')" "config_keys_blank monta uma fixture completa: carrega sem nenhum aviso"
 
 echo
 echo "== ask_questions_po_jira: pede link (obrigatório) e descrição extra (opcional) =="
@@ -296,6 +449,9 @@ TECH_LEADER_TEMPLATE="$SCRIPT_DIR/../templates/tech_leader.md"
 TECH_LEADER_JIRA_TEMPLATE="$SCRIPT_DIR/../templates/tech_leader_jira.md"
 for tpl in "$TECH_LEADER_TEMPLATE" "$TECH_LEADER_JIRA_TEMPLATE"; do
   tpl_src="$(cat "$tpl")"
+  # shellcheck disable=SC2016
+  # Aspas simples intencionais: '${TECH_LEADER_PLAN_RULES_BLOCK}' é o texto literal buscado
+  # no fonte do template, não uma variável pra expandir aqui.
   assert_contains "$tpl_src" '${TECH_LEADER_PLAN_RULES_BLOCK}' "$(basename "$tpl") usa \${TECH_LEADER_PLAN_RULES_BLOCK} em vez de repetir o texto"
   assert_not_contains "$tpl_src" "O plano deve ser pensado para ser executado usando a metodologia TDD" "$(basename "$tpl") não duplica o texto da regra de TDD (deve vir só de TECH_LEADER_PLAN_RULES_BLOCK)"
 done
@@ -348,6 +504,7 @@ lpc_dir="$TEST_TMP/load_project_config"
 mkdir -p "$lpc_dir"
 
 printf '%s\n' \
+  "$(config_keys_blank)" \
   '# Config de exemplo, no formato do esqueleto.' \
   '# Exemplo: STACK_DESCRIPTION="não deve ser lido"' \
   'STACK_DESCRIPTION="Bash (POSIX [ ], set -euo pipefail), pytest e TDD"' \
@@ -381,7 +538,7 @@ lpc_result="$(run_loader "$lpc_dir/unquoted.conf" "$lpc_dir/unquoted")"
 assert_eq "||||" "$lpc_result" "valor sem aspas (SENTRY_ENABLED=true) é ignorado"
 assert_contains "$(cat "$lpc_dir/unquoted.err" 2>/dev/null)" "Aviso: $lpc_dir/unquoted.conf:1: linha de SENTRY_ENABLED ignorada (formato esperado: SENTRY_ENABLED=\"valor\", sem aspas duplas dentro do valor)" "valor sem aspas gera aviso no stderr"
 
-printf '%s\n' 'FOO="bar"' 'TYPE="review"' 'PATH="/nao/existe"' 'PRODUCTION_ENABLED=""' > "$lpc_dir/unknown.conf"
+printf '%s\n' "$(config_keys_blank)" 'FOO="bar"' 'TYPE="review"' 'PATH="/nao/existe"' > "$lpc_dir/unknown.conf"
 unknown_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; load_project_config '$lpc_dir/unknown.conf' 2>'$lpc_dir/unknown.err'; printf '%s|' \"\$TYPE\"; command -v ls >/dev/null && printf 'ls ok'" 2>/dev/null || true)"
 assert_eq "|ls ok" "$unknown_result" "chaves desconhecidas (FOO, TYPE, PATH) não alteram variáveis nem quebram a execução"
 assert_eq "" "$(cat "$lpc_dir/unknown.err" 2>/dev/null || echo 'sem stderr')" "chaves desconhecidas não geram aviso"
@@ -394,12 +551,12 @@ printf 'JIRA_ENABLED="true"\r' > "$lpc_dir/crlf.conf"
 lpc_result="$(run_loader "$lpc_dir/crlf.conf" "$lpc_dir/crlf")"
 assert_eq "|||true|" "$lpc_result" "última linha com CRLF e sem \\n final é aceita, sem o \\r no valor"
 
-printf '%s\n' 'STACK_DESCRIPTION_EXTRA="x"' 'PRODUCTION_ENABLED=""' > "$lpc_dir/prefix.conf"
+printf '%s\n' "$(config_keys_blank)" 'STACK_DESCRIPTION_EXTRA="x"' > "$lpc_dir/prefix.conf"
 lpc_result="$(run_loader "$lpc_dir/prefix.conf" "$lpc_dir/prefix")"
 assert_eq "||||" "$lpc_result" "chave com prefixo parecido (STACK_DESCRIPTION_EXTRA) é ignorada"
 assert_eq "" "$(cat "$lpc_dir/prefix.err" 2>/dev/null || echo 'sem stderr')" "chave com prefixo parecido não gera aviso"
 
-printf '%s\n' 'STACK_DESCRIPTION=""' 'PRODUCTION_ENABLED=""' > "$lpc_dir/empty.conf"
+config_keys_blank > "$lpc_dir/empty.conf"
 lpc_result="$(run_loader "$lpc_dir/empty.conf" "$lpc_dir/empty" "STACK_DESCRIPTION=antes")"
 assert_eq "||||" "$lpc_result" "CHAVE=\"\" atribui valor vazio"
 assert_eq "" "$(cat "$lpc_dir/empty.err" 2>/dev/null || echo 'sem stderr')" "CHAVE=\"\" não gera aviso"
@@ -411,7 +568,7 @@ for lpc_near_line in 'export JIRA_ENABLED="true"' 'SENTRY_ENABLED = "true"' 'PER
   lpc_near_case=$((lpc_near_case + 1))
   lpc_near_key="${lpc_near_line#export }"
   lpc_near_key="${lpc_near_key%%[ =]*}"
-  printf '%s\n' '# linha 1' "$lpc_near_line" 'PRODUCTION_ENABLED=""' > "$lpc_dir/near_$lpc_near_case.conf"
+  printf '%s\n' '# linha 1' "$lpc_near_line" "$(config_keys_blank "$lpc_near_key")" > "$lpc_dir/near_$lpc_near_case.conf"
   lpc_result="$(run_loader "$lpc_dir/near_$lpc_near_case.conf" "$lpc_dir/near_$lpc_near_case")"
   lpc_near_err="$(cat "$lpc_dir/near_$lpc_near_case.err" 2>/dev/null || true)"
   assert_eq "||||" "$lpc_result" "linha '$lpc_near_line' não altera $lpc_near_key"
@@ -419,80 +576,179 @@ for lpc_near_line in 'export JIRA_ENABLED="true"' 'SENTRY_ENABLED = "true"' 'PER
   assert_eq "1" "$(grep -c 'Aviso:' "$lpc_dir/near_$lpc_near_case.err" 2>/dev/null || true)" "linha '$lpc_near_line' gera um aviso só"
 done
 
-printf '%s\n' 'STACK_DESCRIPTION_EXTRA = "x"' 'PRODUCTION_ENABLED=""' > "$lpc_dir/prefix_spaced.conf"
+printf '%s\n' "$(config_keys_blank)" 'STACK_DESCRIPTION_EXTRA = "x"' > "$lpc_dir/prefix_spaced.conf"
 lpc_result="$(run_loader "$lpc_dir/prefix_spaced.conf" "$lpc_dir/prefix_spaced")"
 assert_eq "||||" "$lpc_result" "chave com prefixo parecido e espaço em volta do = (STACK_DESCRIPTION_EXTRA = \"x\") é ignorada"
 assert_eq "" "$(cat "$lpc_dir/prefix_spaced.err" 2>/dev/null || echo 'sem stderr')" "chave com prefixo parecido e espaço em volta do = não gera aviso"
 
 echo
-echo '== load_project_config: aviso de migração quando o arquivo não tem a linha PRODUCTION_ENABLED =='
-# "Aviso de migração" é a linha do stderr que contém migration_marker: configurações de antes
-# da chave perderiam a pergunta de impacto em produção em silêncio, então o leitor avisa.
-migration_marker="não tem a linha PRODUCTION_ENABLED"
+echo '== load_project_config: aviso de chave ausente (um bloco só, com as linhas a adicionar) =='
+miss_dir="$TEST_TMP/missing_keys"
+mkdir -p "$miss_dir"
 
-# migration_warning <file>: imprime o texto exato do aviso de migração pra <file>.
-migration_warning() {
-  local file="$1"
-  printf '%s' "Aviso: $file não tem a linha PRODUCTION_ENABLED — a pergunta de impacto em produção está desligada no prompt do PO. Para ligá-la, adicione ao arquivo: PRODUCTION_ENABLED=\"true\" (ou PRODUCTION_ENABLED=\"false\" para mantê-la desligada sem este aviso)"
-}
+config_keys_blank PRODUCTION_ENABLED > "$miss_dir/only_production.conf"
+miss_result="$(run_loader "$miss_dir/only_production.conf" "$miss_dir/only_production")"
+miss_err="$(cat "$miss_dir/only_production.err" 2>/dev/null || true)"
+assert_eq "||||" "$miss_result" "só PRODUCTION_ENABLED ausente: as outras chaves carregam e PRODUCTION_ENABLED fica vazio"
+assert_eq "1" "$(count_warnings "$miss_dir/only_production.err")" "só PRODUCTION_ENABLED ausente: exatamente um aviso no stderr"
+assert_eq "$(missing_warning "$miss_dir/only_production.conf" "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$miss_err" "só PRODUCTION_ENABLED ausente: o aviso tem o texto exato, com o caminho do arquivo, a nota e a linha a adicionar"
+assert_not_contains "$miss_err" "Existe impacto em produção?" "só PRODUCTION_ENABLED ausente: o aviso não repete a pergunta literal do prompt"
+assert_not_contains "$miss_err" "--init" "só PRODUCTION_ENABLED ausente: o aviso não sugere --init (sobrescreveria o arquivo)"
 
-# count_migration_warnings <file>: imprime quantas linhas de <file> são aviso de migração
-# (nada, se o arquivo não existir).
-count_migration_warnings() {
-  local file="$1"
-  grep -cF "$migration_marker" "$file" 2>/dev/null || true
-}
+printf '%s\n' 'STACK_DESCRIPTION="stack-secreta-19"' 'JIRA_ENABLED="true"' > "$miss_dir/several.conf"
+miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
+miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
+assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
+assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de PROJECT_CONFIG_KEYS"
+assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
-mig_dir="$TEST_TMP/migration_warning"
-mkdir -p "$mig_dir"
+: > "$miss_dir/empty_file.conf"
+miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
+assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
+assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as cinco chaves na ordem de PROJECT_CONFIG_KEYS"
 
-printf '%s\n' 'STACK_DESCRIPTION="x"' > "$mig_dir/missing.conf"
-mig_result="$(run_loader "$mig_dir/missing.conf" "$mig_dir/missing")"
-mig_err="$(cat "$mig_dir/missing.err" 2>/dev/null || true)"
-assert_eq "x||||" "$mig_result" "sem a linha: as outras chaves carregam e PRODUCTION_ENABLED fica vazio"
-assert_eq "1" "$(grep -c 'Aviso:' "$mig_dir/missing.err" 2>/dev/null || true)" "sem a linha: exatamente um aviso no stderr"
-assert_eq "$(migration_warning "$mig_dir/missing.conf")" "$mig_err" "sem a linha: o aviso de migração tem o texto exato, com o caminho do arquivo"
-assert_contains "$mig_err" 'PRODUCTION_ENABLED="true"' "sem a linha: o aviso mostra a linha a adicionar"
-assert_contains "$mig_err" 'ou PRODUCTION_ENABLED="false" para mantê-la desligada sem este aviso' "sem a linha: o aviso mostra como manter a pergunta desligada sem o aviso"
-assert_not_contains "$mig_err" "Existe impacto em produção?" "sem a linha: o aviso não repete a pergunta literal do prompt"
-
-# Também contam como "sem a linha": o leitor não vê a chave em nenhum destes.
-: > "$mig_dir/empty_file.conf"
-printf '%s\n' '# PRODUCTION_ENABLED="true"' > "$mig_dir/commented.conf"
-printf '%s\n' 'PRODUCTION_ENABLED_OLD="true"' > "$mig_dir/lookalike.conf"
-for mig_case in "empty_file|arquivo vazio (0 byte)" "commented|linha comentada" "lookalike|chave parecida (PRODUCTION_ENABLED_OLD)"; do
-  mig_name="${mig_case%%|*}"
-  mig_label="${mig_case#*|}"
-  mig_result="$(run_loader "$mig_dir/$mig_name.conf" "$mig_dir/$mig_name")"
-  assert_eq "||||" "$mig_result" "$mig_label: PRODUCTION_ENABLED fica vazio"
-  assert_eq "1" "$(grep -c 'Aviso:' "$mig_dir/$mig_name.err" 2>/dev/null || true)" "$mig_label: exatamente um aviso no stderr"
-  assert_eq "$(migration_warning "$mig_dir/$mig_name.conf")" "$(cat "$mig_dir/$mig_name.err" 2>/dev/null || true)" "$mig_label: o aviso é o de migração, com o caminho do arquivo"
+# Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
+# outras chaves, então o bloco só pode listar a chave do caso.
+miss_absent_case=0
+for miss_absent in \
+  'PRODUCTION_ENABLED|# PRODUCTION_ENABLED="true"' \
+  'PRODUCTION_ENABLED|PRODUCTION_ENABLED_OLD="true"' \
+  'JIRA_ENABLED|JIRA_ENABLE="true"' \
+  'JIRA_ENABLED|# JIRA_ENABLED="true"' \
+  'JIRA_ENABLED|JIRA_ENABLED_OLD="true"' \
+  'STACK_DESCRIPTION|# STACK_DESCRIPTION="x"'; do
+  miss_absent_case=$((miss_absent_case + 1))
+  miss_absent_key="${miss_absent%%|*}"
+  miss_absent_line="${miss_absent#*|}"
+  miss_absent_file="$miss_dir/absent_$miss_absent_case.conf"
+  printf '%s\n' "$(config_keys_blank "$miss_absent_key")" "$miss_absent_line" > "$miss_absent_file"
+  case "$miss_absent_key" in
+    PRODUCTION_ENABLED) miss_expected="$(missing_warning "$miss_absent_file" "$production_note_line" 'PRODUCTION_ENABLED="false"')" ;;
+    JIRA_ENABLED) miss_expected="$(missing_warning "$miss_absent_file" 'JIRA_ENABLED="false"')" ;;
+    *) miss_expected="$(missing_warning "$miss_absent_file" 'STACK_DESCRIPTION=""')" ;;
+  esac
+  miss_result="$(run_loader "$miss_absent_file" "$miss_dir/absent_$miss_absent_case")"
+  assert_eq "||||" "$miss_result" "linha '$miss_absent_line': $miss_absent_key fica vazia"
+  assert_eq "1" "$(count_warnings "$miss_dir/absent_$miss_absent_case.err")" "linha '$miss_absent_line': exatamente um aviso no stderr"
+  assert_eq "$miss_expected" "$(cat "$miss_dir/absent_$miss_absent_case.err" 2>/dev/null || true)" "linha '$miss_absent_line': o aviso de chave ausente lista só $miss_absent_key"
 done
 
-# Com a linha, qualquer valor silencia o aviso (inclusive "", que não liga a pergunta).
-mig_with_case=0
-for mig_value in true false "" sim; do
-  mig_with_case=$((mig_with_case + 1))
-  printf '%s\n' "PRODUCTION_ENABLED=\"$mig_value\"" > "$mig_dir/with_$mig_with_case.conf"
-  mig_result="$(run_loader "$mig_dir/with_$mig_with_case.conf" "$mig_dir/with_$mig_with_case")"
-  assert_eq "||||$mig_value" "$mig_result" "PRODUCTION_ENABLED=\"$mig_value\": o valor é carregado"
-  assert_eq "" "$(cat "$mig_dir/with_$mig_with_case.err" 2>/dev/null || echo 'sem stderr')" "PRODUCTION_ENABLED=\"$mig_value\": nenhum aviso no stderr"
+# Linha fora do formato conta como presente: sai só o aviso de formato, que já aponta
+# arquivo e linha — dois avisos pro mesmo problema seriam ruído. JIRA_ENABLED=TRUE também
+# garante que linha fora do formato não recebe aviso de valor.
+miss_bad_case=0
+for miss_bad_line in 'PRODUCTION_ENABLED=true' 'PRODUCTION_ENABLED="true" # comentário' 'export PRODUCTION_ENABLED="true"' 'PRODUCTION_ENABLED = "true"' 'STACK_DESCRIPTION=x' 'JIRA_ENABLED=TRUE'; do
+  miss_bad_case=$((miss_bad_case + 1))
+  miss_bad_key="${miss_bad_line#export }"
+  miss_bad_key="${miss_bad_key%%[ =]*}"
+  miss_bad_file="$miss_dir/malformed_$miss_bad_case.conf"
+  printf '%s\n' '# linha 1' "$miss_bad_line" "$(config_keys_blank "$miss_bad_key")" > "$miss_bad_file"
+  miss_result="$(run_loader "$miss_bad_file" "$miss_dir/malformed_$miss_bad_case")"
+  miss_err="$(cat "$miss_dir/malformed_$miss_bad_case.err" 2>/dev/null || true)"
+  assert_eq "||||" "$miss_result" "linha '$miss_bad_line': $miss_bad_key fica vazia"
+  assert_eq "1" "$(count_warnings "$miss_dir/malformed_$miss_bad_case.err")" "linha '$miss_bad_line': exatamente um aviso no stderr"
+  assert_contains "$miss_err" "$miss_bad_file:2: linha de $miss_bad_key ignorada" "linha '$miss_bad_line': o aviso é o de formato, com arquivo e número da linha"
+  assert_eq "0" "$(count_missing_warnings "$miss_dir/malformed_$miss_bad_case.err")" "linha '$miss_bad_line': conta como presente, sem aviso de chave ausente"
 done
 
-# Linha de PRODUCTION_ENABLED fora do formato: sai só o aviso de formato, que já aponta
-# arquivo e linha — dois avisos pro mesmo problema seriam ruído.
-mig_bad_case=0
-for mig_bad_line in 'PRODUCTION_ENABLED=true' 'PRODUCTION_ENABLED="true" # comentário' 'export PRODUCTION_ENABLED="true"' 'PRODUCTION_ENABLED = "true"'; do
-  mig_bad_case=$((mig_bad_case + 1))
-  mig_bad_file="$mig_dir/malformed_$mig_bad_case.conf"
-  printf '%s\n' '# linha 1' "$mig_bad_line" > "$mig_bad_file"
-  mig_result="$(run_loader "$mig_bad_file" "$mig_dir/malformed_$mig_bad_case")"
-  mig_err="$(cat "$mig_dir/malformed_$mig_bad_case.err" 2>/dev/null || true)"
-  assert_eq "||||" "$mig_result" "linha '$mig_bad_line': PRODUCTION_ENABLED fica vazio"
-  assert_eq "1" "$(grep -c 'Aviso:' "$mig_dir/malformed_$mig_bad_case.err" 2>/dev/null || true)" "linha '$mig_bad_line': exatamente um aviso no stderr"
-  assert_contains "$mig_err" "$mig_bad_file:2: linha de PRODUCTION_ENABLED ignorada" "linha '$mig_bad_line': o aviso é o de formato, com arquivo e número da linha"
-  assert_not_contains "$mig_err" "$migration_marker" "linha '$mig_bad_line': sem o aviso de migração"
+# Com a linha e um valor aceito, nenhum aviso (inclusive "", que não liga a pergunta).
+miss_with_case=0
+for miss_value in true false ""; do
+  miss_with_case=$((miss_with_case + 1))
+  printf '%s\n' "$(config_keys_blank PRODUCTION_ENABLED)" "PRODUCTION_ENABLED=\"$miss_value\"" > "$miss_dir/with_$miss_with_case.conf"
+  miss_result="$(run_loader "$miss_dir/with_$miss_with_case.conf" "$miss_dir/with_$miss_with_case")"
+  assert_eq "||||$miss_value" "$miss_result" "PRODUCTION_ENABLED=\"$miss_value\": o valor é carregado"
+  assert_eq "" "$(cat "$miss_dir/with_$miss_with_case.err" 2>/dev/null || echo 'sem stderr')" "PRODUCTION_ENABLED=\"$miss_value\": nenhum aviso no stderr"
 done
+
+miss_continue="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; load_project_config '$miss_dir/empty_file.conf' 2>/dev/null; printf fim" 2>/dev/null || true)"
+assert_eq "fim" "$miss_continue" "o aviso de chave ausente não interrompe: load_project_config retorna 0"
+
+echo
+echo '== load_project_config: aviso de valor inválido em chave liga/desliga (um por linha, o valor continua atribuído) =='
+val_dir="$TEST_TMP/invalid_toggle_value"
+mkdir -p "$val_dir"
+
+# Nas fixtures, a linha testada vai sempre por último: o número dela é o wc -l do arquivo.
+val_case=0
+for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED; do
+  val_off="$default_off_note"
+  if [ "$val_key" = "PRODUCTION_ENABLED" ]; then
+    val_off="$production_note"
+  fi
+  for val_value in TRUE True sim; do
+    val_case=$((val_case + 1))
+    val_label="$val_key=\"$val_value\""
+    val_file="$val_dir/invalid_$val_case.conf"
+    printf '%s\n' "$(config_keys_blank "$val_key")" "$val_label" > "$val_file"
+    val_line="$(wc -l < "$val_file")"
+    run_loader "$val_file" "$val_dir/invalid_$val_case" >/dev/null
+    val_err="$(cat "$val_dir/invalid_$val_case.err" 2>/dev/null || true)"
+    assert_eq "1" "$(count_warnings "$val_dir/invalid_$val_case.err")" "$val_label: exatamente um aviso no stderr"
+    assert_eq "$(value_warning "$val_file:$val_line" "$val_key" "$val_value" "$val_off")" "$val_err" "$val_label: o aviso de valor tem o texto exato (arquivo, linha, chave, valor, valores aceitos e opção desligada)"
+    assert_eq "0" "$(count_missing_warnings "$val_dir/invalid_$val_case.err")" "$val_label: a linha conta como presente, sem aviso de chave ausente"
+    assert_eq "$val_value" "$(loaded_value "$val_file" "$val_key")" "$val_label: a variável recebe o valor literal (o leitor não mudou)"
+    if [ "$val_key" = "PRODUCTION_ENABLED" ]; then
+      assert_not_contains "$val_err" "Existe impacto em produção?" "$val_label: o aviso não repete a pergunta literal do prompt"
+    fi
+  done
+done
+
+val_case=0
+for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED; do
+  for val_value in true false ""; do
+    val_case=$((val_case + 1))
+    val_label="$val_key=\"$val_value\""
+    val_file="$val_dir/accepted_$val_case.conf"
+    printf '%s\n' "$(config_keys_blank "$val_key")" "$val_label" > "$val_file"
+    run_loader "$val_file" "$val_dir/accepted_$val_case" >/dev/null
+    assert_eq "" "$(cat "$val_dir/accepted_$val_case.err" 2>/dev/null || echo 'sem stderr')" "$val_label: valor aceito, nenhum aviso no stderr"
+    assert_eq "$val_value" "$(loaded_value "$val_file" "$val_key")" "$val_label: o valor é carregado"
+  done
+done
+
+# STACK_DESCRIPTION é texto livre: nenhum valor gera aviso de valor.
+val_case=0
+for val_value in "" TRUE sim "Django, DRF"; do
+  val_case=$((val_case + 1))
+  val_label="STACK_DESCRIPTION=\"$val_value\""
+  val_file="$val_dir/stack_$val_case.conf"
+  printf '%s\n' "$(config_keys_blank STACK_DESCRIPTION)" "$val_label" > "$val_file"
+  run_loader "$val_file" "$val_dir/stack_$val_case" >/dev/null
+  assert_eq "" "$(cat "$val_dir/stack_$val_case.err" 2>/dev/null || echo 'sem stderr')" "$val_label: STACK_DESCRIPTION não é checada, nenhum aviso no stderr"
+done
+
+val_file="$val_dir/two_lines.conf"
+printf '%s\n' "$(config_keys_blank)" 'SENTRY_ENABLED="TRUE"' 'PERMISSION_ENABLED="sim"' > "$val_file"
+val_line="$(wc -l < "$val_file")"
+run_loader "$val_file" "$val_dir/two_lines" >/dev/null
+assert_eq "2" "$(count_warnings "$val_dir/two_lines.err")" "duas linhas com valor inválido: dois avisos no stderr"
+assert_eq "$(value_warning "$val_file:$((val_line - 1))" SENTRY_ENABLED TRUE "$default_off_note")"$'\n'"$(value_warning "$val_file:$val_line" PERMISSION_ENABLED sim "$default_off_note")" "$(cat "$val_dir/two_lines.err" 2>/dev/null || true)" "duas linhas com valor inválido: um aviso por linha (as duas últimas), na ordem do arquivo"
+
+val_file="$val_dir/invalid_and_missing.conf"
+printf '%s\n' 'JIRA_ENABLED="sim"' > "$val_file"
+run_loader "$val_file" "$val_dir/invalid_and_missing" >/dev/null
+assert_eq "2" "$(count_warnings "$val_dir/invalid_and_missing.err")" "valor inválido e chaves ausentes: dois avisos no stderr"
+assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
+
+val_file="$val_dir/control_char.conf"
+val_raw="a"$'\e'"[31mb"
+printf '%s\n' "$(config_keys_blank PERMISSION_ENABLED)" "PERMISSION_ENABLED=\"$val_raw\"" > "$val_file"
+run_loader "$val_file" "$val_dir/control_char" >/dev/null
+assert_contains "$(cat "$val_dir/control_char.err" 2>/dev/null || true)" 'valor "a?[31mb"' "caractere de controle no valor: sai como ? no aviso"
+assert_eq "0" "$(grep -c $'\e' "$val_dir/control_char.err" 2>/dev/null || true)" "caractere de controle no valor: nenhum byte ESC no stderr"
+assert_eq "$val_raw" "$(loaded_value "$val_file" PERMISSION_ENABLED)" "caractere de controle no valor: a variável recebe o valor bruto, com o ESC"
+
+# Com LC_ALL=C, [![:print:]] também trocaria os bytes de "não" por "?"; a troca usa
+# [[:cntrl:]], que nesse locale só pega os controles ASCII. O LC_ALL=C vai no setup porque o
+# bash reaplica o locale quando LC_ALL muda.
+val_file="$val_dir/non_ascii.conf"
+printf '%s\n' "$(config_keys_blank JIRA_ENABLED)" 'JIRA_ENABLED="não"' > "$val_file"
+run_loader "$val_file" "$val_dir/non_ascii" "LC_ALL=C" >/dev/null
+assert_eq "$(value_warning "$val_file:$(wc -l < "$val_file")" JIRA_ENABLED "não" "$default_off_note")" "$(cat "$val_dir/non_ascii.err" 2>/dev/null || true)" "valor com acento sob LC_ALL=C: sai intacto no aviso (a troca usa [[:cntrl:]], não [![:print:]])"
+assert_not_contains "$(cat "$val_dir"/*.err 2>/dev/null || true)" "--init" "nenhum aviso desta seção sugere --init"
 
 echo
 echo "== resolve_stack: projects/ usa extensão .conf e é lido por load_project_config (sem source) =="
@@ -596,45 +852,88 @@ assert_not_contains "$cwd_output" "ignorado" "sem .nick.conf no cwd, --projeto=a
 assert_not_contains "$cwd_output" "Configuração do projeto carregada de" "sem .nick.conf no cwd, --projeto=alpha não imprime a linha 'carregada de'"
 
 echo
-echo "== resolve_stack: aviso de migração só pro arquivo carregado (cwd, --projeto=, menu; nunca em 'Nenhum') =="
-rs_mig_dir="$TEST_TMP/resolve_stack_migration"
-rs_mig_cwd_missing="$rs_mig_dir/cwd_sem_linha"
-rs_mig_cwd_with="$rs_mig_dir/cwd_com_linha"
-rs_mig_cwd_none="$rs_mig_dir/cwd_sem_config"
-rs_mig_projects="$rs_mig_dir/projects"
-mkdir -p "$rs_mig_cwd_missing" "$rs_mig_cwd_with" "$rs_mig_cwd_none" "$rs_mig_projects"
-printf '%s\n' 'STACK_DESCRIPTION="stack-do-cwd"' > "$rs_mig_cwd_missing/.nick.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-do-cwd"' 'PRODUCTION_ENABLED="false"' > "$rs_mig_cwd_with/.nick.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-com-linha"' 'PRODUCTION_ENABLED="true"' > "$rs_mig_projects/comlinha.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_mig_projects/semlinha.conf"
+echo "== resolve_stack: aviso de chave ausente só pro arquivo carregado (cwd, --projeto=, menu; nunca em 'Nenhum') =="
+rs_miss_dir="$TEST_TMP/resolve_stack_missing_keys"
+rs_miss_cwd_incomplete="$rs_miss_dir/cwd_incompleto"
+rs_miss_cwd_complete="$rs_miss_dir/cwd_completo"
+rs_miss_cwd_none="$rs_miss_dir/cwd_sem_config"
+rs_miss_projects="$rs_miss_dir/projects"
+mkdir -p "$rs_miss_cwd_incomplete" "$rs_miss_cwd_complete" "$rs_miss_cwd_none" "$rs_miss_projects"
+printf '%s\n' 'STACK_DESCRIPTION="stack-do-cwd"' > "$rs_miss_cwd_incomplete/.nick.conf"
+printf '%s\n' "$(config_keys_blank PRODUCTION_ENABLED)" 'STACK_DESCRIPTION="stack-do-cwd"' 'PRODUCTION_ENABLED="false"' > "$rs_miss_cwd_complete/.nick.conf"
+printf '%s\n' "$(config_keys_blank PRODUCTION_ENABLED)" 'STACK_DESCRIPTION="stack-com-linha"' 'PRODUCTION_ENABLED="true"' > "$rs_miss_projects/comlinha.conf"
+printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_miss_projects/semlinha.conf"
 
-rs_mig_result="$(run_resolve_stack "$rs_mig_cwd_missing" "$rs_mig_projects" "" "" "$rs_mig_dir/cwd_missing")"
-assert_eq "stack-do-cwd||||" "$rs_mig_result" "cwd sem a linha: a configuração do cwd é carregada"
-assert_eq "1" "$(count_migration_warnings "$rs_mig_dir/cwd_missing.err")" "cwd sem a linha: exatamente um aviso de migração"
-assert_contains "$(cat "$rs_mig_dir/cwd_missing.err" 2>/dev/null || true)" "$(migration_warning "$rs_mig_cwd_missing/.nick.conf")" "cwd sem a linha: o aviso mostra o caminho do .nick.conf do cwd"
+# rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
+rs_miss_expected() {
+  local file="$1"
+  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"'
+}
 
-rs_mig_result="$(run_resolve_stack "$rs_mig_cwd_with" "$rs_mig_projects" "" "" "$rs_mig_dir/cwd_with")"
-assert_eq "stack-do-cwd||||false" "$rs_mig_result" "cwd com PRODUCTION_ENABLED=\"false\": a configuração do cwd é carregada"
-assert_eq "0" "$(count_migration_warnings "$rs_mig_dir/cwd_with.err")" "cwd com PRODUCTION_ENABLED=\"false\": nenhum aviso de migração"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_incomplete")"
+rs_miss_err="$(cat "$rs_miss_dir/cwd_incomplete.err" 2>/dev/null || true)"
+assert_eq "stack-do-cwd||||" "$rs_miss_result" "cwd incompleto: a configuração do cwd é carregada"
+assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/cwd_incomplete.err")" "cwd incompleto: exatamente um aviso de chave ausente"
+assert_contains "$rs_miss_err" "Aviso: $rs_miss_cwd_incomplete/.nick.conf não tem todas as chaves" "cwd incompleto: o aviso mostra o caminho do .nick.conf do cwd"
+assert_contains "$rs_miss_err" "$(rs_miss_expected "$rs_miss_cwd_incomplete/.nick.conf")" "cwd incompleto: o aviso tem o texto exato, com as linhas a adicionar"
 
-rs_mig_result="$(run_resolve_stack "$rs_mig_cwd_none" "$rs_mig_projects" "semlinha" "" "$rs_mig_dir/arg_missing")"
-assert_eq "stack-sem-linha||||" "$rs_mig_result" "--projeto=semlinha: semlinha.conf é carregado"
-assert_eq "1" "$(count_migration_warnings "$rs_mig_dir/arg_missing.err")" "--projeto=semlinha: exatamente um aviso de migração"
-assert_contains "$(cat "$rs_mig_dir/arg_missing.err" 2>/dev/null || true)" "$(migration_warning "$rs_mig_projects/semlinha.conf")" "--projeto=semlinha: o aviso mostra o caminho de projects/semlinha.conf"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_complete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_complete")"
+assert_eq "stack-do-cwd||||false" "$rs_miss_result" "cwd completo: a configuração do cwd é carregada"
+assert_eq "0" "$(count_warnings "$rs_miss_dir/cwd_complete.err")" "cwd completo: nenhum aviso"
+
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "semlinha" "" "$rs_miss_dir/arg_incomplete")"
+assert_eq "stack-sem-linha||||" "$rs_miss_result" "--projeto=semlinha: semlinha.conf é carregado"
+assert_eq "1" "$(count_warnings "$rs_miss_dir/arg_incomplete.err")" "--projeto=semlinha: exatamente um aviso"
+assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/arg_incomplete.err")" "--projeto=semlinha: o aviso é o de chave ausente"
+assert_contains "$(cat "$rs_miss_dir/arg_incomplete.err" 2>/dev/null || true)" "$(rs_miss_expected "$rs_miss_projects/semlinha.conf")" "--projeto=semlinha: o aviso mostra o caminho de projects/semlinha.conf"
 
 # Menu: 1) comlinha, 2) semlinha, 3) Nenhum (glob em ordem alfabética).
-rs_mig_result="$(run_resolve_stack "$rs_mig_cwd_none" "$rs_mig_projects" "" "2" "$rs_mig_dir/menu_missing")"
-assert_eq "stack-sem-linha||||" "$rs_mig_result" "menu escolhendo semlinha: semlinha.conf é carregado"
-assert_eq "1" "$(count_migration_warnings "$rs_mig_dir/menu_missing.err")" "menu escolhendo semlinha: exatamente um aviso de migração"
-assert_contains "$(cat "$rs_mig_dir/menu_missing.err" 2>/dev/null || true)" "$(migration_warning "$rs_mig_projects/semlinha.conf")" "menu escolhendo semlinha: o aviso mostra o caminho de projects/semlinha.conf"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "2" "$rs_miss_dir/menu_incomplete")"
+assert_eq "stack-sem-linha||||" "$rs_miss_result" "menu escolhendo semlinha: semlinha.conf é carregado"
+assert_eq "1" "$(count_warnings "$rs_miss_dir/menu_incomplete.err")" "menu escolhendo semlinha: exatamente um aviso"
+assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/menu_incomplete.err")" "menu escolhendo semlinha: o aviso é o de chave ausente"
+assert_contains "$(cat "$rs_miss_dir/menu_incomplete.err" 2>/dev/null || true)" "$(rs_miss_expected "$rs_miss_projects/semlinha.conf")" "menu escolhendo semlinha: o aviso mostra o caminho de projects/semlinha.conf"
 
-rs_mig_result="$(run_resolve_stack "$rs_mig_cwd_none" "$rs_mig_projects" "" "1" "$rs_mig_dir/menu_with")"
-assert_eq "stack-com-linha||||true" "$rs_mig_result" "menu escolhendo comlinha: comlinha.conf é carregado"
-assert_eq "0" "$(count_migration_warnings "$rs_mig_dir/menu_with.err")" "menu escolhendo comlinha (PRODUCTION_ENABLED=\"true\"): nenhum aviso de migração"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "1" "$rs_miss_dir/menu_complete")"
+assert_eq "stack-com-linha||||true" "$rs_miss_result" "menu escolhendo comlinha: comlinha.conf é carregado"
+assert_eq "0" "$(count_warnings "$rs_miss_dir/menu_complete.err")" "menu escolhendo comlinha (completo): nenhum aviso"
 
-rs_mig_result="$(run_resolve_stack "$rs_mig_cwd_none" "$rs_mig_projects" "" "3" "$rs_mig_dir/menu_none")"
-assert_eq "||||" "$rs_mig_result" "menu escolhendo Nenhum: nenhuma configuração é carregada"
-assert_eq "0" "$(count_migration_warnings "$rs_mig_dir/menu_none.err")" "menu escolhendo Nenhum (com semlinha.conf em projects/): nenhum aviso de migração"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "3" "$rs_miss_dir/menu_none")"
+assert_eq "||||" "$rs_miss_result" "menu escolhendo Nenhum: nenhuma configuração é carregada"
+assert_eq "0" "$(count_warnings "$rs_miss_dir/menu_none.err")" "menu escolhendo Nenhum (com semlinha.conf em projects/): nenhum aviso"
+
+echo
+echo "== resolve_stack: aviso de valor inválido nos três caminhos (cwd, --projeto=, menu; nunca em 'Nenhum') =="
+# PROJECTS_DIR próprio, pra não mudar a numeração do menu da seção acima.
+rs_val_dir="$TEST_TMP/resolve_stack_invalid_value"
+rs_val_cwd="$rs_val_dir/cwd_invalido"
+rs_val_cwd_none="$rs_val_dir/cwd_sem_config"
+rs_val_projects="$rs_val_dir/projects"
+mkdir -p "$rs_val_cwd" "$rs_val_cwd_none" "$rs_val_projects"
+rs_val_conf="$(config_keys_blank SENTRY_ENABLED)"$'\n''SENTRY_ENABLED="sim"'
+printf '%s\n' "$rs_val_conf" > "$rs_val_cwd/.nick.conf"
+printf '%s\n' "$rs_val_conf" > "$rs_val_projects/invalido.conf"
+rs_val_line="$(wc -l < "$rs_val_projects/invalido.conf")"
+
+rs_val_result="$(run_resolve_stack "$rs_val_cwd" "$rs_val_projects" "" "" "$rs_val_dir/cwd")"
+assert_eq "|sim|||" "$rs_val_result" "cwd com SENTRY_ENABLED=\"sim\": o valor literal é carregado"
+assert_eq "1" "$(count_warnings "$rs_val_dir/cwd.err")" "cwd com SENTRY_ENABLED=\"sim\": exatamente um aviso"
+assert_contains "$(cat "$rs_val_dir/cwd.err" 2>/dev/null || true)" "$(value_warning "$rs_val_cwd/.nick.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "cwd com SENTRY_ENABLED=\"sim\": o aviso de valor aponta o .nick.conf do cwd, última linha"
+
+rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "invalido" "" "$rs_val_dir/arg")"
+assert_eq "|sim|||" "$rs_val_result" "--projeto=invalido: o valor literal é carregado"
+assert_eq "1" "$(count_warnings "$rs_val_dir/arg.err")" "--projeto=invalido: exatamente um aviso"
+assert_contains "$(cat "$rs_val_dir/arg.err" 2>/dev/null || true)" "$(value_warning "$rs_val_projects/invalido.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "--projeto=invalido: o aviso de valor aponta projects/invalido.conf, última linha"
+
+# Menu: 1) invalido, 2) Nenhum.
+rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "" "1" "$rs_val_dir/menu")"
+assert_eq "|sim|||" "$rs_val_result" "menu escolhendo invalido: o valor literal é carregado"
+assert_eq "1" "$(count_warnings "$rs_val_dir/menu.err")" "menu escolhendo invalido: exatamente um aviso"
+assert_contains "$(cat "$rs_val_dir/menu.err" 2>/dev/null || true)" "$(value_warning "$rs_val_projects/invalido.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "menu escolhendo invalido: o aviso de valor aponta projects/invalido.conf, última linha"
+
+rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "" "2" "$rs_val_dir/menu_none")"
+assert_eq "||||" "$rs_val_result" "menu escolhendo Nenhum: nenhuma configuração é carregada"
+assert_eq "0" "$(count_warnings "$rs_val_dir/menu_none.err")" "menu escolhendo Nenhum (com invalido.conf em projects/): nenhum aviso"
 
 echo
 echo "== main(): com .nick.conf no cwd, 'carregada de' vem antes do menu de tipo e o JIRA_ENABLED do cwd chega a choose_type =="
@@ -926,20 +1225,23 @@ logs_for_type() {
 
 # check_production_e2e <type> <variant> <extra_conf_line> <stdin> [setup]: roda main() com
 # run_main, num case_dir próprio, e confere o prompt no log (o texto exato enviado ao
-# claude). <variant> é true, false (PRODUCTION_ENABLED com esse valor, depois da
-# <extra_conf_line>) ou sem_linha (.nick.conf só com a <extra_conf_line>).
+# claude). O .nick.conf tem as outras chaves vazias (config_keys_blank), depois a
+# <extra_conf_line> (que vence o valor vazio da mesma chave) e, fora da variante sem_linha,
+# PRODUCTION_ENABLED="<variant>". <variant> é true, false, TRUE (valor inválido, que desliga
+# com aviso) ou sem_linha.
 check_production_e2e() {
   local type="$1" variant="$2" extra_line="$3" input="$4" setup="${5:-:}"
   local case_dir="$TEST_TMP/main_e2e_production/${type}_$variant"
-  local conf_line="$extra_line" label rc logs log_text output
+  local conf_line label rc logs log_text output
+  conf_line="$(config_keys_blank PRODUCTION_ENABLED)"
+  if [ -n "$extra_line" ]; then
+    conf_line="$conf_line"$'\n'"$extra_line"
+  fi
   if [ "$variant" = "sem_linha" ]; then
     label="$type, .nick.conf sem a linha PRODUCTION_ENABLED"
   else
     label="$type, PRODUCTION_ENABLED=\"$variant\""
-    conf_line="PRODUCTION_ENABLED=\"$variant\""
-    if [ -n "$extra_line" ]; then
-      conf_line="$extra_line"$'\n'"$conf_line"
-    fi
+    conf_line="$conf_line"$'\n'"PRODUCTION_ENABLED=\"$variant\""
   fi
   rc="$(run_main "$case_dir" "$conf_line" "$input" "$setup")"
   logs="$(logs_for_type "$case_dir/logs" "$type")"
@@ -954,17 +1256,24 @@ check_production_e2e() {
     assert_not_contains "$log_text" "Existe impacto em produção?" "$label: o prompt não tem a pergunta de impacto em produção"
     assert_not_contains "$output" "Existe impacto em produção?" "$label: a saída (stdout+stderr) não tem a pergunta de impacto em produção"
   fi
-  if [ "$variant" = "sem_linha" ]; then
-    assert_eq "1" "$(count_migration_warnings "$case_dir/output")" "$label: exatamente um aviso de migração na saída"
-    assert_contains "$output" "$(migration_warning "$case_dir/cwd/.nick.conf")" "$label: o aviso de migração mostra o caminho do .nick.conf"
-  else
-    assert_eq "0" "$(count_migration_warnings "$case_dir/output")" "$label: nenhum aviso de migração na saída"
-  fi
+  case "$variant" in
+    sem_linha)
+      assert_eq "1" "$(count_warnings "$case_dir/output")" "$label: exatamente um aviso na saída"
+      assert_contains "$output" "$(missing_warning "$case_dir/cwd/.nick.conf" "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$label: o aviso de chave ausente mostra o caminho do .nick.conf e só PRODUCTION_ENABLED"
+      ;;
+    TRUE)
+      assert_eq "1" "$(count_warnings "$case_dir/output")" "$label: exatamente um aviso na saída"
+      assert_contains "$output" "$(value_warning "$case_dir/cwd/.nick.conf:$(wc -l < "$case_dir/cwd/.nick.conf")" PRODUCTION_ENABLED TRUE "$production_note")" "$label: o aviso de valor mostra o .nick.conf, a linha e a nota de PRODUCTION_ENABLED"
+      ;;
+    *)
+      assert_eq "0" "$(count_warnings "$case_dir/output")" "$label: nenhum aviso na saída"
+      ;;
+  esac
 }
 
 # stdin de cada TYPE: a opção do menu, as respostas do roteiro e N pra recusar o envio. Com
 # Jira ou Sentry ligado (e o outro desligado), a opção 3 é po_jira ou po_sentry.
-for production_variant in true false sem_linha; do
+for production_variant in true false TRUE sem_linha; do
   check_production_e2e po "$production_variant" "" $'1\nTítulo de teste\nN' "EDITOR='$fake_editor'"
   check_production_e2e po_discussion "$production_variant" "" $'2\nassunto de teste\nN'
   check_production_e2e po_jira "$production_variant" 'JIRA_ENABLED="true"' $'3\nhttps://jira.example.com/browse/SC-14\n\nN'
@@ -988,7 +1297,7 @@ assert_eq "1" "$(grep -c . <<< "$none_logs" || true)" "Nenhum: gera exatamente u
 assert_contains "$none_log_text" "- Quais são os impactos negativos possíveis?" "Nenhum: o prompt tem a pergunta de impactos negativos"
 assert_not_contains "$none_log_text" "Existe impacto em produção?" "Nenhum: o prompt não tem a pergunta de impacto em produção"
 assert_not_contains "$none_output" "Existe impacto em produção?" "Nenhum: a saída (stdout+stderr) não tem a pergunta de impacto em produção"
-assert_eq "0" "$(count_migration_warnings "$none_dir/output")" "Nenhum (com alpha.conf sem a linha em projects/): nenhum aviso de migração na saída"
+assert_eq "0" "$(count_warnings "$none_dir/output")" "Nenhum (com alpha.conf incompleto em projects/): nenhum aviso na saída"
 
 echo
 echo "== consistência: variáveis dos templates = lista do envsubst = lista do export =="

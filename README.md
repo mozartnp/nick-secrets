@@ -59,14 +59,10 @@ menu. Essa configuração pode ficar em dois lugares, procurados nesta ordem:
    o arquivo não existir) ou, sem argumento, pelo menu com os projetos encontrados + a
    opção "Nenhum" (usa uma stack genérica).
 
-Exemplo de `.nick.conf` (o formato de `auto_scrum/projects/<nome>.conf` é o mesmo):
-
-```
-# Config do projeto pro auto_scrum.
-STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, Django CBV, Django auth, Bootstrap 5, PostgreSQL, JavaScript, pytest e TDD"
-```
-
-As chaves aceitas e o que cada uma faz estão comentadas no arquivo gerado por `--init`.
+O formato de `.nick.conf` e de `auto_scrum/projects/<nome>.conf` é o mesmo. O exemplo
+completo é o arquivo gerado por `--init`: ele traz todas as chaves aceitas, com um
+comentário explicando cada uma. Uma linha preenchida fica assim:
+`STACK_DESCRIPTION="Django, DRF, PostgreSQL"`.
 
 Regra de formato: o arquivo **não é executado** — o script lê só linhas `CHAVE="valor"`
 das chaves aceitas, com aspas duplas, sem aspas duplas dentro do valor e sem comentário no
@@ -74,6 +70,18 @@ fim da linha (comentário em linha própria, começando com `#`, pode). O valor 
 literalmente (`$VAR`/`$(...)` não são expandidos). Qualquer outra linha é ignorada; uma
 linha de chave aceita fora do formato (ex: `CHAVE=valor` sem aspas, `export CHAVE="valor"`
 ou `CHAVE = "valor"`) é ignorada com um aviso mostrando o arquivo e o número da linha.
+
+Duas regras valem além do formato:
+
+- **Toda chave aceita precisa estar no arquivo**, mesmo as que o projeto não usa. Se faltar
+  alguma, o script avisa no stderr, com o caminho do arquivo e as linhas a adicionar, e a
+  chave ausente vale como vazia. Uma linha comentada ou com outro nome não conta.
+- **As chaves `*_ENABLED` aceitam só `"true"`, `"false"` e `""`.** Qualquer outro valor (ex:
+  `"TRUE"`, `"sim"`) deixa a opção desligada e gera um aviso com o arquivo e o número da
+  linha.
+
+Os avisos não interrompem a execução. Quando uma chave nova é criada, as configurações que
+já existem passam a receber o aviso de chaves ausentes, com a linha a adicionar.
 
 - Pra criar a configuração: `./auto_scrum/auto_scrum.sh --init` — pergunta o destino
   (`.nick.conf` no diretório atual, ou `auto_scrum/projects/<nome>.conf`, que pede o nome)
@@ -99,7 +107,9 @@ conteúdo não precisa mudar, só a extensão — o script avisa e sugere o coma
 passou a depender da chave `PRODUCTION_ENABLED` e fica desligada por padrão. Configurações
 criadas antes dela — tanto `.nick.conf` versionados nos projetos alvo quanto
 `auto_scrum/projects/<nome>.conf` — perdem a pergunta até ganharem
-`PRODUCTION_ENABLED="true"`. Enquanto o arquivo carregado não tiver essa linha, o script
-avisa no stderr, mostrando o caminho do arquivo; um projeto sem produção usa
-`PRODUCTION_ENABLED="false"`, que mantém a pergunta desligada sem o aviso. Arquivos novos
-gerados por `--init` já vêm com a linha.
+`PRODUCTION_ENABLED="true"`. Enquanto o arquivo carregado não tiver essa linha, o aviso de
+chaves ausentes lista `PRODUCTION_ENABLED`, explicando que a pergunta está desligada; um
+projeto sem produção usa `PRODUCTION_ENABLED="false"`, que mantém a pergunta desligada e
+tira essa chave do aviso. Valores como `"TRUE"` ou `"sim"`, que antes desligavam a pergunta
+em silêncio, agora geram o aviso de valor. Arquivos novos gerados por `--init` já vêm com
+todas as chaves.

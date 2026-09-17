@@ -60,7 +60,10 @@ crescem a cada ticket — chaves de configuração, quais etapas usam cada flag,
 menu — **não** vão pro README: ficam no código, neste `ABOUT.md` ou nos comentários do
 esqueleto gerado por `--init` (`print_project_skeleton()`), que é a fonte única da lista de
 chaves da configuração do projeto (protegida pelo teste de consistência com
-`PROJECT_CONFIG_KEYS`). O README remete a essas fontes em vez de copiá-las.
+`PROJECT_CONFIG_KEYS`). O README remete a essas fontes em vez de copiá-las. Pelo mesmo
+motivo, o README não traz um exemplo de arquivo de configuração completo: ele teria de
+listar todas as chaves. O exemplo completo é o arquivo gerado por `--init`, e o README só
+ilustra o formato com uma linha preenchida.
 
 **Por quê:** o README não tem teste que pegue desatualização, e cada flag nova exigiria
 lembrar de editá-lo. O ticket 8 já mostrou isso acontecendo: uma frase do passo 1 de "Uso"
@@ -221,7 +224,8 @@ Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa 
 Esse tipo de coisa vira uma variável booleana no arquivo de configuração do projeto
 (`.nick.conf` no cwd ou `auto_scrum/projects/<name>.conf` — ver seção "Configuração do
 projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
-`SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`), lida por uma função
+`SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`; só `"true"`, `"false"` e
+`""` são aceitos, e qualquer outro valor desliga a opção com aviso), lida por uma função
 `build_*_blocks()` em `auto_scrum.sh` (mesmo padrão de `build_stack_blocks()`/
 `STACK_DESCRIPTION`) que monta o bloco de texto correspondente só quando a flag está ativa. O
 template usa a variável de bloco (ex: `${SENTRY_BLOCK_TL}`) no lugar do texto fixo — nunca
@@ -246,7 +250,10 @@ Toda flag nova precisa entrar também em `PROJECT_CONFIG_KEYS` (topo do `auto_sc
 esqueleto de `print_project_skeleton()`: o leitor `load_project_config` ignora qualquer chave
 fora dessa lista, então uma flag só escrita no arquivo nunca chegaria ao script. Um teste
 compara as chaves do esqueleto com `PROJECT_CONFIG_KEYS` pra pegar o esquecimento de um dos
-dois lados.
+dois lados. A flag nova também precisa terminar em `_ENABLED` e entrar no esqueleto com
+`"false"` (chave de texto entra com `""`): é o sufixo que a põe na checagem de valor
+(`is_toggle_config_key`), e o teste de consistência do esqueleto cobra isso — ver seção
+"Validação da configuração do projeto: chave ausente e valor inválido".
 
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
@@ -256,9 +263,10 @@ criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer.
 
 `PRODUCTION_ENABLED` (opt-in, no mesmo formato das flags da seção acima) controla se a
 pergunta "Existe impacto em produção?" entra na análise obrigatória do PO.
-`build_production_blocks()` monta `PRODUCTION_BLOCK_PO` só quando o valor é `"true"` exato
-(vazio, `"false"`, `"TRUE"`, `"sim"` ou qualquer outro valor desliga), e `build_po_blocks()`
-o embute em `PO_VALIDATION_BLOCK` logo depois do bloco de permissão
+`build_production_blocks()` monta `PRODUCTION_BLOCK_PO` só quando o valor é `"true"` exato.
+Vazio, `"false"`, `"TRUE"`, `"sim"` ou qualquer outro valor desliga; os que não são `"true"`,
+`"false"` nem vazio (ex: `"TRUE"`, `"sim"`) desligam com o aviso de valor.
+`build_po_blocks()` o embute em `PO_VALIDATION_BLOCK` logo depois do bloco de permissão
 (`PERMISSION_BLOCK_PO`). Por estar nesse bloco compartilhado, vale pros quatro pontos de
 entrada do PO (`po`, `po_discussion`, `po_jira`, `po_sentry`) sem mexer em template, e,
 como os outros blocos embutidos, não é exportado nem passado ao `envsubst`. Com `"true"`,
@@ -266,39 +274,37 @@ como os outros blocos embutidos, não é exportado nem passado ao `envsubst`. Co
 permissão → produção (coberto por teste com referência fixa). Desligada, só a linha da
 pergunta sai, sem deixar linha em branco.
 
-**Aviso de migração.** `load_project_config` avisa no stderr quando o arquivo que carregou
-não tem nenhuma linha `PRODUCTION_ENABLED` (texto único em `warn_missing_production_line`,
-com o caminho do arquivo e as duas linhas possíveis: `"true"` pra ligar a pergunta, `"false"`
-pra mantê-la desligada sem o aviso). Regras, cada uma com o seu motivo:
+**Aviso de migração.** O aviso específico de `PRODUCTION_ENABLED` (a função
+`warn_missing_production_line`, que não existe mais) virou parte do aviso geral de chaves
+ausentes — ver seção "Validação da configuração do projeto: chave ausente e valor inválido",
+que também guarda as regras gerais (roda só em `load_project_config`, linha mal formatada
+conta como presente, linha comentada e chave parecida não contam, "Nenhum" não avisa). Um
+arquivo sem a linha `PRODUCTION_ENABLED` recebe esse aviso, que sugere
+`PRODUCTION_ENABLED="false"` precedida de uma nota da chave (`config_key_off_note`). Regras
+que continuam específicas desta chave, cada uma com o seu motivo:
 
-- **Fica em `load_project_config`, não em `resolve_stack`.** É o único leitor de arquivo dos
-  três caminhos (cwd, `--projeto=` e menu), então a regra vale em todos sem repetir código.
-  Só o arquivo carregado é avaliado: outros `projects/*.conf` sem a linha não geram aviso,
-  porque não são eles que definem o prompt dessa execução.
-- **"Ter a linha" inclui a linha mal formatada** (`PRODUCTION_ENABLED=true`,
-  `export PRODUCTION_ENABLED=...`, `PRODUCTION_ENABLED = "true"`, comentário no fim). Ela já
-  recebe o aviso de formato, que aponta arquivo e linha, e dois avisos pro mesmo problema
-  seriam ruído.
-- **Linha comentada (`# PRODUCTION_ENABLED="true"`) e chave parecida
-  (`PRODUCTION_ENABLED_OLD="true"`) não contam.** O leitor não vê a chave nelas, então a
-  pergunta continua desligada e o aviso é verdadeiro.
-- **"Nenhum" no menu não avisa.** Não há arquivo onde adicionar a linha (e
-  `load_project_config` nem é chamado nesse caminho).
+- **Ela é a única com nota própria nos avisos**, dizendo que a pergunta de impacto em
+  produção está desligada no prompt do PO. É a primeira flag cujo padrão desligado *remove*
+  um comportamento que já existia (ver "Por quê" abaixo); nas outras, ficar desligada só
+  deixa de acrescentar algo.
+- **A nota mostra as duas saídas, não só a de ligar** (`"true"` pra ligar a pergunta,
+  `"false"` pra mantê-la desligada). O aviso aparece em toda execução, e quem mais precisa
+  silenciá-lo é justamente o projeto sem produção. Se o texto só ensinasse
+  `PRODUCTION_ENABLED="true"`, essa pessoa teria que ir ao README pra descobrir que `"false"`
+  também silencia, e poderia acabar ligando a pergunta que a flag existe pra tirar.
+- **A nota não repete a pergunta literal** ("Existe impacto em produção?"). As checagens de
+  ponta a ponta juntam stdout e stderr e procuram essa frase pra saber se ela chegou ao
+  prompt, então um aviso com a mesma frase daria falso positivo.
+- **O aviso é permanente.** Não tem data de expiração nem flag pra desligar, porque o script
+  não tem como saber quando todas as configurações antigas foram migradas (elas ficam em
+  outras máquinas e em repositórios de outros times). A linha com `"true"`, `"false"` ou `""`
+  registra a decisão do projeto e tira a chave do aviso de ausentes. Uma linha com valor
+  inválido (`"TRUE"`, `"sim"`) também tira a chave desse aviso, mas recebe o aviso de valor,
+  que termina com a mesma nota e também diz que a pergunta está desligada. Um projeto sem
+  produção usa `PRODUCTION_ENABLED="false"`.
 - **O `--init` já traz a linha** (`PRODUCTION_ENABLED="false"`, com comentário mandando ligar
   quando o projeto entrar em produção), então um arquivo novo já nasce com a decisão
   explícita e não dispara o aviso.
-- **O aviso é permanente e sai com a linha em qualquer valor, inclusive `""`.** Não tem data
-  de expiração nem flag pra desligar, porque o script não tem como saber quando todas as
-  configurações antigas foram migradas (elas ficam em outras máquinas e em repositórios de
-  outros times). O aviso trata da linha que falta, não do valor: ter a linha já registra a
-  decisão do projeto. Um projeto sem produção usa `PRODUCTION_ENABLED="false"`.
-- **O texto mostra as duas saídas, não só a de ligar.** O aviso aparece em toda execução, e
-  quem mais precisa silenciá-lo é justamente o projeto sem produção. Se o texto só ensinasse
-  `PRODUCTION_ENABLED="true"`, essa pessoa teria que ir ao README pra descobrir que `"false"`
-  também silencia, e poderia acabar ligando a pergunta que a flag existe pra tirar.
-- **O texto não repete a pergunta literal** ("Existe impacto em produção?"). As checagens de
-  ponta a ponta juntam stdout e stderr e procuram essa frase pra saber se ela chegou ao
-  prompt, então um aviso com a mesma frase daria falso positivo.
 
 **Por quê:** num projeto que ainda não está em produção, a pergunta fixa fazia o modelo
 inventar uma análise de impacto em produção sem valor nenhum. O aviso existe porque esta é
@@ -420,12 +426,11 @@ x`, `JIRA_ENABLED="true" # comentário`) quanto as formas "quase certas" `export
 continua sendo chave desconhecida, sem aviso). Ela é ignorada com um único aviso no stderr,
 com arquivo e número da linha (texto único em `warn_malformed_config_line`); essas formas
 continuam **não** sendo aceitas, só deixam de ser descartadas em silêncio. Além do aviso de
-formato, existe o aviso de migração, dado quando o arquivo carregado não tem nenhuma linha
-`PRODUCTION_ENABLED` (ver seção "Análise de impacto em produção no PO
-(`PRODUCTION_ENABLED`)"). Aspas simples, valores sem aspas e comentário no fim da linha ficam de fora de
-propósito, pra gramática ser pequena e fácil de testar. Variáveis locais da função precisam
-ficar em minúsculo — uma local com o nome de uma chave faria o `printf -v` alterar a local
-em vez da global.
+formato, existem o de chave ausente e o de valor inválido (ver seção "Validação da
+configuração do projeto: chave ausente e valor inválido"). Aspas simples, valores sem aspas
+e comentário no fim da linha ficam de fora de propósito, pra gramática ser pequena e fácil
+de testar. Variáveis locais da função precisam ficar em minúsculo — uma local com o nome de
+uma chave faria o `printf -v` alterar a local em vez da global.
 
 **`projects/` passou de `.sh` pra `.conf`.** Os arquivos deixaram de ser executados, e manter
 `.sh` passaria a ideia errada de que são `source`ados (e editores/`shellcheck` os tratariam
@@ -473,6 +478,107 @@ chave conhecida mal formatada existe porque, sem ele, um erro comum como `JIRA_E
 desligaria a flag sem explicação — e o mesmo vale pra `export CHAVE=` (provável em quem vem
 do formato `.sh` antigo, que era `source`ado, ou copia de um `.bashrc`) e pra espaço em volta
 do `=`.
+
+## Validação da configuração do projeto: chave ausente e valor inválido
+
+Além do aviso de formato (seção acima), `load_project_config` faz duas checagens no arquivo
+que carregou. Nenhuma delas interrompe a execução: a função sempre retorna 0, e `main()`
+segue até o prompt.
+
+1. **Toda chave de `PROJECT_CONFIG_KEYS` deve estar declarada no arquivo**, mesmo as que o
+   projeto não usa. As ausentes geram um único aviso (`warn_missing_config_keys`), com o
+   caminho do arquivo e a linha a adicionar pra cada uma, na ordem de `PROJECT_CONFIG_KEYS`.
+   A chave ausente continua valendo como vazia.
+2. **As chaves liga/desliga aceitam só `"true"`, `"false"` e `""`.** Qualquer outro valor
+   (`"TRUE"`, `"True"`, `"sim"`) gera um aviso por linha (`warn_invalid_toggle_value`), com
+   arquivo, número da linha, chave, valor encontrado, valores aceitos e a informação de que a
+   opção está desligada.
+
+**O que é liga/desliga: nome terminado em `_ENABLED`**, decidido só em
+`is_toggle_config_key`. As duas checagens e o valor padrão da linha sugerida usam essa
+função. Uma flag nova precisa seguir o sufixo e entrar no esqueleto de
+`print_project_skeleton()` com `"false"`; uma chave de texto entra com `""`. O teste de
+consistência do esqueleto cobra isso nos dois sentidos: cada chave com `"false"` no
+esqueleto, trocada por `"sim"`, tem de gerar o aviso de valor, e cada chave com `""` não. Não
+existe um array separado de chaves liga/desliga porque ele seria um terceiro lugar a
+atualizar a cada flag nova, além de `PROJECT_CONFIG_KEYS` e do esqueleto — e todas as flags
+já seguem o sufixo.
+
+**Valor padrão da linha sugerida.** Vem da mesma regra: `"false"` pra liga/desliga e `""` pra
+texto. É exatamente a linha do esqueleto, e um teste confere que cada linha sugerida aparece
+idêntica no arquivo gerado por `--init` (o script não lê o esqueleto em tempo de execução).
+Esse padrão mantém o comportamento de antes, já que vazio e `"false"` desligam igual.
+
+**Presença.** Conta como presente a linha válida com qualquer valor, inclusive inválido, e a
+linha fora do formato: as duas já recebem um aviso próprio, que aponta arquivo e linha, e
+somar o aviso de chave ausente seria ruído pro mesmo problema. Conta como ausente a linha
+comentada, a chave de nome parecido (`JIRA_ENABLED_OLD`), o nome digitado errado
+(`JIRA_ENABLE`) e o arquivo vazio: o leitor não vê a chave em nenhum deles, então ela de fato
+vale como vazia. É por esse lado que o nome digitado errado aparece: `JIRA_ENABLE="true"`
+continua sendo uma chave desconhecida, ignorada em silêncio, mas `JIRA_ENABLED` entra no
+aviso de ausentes.
+
+**Forma dos avisos.**
+- O de chave ausente é um bloco só, e só a primeira linha começa com `Aviso:` (os testes
+  contam avisos por ela, aceitando antes o prompt `#? ` que o `select` do menu de projetos
+  deixa sem quebra de linha — sem isso, um aviso logo depois do menu passaria sem ser
+  contado). Cada chave vem numa linha `  CHAVE="padrão"`. A nota da chave,
+  quando existe, vai numa linha de comentário antes dela, e não no fim da linha: assim o
+  bloco pode ser colado no arquivo como está, porque o leitor ignora comentários e tira os
+  espaços do começo, enquanto um comentário no fim da linha geraria aviso de formato.
+- O de valor inválido é um por linha, no padrão do aviso de formato, e só vale pra linhas que
+  o leitor aceitou: uma linha fora do formato recebe só o aviso de formato, mesmo que o valor
+  também seja ruim (`JIRA_ENABLED=TRUE`).
+- O valor inválido continua sendo atribuído (a variável guarda `"TRUE"` literal), e só
+  `"true"` liga. O comportamento do leitor não muda: o aviso só explica por que a opção está
+  desligada.
+
+**Nota por chave, só em `config_key_off_note`.** É o único lugar com texto específico de
+chave, usado pelos dois avisos. Hoje só `PRODUCTION_ENABLED` tem nota, porque é a única flag
+cujo padrão desligado remove algo que o prompt já tinha (ver seção "Análise de impacto em
+produção no PO"). Nas outras, o aviso de valor termina com "a opção está desligada.".
+
+**O que os avisos não fazem, e por quê.**
+- Não sugerem `--init`: ele sobrescreve o arquivo e apagaria os valores já preenchidos.
+- Não mostram o valor de `STACK_DESCRIPTION`. Ele é texto livre, pode ser longo e pode trazer
+  nome de cliente ou pista de infraestrutura, que é o motivo de essas configurações não
+  ficarem neste repositório público. Como nunca é validado, não há por que mostrá-lo.
+- Trocam os caracteres de controle do valor por `?` antes de imprimir: o valor vem de um
+  arquivo que outro time pode editar e vai direto pro terminal. A troca usa `[[:cntrl:]]`, e
+  não `[![:print:]]`, que com locale C trocaria também os bytes de `"não"` (um teste sob
+  `LC_ALL=C` protege essa escolha). Ela vale só pro texto do aviso: a variável continua com o
+  valor bruto. Limite aceito: os controles C1 (U+0080–U+009F, ex: `C2 9B`) só são
+  reconhecidos com locale UTF-8; com locale C, ou como byte solto (`9B`), passam intactos.
+  Filtrar os bytes `0x80`–`0x9F` quebraria letras acentuadas em UTF-8 (`É` é `C3 89`), e o
+  risco é pequeno perto do que quem edita o arquivo já consegue — mesmo racional do
+  parágrafo "O leitor protege o shell, não o prompt".
+- Não interrompem a execução: a configuração continua utilizável, só com a opção desligada
+  ou a chave vazia, que é o comportamento de antes das checagens.
+
+**Onde rodam.** Só em `load_project_config`, o único leitor, então valem nos três caminhos
+(cwd, `--projeto=` e menu) sem repetir código. Só o arquivo carregado é verificado: outros
+`projects/*.conf` incompletos ou inválidos não geram aviso, porque não são eles que definem
+essa execução. "Nenhum" no menu e o `--init` não chamam o leitor e por isso não avisam — o
+`--init` nem quando sobrescreve um arquivo incompleto que já existe. O esqueleto já nasce com
+todas as chaves e traz um comentário com as duas regras, então um arquivo novo carrega sem
+aviso.
+
+**Por quê:** uma chave nova nunca chega sozinha às configurações que já existem, inclusive
+aos `.nick.conf` versionados em repositórios de outros times, e um valor como `"TRUE"` ou um
+nome digitado errado desligavam a opção sem nenhuma explicação. O aviso de migração do ticket
+14 resolvia isso só pra `PRODUCTION_ENABLED`. Generalizá-lo evita um aviso novo a cada flag:
+basta a flag estar em `PROJECT_CONFIG_KEYS` e no esqueleto pra entrar nas duas checagens.
+
+**Fora de escopo, de propósito:**
+- aceitar `"TRUE"`, `"sim"` e parecidos como ligado: o leitor continua exigindo `"true"`
+  exato, e o aviso já tira o silêncio, que era o problema;
+- validar `STACK_DESCRIPTION`: é texto livre, sem valor inválido a definir;
+- avisar chave desconhecida ou sugerir o nome certo: o aviso de chave ausente já pega o nome
+  digitado errado pelo lado da chave certa;
+- avisar quando não há arquivo ("Nenhum"): não há arquivo onde adicionar as linhas;
+- corrigir ou completar o arquivo automaticamente: mexer no arquivo do usuário sem pedir é
+  surpresa (mesmo racional de não renomear os `.sh` legados), e o aviso já traz as linhas
+  prontas pra colar.
 
 ## Modo auto só na etapa de Desenvolvimento
 

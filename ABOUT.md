@@ -227,9 +227,10 @@ projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
 template usa a variável de bloco (ex: `${SENTRY_BLOCK_TL}`) no lugar do texto fixo — nunca
 um `if` dentro do `.md`, porque `envsubst` não suporta condicional. Quando o bloco precisa
 valer pra vários templates de um mesmo papel, o bash o embute dentro de um bloco
-compartilhado em vez de o template referenciá-lo direto: `SENTRY_BLOCK_PO` e
-`PERMISSION_BLOCK_PO` entram em `PO_VALIDATION_BLOCK` via `build_po_blocks()`, e só o bloco
-de fora é exportado e passado ao `envsubst` (que não expande recursivamente).
+compartilhado em vez de o template referenciá-lo direto: `SENTRY_BLOCK_PO`,
+`PERMISSION_BLOCK_PO` e `PRODUCTION_BLOCK_PO` entram em `PO_VALIDATION_BLOCK` via
+`build_po_blocks()`, e só o bloco de fora é exportado e passado ao `envsubst` (que não
+expande recursivamente).
 
 Toda variável do `envsubst`/`export` em `main()` precisa ser usada em algum template, e toda
 variável usada em template precisa estar nas duas listas — um teste estrutural compara os
@@ -250,6 +251,69 @@ dois lados.
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
 criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer.
+
+## Análise de impacto em produção no PO (`PRODUCTION_ENABLED`)
+
+`PRODUCTION_ENABLED` (opt-in, no mesmo formato das flags da seção acima) controla se a
+pergunta "Existe impacto em produção?" entra na análise obrigatória do PO.
+`build_production_blocks()` monta `PRODUCTION_BLOCK_PO` só quando o valor é `"true"` exato
+(vazio, `"false"`, `"TRUE"`, `"sim"` ou qualquer outro valor desliga), e `build_po_blocks()`
+o embute em `PO_VALIDATION_BLOCK` logo depois do bloco de permissão
+(`PERMISSION_BLOCK_PO`). Por estar nesse bloco compartilhado, vale pros quatro pontos de
+entrada do PO (`po`, `po_discussion`, `po_jira`, `po_sentry`) sem mexer em template, e,
+como os outros blocos embutidos, não é exportado nem passado ao `envsubst`. Com `"true"`,
+`PO_VALIDATION_BLOCK` fica byte a byte igual ao de antes da flag, inclusive a ordem
+permissão → produção (coberto por teste com referência fixa). Desligada, só a linha da
+pergunta sai, sem deixar linha em branco.
+
+**Aviso de migração.** `load_project_config` avisa no stderr quando o arquivo que carregou
+não tem nenhuma linha `PRODUCTION_ENABLED` (texto único em `warn_missing_production_line`,
+com o caminho do arquivo e as duas linhas possíveis: `"true"` pra ligar a pergunta, `"false"`
+pra mantê-la desligada sem o aviso). Regras, cada uma com o seu motivo:
+
+- **Fica em `load_project_config`, não em `resolve_stack`.** É o único leitor de arquivo dos
+  três caminhos (cwd, `--projeto=` e menu), então a regra vale em todos sem repetir código.
+  Só o arquivo carregado é avaliado: outros `projects/*.conf` sem a linha não geram aviso,
+  porque não são eles que definem o prompt dessa execução.
+- **"Ter a linha" inclui a linha mal formatada** (`PRODUCTION_ENABLED=true`,
+  `export PRODUCTION_ENABLED=...`, `PRODUCTION_ENABLED = "true"`, comentário no fim). Ela já
+  recebe o aviso de formato, que aponta arquivo e linha, e dois avisos pro mesmo problema
+  seriam ruído.
+- **Linha comentada (`# PRODUCTION_ENABLED="true"`) e chave parecida
+  (`PRODUCTION_ENABLED_OLD="true"`) não contam.** O leitor não vê a chave nelas, então a
+  pergunta continua desligada e o aviso é verdadeiro.
+- **"Nenhum" no menu não avisa.** Não há arquivo onde adicionar a linha (e
+  `load_project_config` nem é chamado nesse caminho).
+- **O `--init` já traz a linha** (`PRODUCTION_ENABLED="false"`, com comentário mandando ligar
+  quando o projeto entrar em produção), então um arquivo novo já nasce com a decisão
+  explícita e não dispara o aviso.
+- **O aviso é permanente e sai com a linha em qualquer valor, inclusive `""`.** Não tem data
+  de expiração nem flag pra desligar, porque o script não tem como saber quando todas as
+  configurações antigas foram migradas (elas ficam em outras máquinas e em repositórios de
+  outros times). O aviso trata da linha que falta, não do valor: ter a linha já registra a
+  decisão do projeto. Um projeto sem produção usa `PRODUCTION_ENABLED="false"`.
+- **O texto mostra as duas saídas, não só a de ligar.** O aviso aparece em toda execução, e
+  quem mais precisa silenciá-lo é justamente o projeto sem produção. Se o texto só ensinasse
+  `PRODUCTION_ENABLED="true"`, essa pessoa teria que ir ao README pra descobrir que `"false"`
+  também silencia, e poderia acabar ligando a pergunta que a flag existe pra tirar.
+- **O texto não repete a pergunta literal** ("Existe impacto em produção?"). As checagens de
+  ponta a ponta juntam stdout e stderr e procuram essa frase pra saber se ela chegou ao
+  prompt, então um aviso com a mesma frase daria falso positivo.
+
+**Por quê:** num projeto que ainda não está em produção, a pergunta fixa fazia o modelo
+inventar uma análise de impacto em produção sem valor nenhum. O aviso existe porque esta é
+a primeira flag cujo padrão desligado *remove* um comportamento que já existia: as outras
+(`SENTRY_ENABLED`, `PERMISSION_ENABLED`, `JIRA_ENABLED`) só acrescentam algo quando ligadas.
+Sem o aviso, toda configuração criada antes da chave, inclusive os `.nick.conf` já
+versionados em projetos alvo, perderia a pergunta em silêncio.
+
+**Fora de escopo, de propósito:**
+- staging, homologação e outros ambientes: hoje nenhum prompt mudaria por causa deles, então
+  viram ticket próprio quando houver um efeito concreto definido;
+- pergunta interativa no `--init`: ele continua só gerando o esqueleto comentado, como faz
+  pras outras chaves;
+- prompts de Tech Leader, Desenvolvimento e Review: não falam de produção, então não há o
+  que desligar neles.
 
 ## DRY entre templates do mesmo papel (texto compartilhado vira `build_*_blocks()`)
 
@@ -312,9 +376,8 @@ coincidentemente usam o mesmo nome de projeto.
 
 ## Configuração do projeto: cwd primeiro, projects/ como fallback
 
-A configuração de cada projeto alvo (`STACK_DESCRIPTION`, `SENTRY_ENABLED`,
-`PERMISSION_ENABLED`, `JIRA_ENABLED`) pode morar em dois lugares, e `resolve_stack()`
-procura nesta ordem:
+A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves de
+`PROJECT_CONFIG_KEYS`) pode morar em dois lugares, e `resolve_stack()` procura nesta ordem:
 
 1. **`.nick.conf` na raiz do cwd** (`$PWD/.nick.conf`, constante `CWD_CONFIG_NAME`). Se
    existir, vence tudo: é carregado, o script imprime no stdout
@@ -356,7 +419,10 @@ x`, `JIRA_ENABLED="true" # comentário`) quanto as formas "quase certas" `export
 `CHAVE = ...`/`CHAVE ="..."` (espaço logo depois do nome — `STACK_DESCRIPTION_EXTRA = "x"`
 continua sendo chave desconhecida, sem aviso). Ela é ignorada com um único aviso no stderr,
 com arquivo e número da linha (texto único em `warn_malformed_config_line`); essas formas
-continuam **não** sendo aceitas, só deixam de ser descartadas em silêncio. Aspas simples, valores sem aspas e comentário no fim da linha ficam de fora de
+continuam **não** sendo aceitas, só deixam de ser descartadas em silêncio. Além do aviso de
+formato, existe o aviso de migração, dado quando o arquivo carregado não tem nenhuma linha
+`PRODUCTION_ENABLED` (ver seção "Análise de impacto em produção no PO
+(`PRODUCTION_ENABLED`)"). Aspas simples, valores sem aspas e comentário no fim da linha ficam de fora de
 propósito, pra gramática ser pequena e fácil de testar. Variáveis locais da função precisam
 ficar em minúsculo — uma local com o nome de uma chave faria o `printf -v` alterar a local
 em vez da global.

@@ -9,7 +9,7 @@ TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
 CWD_CONFIG_NAME=".nick.conf"
-PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED)
+PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED)
 
 TITLE=""
 DESCRIPTION=""
@@ -28,6 +28,8 @@ SENTRY_BLOCK_TL=""
 PERMISSION_ENABLED=""
 PERMISSION_BLOCK_PO=""
 JIRA_ENABLED=""
+PRODUCTION_ENABLED=""
+PRODUCTION_BLOCK_PO=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
@@ -160,21 +162,34 @@ warn_legacy_project_files() {
 # format (no quotes, quotes inside the value, trailing comment/command, but also the
 # "almost right" `export KEY=...` and `KEY = ...`) is ignored with a warning on stderr, so
 # a typo doesn't silently turn a flag off.
+# A file with no PRODUCTION_ENABLED line at all gets a migration warning on stderr
+# (warn_missing_production_line): it is the first flag whose default removes something the
+# PO prompt already had, so configs written before it would lose the production impact
+# question silently. A malformed PRODUCTION_ENABLED line counts as present — it already
+# gets the format warning. This lives here, the only reader, so it covers the cwd,
+# --projeto= and the menu alike, while "Nenhum" (no file loaded) never warns.
 # Local variables must stay lowercase: an uppercase local named like a key would make
 # printf -v set the local instead of the global.
 load_project_config() {
   local file="$1"
-  local line="" line_number=0 key value
+  local line="" line_number=0 key value production_seen=0
   while IFS= read -r line || [ -n "$line" ]; do
     line_number=$((line_number + 1))
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     for key in "${PROJECT_CONFIG_KEYS[@]}"; do
       case "$line" in
-        "$key"=*) ;;
+        "$key"=*)
+          if [ "$key" = "PRODUCTION_ENABLED" ]; then
+            production_seen=1
+          fi
+          ;;
         # Only a space right after the name counts, so a lookalike key such as
         # STACK_DESCRIPTION_EXTRA = "x" stays silently ignored.
         "export $key"=* | "export $key"[[:space:]]* | "$key"[[:space:]]*=*)
+          if [ "$key" = "PRODUCTION_ENABLED" ]; then
+            production_seen=1
+          fi
           warn_malformed_config_line "$file:$line_number" "$key"
           continue 2
           ;;
@@ -197,6 +212,9 @@ load_project_config() {
       warn_malformed_config_line "$file:$line_number" "$key"
     done
   done < "$file"
+  if [ "$production_seen" -eq 0 ]; then
+    warn_missing_production_line "$file"
+  fi
 }
 
 # warn_malformed_config_line <file:line_number> <key>: the single warning text for a
@@ -206,6 +224,17 @@ load_project_config() {
 warn_malformed_config_line() {
   local location="$1" key="$2"
   echo "Aviso: $location: linha de $key ignorada (formato esperado: $key=\"valor\", sem aspas duplas dentro do valor)" >&2
+}
+
+# warn_missing_production_line <file>: the single migration warning text for a loaded
+# config file without a PRODUCTION_ENABLED line (see load_project_config). It shows both
+# ways out, "true" and "false": a project without production must not have to guess that
+# "false" silences it and end up turning the question on. It must not repeat the PO
+# question itself: end-to-end checks read stdout and stderr together and look for that
+# question to tell whether it reached the prompt.
+warn_missing_production_line() {
+  local file="$1"
+  echo "Aviso: $file não tem a linha PRODUCTION_ENABLED — a pergunta de impacto em produção está desligada no prompt do PO. Para ligá-la, adicione ao arquivo: PRODUCTION_ENABLED=\"true\" (ou PRODUCTION_ENABLED=\"false\" para mantê-la desligada sem este aviso)" >&2
 }
 
 # resolve_stack <project_name_via_argv_or_empty>
@@ -323,12 +352,26 @@ build_permission_blocks() {
   fi
 }
 
+# build_production_blocks: assembles PRODUCTION_BLOCK_PO from PRODUCTION_ENABLED (set in
+# the project file, opt-in — empty/"false" is the default), same mechanism as
+# build_permission_blocks(). A project that isn't in production would make the model
+# invent a production impact analysis that doesn't exist, so the question only shows up
+# in the PO prompt when the project opts in. The block is embedded in PO_VALIDATION_BLOCK
+# (build_po_blocks), so it is neither exported nor passed to envsubst.
+build_production_blocks() {
+  if [ "$PRODUCTION_ENABLED" = "true" ]; then
+    printf -v PRODUCTION_BLOCK_PO '\n- Existe impacto em produção?'
+  else
+    PRODUCTION_BLOCK_PO=""
+  fi
+}
+
 # build_po_blocks: assembles PO_VALIDATION_BLOCK/PO_TICKET_FORMAT_BLOCK — the parts of
-# po.md and po_discussion.md that must stay identical no matter which entry point
-# triggered the PO (same role, same validity criteria), built once here instead of
-# duplicated in both templates. Must run after build_sentry_blocks/build_permission_blocks,
-# since the already-resolved SENTRY_BLOCK_PO/PERMISSION_BLOCK_PO values get embedded
-# inside PO_VALIDATION_BLOCK.
+# the four PO templates that must stay identical no matter which entry point triggered
+# the PO (same role, same validity criteria), built once here instead of duplicated in
+# each template. Must run after build_sentry_blocks/build_permission_blocks/
+# build_production_blocks, since the already-resolved SENTRY_BLOCK_PO/PERMISSION_BLOCK_PO/
+# PRODUCTION_BLOCK_PO values get embedded inside PO_VALIDATION_BLOCK.
 build_po_blocks() {
   printf -v PO_VALIDATION_BLOCK '%s' "Considere o pedido válido quando, ao mesmo tempo:
 - resolve um problema real de usuário ou de negócio;
@@ -338,8 +381,7 @@ build_po_blocks() {
 Se faltar informação essencial para decidir (pedido vago, sem contexto suficiente),
 pergunte antes de concluir — não presuma.
 
-Análise obrigatória, independente do resultado:${PERMISSION_BLOCK_PO}
-- Existe impacto em produção?
+Análise obrigatória, independente do resultado:${PERMISSION_BLOCK_PO}${PRODUCTION_BLOCK_PO}
 - Quais são os impactos negativos possíveis?
 ${SENTRY_BLOCK_PO}"
 
@@ -401,6 +443,10 @@ PERMISSION_ENABLED="false"
 # projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
 # principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.
 JIRA_ENABLED="false"
+# PRODUCTION_ENABLED: "true" se esse projeto já está em produção — o PO passa a avaliar,
+# pra cada pedido, se existe impacto em produção. Padrão é opt-in: vazio ou "false" tira
+# essa pergunta do prompt do PO. Ligue ("true") quando o projeto entrar em produção.
+PRODUCTION_ENABLED="false"
 EOF
 }
 
@@ -547,6 +593,7 @@ main() {
   build_stack_blocks
   build_sentry_blocks
   build_permission_blocks
+  build_production_blocks
   build_po_blocks
   build_tech_leader_blocks
   choose_type

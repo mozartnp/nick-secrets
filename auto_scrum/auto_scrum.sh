@@ -9,6 +9,9 @@ TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
 CWD_CONFIG_NAME=".nick.conf"
+# Keys read from the project config by load_project_config. A toggle key ("true"/"false")
+# must end in _ENABLED: is_toggle_config_key is the only place that decides it. Every key
+# here must also be in print_project_skeleton, a toggle with "false" and a text key with "".
 PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED)
 
 TITLE=""
@@ -162,17 +165,22 @@ warn_legacy_project_files() {
 # format (no quotes, quotes inside the value, trailing comment/command, but also the
 # "almost right" `export KEY=...` and `KEY = ...`) is ignored with a warning on stderr, so
 # a typo doesn't silently turn a flag off.
-# A file with no PRODUCTION_ENABLED line at all gets a migration warning on stderr
-# (warn_missing_production_line): it is the first flag whose default removes something the
-# PO prompt already had, so configs written before it would lose the production impact
-# question silently. A malformed PRODUCTION_ENABLED line counts as present — it already
-# gets the format warning. This lives here, the only reader, so it covers the cwd,
-# --projeto= and the menu alike, while "Nenhum" (no file loaded) never warns.
+# Two more checks warn on stderr and never stop the run (the function always returns 0):
+#   - every key of PROJECT_CONFIG_KEYS must be declared in the file. The missing ones get a
+#     single warning after the loop (warn_missing_config_keys), with the lines to add. A
+#     malformed line counts as present, since it already gets the format warning; a
+#     commented line or a lookalike key (JIRA_ENABLED_OLD, JIRA_ENABLE) doesn't, since the
+#     reader never sees the key in them;
+#   - an accepted line of a toggle key (is_toggle_config_key) whose value isn't "true",
+#     "false" or "" gets one warning per line (warn_invalid_toggle_value). The value is still
+#     assigned as is, so only "true" turns the option on, as before.
+# Both live here, the only reader, so they cover the cwd, --projeto= and the menu alike,
+# while "Nenhum" (no file loaded) never warns.
 # Local variables must stay lowercase: an uppercase local named like a key would make
 # printf -v set the local instead of the global.
 load_project_config() {
   local file="$1"
-  local line="" line_number=0 key value production_seen=0
+  local line="" line_number=0 key value seen_keys=" " missing_keys=()
   while IFS= read -r line || [ -n "$line" ]; do
     line_number=$((line_number + 1))
     line="${line#"${line%%[![:space:]]*}"}"
@@ -180,16 +188,12 @@ load_project_config() {
     for key in "${PROJECT_CONFIG_KEYS[@]}"; do
       case "$line" in
         "$key"=*)
-          if [ "$key" = "PRODUCTION_ENABLED" ]; then
-            production_seen=1
-          fi
+          seen_keys+="$key "
           ;;
         # Only a space right after the name counts, so a lookalike key such as
         # STACK_DESCRIPTION_EXTRA = "x" stays silently ignored.
         "export $key"=* | "export $key"[[:space:]]* | "$key"[[:space:]]*=*)
-          if [ "$key" = "PRODUCTION_ENABLED" ]; then
-            production_seen=1
-          fi
+          seen_keys+="$key "
           warn_malformed_config_line "$file:$line_number" "$key"
           continue 2
           ;;
@@ -204,6 +208,12 @@ load_project_config() {
             *\"*) ;;
             *)
               printf -v "$key" '%s' "$value"
+              if is_toggle_config_key "$key"; then
+                case "$value" in
+                  true | false | "") ;;
+                  *) warn_invalid_toggle_value "$file:$line_number" "$key" "$value" ;;
+                esac
+              fi
               continue 2
               ;;
           esac
@@ -212,8 +222,14 @@ load_project_config() {
       warn_malformed_config_line "$file:$line_number" "$key"
     done
   done < "$file"
-  if [ "$production_seen" -eq 0 ]; then
-    warn_missing_production_line "$file"
+  for key in "${PROJECT_CONFIG_KEYS[@]}"; do
+    case "$seen_keys" in
+      *" $key "*) ;;
+      *) missing_keys+=("$key") ;;
+    esac
+  done
+  if [ "${#missing_keys[@]}" -gt 0 ]; then
+    warn_missing_config_keys "$file" "${missing_keys[@]}"
   fi
 }
 
@@ -226,15 +242,70 @@ warn_malformed_config_line() {
   echo "Aviso: $location: linha de $key ignorada (formato esperado: $key=\"valor\", sem aspas duplas dentro do valor)" >&2
 }
 
-# warn_missing_production_line <file>: the single migration warning text for a loaded
-# config file without a PRODUCTION_ENABLED line (see load_project_config). It shows both
-# ways out, "true" and "false": a project without production must not have to guess that
-# "false" silences it and end up turning the question on. It must not repeat the PO
-# question itself: end-to-end checks read stdout and stderr together and look for that
-# question to tell whether it reached the prompt.
-warn_missing_production_line() {
-  local file="$1"
-  echo "Aviso: $file não tem a linha PRODUCTION_ENABLED — a pergunta de impacto em produção está desligada no prompt do PO. Para ligá-la, adicione ao arquivo: PRODUCTION_ENABLED=\"true\" (ou PRODUCTION_ENABLED=\"false\" para mantê-la desligada sem este aviso)" >&2
+# warn_invalid_toggle_value <file:line_number> <key> <value>: the single warning text for an
+# accepted toggle line whose value isn't "true", "false" or "". The value comes from a file
+# another team may edit and goes straight to the terminal, so control characters become "?"
+# ([:cntrl:], not [:print:], which under the C locale would also mangle the bytes of "não").
+# That is only for the text: the variable keeps the raw value. Only toggle keys get here, so
+# STACK_DESCRIPTION is never shown — it is free text that may name a client or hint at
+# infrastructure, and it is never validated. The location comes already joined, as in
+# warn_malformed_config_line (SC2094).
+warn_invalid_toggle_value() {
+  local location="$1" key="$2" value="$3" note
+  value="${value//[[:cntrl:]]/?}"
+  note="$(config_key_off_note "$key")"
+  echo "Aviso: $location: valor \"$value\" inválido para $key (valores aceitos: \"true\", \"false\" ou \"\") — ${note:-a opção está desligada.}" >&2
+}
+
+# is_toggle_config_key <key>: succeeds when <key> is a toggle ("true"/"false") key, i.e. its
+# name ends in _ENABLED. This is the only place with that rule — both checks and the default
+# of the suggested line use it — instead of a separate key list, which would be one more
+# place to update for every new flag. The skeleton consistency test guards it: a key with
+# "false" in print_project_skeleton must be checked as a toggle, and a key with "" must not.
+is_toggle_config_key() {
+  case "$1" in
+    *_ENABLED) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# config_key_off_note <key>: prints the note both warnings show for <key> when it is off, or
+# nothing — the only key-specific warning text. Only PRODUCTION_ENABLED has one: it is the
+# only flag whose off default removes something the PO prompt already had. The note shows
+# both ways out, "true" and "false", so a project without production doesn't turn the
+# question on just to silence the warning. It must not repeat the PO question itself:
+# end-to-end checks read stdout and stderr together and look for that question to tell
+# whether it reached the prompt.
+config_key_off_note() {
+  case "$1" in
+    PRODUCTION_ENABLED)
+      echo 'a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.'
+      ;;
+  esac
+}
+
+# warn_missing_config_keys <file> <key>...: the single warning for a loaded file that lacks
+# some keys — one block, and only its first line starts with "Aviso:". Each missing key gets
+# the line to add, with the same default as print_project_skeleton ("false" for toggles, ""
+# for text), which keeps today's behavior since an absent key is empty. A key note goes on a
+# comment line before its key, not at the end of the line, so the block can be pasted into
+# the file as is (a trailing comment would get the format warning). It never suggests
+# --init: that overwrites the file and would wipe the values already in it.
+warn_missing_config_keys() {
+  local file="$1" key note default
+  shift
+  echo "Aviso: $file não tem todas as chaves da configuração — cada chave ausente vale como vazia (as opções \"true\"/\"false\" ficam desligadas). Adicione ao arquivo:" >&2
+  for key in "$@"; do
+    default='""'
+    if is_toggle_config_key "$key"; then
+      default='"false"'
+    fi
+    note="$(config_key_off_note "$key")"
+    if [ -n "$note" ]; then
+      echo "  # $key: $note" >&2
+    fi
+    echo "  $key=$default" >&2
+  done
 }
 
 # resolve_stack <project_name_via_argv_or_empty>
@@ -426,6 +497,7 @@ print_project_skeleton() {
   cat <<'EOF'
 # Config do projeto pro auto_scrum. Preencha as variáveis abaixo e salve.
 # Não é executado: o auto_scrum lê só linhas CHAVE="valor" (aspas duplas, sem aspas dentro do valor nem comentário no fim da linha) das chaves abaixo.
+# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".
 # STACK_DESCRIPTION: stack técnica usada no prompt do Tech Leader/Desenvolvimento
 # (texto livre, sem ponto final no fim — o template já adiciona).
 # Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"

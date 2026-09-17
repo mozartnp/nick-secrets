@@ -94,3 +94,12 @@ neste repo por engano).
 **Migração:** arquivos antigos `auto_scrum/projects/<nome>.sh` não são mais lidos. O
 conteúdo não precisa mudar, só a extensão — o script avisa e sugere o comando pra cada um
 (`mv 'auto_scrum/projects/<nome>.sh' 'auto_scrum/projects/<nome>.conf'`).
+
+**Migração (`PRODUCTION_ENABLED`):** a pergunta de impacto em produção no prompt do PO
+passou a depender da chave `PRODUCTION_ENABLED` e fica desligada por padrão. Configurações
+criadas antes dela — tanto `.nick.conf` versionados nos projetos alvo quanto
+`auto_scrum/projects/<nome>.conf` — perdem a pergunta até ganharem
+`PRODUCTION_ENABLED="true"`. Enquanto o arquivo carregado não tiver essa linha, o script
+avisa no stderr, mostrando o caminho do arquivo; um projeto sem produção usa
+`PRODUCTION_ENABLED="false"`, que mantém a pergunta desligada sem o aviso. Arquivos novos
+gerados por `--init` já vêm com a linha.

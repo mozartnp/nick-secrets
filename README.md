@@ -35,6 +35,10 @@ etapa, monta o prompt final e já abre o `claude` com ele.
 5. Confirme (`s`/`N`) para abrir o `claude` com esse prompt em uma sessão nova, ou
    cancele — o prompt gerado continua salvo no log.
 
+Todo menu (inclusive o de destino do `--init`) termina com a opção **Sair (q)**: o número
+dela, ou `q`/`Q`, encerra o script sem fazer nada — nenhum log gravado, nenhuma
+configuração criada e o `claude` não é aberto.
+
 Cada etapa roda de forma independente (normalmente em terminais separados); não há
 encadeamento automático entre elas — por exemplo, depois do Review, quem decide se volta
 para o Desenvolvimento é o humano, lendo o resultado.

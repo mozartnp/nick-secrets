@@ -46,11 +46,90 @@ O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
   falso positivo intencional (ex: aspas simples de propósito numa lista de variáveis),
   suprimir com `# shellcheck disable=SCxxxx` acompanhado do porquê, como já feito no
   `SC2016` da linha do `envsubst` em `main()`.
+- Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
+  morde) só numa cópia descartável **fora do repositório**, com só `auto_scrum.sh`,
+  `templates/` e `tests/` (sem copiar `projects/` nem `logs/`, que têm dados reais), e
+  com o cwd dentro dessa cópia ao rodar a suíte. No fim, apagar a cópia e conferir com
+  `git status --short --ignored` que nada mudou no repositório.
 
 **Por quê:** essas regras evitam as três classes de bug mais comuns em bash —
 variável não citada que quebra com espaço/glob, variável de função vazando pro
 escopo global, e falha de comando ignorada silenciosamente por causa do
-`set -e` ausente.
+`set -e` ausente. A regra da sabotagem existe porque os testes unitários usam o
+`LOGS_DIR`, o `PROJECTS_DIR` e o cwd reais (só os de `main()` apontam pra diretórios
+temporários), e o `.nick.conf` da raiz é gitignorado, sem cópia: uma sabotagem que
+escreve arquivo, rodada da raiz do repositório, zera ou cria arquivos reais — já
+aconteceu na validação do ticket 5, com o `.nick.conf` do usuário.
+
+## Menus: opção "Sair (q)"
+
+**Regra:** todo menu do `auto_scrum.sh` passa por `select_menu <variável> <opção>...`;
+nunca um `select` direto. O helper acrescenta "Sair (q)" como último item numerado, então
+um menu novo ganha a saída só por usar o helper. Um teste estrutural garante que o script
+tem uma única linha `select`, dentro de `select_menu()`.
+
+**Contrato de `select_menu`:**
+- mostra as opções do chamador e depois "Sair (q)", numerados pelo próprio `select`, sem
+  mudar o número das opções que já existem;
+- grava em `<variável>` o **índice base 0** da opção escolhida, via `printf -v` (mesmo
+  padrão de `read_required`);
+- o "Sair" é decidido pela **posição** (o índice logo depois das opções do chamador), não
+  pelo texto — um projeto chamado `Sair (q).conf` continua sendo um projeto comum;
+- só `q` e `Q` **exatos** encerram; ` q`, `qq`, `quit` e `sair` são inválidos, como
+  qualquer outra entrada que o `select` não aceite (mostram `Opção inválida, tente
+  novamente.` e repetem a pergunta);
+- o índice sai de `[ "$REPLY" -eq N ]`, nunca de `$((REPLY - 1))`: o `select` aceita `08`
+  como 8, e o `[ -eq ]` também, mas a aritmética do bash lê `08`/`09` como octal inválido e
+  derrubaria o script. O `-eq` só roda depois de conferir que a opção veio preenchida,
+  senão `REPLY=x` geraria "integer expression expected";
+- as locais usam o prefixo `__menu_`, pra não sombrear a variável do chamador no
+  `printf -v`, e `REPLY` também é local: o que o usuário digitou não vaza pro escopo global
+  (o `select` continua preenchendo o `REPLY` local normalmente);
+- **nunca** chame um menu dentro de `$(...)`: a saída é por `exit`, que só encerraria o
+  subshell — o script seguiria e a mensagem de saída seria engolida pela captura. É por
+  isso que o resultado volta por `printf -v`, e os três menus rodam no shell principal
+  (`main` chama `resolve_stack`, `choose_type` e `init_project` diretamente). Um teste
+  estrutural garante que nem `select_menu` nem as três funções de menu aparecem depois de
+  `$(`.
+
+**A saída:** `quit_from_menu` é o único caminho, com o texto `Saindo. Nada foi feito.`
+só nessa função, no **stdout**, e `exit 0`. Sair é uma ação normal, como responder `N` na
+confirmação de envio, que também usa stdout e código 0. É `exit`, e não `return`, porque o
+menu de projetos roda antes do principal, e voltar até `main()` exigiria um sinal a mais em
+cada chamador. Não há efeito colateral porque a ordem já garante isso: em `main()`, o
+`mkdir -p "$LOGS_DIR"`, o log e o `exec claude` só acontecem depois de `choose_type`; no
+`--init`, o arquivo e o `mkdir -p "$PROJECTS_DIR"` só acontecem depois da escolha do
+destino. Os testes de ponta a ponta (com um `claude` falso no `PATH` e um controle positivo
+que prova que o stub é usado) protegem essa ordem.
+
+**Ctrl+D continua igual** (fora do escopo do ticket, mas o caminho foi tocado e ganhou teste
+de regressão): no EOF, `select_menu` deixa a variável vazia e retorna 1, o mesmo status do
+`select` puro. `choose_type` e `resolve_stack` fazem `select_menu ... || return 1`, e o
+`set -e` de `main()` encerra com código 1, sem mensagem; `init_project` usa
+`if ! select_menu ...` e mantém o `Cancelado. Nada foi alterado.` no stderr. Atenção: chamar
+a função num `if !` ou antes de `||` desliga o `set -e` **dentro** dela. Isso é aceitável
+porque o corpo de `select_menu` só tem `select`, `printf -v`, `echo`, `[ ]` e
+`quit_from_menu`, e o `exit` funciona do mesmo jeito. Não acrescente ao helper comandos que
+dependam do `set -e`.
+
+**Por que `q`:**
+- é a tecla de sair de `less`, `man`, `top`/`htop` e do pager do `git`, então quem usa
+  terminal já a conhece;
+- `s` (de "sair") não serve: no próprio script, `s` já significa "sim" nas confirmações
+  `(s/N)`, e a mesma tecla teria sentidos opostos em telas vizinhas;
+- um número fixo também não serve: o número do Sair muda conforme as flags e a quantidade
+  de projetos, e o `select` não mostra um `0`.
+
+**"Nenhum" continua comparado pelo nome** no menu de projetos
+(`"${names[$choice]}" = "Nenhum"`), como antes. Trocar pra posição mudaria o comportamento
+de um projeto chamado `Nenhum.conf`, e esse caso não faz parte do ticket.
+
+**Fora de escopo, de propósito:**
+- prompts de texto (`read -p`, inclusive o "Nome do projeto" do `--init` e a confirmação
+  `(s/N)`) e o loop do editor em `read_via_editor`;
+- mudar o comportamento do Ctrl+D (só ganhou testes de regressão) e tratar Ctrl+C (`trap`);
+- aceitar `sair`, `quit`, `qq` ou `q` com espaços em volta;
+- um projeto chamado `Nenhum.conf`, que continua se confundindo com a opção "Nenhum".
 
 ## README genérico: sem repetir detalhe que muda com o código
 
@@ -393,7 +472,8 @@ A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves de
    tem precedência.`, e o nome **não é validado** (`--projeto=inexistente` não dá `exit 1`,
    já que a flag nem é usada).
 2. **`--projeto=<nome>`** → `auto_scrum/projects/<nome>.conf` (erro se não existir).
-3. **Menu** com `auto_scrum/projects/*.conf` + "Nenhum".
+3. **Menu** com `auto_scrum/projects/*.conf` + "Nenhum" + "Sair (q)" (ver seção "Menus:
+   opção Sair (q)" — o Sair encerra o script sem carregar nada).
 
 A linha "carregada de" só existe no caminho do cwd; nos caminhos 2 e 3 a saída é a de
 sempre, exceto pelo aviso de `.sh` legado (abaixo).

@@ -92,9 +92,57 @@ read_via_editor() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
-# choose_type: builds the main menu. Two project flags (opt-in, empty/"false" by default)
-# gate entry points that depend on an MCP server from the target project's .mcp.json, so
-# a project without it isn't offered an option that would fail right away:
+# quit_from_menu: the only way out through a menu ("Sair (q)"). Ends the script right away
+# with code 0, before anything with a side effect: no log, no config file, no projects/
+# directory and no claude call. Menus run in the main shell, never inside $(...), so this
+# exit ends the script and not a subshell.
+quit_from_menu() {
+  echo "Saindo. Nada foi feito."
+  exit 0
+}
+
+# select_menu <variable_name> <option>...: the only select in the script — every menu goes
+# through here, so every menu gets the way out. Shows <option>... plus "Sair (q)" as the last
+# numbered item, and stores in <variable_name> the 0-based index of the chosen option. The
+# number of "Sair (q)" moves with the project flags and the number of projects, so q/Q also
+# quits; any other input is invalid. The index comes from comparing REPLY with [ -eq ], not
+# from $((REPLY - 1)): select accepts "08", which bash arithmetic reads as a bad octal.
+# When stdin closes (Ctrl+D) it leaves <variable_name> empty and returns 1, the same status
+# a bare select gave — each caller keeps its own handling for that.
+# Locals are prefixed with __menu_ so they can't shadow the caller's <variable_name>; REPLY
+# is local too, so what the user typed doesn't leak into the global scope.
+select_menu() {
+  local __menu_result="$1"
+  shift
+  local __menu_options=("$@" "Sair (q)")
+  local __menu_choice __menu_index REPLY
+  printf -v "$__menu_result" '%s' ""
+  select __menu_choice in "${__menu_options[@]}"; do
+    case "$REPLY" in
+      q | Q) quit_from_menu ;;
+    esac
+    if [ -z "${__menu_choice:-}" ]; then
+      echo "Opção inválida, tente novamente."
+      continue
+    fi
+    for __menu_index in "${!__menu_options[@]}"; do
+      if [ "$REPLY" -eq "$((__menu_index + 1))" ]; then
+        break
+      fi
+    done
+    if [ "$__menu_index" -eq "$#" ]; then
+      quit_from_menu
+    fi
+    printf -v "$__menu_result" '%s' "$__menu_index"
+    return 0
+  done
+  return 1
+}
+
+# choose_type: builds the main menu, shown through select_menu (which appends "Sair (q)" as
+# the last item and ends the script on it). Two project flags (opt-in, empty/"false" by
+# default) gate entry points that depend on an MCP server from the target project's
+# .mcp.json, so a project without it isn't offered an option that would fail right away:
 #   - JIRA_ENABLED="true" adds "po_jira" and "tech_leader_jira";
 #   - SENTRY_ENABLED="true" adds "po_sentry".
 # Each one goes right after the manual entry points of its role: po_jira after
@@ -119,15 +167,11 @@ choose_type() {
   fi
   options+=("Desenvolvimento" "Review")
   keys+=("development" "review")
-  local opt
+  local choice
   echo "Qual tipo de conversa você quer iniciar?"
-  select opt in "${options[@]}"; do
-    if [ -n "${opt:-}" ]; then
-      TYPE="${keys[$((REPLY - 1))]}"
-      break
-    fi
-    echo "Opção inválida, tente novamente."
-  done
+  # stdin closed (Ctrl+D): return 1, so main stops with code 1 (set -e), as before.
+  select_menu choice "${options[@]}" || return 1
+  TYPE="${keys[$choice]}"
 }
 
 list_projects() {
@@ -316,9 +360,10 @@ warn_missing_config_keys() {
 #      (with a warning on stderr, and not validated — the flag isn't used at all);
 #   2. auto_scrum/projects/<name>.conf, with the name passed as an argument (error if it
 #      doesn't exist);
-#   3. a select with the projects found + a "Nenhum" option (leaves STACK_DESCRIPTION
-#      empty — build_stack_blocks(), in main, is what assembles the conditional text that
-#      makes the stack mention disappear when empty).
+#   3. a menu (select_menu) with the projects found + a "Nenhum" option (leaves
+#      STACK_DESCRIPTION empty — build_stack_blocks(), in main, is what assembles the
+#      conditional text that makes the stack mention disappear when empty). The menu's
+#      "Sair (q)" ends the script (quit_from_menu), before anything is loaded.
 # Old projects/*.sh files are only warned about (warn_legacy_project_files), in steps 2/3.
 resolve_stack() {
   local project_arg="$1"
@@ -347,7 +392,7 @@ resolve_stack() {
     return
   fi
 
-  local names=() f opt
+  local names=() f choice
   for f in "$PROJECTS_DIR"/*.conf; do
     [ -e "$f" ] || continue
     names+=("$(basename "$f" .conf)")
@@ -355,18 +400,13 @@ resolve_stack() {
   names+=("Nenhum")
 
   echo "Qual projeto (define a stack usada no prompt)?"
-  select opt in "${names[@]}"; do
-    if [ -z "${opt:-}" ]; then
-      echo "Opção inválida, tente novamente."
-      continue
-    fi
-    if [ "$opt" = "Nenhum" ]; then
-      STACK_DESCRIPTION=""
-    else
-      load_project_config "$PROJECTS_DIR/$opt.conf"
-    fi
-    break
-  done
+  # stdin closed (Ctrl+D): return 1, so main stops with code 1 (set -e), as before.
+  select_menu choice "${names[@]}" || return 1
+  if [ "${names[$choice]}" = "Nenhum" ]; then
+    STACK_DESCRIPTION=""
+  else
+    load_project_config "$PROJECTS_DIR/${names[$choice]}.conf"
+  fi
 }
 
 # build_stack_blocks: assembles STACK_BLOCK_DEV/STACK_BLOCK_TL/STACK_BLOCK_REVIEW from
@@ -522,40 +562,34 @@ PRODUCTION_ENABLED="false"
 EOF
 }
 
-# init_project: asks where to create the project config and writes the skeleton
-# (print_project_skeleton) there. The user opens it and fills it in afterwards.
+# init_project: asks where to create the project config (select_menu, which also offers
+# "Sair (q)") and writes the skeleton (print_project_skeleton) there. The user opens it and
+# fills it in afterwards.
 #   1. $PWD/.nick.conf — listed first since it's the recommended place: versioned with
 #      the target project, shared with its team. No name is asked;
 #   2. auto_scrum/projects/<name>.conf — local to this machine (gitignored). PROJECTS_DIR
-#      is only created in this branch, so option 1 doesn't create a directory for nothing.
+#      is only created in this branch, so neither option 1 nor "Sair (q)" creates a
+#      directory for nothing.
 # Either way, an existing file is only overwritten after confirmation.
 init_project() {
   local options=(
     "Diretório atual ($PWD/$CWD_CONFIG_NAME) — versionado junto com o projeto"
     "auto_scrum/projects/<nome>.conf — só nesta máquina"
   )
-  local opt name file="" confirm
+  local choice name file="" confirm
   echo "Onde criar a configuração do projeto?"
-  select opt in "${options[@]}"; do
-    if [ -z "${opt:-}" ]; then
-      echo "Opção inválida, tente novamente."
-      continue
-    fi
-    if [ "$opt" = "${options[0]}" ]; then
-      file="$PWD/$CWD_CONFIG_NAME"
-    else
-      mkdir -p "$PROJECTS_DIR"
-      read_required "Nome do projeto: " name
-      file="$PROJECTS_DIR/$name.conf"
-    fi
-    break
-  done
-
-  # stdin closed during the select (Ctrl+D, or an invalid option followed by EOF): no
+  # stdin closed during the menu (Ctrl+D, or an invalid option followed by EOF): no
   # destination was chosen, so stop here instead of failing on a redirect to "".
-  if [ -z "$file" ]; then
+  if ! select_menu choice "${options[@]}"; then
     echo "Cancelado. Nada foi alterado." >&2
     return 1
+  fi
+  if [ "$choice" -eq 0 ]; then
+    file="$PWD/$CWD_CONFIG_NAME"
+  else
+    mkdir -p "$PROJECTS_DIR"
+    read_required "Nome do projeto: " name
+    file="$PROJECTS_DIR/$name.conf"
   fi
 
   if [ -f "$file" ]; then

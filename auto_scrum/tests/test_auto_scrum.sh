@@ -768,7 +768,7 @@ assert_contains "$(cat "$rs_dir/menu.err")" "1) alpha" "menu lista alpha (nome v
 assert_contains "$(cat "$rs_dir/menu.err")" "2) beta" "menu lista beta (nome vindo de basename .conf)"
 
 rs_result="$(run_resolve_stack "$rs_cwd" "$rs_projects" "" "3" "$rs_dir/none")"
-assert_eq "||||" "$rs_result" "menu: opção Nenhum (último número) deixa STACK_DESCRIPTION vazio"
+assert_eq "||||" "$rs_result" "menu: opção Nenhum (3, antes do Sair) deixa STACK_DESCRIPTION vazio"
 
 rs_result="$(run_resolve_stack "$rs_cwd" "$rs_projects" "inexistente" "" "$rs_dir/missing")"
 assert_eq "1" "$(cat "$rs_dir/missing.rc")" "--projeto=inexistente sai com código 1"
@@ -887,7 +887,7 @@ assert_eq "1" "$(count_warnings "$rs_miss_dir/arg_incomplete.err")" "--projeto=s
 assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/arg_incomplete.err")" "--projeto=semlinha: o aviso é o de chave ausente"
 assert_contains "$(cat "$rs_miss_dir/arg_incomplete.err" 2>/dev/null || true)" "$(rs_miss_expected "$rs_miss_projects/semlinha.conf")" "--projeto=semlinha: o aviso mostra o caminho de projects/semlinha.conf"
 
-# Menu: 1) comlinha, 2) semlinha, 3) Nenhum (glob em ordem alfabética).
+# Menu: 1) comlinha, 2) semlinha, 3) Nenhum, 4) Sair (q) (glob em ordem alfabética).
 rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "2" "$rs_miss_dir/menu_incomplete")"
 assert_eq "stack-sem-linha||||" "$rs_miss_result" "menu escolhendo semlinha: semlinha.conf é carregado"
 assert_eq "1" "$(count_warnings "$rs_miss_dir/menu_incomplete.err")" "menu escolhendo semlinha: exatamente um aviso"
@@ -925,7 +925,7 @@ assert_eq "|sim|||" "$rs_val_result" "--projeto=invalido: o valor literal é car
 assert_eq "1" "$(count_warnings "$rs_val_dir/arg.err")" "--projeto=invalido: exatamente um aviso"
 assert_contains "$(cat "$rs_val_dir/arg.err" 2>/dev/null || true)" "$(value_warning "$rs_val_projects/invalido.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "--projeto=invalido: o aviso de valor aponta projects/invalido.conf, última linha"
 
-# Menu: 1) invalido, 2) Nenhum.
+# Menu: 1) invalido, 2) Nenhum, 3) Sair (q).
 rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "" "1" "$rs_val_dir/menu")"
 assert_eq "|sim|||" "$rs_val_result" "menu escolhendo invalido: o valor literal é carregado"
 assert_eq "1" "$(count_warnings "$rs_val_dir/menu.err")" "menu escolhendo invalido: exatamente um aviso"
@@ -1319,6 +1319,236 @@ echo
 echo "== auto_scrum.sh: nenhuma linha source/. (config lida só por load_project_config) =="
 source_lines="$(grep -nE '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 assert_eq "" "$source_lines" "auto_scrum.sh não tem nenhuma linha source/."
+
+echo
+echo "== menus: \"Sair (q)\" é o último número; o número, q ou Q encerram com código 0 =="
+menu_quit_label="Sair (q)"
+menu_quit_message="Saindo. Nada foi feito."
+menu_invalid_message="Opção inválida, tente novamente."
+menu_dir="$TEST_TMP/menu_quit"
+mkdir -p "$menu_dir"
+
+# run_choose_type_rc <setup> <stdin> <out_file>: como run_choose_type, mas grava
+# stdout+stderr de choose_type em <out_file> e imprime "<código de saída>|<TYPE>". O TYPE só
+# sai se choose_type retornou: quem sai pelo menu encerra o bash antes do printf. <stdin>
+# vazio vira < /dev/null.
+run_choose_type_rc() {
+  local setup="$1" input="$2" out_file="$3" rc=0 type=""
+  local cmd="source '$AUTO_SCRUM_SH'; $setup; choose_type >'$out_file' 2>&1; printf '%s' \"\$TYPE\""
+  if [ -z "$input" ]; then
+    type="$(timeout 2 bash -c "$cmd" < /dev/null 2>/dev/null)" || rc=$?
+  else
+    type="$(timeout 2 bash -c "$cmd" <<< "$input" 2>/dev/null)" || rc=$?
+  fi
+  printf '%s|%s' "$rc" "$type"
+}
+
+# count_in_file <file> <text>: imprime quantas vezes <text> aparece em <file>. Conta
+# ocorrências, não linhas: sem terminal, o prompt "#? " e as mensagens do menu podem cair na
+# mesma linha.
+count_in_file() {
+  local file="$1" text="$2"
+  { grep -oF "$text" "$file" 2>/dev/null || true; } | grep -c . || true
+}
+
+# Menu principal (choose_type): as quatro combinações de JIRA_ENABLED/SENTRY_ENABLED, com os
+# TYPEs na ordem do menu. Cada número antigo continua dando o mesmo TYPE, e o número seguinte
+# ao último (o "Sair (q)"), q e Q encerram com código 0 sem TYPE.
+ct_combos=(
+  ":|po po_discussion tech_leader development review"
+  "JIRA_ENABLED=true|po po_discussion po_jira tech_leader tech_leader_jira development review"
+  "SENTRY_ENABLED=true|po po_discussion po_sentry tech_leader development review"
+  "JIRA_ENABLED=true; SENTRY_ENABLED=true|po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review"
+)
+for ct_combo in "${ct_combos[@]}"; do
+  ct_setup="${ct_combo%%|*}"
+  read -r -a ct_types <<< "${ct_combo#*|}"
+  ct_n="${#ct_types[@]}"
+  ct_quit_number="$((ct_n + 1))"
+  for ct_index in "${!ct_types[@]}"; do
+    assert_eq "${ct_types[$ct_index]}" "$(run_choose_type "$ct_setup" "$((ct_index + 1))")" "menu principal ($ct_setup): opção $((ct_index + 1)) continua sendo ${ct_types[$ct_index]}"
+  done
+  for ct_input in "$ct_quit_number" q Q; do
+    ct_out="$menu_dir/choose_type_${ct_n}_$ct_input.log"
+    assert_eq "0|" "$(run_choose_type_rc "$ct_setup" "$ct_input" "$ct_out")" "menu principal ($ct_setup), entrada '$ct_input': encerra com código 0 e sem TYPE"
+    assert_contains "$(cat "$ct_out" 2>/dev/null || true)" "$menu_quit_message" "menu principal ($ct_setup), entrada '$ct_input': mostra a mensagem de saída"
+  done
+  ct_out="$menu_dir/choose_type_${ct_n}_$ct_quit_number.log"
+  assert_contains "$(cat "$ct_out" 2>/dev/null || true)" "$ct_quit_number) $menu_quit_label" "menu principal ($ct_setup): \"$menu_quit_label\" é o item $ct_quit_number, logo depois das opções"
+  assert_not_contains "$(cat "$ct_out" 2>/dev/null || true)" "$((ct_n + 2)))" "menu principal ($ct_setup): nada depois do \"$menu_quit_label\""
+done
+
+# Zero à esquerda: o select aceita "08" como 8, e o índice não pode vir de $((REPLY - 1)),
+# que lê "08" como octal inválido. Com Jira e Sentry: 8 é review e 9 é o Sair.
+ct_setup="JIRA_ENABLED=true; SENTRY_ENABLED=true"
+assert_eq "review" "$(run_choose_type "$ct_setup" 08)" "menu principal: '08' é lido como 8 (review), sem erro aritmético"
+assert_eq "0|" "$(run_choose_type_rc "$ct_setup" 09 "$menu_dir/choose_type_09.log")" "menu principal: '09' é lido como 9 (Sair), encerra com código 0"
+
+# Entradas inválidas, sem flags (Sair é o 6): só q e Q exatos encerram; o resto repete a
+# pergunta até uma opção válida.
+ct_out="$menu_dir/choose_type_invalid.log"
+assert_eq "0|po" "$(run_choose_type_rc ":" $'x\nqq\nsair\n q\n0\n7\n1' "$ct_out")" "menu principal: x, qq, sair, ' q', 0 e 7 são inválidas; o 1 seguinte dá po"
+assert_eq "6" "$(count_in_file "$ct_out" "$menu_invalid_message")" "menu principal: cada entrada inválida mostra a mensagem de inválida (6 vezes)"
+assert_not_contains "$(cat "$ct_out" 2>/dev/null || true)" "$menu_quit_message" "menu principal: nenhuma entrada inválida encerra pelo menu"
+
+# Ctrl+D (regressão): stdin fechado, com ou sem entrada inválida antes, continua saindo com
+# código 1 e sem mensagem de saída.
+for ct_input in "" x; do
+  ct_out="$menu_dir/choose_type_eof_${#ct_input}.log"
+  assert_eq "1|" "$(run_choose_type_rc ":" "$ct_input" "$ct_out")" "menu principal, stdin fecha (entrada: '$ct_input' + EOF): choose_type retorna 1, sem TYPE"
+  assert_not_contains "$(cat "$ct_out" 2>/dev/null || true)" "$menu_quit_message" "menu principal, stdin fecha (entrada: '$ct_input' + EOF): sem mensagem de saída"
+done
+
+# Menu de projetos (resolve_stack): com alpha.conf e beta.conf o menu é
+# 1) alpha 2) beta 3) Nenhum 4) Sair (q). Sair não carrega projeto nenhum (sem aviso) e
+# encerra antes de resolve_stack retornar, então o helper imprime vazio.
+rs_quit_dir="$menu_dir/resolve_stack"
+rs_quit_cwd="$rs_quit_dir/cwd"
+rs_quit_projects="$rs_quit_dir/projects"
+mkdir -p "$rs_quit_cwd" "$rs_quit_projects"
+printf '%s\n' 'STACK_DESCRIPTION="stack-alpha"' > "$rs_quit_projects/alpha.conf"
+printf '%s\n' 'STACK_DESCRIPTION="stack-beta"' > "$rs_quit_projects/beta.conf"
+for rs_quit_input in 4 q Q; do
+  rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" "$rs_quit_input" "$rs_quit_dir/quit_$rs_quit_input")"
+  assert_eq "" "$rs_quit_result" "menu de projetos, entrada '$rs_quit_input': resolve_stack não retorna (o script encerra no menu)"
+  assert_eq "0" "$(cat "$rs_quit_dir/quit_$rs_quit_input.rc")" "menu de projetos, entrada '$rs_quit_input': código 0"
+  assert_contains "$(cat "$rs_quit_dir/quit_$rs_quit_input.out" 2>/dev/null || true)" "$menu_quit_message" "menu de projetos, entrada '$rs_quit_input': mostra a mensagem de saída no stdout"
+  assert_eq "0" "$(count_warnings "$rs_quit_dir/quit_$rs_quit_input.err")" "menu de projetos, entrada '$rs_quit_input': nenhum projeto é carregado (sem aviso)"
+done
+assert_contains "$(cat "$rs_quit_dir/quit_4.err" 2>/dev/null || true)" "4) $menu_quit_label" "menu de projetos: \"$menu_quit_label\" é o item 4, depois do Nenhum"
+assert_contains "$(cat "$rs_quit_dir/quit_4.err" 2>/dev/null || true)" "3) Nenhum" "menu de projetos: Nenhum continua sendo o item 3"
+
+rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" "3" "$rs_quit_dir/none")"
+assert_eq "||||" "$rs_quit_result" "menu de projetos: Nenhum (3) segue sem projeto, separado do Sair"
+assert_eq "0" "$(cat "$rs_quit_dir/none.rc")" "menu de projetos: Nenhum (3) retorna com código 0"
+assert_not_contains "$(cat "$rs_quit_dir/none.out" 2>/dev/null || true)" "$menu_quit_message" "menu de projetos: Nenhum (3) não mostra a mensagem de saída"
+
+# Sem projetos: o menu é 1) Nenhum 2) Sair (q).
+rs_quit_empty="$rs_quit_dir/projects_empty"
+mkdir -p "$rs_quit_empty"
+rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_empty" "" "2" "$rs_quit_dir/empty_quit")"
+assert_eq "" "$rs_quit_result" "menu de projetos sem projetos, entrada '2': resolve_stack não retorna"
+assert_eq "0" "$(cat "$rs_quit_dir/empty_quit.rc")" "menu de projetos sem projetos, entrada '2': código 0"
+assert_contains "$(cat "$rs_quit_dir/empty_quit.err" 2>/dev/null || true)" "2) $menu_quit_label" "menu de projetos sem projetos: \"$menu_quit_label\" é o item 2"
+rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_empty" "" "1" "$rs_quit_dir/empty_none")"
+assert_eq "||||" "$rs_quit_result" "menu de projetos sem projetos: Nenhum (1) segue sem projeto"
+
+# Inválidas: x, 5 (depois do Sair) e qq repetem a pergunta; o 3 seguinte é Nenhum.
+rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" $'x\n5\nqq\n3' "$rs_quit_dir/invalid")"
+assert_eq "||||" "$rs_quit_result" "menu de projetos: x, 5 e qq são inválidas; o 3 seguinte dá Nenhum"
+assert_eq "3" "$(count_in_file "$rs_quit_dir/invalid.out" "$menu_invalid_message")" "menu de projetos: cada entrada inválida mostra a mensagem de inválida (3 vezes)"
+
+# Ctrl+D (regressão): stdin fechado continua saindo com código 1 e sem mensagem de saída.
+rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" "" "$rs_quit_dir/eof")"
+assert_eq "" "$rs_quit_result" "menu de projetos, stdin fecha (EOF): resolve_stack não retorna valor"
+assert_eq "1" "$(cat "$rs_quit_dir/eof.rc")" "menu de projetos, stdin fecha (EOF): código 1"
+assert_not_contains "$(cat "$rs_quit_dir/eof.out" 2>/dev/null || true)" "$menu_quit_message" "menu de projetos, stdin fecha (EOF): sem mensagem de saída"
+
+# Menu do --init (init_project): 1) diretório atual 2) projects/ 3) Sair (q). Sair encerra
+# com código 0 sem criar o .nick.conf nem o PROJECTS_DIR.
+init_quit_dir="$menu_dir/init_project"
+for init_quit_input in 3 q Q; do
+  init_quit_cwd="$init_quit_dir/cwd_$init_quit_input"
+  init_quit_projects="$init_quit_dir/projects_$init_quit_input"
+  mkdir -p "$init_quit_cwd"
+  init_quit_rc="$(run_init_project "$init_quit_cwd" "$init_quit_projects" "$init_quit_input" "$init_quit_dir/quit_$init_quit_input.log")"
+  assert_eq "0" "$init_quit_rc" "--init, entrada '$init_quit_input': init_project encerra com código 0"
+  assert_contains "$(cat "$init_quit_dir/quit_$init_quit_input.log" 2>/dev/null || true)" "$menu_quit_message" "--init, entrada '$init_quit_input': mostra a mensagem de saída"
+  assert_not_exists "$init_quit_cwd/.nick.conf" "--init, entrada '$init_quit_input': nenhum .nick.conf é criado no cwd"
+  assert_not_exists "$init_quit_projects" "--init, entrada '$init_quit_input': PROJECTS_DIR não é criado"
+done
+assert_contains "$(cat "$init_quit_dir/quit_3.log" 2>/dev/null || true)" "3) $menu_quit_label" "--init: \"$menu_quit_label\" é o item 3, depois dos dois destinos"
+
+# Inválidas seguidas de EOF: x, 4 (depois do Sair) e qq repetem a pergunta; o stdin fecha
+# e o comportamento de hoje continua (código 1, cancelado, nada criado).
+init_quit_cwd="$init_quit_dir/cwd_invalid"
+init_quit_projects="$init_quit_dir/projects_invalid"
+mkdir -p "$init_quit_cwd"
+init_quit_rc="$(run_init_project "$init_quit_cwd" "$init_quit_projects" $'x\n4\nqq' "$init_quit_dir/invalid.log")"
+assert_eq "1" "$init_quit_rc" "--init: x, 4 e qq são inválidas; o EOF seguinte sai com código 1"
+assert_eq "3" "$(count_in_file "$init_quit_dir/invalid.log" "$menu_invalid_message")" "--init: cada entrada inválida mostra a mensagem de inválida (3 vezes)"
+assert_not_contains "$(cat "$init_quit_dir/invalid.log" 2>/dev/null || true)" "$menu_quit_message" "--init: nenhuma entrada inválida encerra pelo menu"
+assert_not_exists "$init_quit_cwd/.nick.conf" "--init: entradas inválidas + EOF não criam .nick.conf"
+
+echo
+echo "== main(): sair por qualquer menu não cria log, não chama o claude e não cria configuração =="
+# claude falso: só toca um marcador. Prova que o exec claude não acontece ao sair pelo menu
+# — e o controle positivo abaixo prova que, quando o envio é confirmado, o stub é chamado.
+fake_claude_dir="$TEST_TMP/fake_claude"
+fake_claude_marker="$fake_claude_dir/called"
+mkdir -p "$fake_claude_dir"
+printf '%s\n' '#!/usr/bin/env bash' "touch '$fake_claude_marker'" > "$fake_claude_dir/claude"
+chmod +x "$fake_claude_dir/claude"
+fake_claude_setup="PATH='$fake_claude_dir':\"\$PATH\""
+
+# Controle positivo: po_discussion (2), assunto e s pra confirmar — o marcador tem de existir.
+mq_main_dir="$menu_dir/main_positive"
+rm -f "$fake_claude_marker"
+mq_rc="$(run_main "$mq_main_dir" "$(config_keys_blank)" $'2\nassunto de teste\ns' "$fake_claude_setup")"
+assert_eq "0" "$mq_rc" "controle positivo: confirmar o envio termina com código 0 (claude falso)"
+assert_exists "$fake_claude_marker" "controle positivo: confirmar o envio chama o claude (marcador criado pelo stub)"
+
+# Menu principal: flags desligadas, 5 opções, então o Sair é o 6.
+for mq_input in 6 q Q; do
+  mq_main_dir="$menu_dir/main_menu_$mq_input"
+  rm -f "$fake_claude_marker"
+  mq_rc="$(run_main "$mq_main_dir" "$(config_keys_blank)" "$mq_input" "$fake_claude_setup")"
+  mq_output="$(cat "$mq_main_dir/output" 2>/dev/null || true)"
+  assert_eq "0" "$mq_rc" "menu principal, entrada '$mq_input': main() termina com código 0"
+  assert_contains "$mq_output" "$menu_quit_message" "menu principal, entrada '$mq_input': mostra a mensagem de saída"
+  assert_not_exists "$mq_main_dir/logs" "menu principal, entrada '$mq_input': nenhum log é criado"
+  assert_not_exists "$fake_claude_marker" "menu principal, entrada '$mq_input': o claude não é chamado"
+  assert_not_contains "$mq_output" "Confirma o envio" "menu principal, entrada '$mq_input': não chega à confirmação de envio"
+done
+
+# Menu de projetos: cwd sem .nick.conf e projects/alpha.conf, então o menu é
+# 1) alpha 2) Nenhum 3) Sair (q).
+for mq_input in 3 q Q; do
+  mq_proj_dir="$menu_dir/projects_menu_$mq_input"
+  mkdir -p "$mq_proj_dir/cwd" "$mq_proj_dir/projects"
+  printf '%s\n' 'STACK_DESCRIPTION="x"' > "$mq_proj_dir/projects/alpha.conf"
+  rm -f "$fake_claude_marker"
+  mq_rc=0
+  timeout 5 bash -c "cd '$mq_proj_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$mq_proj_dir/logs'; PROJECTS_DIR='$mq_proj_dir/projects'; $fake_claude_setup; main" <<< "$mq_input" > "$mq_proj_dir/output" 2>&1 || mq_rc=$?
+  mq_output="$(cat "$mq_proj_dir/output" 2>/dev/null || true)"
+  assert_eq "0" "$mq_rc" "menu de projetos, entrada '$mq_input': main() termina com código 0"
+  assert_contains "$mq_output" "$menu_quit_message" "menu de projetos, entrada '$mq_input': mostra a mensagem de saída"
+  assert_not_contains "$mq_output" "Qual tipo de conversa" "menu de projetos, entrada '$mq_input': não chega ao menu principal"
+  assert_not_exists "$mq_proj_dir/logs" "menu de projetos, entrada '$mq_input': nenhum log é criado"
+  assert_not_exists "$fake_claude_marker" "menu de projetos, entrada '$mq_input': o claude não é chamado"
+done
+
+# --init: cwd vazio e PROJECTS_DIR inexistente; o menu é 1) cwd 2) projects/ 3) Sair (q).
+for mq_input in 3 q Q; do
+  mq_init_dir="$menu_dir/init_menu_$mq_input"
+  mkdir -p "$mq_init_dir/cwd"
+  rm -f "$fake_claude_marker"
+  mq_rc=0
+  timeout 5 bash -c "cd '$mq_init_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$mq_init_dir/logs'; PROJECTS_DIR='$mq_init_dir/projects'; $fake_claude_setup; main --init" <<< "$mq_input" > "$mq_init_dir/output" 2>&1 || mq_rc=$?
+  mq_output="$(cat "$mq_init_dir/output" 2>/dev/null || true)"
+  assert_eq "0" "$mq_rc" "--init, entrada '$mq_input': main --init termina com código 0"
+  assert_contains "$mq_output" "$menu_quit_message" "--init, entrada '$mq_input': mostra a mensagem de saída"
+  assert_not_exists "$mq_init_dir/cwd/.nick.conf" "--init, entrada '$mq_input': nenhum .nick.conf é criado"
+  assert_not_exists "$mq_init_dir/projects" "--init, entrada '$mq_input': PROJECTS_DIR não é criado"
+  assert_not_exists "$mq_init_dir/logs" "--init, entrada '$mq_input': nenhum log é criado"
+  assert_not_exists "$fake_claude_marker" "--init, entrada '$mq_input': o claude não é chamado"
+done
+rm -f "$fake_claude_marker"
+
+echo
+echo "== auto_scrum.sh: um select só, dentro de select_menu (todo menu ganha o Sair) =="
+# Todo menu passa por select_menu, que acrescenta o "Sair (q)": um select direto em outra
+# função seria um menu sem saída. A âncora aceita "select" no começo da linha ou depois de
+# ";", pra um select escondido na mesma linha de outro comando não escapar.
+select_lines="$(grep -nE '(^|;)[[:space:]]*select[[:space:]]' "$AUTO_SCRUM_SH" || true)"
+assert_eq "1" "$(grep -c . <<< "$select_lines" || true)" "auto_scrum.sh tem exatamente uma linha select"
+select_menu_body="$(awk '/^select_menu\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
+assert_contains "$select_menu_body" "select " "a única linha select fica dentro de select_menu()"
+# A saída pelo menu é um exit: dentro de $(...) ele só encerraria o subshell, o script
+# seguiria e a mensagem de saída seria engolida pela captura. Nenhum menu (nem função que
+# mostra um) pode ser chamado assim.
+menu_in_subshell="$(grep -nE '\$\((select_menu|choose_type|resolve_stack|init_project)\b' "$AUTO_SCRUM_SH" || true)"
+assert_eq "" "$menu_in_subshell" "nenhum menu é chamado dentro de \$(...)"
 
 echo
 if [ "$failures" -gt 0 ]; then

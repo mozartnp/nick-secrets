@@ -33,7 +33,9 @@ conteúdo voltado a ele, e trocar isso pra inglês só atrapalharia sem ganho re
 
 O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
 
-- `set -euo pipefail` no topo do script.
+- `set -euo pipefail` no topo do **script**. Uma biblioteca em `lib/` (carregada com
+  `source`) não tem: quem decide isso é o script que a carrega, e ela funciona com ou sem
+  (ver seção "Código compartilhado entre ferramentas (`lib/`)").
 - Aspas em toda expansão de variável (`"$var"`, `"$@"`) — nunca `$var` solto.
 - `local` em toda variável declarada dentro de função.
 - `[ ]` para testes condicionais (não `[[ ]]`) — é o que já está em uso no
@@ -48,7 +50,8 @@ O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
   `SC2016` da linha do `envsubst` em `main()`.
 - Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
   morde) só numa cópia descartável **fora do repositório**, com só `auto_scrum.sh`,
-  `templates/` e `tests/` (sem copiar `projects/` nem `logs/`, que têm dados reais), e
+  `templates/`, `tests/` e o `lib/` irmão, na mesma estrutura relativa (sem copiar
+  `projects/` nem `logs/`, que têm dados reais), e
   com o cwd dentro dessa cópia ao rodar a suíte. No fim, apagar a cópia e conferir com
   `git status --short --ignored` que nada mudou no repositório.
 
@@ -133,16 +136,16 @@ de um projeto chamado `Nenhum.conf`, e esse caso não faz parte do ticket.
 
 ## README genérico: sem repetir detalhe que muda com o código
 
-O `README.md` descreve uso e comportamento estável: como rodar, de onde vem a configuração
-e em que ordem, a regra de formato, o que é versionado onde, notas de migração. Listas que
-crescem a cada ticket — chaves de configuração, quais etapas usam cada flag, opções de
-menu — **não** vão pro README: ficam no código, neste `ABOUT.md` ou nos comentários do
-esqueleto gerado por `--init` (`print_project_skeleton()`), que é a fonte única da lista de
-chaves da configuração do projeto (protegida pelo teste de consistência com
-`PROJECT_CONFIG_KEYS`). O README remete a essas fontes em vez de copiá-las. Pelo mesmo
-motivo, o README não traz um exemplo de arquivo de configuração completo: ele teria de
-listar todas as chaves. O exemplo completo é o arquivo gerado por `--init`, e o README só
-ilustra o formato com uma linha preenchida.
+O `README.md` descreve uso e comportamento estável: como rodar, de onde vem a configuração e em
+que ordem, a regra de formato, o que é versionado onde, notas de migração. Listas que crescem a
+cada ticket — chaves de configuração, quais etapas usam cada flag, opções de menu — **não** vão
+pro README: ficam no código, neste `ABOUT.md` ou nos comentários do esqueleto gerado por
+`--init`. A fonte única da lista de chaves da configuração do projeto é o bloco de registro
+(`config_register_key`) no topo do `auto_scrum.sh`, de onde saem o esqueleto e os avisos (ver
+seção "Registro de chaves da configuração"). O README remete a essas fontes em vez de
+copiá-las. Pelo mesmo motivo, o README não traz um exemplo de arquivo de configuração completo:
+ele teria de listar todas as chaves. O exemplo completo é o arquivo gerado por `--init`, e o
+README só ilustra o formato com uma linha preenchida.
 
 **Por quê:** o README não tem teste que pegue desatualização, e cada flag nova exigiria
 lembrar de editá-lo. O ticket 8 já mostrou isso acontecendo: uma frase do passo 1 de "Uso"
@@ -328,15 +331,17 @@ silenciosamente por vazio. Pra isso existe um teste de conjunto exato por templa
 `development.md` e `review.md` o têm.
 Template novo, ou que ganhe variável nova, deve ganhar o seu.
 
-Toda flag nova precisa entrar também em `PROJECT_CONFIG_KEYS` (topo do `auto_scrum.sh`) e no
-esqueleto de `print_project_skeleton()`: o leitor `load_project_config` ignora qualquer chave
-fora dessa lista, então uma flag só escrita no arquivo nunca chegaria ao script. Um teste
-compara as chaves do esqueleto com `PROJECT_CONFIG_KEYS` pra pegar o esquecimento de um dos
-dois lados. A flag nova também precisa terminar em `_ENABLED` e entrar no esqueleto com
-`"false"` (chave de texto entra com `""`; a exceção é `TDD_ENABLED`, que entra com `"true"`):
-é o sufixo que a põe na checagem de valor (`is_toggle_config_key`), o padrão vem de
-`config_key_default`, e o teste de consistência do esqueleto cobra isso — ver seção
-"Validação da configuração do projeto: chave ausente e valor inválido".
+Toda flag nova é uma chamada `config_register_key` no bloco de registro do topo do
+`auto_scrum.sh` (ver seção "Registro de chaves da configuração"): o leitor (`config_load`, em
+`lib/config.sh`) ignora qualquer chave fora do registro, então uma flag só escrita no arquivo
+nunca chegaria ao script. A mesma chamada já a põe no esqueleto e nos avisos, e um teste
+compara as chaves do esqueleto com `CONFIG_KEYS`. A flag nova também precisa terminar em
+`_ENABLED` e ser registrada com padrão `"false"` (chave de texto entra com `""`; a exceção é
+`TDD_ENABLED`, que entra com `"true"`): é o sufixo que a põe na checagem de valor
+(`config_is_toggle_key`), o padrão vem do registro (`config_key_default`), e o próprio
+`config_register_key` recusa um padrão incompatível com o tipo, além do teste de consistência
+do esqueleto — ver seção "Validação da configuração do projeto: chave ausente e valor
+inválido".
 
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
@@ -363,10 +368,11 @@ pergunta sai, sem deixar linha em branco.
 **Aviso de migração.** O aviso específico de `PRODUCTION_ENABLED` (a função
 `warn_missing_production_line`, que não existe mais) virou parte do aviso geral de chaves
 ausentes — ver seção "Validação da configuração do projeto: chave ausente e valor inválido",
-que também guarda as regras gerais (roda só em `load_project_config`, linha mal formatada
+que também guarda as regras gerais (roda só no leitor, `config_load`, linha mal formatada
 conta como presente, linha comentada e chave parecida não contam, "Nenhum" não avisa). Um
 arquivo sem a linha `PRODUCTION_ENABLED` recebe esse aviso, que sugere
-`PRODUCTION_ENABLED="false"` precedida de uma nota da chave (`config_key_note`). Regras
+`PRODUCTION_ENABLED="false"` precedida de uma nota da chave (registrada em
+`config_register_key` e lida por `config_key_note`). Regras
 que continuam específicas desta chave, cada uma com o seu motivo:
 
 - **Ela tem nota própria nos avisos**, dizendo que a pergunta de impacto em produção está
@@ -437,22 +443,24 @@ técnica de `PERMISSION_BLOCK_PO`).
   de antes da flag (coberto por testes de caracterização com referência fixa, que passaram
   com o código antigo).
 - **Só `"false"` exato desliga.** `"true"`, vazio, chave ausente, "Nenhum" e qualquer valor
-  inválido (`"TRUE"`, `"False"`, `" false"`, `"sim"`) mantêm a TDD ligada. Um erro de
-  digitação nunca pode remover a TDD de um projeto que tem testes; o erro contrário (TDD
-  ligada num projeto sem testes) é o problema de antes da flag, e o aviso de valor já o
-  torna visível. O leitor (`load_project_config`) não muda: `"TRUE"` continua atribuído
-  literal e recebe o aviso; quem decide é só `build_tdd_blocks`, com
-  `[ "$TDD_ENABLED" = "false" ]` — essa é a regra de desligamento, não o padrão da chave.
+  inválido (`"TRUE"`, `"False"`, `" false"`, `"sim"`) mantêm a TDD ligada. Um erro de digitação
+  nunca pode remover a TDD de um projeto que tem testes; o erro contrário (TDD ligada num
+  projeto sem testes) é o problema de antes da flag, e o aviso de valor já o torna visível. O
+  leitor (`config_load`, em `lib/config.sh`) não muda: `"TRUE"` continua atribuído literal e
+  recebe o aviso; quem decide é só `build_tdd_blocks`, com `[ "$TDD_ENABLED" = "false" ]` —
+  essa é a regra de desligamento, não o padrão da chave.
 - **As outras flags `_ENABLED` continuam opt-in** (padrão desligado). Uma flag nova não deve
   copiar esta exceção sem um motivo do mesmo tipo (desligar por padrão removeria um
   comportamento que todo projeto já tinha e que continua sendo o esperado).
-- **Padrão por chave só em `config_key_default`.** É o único lugar com o padrão de cada chave
-  (`"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga, `""` pras de texto), usado
-  pela linha sugerida do aviso de ausente e espelhado no esqueleto (`TDD_ENABLED="true"`,
-  última chave). Não há array de padrões nem outro `case` por chave.
-- **Nota da chave em `config_key_note`.** Diz que a TDD continua ligada e que `"false"` é só
-  pra projeto sem testes automatizados. Aparece antes de `TDD_ENABLED="true"` no aviso de
-  chave ausente e no fim do aviso de valor inválido, no lugar de "a opção está desligada.".
+- **Padrão por chave só no registro.** A chamada `config_register_key` de cada chave é o único
+  lugar com o padrão dela (`"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga, `""`
+  pras de texto); `config_key_default` (em `lib/config.sh`) só o devolve. Ele é usado pela
+  linha sugerida do aviso de ausente e pelo esqueleto (`TDD_ENABLED="true"`, última chave). Não
+  há outro `case` por chave.
+- **Nota da chave no registro** (lida por `config_key_note`). Diz que a TDD continua ligada e
+  que `"false"` é só pra projeto sem testes automatizados. Aparece antes de
+  `TDD_ENABLED="true"` no aviso de chave ausente e no fim do aviso de valor inválido, no lugar
+  de "a opção está desligada.".
 - **"Nenhum prompt menciona TDD" vale pro texto do `auto_scrum`.** Uma `STACK_DESCRIPTION`
   escrita pelo usuário com "TDD" continua aparecendo — é dado do projeto.
 
@@ -525,10 +533,11 @@ coincidentemente usam o mesmo nome de projeto.
 
 ## Configuração do projeto: cwd primeiro, projects/ como fallback
 
-A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves de
-`PROJECT_CONFIG_KEYS`) pode morar em dois lugares, e `resolve_stack()` procura nesta ordem:
+A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves registradas
+com `config_register_key`) pode morar em dois lugares, e `resolve_stack()` procura nesta ordem:
 
-1. **`.nick.conf` na raiz do cwd** (`$PWD/.nick.conf`, constante `CWD_CONFIG_NAME`). Se
+1. **`.nick.conf` na raiz do cwd** (`$PWD/.nick.conf`, de `config_cwd_file` e da constante
+   `CONFIG_CWD_FILE_NAME`, em `lib/config.sh`). Se
    existir, vence tudo: é carregado, o script imprime no stdout
    `Configuração do projeto carregada de: <caminho absoluto>` e retorna — sem menu de
    projetos e sem aviso de `.sh` legado. Se `--projeto=<nome>` também foi passado, sai no
@@ -555,26 +564,28 @@ arquivo, então o esqueleto do `--init` sai sem espaço no fim de linha, com LF 
 do git: a convenção já é rodar da raiz do projeto alvo, e subir criaria ambiguidade (qual
 arquivo vence num monorepo?) sem pedido concreto.
 
-**Leitura por `CHAVE="valor"` (`load_project_config`), sem `source` nem `eval`.** O mesmo
+**Leitura por `CHAVE="valor"` (`config_load`, em `lib/config.sh`; no `auto_scrum`, chamado
+pela casca fina `load_project_config`), sem `source` nem `eval`.** O mesmo
 leitor vale pro cwd e pra `projects/` — um mecanismo de carga só. Gramática: depois de tirar
 espaços/tabs do começo e do fim da linha (o que também remove o `\r` de CRLF), só é aplicada
-uma linha `CHAVE="valor"` com `CHAVE` em `PROJECT_CONFIG_KEYS` (comparação exata) e `valor`
+uma linha `CHAVE="valor"` com `CHAVE` em `CONFIG_KEYS` (comparação exata) e `valor`
 sem aspas duplas dentro. O valor é atribuído **literalmente** com `printf -v` — sem expansão
 de `$VAR`, `$(...)`, crase ou escape —, e o nome da variável vem sempre de
-`PROJECT_CONFIG_KEYS`, nunca do arquivo. Todo o resto é ignorado em silêncio: comentários,
+`CONFIG_KEYS`, nunca do arquivo. Todo o resto é ignorado em silêncio: comentários,
 linhas em branco, comandos e chaves desconhecidas (inclusive globais do script como `PATH` e
 `TYPE`, que um `source` sobrescreveria). A exceção é uma linha de chave conhecida que foge do
 formato: tanto a que começa com `CHAVE=` (`JIRA_ENABLED=true`, `JIRA_ENABLED="true" && touch
 x`, `JIRA_ENABLED="true" # comentário`) quanto as formas "quase certas" `export CHAVE=...` e
 `CHAVE = ...`/`CHAVE ="..."` (espaço logo depois do nome — `STACK_DESCRIPTION_EXTRA = "x"`
 continua sendo chave desconhecida, sem aviso). Ela é ignorada com um único aviso no stderr,
-com arquivo e número da linha (texto único em `warn_malformed_config_line`); essas formas
+com arquivo e número da linha (texto único em `config_warn_malformed_line`); essas formas
 continuam **não** sendo aceitas, só deixam de ser descartadas em silêncio. Além do aviso de
 formato, existem o de chave ausente e o de valor inválido (ver seção "Validação da
 configuração do projeto: chave ausente e valor inválido"). Aspas simples, valores sem aspas
 e comentário no fim da linha ficam de fora de propósito, pra gramática ser pequena e fácil
-de testar. Variáveis locais da função precisam ficar em minúsculo — uma local com o nome de
-uma chave faria o `printf -v` alterar a local em vez da global.
+de testar. Variáveis locais do leitor ficam em minúsculo — uma local com o nome de uma chave
+faria o `printf -v` alterar a local em vez da global —, e isso agora é garantido pela
+estrutura: `config_register_key` só aceita nome de chave em maiúsculo (`^[A-Z][A-Z0-9_]*$`).
 
 **`projects/` passou de `.sh` pra `.conf`.** Os arquivos deixaram de ser executados, e manter
 `.sh` passaria a ideia errada de que são `source`ados (e editores/`shellcheck` os tratariam
@@ -586,7 +597,8 @@ vem do cwd.
 
 **`--init` pergunta o destino** (`.nick.conf` no cwd primeiro, por ser o local recomendado,
 ou `auto_scrum/projects/<nome>.conf`), gera o mesmo conteúdo nos dois casos
-(`print_project_skeleton`) e pergunta antes de sobrescrever em ambos.
+(`print_project_skeleton`, que chama `config_print_skeleton "auto_scrum"`) e pergunta antes
+de sobrescrever em ambos.
 
 **`.gitignore` do `nick_secrets`:** lista `auto_scrum/projects/*` com a exceção
 `!auto_scrum/projects/.gitkeep` (o placeholder que mantém o diretório no git continua
@@ -625,39 +637,39 @@ do `=`.
 
 ## Validação da configuração do projeto: chave ausente e valor inválido
 
-Além do aviso de formato (seção acima), `load_project_config` faz duas checagens no arquivo
+Além do aviso de formato (seção acima), o leitor (`config_load`) faz duas checagens no arquivo
 que carregou. Nenhuma delas interrompe a execução: a função sempre retorna 0, e `main()`
 segue até o prompt.
 
-1. **Toda chave de `PROJECT_CONFIG_KEYS` deve estar declarada no arquivo**, mesmo as que o
-   projeto não usa. As ausentes geram um único aviso (`warn_missing_config_keys`), com o
-   caminho do arquivo e a linha a adicionar pra cada uma, na ordem de `PROJECT_CONFIG_KEYS`.
+1. **Toda chave de `CONFIG_KEYS` deve estar declarada no arquivo**, mesmo as que o
+   projeto não usa. As ausentes geram um único aviso (`config_warn_missing_keys`), com o
+   caminho do arquivo e a linha a adicionar pra cada uma, na ordem do registro.
    A chave ausente continua valendo como vazia, e vazio funciona como o padrão da chave.
    O cabeçalho do aviso diz isso ("cada chave ausente funciona como o valor sugerido
    abaixo"), e não que as opções ausentes ficam desligadas, o que seria falso pra
    `TDD_ENABLED`.
 2. **As chaves liga/desliga aceitam só `"true"`, `"false"` e `""`.** Qualquer outro valor
-   (`"TRUE"`, `"True"`, `"sim"`) gera um aviso por linha (`warn_invalid_toggle_value`), com
+   (`"TRUE"`, `"True"`, `"sim"`) gera um aviso por linha (`config_warn_invalid_toggle`), com
    arquivo, número da linha, chave, valor encontrado, valores aceitos e o efeito: "a opção
    está desligada." ou, quando a chave tem nota, a nota (`TDD_ENABLED` diz que a TDD continua
    ligada).
 
-**O que é liga/desliga: nome terminado em `_ENABLED`**, decidido só em
-`is_toggle_config_key`. As duas checagens e `config_key_default` usam essa função. Uma flag
-nova precisa seguir o sufixo e entrar no esqueleto de `print_project_skeleton()` com
-`"false"` (ou `"true"`, como `TDD_ENABLED`, a única ligada por padrão); uma chave de texto
-entra com `""`. O teste de consistência do esqueleto cobra isso nos dois sentidos: cada chave
-com `"false"` ou `"true"` no esqueleto, trocada por `"sim"`, tem de gerar o aviso de valor, e
-cada chave com `""` não. Não existe um array separado de chaves liga/desliga porque ele seria
-um terceiro lugar a atualizar a cada flag nova, além de `PROJECT_CONFIG_KEYS` e do esqueleto
-— e todas as flags já seguem o sufixo.
+**O que é liga/desliga: nome terminado em `_ENABLED`**, decidido só em `config_is_toggle_key`
+(em `lib/config.sh`). As duas checagens e a validação do registro usam essa função. Uma flag
+nova precisa seguir o sufixo e ser registrada com `"false"` (ou `"true"`, como `TDD_ENABLED`, a
+única ligada por padrão); uma chave de texto entra com `""`. O que cada flag faz, e qual valor
+a desliga, é do `auto_scrum`, não da biblioteca. O teste de consistência do esqueleto cobra
+isso nos dois sentidos: cada chave com `"false"` ou `"true"` no esqueleto, trocada por `"sim"`,
+tem de gerar o aviso de valor, e cada chave com `""` não. Não existe um array separado de
+chaves liga/desliga porque ele seria mais um lugar a atualizar a cada flag nova, além da
+chamada de registro — e todas as flags já seguem o sufixo.
 
-**Valor padrão da linha sugerida.** Vem de `config_key_default`, o único lugar com padrão por
-chave: `"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga e `""` pra texto. É
-exatamente a linha do esqueleto, e um teste confere que cada linha sugerida aparece idêntica
-no arquivo gerado por `--init` (o script não lê o esqueleto em tempo de execução). Esse padrão
-mantém o comportamento de antes: nas flags opt-in, vazio e `"false"` desligam igual; em
-`TDD_ENABLED`, vazio e `"true"` mantêm a TDD ligada.
+**Valor padrão da linha sugerida.** Vem do registro (`config_key_default`), o único lugar com
+padrão por chave: `"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga e `""` pra
+texto. É exatamente a linha do esqueleto, e um teste confere que cada linha sugerida aparece
+idêntica no arquivo gerado por `--init` (o script não lê o esqueleto em tempo de execução).
+Esse padrão mantém o comportamento de antes: nas flags opt-in, vazio e `"false"` desligam
+igual; em `TDD_ENABLED`, vazio e `"true"` mantêm a TDD ligada.
 
 **Presença.** Conta como presente a linha válida com qualquer valor, inclusive inválido, e a
 linha fora do formato: as duas já recebem um aviso próprio, que aponta arquivo e linha, e
@@ -683,14 +695,14 @@ aviso de ausentes.
   opt-in só `"true"` liga, e `TDD_ENABLED` só desliga com `"false"`. O comportamento do
   leitor não muda: o aviso só explica o efeito do valor.
 
-**Nota por chave, só em `config_key_note`.** É o único lugar com texto específico de chave,
-usado pelos dois avisos. Hoje duas chaves têm nota: `PRODUCTION_ENABLED`, porque é a única
-flag cujo padrão desligado remove algo que o prompt já tinha (ver seção "Análise de impacto
-em produção no PO"), e `TDD_ENABLED`, porque é a única ligada por padrão e "a opção está
-desligada." diria o contrário do comportamento (ver seção "Metodologia TDD por projeto").
-Nas outras, o aviso de valor termina com "a opção está desligada.". O nome era
-`config_key_off_note`; virou `config_key_note` porque a nota de `TDD_ENABLED` não fala de
-opção desligada.
+**Nota por chave, só no registro** (o 3º argumento de `config_register_key`, lido por
+`config_key_note`). É o único lugar com texto específico de chave, usado pelos dois avisos.
+Hoje duas chaves têm nota: `PRODUCTION_ENABLED`, porque é a única flag cujo padrão desligado
+remove algo que o prompt já tinha (ver seção "Análise de impacto em produção no PO"), e
+`TDD_ENABLED`, porque é a única ligada por padrão e "a opção está desligada." diria o contrário
+do comportamento (ver seção "Metodologia TDD por projeto"). Nas outras, o aviso de valor
+termina com "a opção está desligada.". O nome era `config_key_off_note`; virou
+`config_key_note` porque a nota de `TDD_ENABLED` não fala de opção desligada.
 
 **O que os avisos não fazem, e por quê.**
 - Não sugerem `--init`: ele sobrescreve o arquivo e apagaria os valores já preenchidos.
@@ -709,7 +721,7 @@ opção desligada.
 - Não interrompem a execução: a configuração continua utilizável, só com a chave no padrão
   dela (opção desligada, TDD ligada) ou vazia, que é o comportamento de antes das checagens.
 
-**Onde rodam.** Só em `load_project_config`, o único leitor, então valem nos três caminhos
+**Onde rodam.** Só em `config_load`, o único leitor, então valem nos três caminhos
 (cwd, `--projeto=` e menu) sem repetir código. Só o arquivo carregado é verificado: outros
 `projects/*.conf` incompletos ou inválidos não geram aviso, porque não são eles que definem
 essa execução. "Nenhum" no menu e o `--init` não chamam o leitor e por isso não avisam — o
@@ -721,7 +733,8 @@ aviso.
 aos `.nick.conf` versionados em repositórios de outros times, e um valor como `"TRUE"` ou um
 nome digitado errado desligavam a opção sem nenhuma explicação. O aviso de migração do ticket
 14 resolvia isso só pra `PRODUCTION_ENABLED`. Generalizá-lo evita um aviso novo a cada flag:
-basta a flag estar em `PROJECT_CONFIG_KEYS` e no esqueleto pra entrar nas duas checagens.
+basta a flag ser registrada com `config_register_key` pra entrar no esqueleto e nas duas
+checagens.
 
 **Fora de escopo, de propósito:**
 - aceitar `"TRUE"`, `"sim"` e parecidos como ligado: o leitor continua exigindo `"true"`
@@ -733,6 +746,122 @@ basta a flag estar em `PROJECT_CONFIG_KEYS` e no esqueleto pra entrar nas duas c
 - corrigir ou completar o arquivo automaticamente: mexer no arquivo do usuário sem pedir é
   surpresa (mesmo racional de não renomear os `.sh` legados), e o aviso já traz as linhas
   prontas pra colar.
+
+## Código compartilhado entre ferramentas (`lib/`)
+
+O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas leem o mesmo
+`.nick.conf`. O que é genérico entre elas mora em `lib/<assunto>.sh`, com testes em
+`lib/tests/`. Hoje existe `lib/config.sh`: o leitor da configuração do projeto
+(`config_load`), os três avisos, a regra liga/desliga (`config_is_toggle_key`), a troca de
+caracteres de controle, o padrão e a nota por chave, o arquivo do cwd
+(`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd) e o formato do esqueleto
+(`config_print_skeleton`). A biblioteca não conhece nenhuma chave concreta: cada ferramenta
+registra as suas (ver "Registro de chaves da configuração" abaixo). Os `assert_*` dos testes
+ficam em `lib/tests/assert.sh`, carregado por todas as suítes; nenhuma suíte define os seus.
+
+**Regras de toda biblioteca em `lib/`** (cobertas por testes estruturais em
+`lib/tests/test_config.sh`):
+- **só define ao ser carregada:** atribui as constantes, cria as globais vazias e define
+  funções; não imprime nada e não roda comando. Sem shebang e sem bit de execução; a 1ª linha
+  é `# shellcheck shell=bash`, seguida do cabeçalho em inglês;
+- não ativa `set -euo pipefail` (é de quem a carrega), mas funciona com ou sem ele no chamador;
+- **prefixo por biblioteca:** toda função `config_` e toda global `CONFIG_` em
+  `lib/config.sh`. O `auto_scrum.sh` não define nada nesse namespace;
+- **nunca chama `exit`** e não usa `source`, `.` nem `eval`;
+- **não lê globais do chamador:** tudo entra por parâmetro ou pelo próprio registro (o `$PWD`
+  de `config_cwd_file` é estado do shell, não global do chamador);
+- mesmas regras de estilo de "Qualidade de código bash".
+
+**Exceção de globais, documentada:** `config_load` escreve, com `printf -v`, as globais das
+chaves que o chamador registrou — esse é o papel do leitor — e nada mais: nem outra global do
+chamador, nem `CONFIG_*` (um teste compara o `declare -p` antes e depois). O registro só
+escreve nos próprios arrays `CONFIG_*` e não inicializa as globais das chaves; as linhas
+`STACK_DESCRIPTION=""` etc. continuam no topo do `auto_scrum.sh`, que é o dono delas. Por isso
+`load_project_config` continua existindo no `auto_scrum` como chamada fina: é ali que a
+ferramenta guarda o que precisar sobre o arquivo carregado, sem pôr global de chamador dentro
+da biblioteca.
+
+**Carga:** logo depois de `SCRIPT_DIR`, com
+
+```bash
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+source "$SCRIPT_DIR/../lib/config.sh"
+```
+
+A diretiva usa `SCRIPTDIR/` e não `../lib/config.sh`: o caminho relativo puro só resolve se o
+`shellcheck` rodar de dentro de `auto_scrum/` (da raiz dá SC1091), e com `SCRIPTDIR` ele
+resolve de qualquer cwd. Rode `shellcheck -x`, pra ele seguir o `source`. O `SCRIPT_DIR` vem de
+`BASH_SOURCE[0]`, então o caminho também funciona quando os testes dão `source` no script de
+outro cwd. O `source` da biblioteca é a única linha `source`/`.` do `auto_scrum.sh` (um teste
+compara a lista inteira); a garantia de que a configuração nunca é executada fica no teste
+estrutural de `lib/config.sh` e nos testes de gramática.
+
+**Riscos aceitos:**
+- a API de `lib/config.sh` nasce com um cliente só e pode mudar quando a segunda ferramenta
+  existir;
+- o `auto_scrum/` depende do `lib/` irmão por caminho relativo: mover o `auto_scrum/` sozinho
+  quebra o script.
+
+**Por que agora:** a decisão 1 do plano do ticket 13 (jail) era extrair o leitor "quando a
+segunda ferramenta existir". O ticket 23 reviu isso: o 13 introduz `JAIL_ENABLED`, que vale
+pro nick inteiro, e extrair antes dele custava só revisar aquele plano; depois, custaria
+refazer código e testes do 13.
+
+**Como rodar as suítes** (cada uma sai com código 1 se houver `FAIL`; não há runner único):
+`bash auto_scrum/tests/test_auto_scrum.sh` e `bash lib/tests/test_config.sh`.
+
+## Registro de chaves da configuração
+
+As chaves da configuração do `auto_scrum` ficam num bloco único no topo do `auto_scrum.sh`,
+logo depois do `source` da biblioteca, uma chamada por chave, na ordem do esqueleto:
+
+```bash
+# config_register_key <name> <default> <note> <skeleton comment>
+config_register_key PRODUCTION_ENABLED "false" \
+'a pergunta de impacto em produção está desligada no prompt do PO. ...' \
+'PRODUCTION_ENABLED: "true" se esse projeto já está em produção — ...'
+```
+
+- o comentário vai **sem** o `# ` de cada linha; quem acrescenta o prefixo (e escreve `#`
+  numa linha vazia) é `config_print_skeleton`, porque é regra de formato do esqueleto;
+- a ordem do registro é a do esqueleto, do aviso de chave ausente e de `CONFIG_KEYS`;
+- as chamadas rodam ao carregar o script (inclusive no `source` dos testes), sob o
+  `set -euo pipefail` dele: um registro inválido derruba o script na carga, de propósito, por
+  ser erro de programação.
+
+`config_register_key` valida antes de registrar e, se uma regra falhar, imprime uma mensagem
+no stderr e retorna 1, sem registrar e sem `exit`: nome em `^[A-Z][A-Z0-9_]*$` (garante a
+regra das locais em minúsculo e fecha o `printf -v` pra nomes como `a[$(cmd)]`), sem o
+prefixo `CONFIG_`, ainda não registrado; padrão `"true"`/`"false"` pra chave `_ENABLED` e `""`
+pra chave de texto; comentário não vazio e sem linha terminando em espaço, tab ou `\r` (que
+quebraria os hooks de texto do time alvo — ver "Nome `.nick.conf`").
+
+O nome também não pode ser uma variável especial do shell (`BASH*`, `PATH`, `IFS`, `ENV`,
+`HOME`, `CDPATH`, `PS[0-9]`, `SHELLOPTS`, `LD_*`, `LC_*`, `LANG`, `TERM`, `EDITOR`, `SHELL`,
+`GLOBIGNORE`, `PROMPT_COMMAND` e outras da lista em `config_register_key`) nem uma variável que
+já seja readonly no momento do registro (ex: `UID`). **Por quê:** o `.nick.conf` pode ser
+editado por outro time, e o leitor atribui o valor do arquivo à global de mesmo nome. Uma
+chave chamada `PATH`, `BASH_ENV` ou `LD_PRELOAD` deixaria esse arquivo mudar como o shell de
+quem roda a ferramenta executa comandos, e um `printf -v` numa readonly derrubaria o chamador
+sob `set -e` (o leitor nunca deve sair). Hoje nenhuma chave registrada é assim; a regra existe
+porque a biblioteca nasce pra ser reaproveitada por outras ferramentas. Consultar o atributo
+readonly lê estado do shell, como o `$PWD` de `config_cwd_file`, e não uma global do chamador.
+
+Testes de integração no `test_auto_scrum.sh` cobram o formato: o bloco é contíguo, no topo,
+fora de função e com uma chamada por chave; `print_project_skeleton` não tem linha `CHAVE=`;
+nenhuma chave registrada aparece em `lib/config.sh` nem em `lib/tests/test_config.sh` (que só
+usa chaves de mentira); e uma chave extra registrada no teste aparece no esqueleto e nos
+avisos de chave ausente e de valor inválido.
+
+**Por quê:** cada chave fica numa chamada só, com as quatro informações (nome, padrão, nota e
+comentário) lado a lado, e acrescentar uma chave é acrescentar uma chamada. Some o trio que
+antes precisava ficar sincronizado à mão (a lista `PROJECT_CONFIG_KEYS`, o `case` de padrão e
+nota por chave e o heredoc do esqueleto), e a regra "flag com `"false"`/`"true"`, texto com
+`""`", que antes só um teste cobrava, passa a valer também no registro. O armazenamento é em
+arrays indexados paralelos (`CONFIG_KEYS`, a lista pública, só pra leitura, e
+`CONFIG_KEY_DEFAULTS`/`CONFIG_KEY_NOTES`/`CONFIG_KEY_COMMENTS`, internos), não em array
+associativo: um `declare -A` exigiria `-g` se a biblioteca fosse carregada dentro de uma
+função.
 
 ## Modo auto só na etapa de Desenvolvimento
 
@@ -766,7 +895,7 @@ A variável é `SENTRY_LINK`, não `JIRA_LINK` reaproveitada — mesmo racional 
 `JIRA_LINK` de `JIRA_ID`: cada variável com uma semântica só, e uma URL do Sentry numa
 variável chamada `JIRA_LINK` seria ambígua. `DESCRIPTION` é reaproveitada porque já faz o
 papel de complemento opcional em `po_jira`/`tech_leader_jira`. `SENTRY_LINK` é dado de
-entrada, não chave de configuração: não entra em `PROJECT_CONFIG_KEYS`.
+entrada, não chave de configuração: não é registrada com `config_register_key`.
 
 `SENTRY_ENABLED` tem dois efeitos:
 1. **Menu:** a opção `po_sentry` só aparece com `"true"`, lida direto em `choose_type()`

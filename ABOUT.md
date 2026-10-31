@@ -251,7 +251,8 @@ pode muito bem ter deixado esse campo vazio, e nesse caso não haveria nada pra 
 ## Tech Leader - Criar plano a partir do Jira (`tech_leader_jira`)
 
 Segundo ponto de entrada do Tech Leader, além de `tech_leader` — mesmo papel, mesmas
-regras de plano (metodologia TDD, seções finais obrigatórias `## Critérios de aceite`/
+regras de plano (metodologia TDD — trecho que depende de `TDD_ENABLED`, ver seção
+"Metodologia TDD por projeto" —, seções finais obrigatórias `## Critérios de aceite`/
 `## Habilidades necessárias`, convenção `docs/plans/<ID>_<resumo-curto>.md`), entrada
 diferente: em vez de `JIRA_ID`/título/descrição digitados manualmente, o analista informa
 só o link de um ticket que já existe no Jira (`ask_questions_tech_leader_jira`,
@@ -304,7 +305,8 @@ Esse tipo de coisa vira uma variável booleana no arquivo de configuração do p
 (`.nick.conf` no cwd ou `auto_scrum/projects/<name>.conf` — ver seção "Configuração do
 projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
 `SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`; só `"true"`, `"false"` e
-`""` são aceitos, e qualquer outro valor desliga a opção com aviso), lida por uma função
+`""` são aceitos, e qualquer outro valor desliga a opção com aviso; a única exceção é
+`TDD_ENABLED`, ligada por padrão — ver seção "Metodologia TDD por projeto"), lida por uma função
 `build_*_blocks()` em `auto_scrum.sh` (mesmo padrão de `build_stack_blocks()`/
 `STACK_DESCRIPTION`) que monta o bloco de texto correspondente só quando a flag está ativa. O
 template usa a variável de bloco (ex: `${SENTRY_BLOCK_TL}`) no lugar do texto fixo — nunca
@@ -322,7 +324,8 @@ três conjuntos. Isso vale pra qualquer variável nova: uma variável de templat
 template é código morto. O teste genérico não pega uma variável de outro `TYPE` usada num
 template cujo `TYPE` não a preenche: ela está nas listas, então seria substituída
 silenciosamente por vazio. Pra isso existe um teste de conjunto exato por template (via
-`template_vars` em `test_auto_scrum.sh`), mas hoje só `po.md` e `po_sentry.md` o têm.
+`template_vars` em `test_auto_scrum.sh`), mas hoje só `po.md`, `po_sentry.md`,
+`development.md` e `review.md` o têm.
 Template novo, ou que ganhe variável nova, deve ganhar o seu.
 
 Toda flag nova precisa entrar também em `PROJECT_CONFIG_KEYS` (topo do `auto_scrum.sh`) e no
@@ -330,13 +333,17 @@ esqueleto de `print_project_skeleton()`: o leitor `load_project_config` ignora q
 fora dessa lista, então uma flag só escrita no arquivo nunca chegaria ao script. Um teste
 compara as chaves do esqueleto com `PROJECT_CONFIG_KEYS` pra pegar o esquecimento de um dos
 dois lados. A flag nova também precisa terminar em `_ENABLED` e entrar no esqueleto com
-`"false"` (chave de texto entra com `""`): é o sufixo que a põe na checagem de valor
-(`is_toggle_config_key`), e o teste de consistência do esqueleto cobra isso — ver seção
+`"false"` (chave de texto entra com `""`; a exceção é `TDD_ENABLED`, que entra com `"true"`):
+é o sufixo que a põe na checagem de valor (`is_toggle_config_key`), o padrão vem de
+`config_key_default`, e o teste de consistência do esqueleto cobra isso — ver seção
 "Validação da configuração do projeto: chave ausente e valor inválido".
 
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
-criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer.
+criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer. `TDD_ENABLED` é
+a exceção, porque ali o padrão é o comportamento que todo projeto já tinha (ver seção
+"Metodologia TDD por projeto"); uma flag nova só copia essa exceção por um motivo do mesmo
+tipo.
 
 ## Análise de impacto em produção no PO (`PRODUCTION_ENABLED`)
 
@@ -359,13 +366,14 @@ ausentes — ver seção "Validação da configuração do projeto: chave ausent
 que também guarda as regras gerais (roda só em `load_project_config`, linha mal formatada
 conta como presente, linha comentada e chave parecida não contam, "Nenhum" não avisa). Um
 arquivo sem a linha `PRODUCTION_ENABLED` recebe esse aviso, que sugere
-`PRODUCTION_ENABLED="false"` precedida de uma nota da chave (`config_key_off_note`). Regras
+`PRODUCTION_ENABLED="false"` precedida de uma nota da chave (`config_key_note`). Regras
 que continuam específicas desta chave, cada uma com o seu motivo:
 
-- **Ela é a única com nota própria nos avisos**, dizendo que a pergunta de impacto em
-  produção está desligada no prompt do PO. É a primeira flag cujo padrão desligado *remove*
-  um comportamento que já existia (ver "Por quê" abaixo); nas outras, ficar desligada só
-  deixa de acrescentar algo.
+- **Ela tem nota própria nos avisos**, dizendo que a pergunta de impacto em produção está
+  desligada no prompt do PO. É a primeira flag cujo padrão desligado *remove* um
+  comportamento que já existia (ver "Por quê" abaixo); nas outras flags opt-in, ficar
+  desligada só deixa de acrescentar algo. (`TDD_ENABLED` também tem nota, por outro motivo:
+  ver seção "Metodologia TDD por projeto".)
 - **A nota mostra as duas saídas, não só a de ligar** (`"true"` pra ligar a pergunta,
   `"false"` pra mantê-la desligada). O aviso aparece em toda execução, e quem mais precisa
   silenciá-lo é justamente o projeto sem produção. Se o texto só ensinasse
@@ -400,6 +408,61 @@ versionados em projetos alvo, perderia a pergunta em silêncio.
 - prompts de Tech Leader, Desenvolvimento e Review: não falam de produção, então não há o
   que desligar neles.
 
+## Metodologia TDD por projeto (`TDD_ENABLED`, ligada por padrão)
+
+Os prompts de Tech Leader, Desenvolvimento e Review exigiam TDD e a execução da suíte de
+testes em qualquer projeto. Num projeto sem testes automatizados (ex: site em HTML
+estático), o modelo inventava testes, montava infraestrutura de testes que ninguém pediu ou
+travava por não ter suíte pra rodar. `TDD_ENABLED="false"` desliga isso por projeto.
+
+`build_tdd_blocks()` monta quatro blocos (mesmo mecanismo das outras flags; o `.md` só
+referencia a variável):
+
+| Bloco | Onde entra | Desligada (`"false"`) |
+|---|---|---|
+| `TDD_BLOCK_TL` | embutido em `TECH_LEADER_PLAN_RULES_BLOCK` (`tech_leader`, `tech_leader_jira`) | sai a frase da metodologia TDD; o plano não deve exigir testes automatizados nem planejar infraestrutura de testes que o ticket não peça |
+| `TDD_CRITERIA_BLOCK_TL` | embutido em `TECH_LEADER_PLAN_RULES_BLOCK`, no fim do texto de `## Critérios de aceite` | o plano diz como cada critério será verificado (ligada, o bloco é vazio) |
+| `TDD_BLOCK_DEV` | `development.md` | cada critério é verificado pela forma descrita no plano; a suíte só roda se existir; o resumo final diz como cada critério foi verificado |
+| `TDD_BLOCK_REVIEW` | `review.md` | a suíte só roda se existir; cada critério é validado pela forma de verificação descrita no plano |
+
+Os dois blocos `_TL` são embutidos (não exportados nem passados ao `envsubst`), por isso
+`build_tdd_blocks` roda antes de `build_tech_leader_blocks` em `main()`.
+`TDD_CRITERIA_BLOCK_TL` começa com `\n`, pra não deixar linha em branco quando vazio (mesma
+técnica de `PERMISSION_BLOCK_PO`).
+
+- **Ligada por padrão, ao contrário das outras flags.** TDD é o comportamento que todo
+  projeto já tinha e que se espera; desligar é a exceção (projeto sem testes). Uma flag
+  opt-in tiraria a TDD de toda configuração existente, inclusive dos `.nick.conf`
+  versionados em repositórios de outros times. Ligada, cada prompt sai byte a byte igual ao
+  de antes da flag (coberto por testes de caracterização com referência fixa, que passaram
+  com o código antigo).
+- **Só `"false"` exato desliga.** `"true"`, vazio, chave ausente, "Nenhum" e qualquer valor
+  inválido (`"TRUE"`, `"False"`, `" false"`, `"sim"`) mantêm a TDD ligada. Um erro de
+  digitação nunca pode remover a TDD de um projeto que tem testes; o erro contrário (TDD
+  ligada num projeto sem testes) é o problema de antes da flag, e o aviso de valor já o
+  torna visível. O leitor (`load_project_config`) não muda: `"TRUE"` continua atribuído
+  literal e recebe o aviso; quem decide é só `build_tdd_blocks`, com
+  `[ "$TDD_ENABLED" = "false" ]` — essa é a regra de desligamento, não o padrão da chave.
+- **As outras flags `_ENABLED` continuam opt-in** (padrão desligado). Uma flag nova não deve
+  copiar esta exceção sem um motivo do mesmo tipo (desligar por padrão removeria um
+  comportamento que todo projeto já tinha e que continua sendo o esperado).
+- **Padrão por chave só em `config_key_default`.** É o único lugar com o padrão de cada chave
+  (`"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga, `""` pras de texto), usado
+  pela linha sugerida do aviso de ausente e espelhado no esqueleto (`TDD_ENABLED="true"`,
+  última chave). Não há array de padrões nem outro `case` por chave.
+- **Nota da chave em `config_key_note`.** Diz que a TDD continua ligada e que `"false"` é só
+  pra projeto sem testes automatizados. Aparece antes de `TDD_ENABLED="true"` no aviso de
+  chave ausente e no fim do aviso de valor inválido, no lugar de "a opção está desligada.".
+- **"Nenhum prompt menciona TDD" vale pro texto do `auto_scrum`.** Uma `STACK_DESCRIPTION`
+  escrita pelo usuário com "TDD" continua aparecendo — é dado do projeto.
+
+**Fora de escopo, de propósito:**
+- mudar o padrão das outras flags `_ENABLED` (continuam opt-in);
+- separar "usa a metodologia TDD" de "tem suíte de testes" em duas flags;
+- pergunta interativa no `--init`;
+- mudanças nos prompts do PO;
+- filtrar "TDD" de uma `STACK_DESCRIPTION` escrita pelo usuário.
+
 ## DRY entre templates do mesmo papel (texto compartilhado vira `build_*_blocks()`)
 
 Variação do mecanismo acima ("Flags booleanas por projeto"), pro caso em que o texto não é
@@ -413,7 +476,8 @@ uma vez, numa função `build_*_blocks()` em `auto_scrum.sh` — `build_po_block
 `envsubst`. O template referencia a variável; nunca repete o texto.
 
 Exemplo: `TECH_LEADER_PLAN_RULES_BLOCK` (regra de perguntar se faltar informação técnica,
-metodologia TDD, as duas seções finais obrigatórias) é montada em
+metodologia TDD — trecho que depende de `TDD_ENABLED`, embutido via `TDD_BLOCK_TL`/
+`TDD_CRITERIA_BLOCK_TL` —, as duas seções finais obrigatórias) é montada em
 `build_tech_leader_blocks()` e usada tanto em `tech_leader.md` quanto em
 `tech_leader_jira.md` — antes da extração, esse parágrafo existia duplicado, palavra por
 palavra, nos dois arquivos.
@@ -568,26 +632,32 @@ segue até o prompt.
 1. **Toda chave de `PROJECT_CONFIG_KEYS` deve estar declarada no arquivo**, mesmo as que o
    projeto não usa. As ausentes geram um único aviso (`warn_missing_config_keys`), com o
    caminho do arquivo e a linha a adicionar pra cada uma, na ordem de `PROJECT_CONFIG_KEYS`.
-   A chave ausente continua valendo como vazia.
+   A chave ausente continua valendo como vazia, e vazio funciona como o padrão da chave.
+   O cabeçalho do aviso diz isso ("cada chave ausente funciona como o valor sugerido
+   abaixo"), e não que as opções ausentes ficam desligadas, o que seria falso pra
+   `TDD_ENABLED`.
 2. **As chaves liga/desliga aceitam só `"true"`, `"false"` e `""`.** Qualquer outro valor
    (`"TRUE"`, `"True"`, `"sim"`) gera um aviso por linha (`warn_invalid_toggle_value`), com
-   arquivo, número da linha, chave, valor encontrado, valores aceitos e a informação de que a
-   opção está desligada.
+   arquivo, número da linha, chave, valor encontrado, valores aceitos e o efeito: "a opção
+   está desligada." ou, quando a chave tem nota, a nota (`TDD_ENABLED` diz que a TDD continua
+   ligada).
 
 **O que é liga/desliga: nome terminado em `_ENABLED`**, decidido só em
-`is_toggle_config_key`. As duas checagens e o valor padrão da linha sugerida usam essa
-função. Uma flag nova precisa seguir o sufixo e entrar no esqueleto de
-`print_project_skeleton()` com `"false"`; uma chave de texto entra com `""`. O teste de
-consistência do esqueleto cobra isso nos dois sentidos: cada chave com `"false"` no
-esqueleto, trocada por `"sim"`, tem de gerar o aviso de valor, e cada chave com `""` não. Não
-existe um array separado de chaves liga/desliga porque ele seria um terceiro lugar a
-atualizar a cada flag nova, além de `PROJECT_CONFIG_KEYS` e do esqueleto — e todas as flags
-já seguem o sufixo.
+`is_toggle_config_key`. As duas checagens e `config_key_default` usam essa função. Uma flag
+nova precisa seguir o sufixo e entrar no esqueleto de `print_project_skeleton()` com
+`"false"` (ou `"true"`, como `TDD_ENABLED`, a única ligada por padrão); uma chave de texto
+entra com `""`. O teste de consistência do esqueleto cobra isso nos dois sentidos: cada chave
+com `"false"` ou `"true"` no esqueleto, trocada por `"sim"`, tem de gerar o aviso de valor, e
+cada chave com `""` não. Não existe um array separado de chaves liga/desliga porque ele seria
+um terceiro lugar a atualizar a cada flag nova, além de `PROJECT_CONFIG_KEYS` e do esqueleto
+— e todas as flags já seguem o sufixo.
 
-**Valor padrão da linha sugerida.** Vem da mesma regra: `"false"` pra liga/desliga e `""` pra
-texto. É exatamente a linha do esqueleto, e um teste confere que cada linha sugerida aparece
-idêntica no arquivo gerado por `--init` (o script não lê o esqueleto em tempo de execução).
-Esse padrão mantém o comportamento de antes, já que vazio e `"false"` desligam igual.
+**Valor padrão da linha sugerida.** Vem de `config_key_default`, o único lugar com padrão por
+chave: `"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga e `""` pra texto. É
+exatamente a linha do esqueleto, e um teste confere que cada linha sugerida aparece idêntica
+no arquivo gerado por `--init` (o script não lê o esqueleto em tempo de execução). Esse padrão
+mantém o comportamento de antes: nas flags opt-in, vazio e `"false"` desligam igual; em
+`TDD_ENABLED`, vazio e `"true"` mantêm a TDD ligada.
 
 **Presença.** Conta como presente a linha válida com qualquer valor, inclusive inválido, e a
 linha fora do formato: as duas já recebem um aviso próprio, que aponta arquivo e linha, e
@@ -609,14 +679,18 @@ aviso de ausentes.
 - O de valor inválido é um por linha, no padrão do aviso de formato, e só vale pra linhas que
   o leitor aceitou: uma linha fora do formato recebe só o aviso de formato, mesmo que o valor
   também seja ruim (`JIRA_ENABLED=TRUE`).
-- O valor inválido continua sendo atribuído (a variável guarda `"TRUE"` literal), e só
-  `"true"` liga. O comportamento do leitor não muda: o aviso só explica por que a opção está
-  desligada.
+- O valor inválido continua sendo atribuído (a variável guarda `"TRUE"` literal): nas flags
+  opt-in só `"true"` liga, e `TDD_ENABLED` só desliga com `"false"`. O comportamento do
+  leitor não muda: o aviso só explica o efeito do valor.
 
-**Nota por chave, só em `config_key_off_note`.** É o único lugar com texto específico de
-chave, usado pelos dois avisos. Hoje só `PRODUCTION_ENABLED` tem nota, porque é a única flag
-cujo padrão desligado remove algo que o prompt já tinha (ver seção "Análise de impacto em
-produção no PO"). Nas outras, o aviso de valor termina com "a opção está desligada.".
+**Nota por chave, só em `config_key_note`.** É o único lugar com texto específico de chave,
+usado pelos dois avisos. Hoje duas chaves têm nota: `PRODUCTION_ENABLED`, porque é a única
+flag cujo padrão desligado remove algo que o prompt já tinha (ver seção "Análise de impacto
+em produção no PO"), e `TDD_ENABLED`, porque é a única ligada por padrão e "a opção está
+desligada." diria o contrário do comportamento (ver seção "Metodologia TDD por projeto").
+Nas outras, o aviso de valor termina com "a opção está desligada.". O nome era
+`config_key_off_note`; virou `config_key_note` porque a nota de `TDD_ENABLED` não fala de
+opção desligada.
 
 **O que os avisos não fazem, e por quê.**
 - Não sugerem `--init`: ele sobrescreve o arquivo e apagaria os valores já preenchidos.
@@ -632,8 +706,8 @@ produção no PO"). Nas outras, o aviso de valor termina com "a opção está de
   Filtrar os bytes `0x80`–`0x9F` quebraria letras acentuadas em UTF-8 (`É` é `C3 89`), e o
   risco é pequeno perto do que quem edita o arquivo já consegue — mesmo racional do
   parágrafo "O leitor protege o shell, não o prompt".
-- Não interrompem a execução: a configuração continua utilizável, só com a opção desligada
-  ou a chave vazia, que é o comportamento de antes das checagens.
+- Não interrompem a execução: a configuração continua utilizável, só com a chave no padrão
+  dela (opção desligada, TDD ligada) ou vazia, que é o comportamento de antes das checagens.
 
 **Onde rodam.** Só em `load_project_config`, o único leitor, então valem nos três caminhos
 (cwd, `--projeto=` e menu) sem repetir código. Só o arquivo carregado é verificado: outros

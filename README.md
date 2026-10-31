@@ -81,7 +81,8 @@ Duas regras valem além do formato:
   alguma, o script avisa no stderr, com o caminho do arquivo e as linhas a adicionar, e a
   chave ausente vale como vazia. Uma linha comentada ou com outro nome não conta.
 - **As chaves `*_ENABLED` aceitam só `"true"`, `"false"` e `""`.** Qualquer outro valor (ex:
-  `"TRUE"`, `"sim"`) deixa a opção desligada e gera um aviso com o arquivo e o número da
+  `"TRUE"`, `"sim"`) mantém a chave no valor padrão dela (o comentário de cada chave no
+  arquivo gerado por `--init` diz qual é) e gera um aviso com o arquivo e o número da
   linha.
 
 Os avisos não interrompem a execução. Quando uma chave nova é criada, as configurações que
@@ -89,7 +90,7 @@ já existem passam a receber o aviso de chaves ausentes, com a linha a adicionar
 
 - Pra criar a configuração: `./auto_scrum/auto_scrum.sh --init` — pergunta o destino
   (`.nick.conf` no diretório atual, ou `auto_scrum/projects/<nome>.conf`, que pede o nome)
-  e cria o arquivo com as chaves aceitas, desligadas/vazias, e comentários explicando cada
+  e cria o arquivo com as chaves aceitas no valor padrão e comentários explicando cada
   uma. O conteúdo é o mesmo nos dois destinos. Abre e preenche depois. Se o arquivo já
   existir, pergunta antes de sobrescrever.
 - Só `--projeto=` (singular) e `--init` são reconhecidos — qualquer outra flag (ex:

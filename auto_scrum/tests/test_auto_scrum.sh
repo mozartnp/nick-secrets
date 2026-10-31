@@ -124,6 +124,10 @@ config_keys_blank() {
 # desligado dela tira do prompt do PO uma pergunta que já existia.
 production_note='a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.'
 production_note_line="# PRODUCTION_ENABLED: $production_note"
+# Nota de TDD_ENABLED: é a única flag ligada por padrão, então a nota diz que a TDD continua
+# ligada (e não "a opção está desligada.").
+tdd_note='a metodologia TDD continua ligada nos prompts de Tech Leader, Desenvolvimento e Review. Use "false" só em projeto sem testes automatizados.'
+tdd_note_line="# TDD_ENABLED: $tdd_note"
 # "Aviso de chave ausente" é o bloco do stderr cuja 1ª linha contém missing_marker.
 missing_marker="não tem todas as chaves da configuração"
 
@@ -132,7 +136,7 @@ missing_marker="não tem todas as chaves da configuração"
 missing_warning() {
   local file="$1" line
   shift
-  printf '%s' "Aviso: $file não tem todas as chaves da configuração — cada chave ausente vale como vazia (as opções \"true\"/\"false\" ficam desligadas). Adicione ao arquivo:"
+  printf '%s' "Aviso: $file não tem todas as chaves da configuração — cada chave ausente funciona como o valor sugerido abaixo. Adicione ao arquivo:"
   for line in "$@"; do
     printf '\n  %s' "$line"
   done
@@ -206,6 +210,8 @@ assert_exists "$init_cwd_file" "destino cwd (opção 1): cria .nick.conf no dire
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'JIRA_ENABLED="false"' "destino cwd: esqueleto declara JIRA_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'PRODUCTION_ENABLED="false"' "destino cwd: esqueleto declara PRODUCTION_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'Ligue ("true") quando o projeto entrar em produção.' "destino cwd: comentário do esqueleto manda ligar PRODUCTION_ENABLED quando o projeto entrar em produção"
+assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'TDD_ENABLED="true"' "destino cwd: esqueleto declara TDD_ENABLED=\"true\" por padrão (a única flag ligada por padrão)"
+assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'só "false" desliga.' "destino cwd: comentário do esqueleto diz que só \"false\" desliga a TDD"
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino cwd: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
 assert_not_exists "$init_projects_unused" "destino cwd: PROJECTS_DIR não é criado"
 
@@ -216,6 +222,8 @@ assert_exists "$init_projects_file" "destino projects/ (opção 2): cria \$PROJE
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'JIRA_ENABLED="false"' "destino projects/: esqueleto declara JIRA_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'PRODUCTION_ENABLED="false"' "destino projects/: esqueleto declara PRODUCTION_ENABLED=\"false\" por padrão"
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'Ligue ("true") quando o projeto entrar em produção.' "destino projects/: comentário do esqueleto manda ligar PRODUCTION_ENABLED quando o projeto entrar em produção"
+assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'TDD_ENABLED="true"' "destino projects/: esqueleto declara TDD_ENABLED=\"true\" por padrão (a única flag ligada por padrão)"
+assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'só "false" desliga.' "destino projects/: comentário do esqueleto diz que só \"false\" desliga a TDD"
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino projects/: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
 assert_not_exists "$init_projects/projeto-teste.sh" "destino projects/: não cria projeto-teste.sh"
 assert_not_exists "$init_projects_dest/.nick.conf" "destino projects/: não cria .nick.conf no diretório atual"
@@ -275,35 +283,39 @@ assert_eq '\n' "$(tail -c1 "$init_cwd_file" 2>/dev/null | od -An -c | tr -d ' ')
 skeleton_result="$(run_loader "$init_cwd_file" "$init_dir/skeleton_loader" "STACK_DESCRIPTION=antes")"
 assert_eq "|false|false|false|false" "$skeleton_result" "esqueleto carregado pelo leitor: flags false e STACK_DESCRIPTION vazio"
 assert_eq "" "$(cat "$init_dir/skeleton_loader.err" 2>/dev/null || echo 'sem stderr')" "esqueleto carregado pelo leitor não gera aviso (nem pelos comentários que citam CHAVE=\"valor\")"
+assert_eq "true" "$(loaded_value "$init_cwd_file" TDD_ENABLED)" "esqueleto carregado pelo leitor: TDD_ENABLED vem \"true\""
 
 skeleton_keys="$(grep -oE '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null | tr -d '=' | sort || true)"
 config_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${PROJECT_CONFIG_KEYS[@]}\" | sort")"
 assert_eq "$config_keys" "$skeleton_keys" "chaves atribuídas no esqueleto são exatamente as de PROJECT_CONFIG_KEYS"
 
 # Testes-guarda da regra liga/desliga (is_toggle_config_key): o esqueleto é o modelo, então
-# toda chave com "false" nele precisa passar pela checagem de valor, e toda chave com "" não.
+# toda chave com "false" ou "true" nele precisa passar pela checagem de valor, e toda chave
+# com "" não. skeleton_toggle_lines guarda a linha inteira, com o padrão da chave.
 skeleton_guard_dir="$init_dir/skeleton_guard"
 mkdir -p "$skeleton_guard_dir"
-skeleton_toggle_keys=()
+skeleton_toggle_lines=()
 skeleton_text_keys=()
 skeleton_other_lines=""
 while IFS= read -r skeleton_line; do
   skeleton_key="${skeleton_line%%=*}"
-  if [ "$skeleton_line" = "$skeleton_key=\"false\"" ]; then
-    skeleton_toggle_keys+=("$skeleton_key")
+  if [ "$skeleton_line" = "$skeleton_key=\"false\"" ] || [ "$skeleton_line" = "$skeleton_key=\"true\"" ]; then
+    skeleton_toggle_lines+=("$skeleton_line")
   elif [ "$skeleton_line" = "$skeleton_key=\"\"" ]; then
     skeleton_text_keys+=("$skeleton_key")
   else
     skeleton_other_lines+="$skeleton_line"$'\n'
   fi
 done < <(grep -E '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null || true)
-assert_eq "" "$skeleton_other_lines" "toda chave do esqueleto é liga/desliga (=\"false\") ou texto (=\"\")"
-assert_eq "true" "$([ "${#skeleton_toggle_keys[@]}" -gt 0 ] && [ "${#skeleton_text_keys[@]}" -gt 0 ] && echo true || echo false)" "o esqueleto tem pelo menos uma chave liga/desliga e uma de texto"
+assert_eq "" "$skeleton_other_lines" "toda chave do esqueleto é liga/desliga (=\"false\"/=\"true\") ou texto (=\"\")"
+assert_eq "true" "$([ "${#skeleton_toggle_lines[@]}" -gt 0 ] && [ "${#skeleton_text_keys[@]}" -gt 0 ] && echo true || echo false)" "o esqueleto tem pelo menos uma chave liga/desliga e uma de texto"
 
-for skeleton_key in "${skeleton_toggle_keys[@]}"; do
+for skeleton_line in "${skeleton_toggle_lines[@]}"; do
+  skeleton_key="${skeleton_line%%=*}"
   skeleton_copy="$skeleton_guard_dir/toggle_$skeleton_key.conf"
-  sed "s/^$skeleton_key=\"false\"\$/$skeleton_key=\"sim\"/" "$init_cwd_file" > "$skeleton_copy"
+  sed "s/^$skeleton_line\$/$skeleton_key=\"sim\"/" "$init_cwd_file" > "$skeleton_copy"
   run_loader "$skeleton_copy" "$skeleton_guard_dir/toggle_$skeleton_key" >/dev/null
+  assert_eq "true" "$(grep -qxF "$skeleton_key=\"sim\"" "$skeleton_copy" && echo true || echo false)" "esqueleto com $skeleton_line trocado por $skeleton_key=\"sim\": a cópia tem a linha trocada"
   assert_eq "1" "$(count_warnings "$skeleton_guard_dir/toggle_$skeleton_key.err")" "esqueleto com $skeleton_key=\"sim\": exatamente um aviso (toda liga/desliga do modelo é checada)"
   assert_contains "$(cat "$skeleton_guard_dir/toggle_$skeleton_key.err" 2>/dev/null || true)" "valor \"sim\" inválido para $skeleton_key" "esqueleto com $skeleton_key=\"sim\": o aviso é o de valor inválido"
 done
@@ -428,7 +440,7 @@ assert_contains "$main_src" "tech_leader_jira) ask_questions_tech_leader_jira ;;
 
 echo
 echo "== build_tech_leader_blocks: monta TECH_LEADER_PLAN_RULES_BLOCK (compartilhado entre tech_leader.md e tech_leader_jira.md) =="
-tl_rules_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; build_tech_leader_blocks; printf '%s' \"\$TECH_LEADER_PLAN_RULES_BLOCK\"")"
+tl_rules_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; build_tdd_blocks; build_tech_leader_blocks; printf '%s' \"\$TECH_LEADER_PLAN_RULES_BLOCK\"")"
 assert_contains "$tl_rules_result" "## Critérios de aceite" "TECH_LEADER_PLAN_RULES_BLOCK inclui a seção Critérios de aceite"
 assert_contains "$tl_rules_result" "## Habilidades necessárias" "TECH_LEADER_PLAN_RULES_BLOCK inclui a seção Habilidades necessárias"
 assert_contains "$tl_rules_result" "metodologia TDD" "TECH_LEADER_PLAN_RULES_BLOCK menciona a metodologia TDD"
@@ -512,7 +524,8 @@ printf '%s\n' \
   'SENTRY_ENABLED="true"' \
   'PERMISSION_ENABLED="false"' \
   'JIRA_ENABLED="true"' \
-  'PRODUCTION_ENABLED="true"' > "$lpc_dir/skeleton.conf"
+  'PRODUCTION_ENABLED="true"' \
+  'TDD_ENABLED="true"' > "$lpc_dir/skeleton.conf"
 lpc_result="$(run_loader "$lpc_dir/skeleton.conf" "$lpc_dir/skeleton")"
 assert_eq "Bash (POSIX [ ], set -euo pipefail), pytest e TDD|true|false|true|true" "$lpc_result" "formato do esqueleto: as 5 chaves carregam com o valor do arquivo (inclusive [ ], vírgula e parênteses)"
 assert_eq "" "$(cat "$lpc_dir/skeleton.err" 2>/dev/null || echo 'sem stderr')" "formato do esqueleto: nenhum aviso no stderr (nem pela linha '# Exemplo: STACK_DESCRIPTION=...')"
@@ -595,19 +608,27 @@ assert_eq "$(missing_warning "$miss_dir/only_production.conf" "$production_note_
 assert_not_contains "$miss_err" "Existe impacto em produção?" "só PRODUCTION_ENABLED ausente: o aviso não repete a pergunta literal do prompt"
 assert_not_contains "$miss_err" "--init" "só PRODUCTION_ENABLED ausente: o aviso não sugere --init (sobrescreveria o arquivo)"
 
+config_keys_blank TDD_ENABLED > "$miss_dir/only_tdd.conf"
+run_loader "$miss_dir/only_tdd.conf" "$miss_dir/only_tdd" >/dev/null
+miss_err="$(cat "$miss_dir/only_tdd.err" 2>/dev/null || true)"
+assert_eq "1" "$(count_warnings "$miss_dir/only_tdd.err")" "só TDD_ENABLED ausente: exatamente um aviso no stderr"
+assert_eq "$(missing_warning "$miss_dir/only_tdd.conf" "$tdd_note_line" 'TDD_ENABLED="true"')" "$miss_err" "só TDD_ENABLED ausente: o aviso sugere TDD_ENABLED=\"true\", precedido da nota da chave"
+assert_not_contains "$miss_err" "--init" "só TDD_ENABLED ausente: o aviso não sugere --init (sobrescreveria o arquivo)"
+assert_not_contains "$miss_err" "ficam desligadas" "só TDD_ENABLED ausente: o cabeçalho do aviso não diz que as opções ausentes ficam desligadas"
+
 printf '%s\n' 'STACK_DESCRIPTION="stack-secreta-19"' 'JIRA_ENABLED="true"' > "$miss_dir/several.conf"
 miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
 miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
 assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
 assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de PROJECT_CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de PROJECT_CONFIG_KEYS"
 assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
 : > "$miss_dir/empty_file.conf"
 miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
 assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
 assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as cinco chaves na ordem de PROJECT_CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as seis chaves na ordem de PROJECT_CONFIG_KEYS"
 
 # Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
 # outras chaves, então o bloco só pode listar a chave do caso.
@@ -673,11 +694,12 @@ mkdir -p "$val_dir"
 
 # Nas fixtures, a linha testada vai sempre por último: o número dela é o wc -l do arquivo.
 val_case=0
-for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED; do
-  val_off="$default_off_note"
-  if [ "$val_key" = "PRODUCTION_ENABLED" ]; then
-    val_off="$production_note"
-  fi
+for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED; do
+  case "$val_key" in
+    PRODUCTION_ENABLED) val_off="$production_note" ;;
+    TDD_ENABLED) val_off="$tdd_note" ;;
+    *) val_off="$default_off_note" ;;
+  esac
   for val_value in TRUE True sim; do
     val_case=$((val_case + 1))
     val_label="$val_key=\"$val_value\""
@@ -697,7 +719,7 @@ for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED
 done
 
 val_case=0
-for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED; do
+for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED; do
   for val_value in true false ""; do
     val_case=$((val_case + 1))
     val_label="$val_key=\"$val_value\""
@@ -708,6 +730,31 @@ for val_key in SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED
     assert_eq "$val_value" "$(loaded_value "$val_file" "$val_key")" "$val_label: o valor é carregado"
   done
 done
+
+# TDD_ENABLED é a única flag ligada por padrão: o aviso de valor diz que a TDD continua
+# ligada, e não que a opção está desligada.
+val_file="$val_dir/tdd_sim.conf"
+printf '%s\n' "$(config_keys_blank TDD_ENABLED)" 'TDD_ENABLED="sim"' > "$val_file"
+run_loader "$val_file" "$val_dir/tdd_sim" >/dev/null
+assert_not_contains "$(cat "$val_dir/tdd_sim.err" 2>/dev/null || true)" "a opção está desligada" "TDD_ENABLED=\"sim\": o aviso não diz que a opção está desligada"
+assert_contains "$(cat "$val_dir/tdd_sim.err" 2>/dev/null || true)" "continua ligada" "TDD_ENABLED=\"sim\": o aviso diz que a TDD continua ligada"
+
+# Guardas do lado perigoso: nada além de uma linha TDD_ENABLED="false" válida desliga a TDD.
+# A linha híbrida não é aplicada (só o aviso de formato, e ela conta como presente); a
+# comentada não é vista pelo leitor (só o aviso de chave ausente, que sugere "true").
+val_file="$val_dir/tdd_hybrid.conf"
+printf '%s\n' "$(config_keys_blank TDD_ENABLED)" "TDD_ENABLED=\"false\" && touch \"$val_dir/tdd_marker\"" > "$val_file"
+run_loader "$val_file" "$val_dir/tdd_hybrid" >/dev/null
+assert_eq "" "$(loaded_value "$val_file" TDD_ENABLED)" "linha 'TDD_ENABLED=\"false\" && touch <marker>': TDD_ENABLED não recebe \"false\""
+assert_not_exists "$val_dir/tdd_marker" "linha 'TDD_ENABLED=\"false\" && touch <marker>': o comando não é executado"
+assert_eq "1" "$(count_warnings "$val_dir/tdd_hybrid.err")" "linha 'TDD_ENABLED=\"false\" && touch <marker>': exatamente um aviso"
+assert_eq "Aviso: $val_file:$(wc -l < "$val_file"): linha de TDD_ENABLED ignorada (formato esperado: TDD_ENABLED=\"valor\", sem aspas duplas dentro do valor)" "$(cat "$val_dir/tdd_hybrid.err" 2>/dev/null || true)" "linha 'TDD_ENABLED=\"false\" && touch <marker>': só o aviso de formato, sem aviso de chave ausente"
+
+val_file="$val_dir/tdd_commented.conf"
+printf '%s\n' "$(config_keys_blank TDD_ENABLED)" '# TDD_ENABLED="false"' > "$val_file"
+run_loader "$val_file" "$val_dir/tdd_commented" >/dev/null
+assert_eq "" "$(loaded_value "$val_file" TDD_ENABLED)" "linha '# TDD_ENABLED=\"false\"': TDD_ENABLED não recebe \"false\""
+assert_eq "$(missing_warning "$val_file" "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$val_dir/tdd_commented.err" 2>/dev/null || true)" "linha '# TDD_ENABLED=\"false\"': só o aviso de chave ausente, sugerindo TDD_ENABLED=\"true\" com a nota"
 
 # STACK_DESCRIPTION é texto livre: nenhum valor gera aviso de valor.
 val_case=0
@@ -731,7 +778,7 @@ val_file="$val_dir/invalid_and_missing.conf"
 printf '%s\n' 'JIRA_ENABLED="sim"' > "$val_file"
 run_loader "$val_file" "$val_dir/invalid_and_missing" >/dev/null
 assert_eq "2" "$(count_warnings "$val_dir/invalid_and_missing.err")" "valor inválido e chaves ausentes: dois avisos no stderr"
-assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
+assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
 
 val_file="$val_dir/control_char.conf"
 val_raw="a"$'\e'"[31mb"
@@ -867,7 +914,7 @@ printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_miss_projects/semlinh
 # rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
 rs_miss_expected() {
   local file="$1"
-  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"'
+  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"'
 }
 
 rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_incomplete")"
@@ -1298,6 +1345,328 @@ assert_contains "$none_log_text" "- Quais são os impactos negativos possíveis?
 assert_not_contains "$none_log_text" "Existe impacto em produção?" "Nenhum: o prompt não tem a pergunta de impacto em produção"
 assert_not_contains "$none_output" "Existe impacto em produção?" "Nenhum: a saída (stdout+stderr) não tem a pergunta de impacto em produção"
 assert_eq "0" "$(count_warnings "$none_dir/output")" "Nenhum (com alpha.conf incompleto em projects/): nenhum aviso na saída"
+
+echo
+echo "== main(): TDD_ENABLED de ponta a ponta nos prompts de Tech Leader, Desenvolvimento e Review =="
+# Referências fixas dos blocos que dependem de TDD_ENABLED. Com a TDD ligada, cada uma é o
+# texto de antes da flag.
+tdd_tl_rules_on='Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
+não presuma.
+
+O plano deve ser pensado para ser executado usando a metodologia TDD. Quem vai executar o
+plano é um(a) desenvolvedor(a) IA em outra sessão — não é você.
+
+O plano deve terminar com estas duas seções:
+## Critérios de aceite
+Se o ticket já trouxer critérios de aceite na descrição, não copie cegamente: avalie
+cada um à luz do plano técnico. Se algum não fizer mais sentido, remova e explique o
+porquê; se faltar algo que o plano exige, adicione. Essa seção é obrigatória — a etapa
+de review usa ela para validar o trabalho feito.
+## Habilidades necessárias
+As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço.'
+tdd_dev_block_on='Siga a metodologia TDD e garanta que todos os critérios de aceite do plano sejam
+atendidos.
+
+Antes de finalizar, rode a suíte completa de testes (não só os novos) e confirme que
+passam.
+
+No final, traga um resumo do que foi feito, incluindo os testes criados/alterados.'
+tdd_review_block_on='Isso
+inclui, no mínimo: rodar a suíte de testes e confirmar que passam, e validar se os
+critérios de aceite do plano foram cumpridos.'
+# Com TDD_ENABLED="false": nenhum menciona TDD, e cada critério de aceite é verificado pela
+# forma descrita no plano.
+tdd_tl_rules_off='Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
+não presuma.
+
+Quem vai executar o plano é um(a) desenvolvedor(a) IA em outra sessão — não é você. O
+plano não deve exigir testes automatizados nem planejar infraestrutura de testes que o
+ticket não peça.
+
+O plano deve terminar com estas duas seções:
+## Critérios de aceite
+Se o ticket já trouxer critérios de aceite na descrição, não copie cegamente: avalie
+cada um à luz do plano técnico. Se algum não fizer mais sentido, remova e explique o
+porquê; se faltar algo que o plano exige, adicione. Essa seção é obrigatória — a etapa
+de review usa ela para validar o trabalho feito.
+Para cada critério, diga como ele será verificado (por exemplo, verificação manual ou
+visual, com o passo a passo) — é por essa descrição que o review vai validá-lo.
+## Habilidades necessárias
+As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço.'
+tdd_dev_block_off='Garanta que todos os critérios de aceite do plano sejam atendidos, verificando cada um
+pela forma descrita no plano.
+
+Antes de finalizar, se o projeto tiver uma suíte de testes automatizados, rode-a completa
+e confirme que passa. Se não tiver, não crie testes nem infraestrutura de testes que o
+plano não peça.
+
+No final, traga um resumo do que foi feito e, para cada critério de aceite, como ele foi
+verificado.'
+tdd_review_block_off='Isso
+inclui, no mínimo: rodar a suíte de testes, se o projeto tiver uma, e confirmar que
+passam; e validar cada critério de aceite do plano pela forma de verificação descrita
+nele.'
+
+# Referências fixas do prompt completo de cada TYPE com a TDD ligada, com as entradas de
+# check_tdd_e2e e STACK_DESCRIPTION vazia (os blocos de stack viram "."). Terminam no
+# marcador <FIM>, como po_validation_expected_all_on: o $(...) apagaria o \n final do log.
+# São lidas por indireção (tdd_ref_<type>_on), por isso o SC2034 desligado em cada uma.
+# shellcheck disable=SC2034
+tdd_ref_tech_leader_on='Você é o tech leader Senior da empresa.
+
+Você recebeu um ticket do Jira com as informações abaixo. Analise-o e monte o plano de
+ação em docs/plans/SC-20_<resumo-curto>.md — troque <resumo-curto> por um resumo do
+título da tarefa (poucas palavras, kebab-case), escolhido por você. Esse resumo serve só
+para facilitar a leitura humana do nome do arquivo; o identificador único continua sendo
+o ID do Jira.
+
+'"$tdd_tl_rules_on"'
+
+
+
+Se já existir um arquivo docs/plans/SC-20_*.md, pergunte antes de sobrescrever.
+
+---
+DADOS DE ENTRADA
+ID Jira: SC-20
+Título: Título de teste
+Descrição: '"$fake_editor_text"'
+<FIM>'
+# A última linha de tech_leader_jira termina em ": " (contexto extra vazio); o espaço vem
+# concatenado pra não deixar espaço no fim de linha neste arquivo. As crases de `auto_scrum`
+# são texto literal do template, não substituição de comando (SC2016).
+# shellcheck disable=SC2016
+tdd_ref_tech_leader_jira_on='Você é o tech leader Senior da empresa.
+
+Você recebeu o link de um ticket do Jira que já existe — o pedido não precisa ser
+retranscrito à mão.
+
+Antes de montar o plano, busque o ticket via MCP do Jira do projeto alvo, a partir do
+link informado: título, ID, descrição e anexos de imagem. Visualize os anexos de imagem
+encontrados e considere o conteúdo deles no plano técnico (ex: diagrama de arquitetura,
+print de comportamento esperado). Anexos de vídeo estão fora de escopo — não busque nem
+trate anexos de vídeo, mesmo que existam no ticket.
+
+Se a busca falhar por qualquer motivo (link inválido, ticket não encontrado, MCP
+indisponível ou não configurado neste projeto), avise o analista e peça que ele resolva
+o link/acesso antes de continuar. Se não for possível resolver, encerre esse fluxo e
+oriente o analista a recomeçar pela opção "Tech Leader - Criar plano" no menu do
+`auto_scrum`, digitando ID, título e descrição diretamente por lá — não continue esta
+conversa tentando coletar esses dados aqui.
+
+Com o ticket em mãos, analise-o e monte o plano de ação em
+docs/plans/<ID-do-ticket>_<resumo-curto>.md — troque <ID-do-ticket> pelo ID do Jira que
+você acabou de buscar e <resumo-curto> por um resumo do título da tarefa (poucas
+palavras, kebab-case), escolhido por você. Esse resumo serve só para facilitar a leitura
+humana do nome do arquivo; o identificador único continua sendo o ID do Jira buscado.
+
+'"$tdd_tl_rules_on"'
+
+
+
+Se já existir um arquivo docs/plans/<ID-do-ticket>_*.md para o ID buscado, pergunte antes
+de sobrescrever.
+
+---
+DADOS DE ENTRADA
+Link do ticket no Jira: https://jira.example.com/browse/SC-20
+Contexto extra (opcional, complementa o ticket buscado):'" "'
+<FIM>'
+# shellcheck disable=SC2034
+tdd_ref_development_on='Você é desenvolvedor(a) Senior.
+
+Foi te atribuído o serviço descrito em docs/plans/SC-20_*.md. Se o plano tiver alguma
+ambiguidade ou faltar informação técnica pra implementar, pergunte antes de prosseguir
+— não presuma.
+
+Confirme que está na branch SC-20 antes de começar; se não estiver, avise antes de
+prosseguir.
+'"$tdd_dev_block_on"'
+Não faça git add, git commit ou git push sem a minha autorização expressa.
+
+Faça só isso e espere novos comandos.
+<FIM>'
+# shellcheck disable=SC2034
+tdd_ref_review_on='Você é desenvolvedor(a) Senior.
+
+Foi te atribuído o serviço de revisar o trabalho feito na branch SC-20. Confirme
+que está nessa branch antes de revisar; se não estiver, avise antes de prosseguir.
+
+O plano do trabalho está em docs/plans/SC-20_*.md — se houver mais de um arquivo nesse padrão,
+ignore docs/plans/SC-20_review.md (é o resultado de um review anterior, não o plano).
+
+Faça um review de código completo, com o mesmo rigor que um(a) senior aplicaria —
+estilo, performance (ex.: N+1), legibilidade, segurança, o que mais for relevante. '"$tdd_review_block_on"'
+
+Liste claramente os problemas encontrados (se houver), com sugestão de correção — não
+corrija o código você mesmo, quem aplica a correção é o(a) desenvolvedor(a) numa
+próxima rodada. Se estiver tudo certo, diga explicitamente que está aprovado.
+
+Grave esse resultado (aprovado, ou a lista de problemas com sugestão de correção) em
+docs/plans/SC-20_review.md, sobrescrevendo se já existir.
+<FIM>'
+
+# Referências fixas do prompt completo com TDD_ENABLED="false": as de antes da flag com os
+# trechos de TDD trocados pelos textos desligados (os dois blocos _TL entram juntos, dentro
+# de TECH_LEADER_PLAN_RULES_BLOCK).
+# shellcheck disable=SC2034
+tdd_ref_tech_leader_off="${tdd_ref_tech_leader_on/"$tdd_tl_rules_on"/"$tdd_tl_rules_off"}"
+# shellcheck disable=SC2034
+tdd_ref_tech_leader_jira_off="${tdd_ref_tech_leader_jira_on/"$tdd_tl_rules_on"/"$tdd_tl_rules_off"}"
+# shellcheck disable=SC2034
+tdd_ref_development_off="${tdd_ref_development_on/"$tdd_dev_block_on"/"$tdd_dev_block_off"}"
+# shellcheck disable=SC2034
+tdd_ref_review_off="${tdd_ref_review_on/"$tdd_review_block_on"/"$tdd_review_block_off"}"
+
+# Um template que referencie variável de outro TYPE passaria no teste de consistência
+# genérico, mas seria substituído silenciosamente por vazio.
+assert_eq "JIRA_ID PLAN_PATH STACK_BLOCK_DEV TDD_BLOCK_DEV" "$(template_vars "$SCRIPT_DIR/../templates/development.md")" "development.md referencia exatamente as variáveis preenchidas pra esse TYPE"
+assert_eq "JIRA_ID PLAN_PATH REVIEW_PATH STACK_BLOCK_REVIEW TDD_BLOCK_REVIEW" "$(template_vars "$SCRIPT_DIR/../templates/review.md")" "review.md referencia exatamente as variáveis preenchidas pra esse TYPE"
+
+# tdd_log_text <logs_dir> <type>: imprime o único log <type>_<timestamp>.md de <logs_dir>
+# seguido do marcador <FIM> (só o marcador, se não houver log).
+tdd_log_text() {
+  local logs_dir="$1" type="$2" logs
+  logs="$(logs_for_type "$logs_dir" "$type")"
+  cat "$(head -n1 <<< "$logs")" 2>/dev/null || true
+  printf '<FIM>'
+}
+
+# check_tdd_e2e <type> <variant> <extra_conf_line> <stdin> [setup]: roda main() com
+# run_main, num case_dir próprio, e compara o prompt no log (o texto exato enviado ao
+# claude) com a referência fixa tdd_ref_<type>_on (ou _off, na variante false). O
+# .nick.conf tem as outras chaves vazias (config_keys_blank TDD_ENABLED), depois a
+# <extra_conf_line> e, conforme <variant>: true → TDD_ENABLED="true"; vazio →
+# TDD_ENABLED=""; TRUE → TDD_ENABLED="TRUE"; sem_linha → nada; false → TDD_ENABLED="false".
+check_tdd_e2e() {
+  local type="$1" variant="$2" extra_line="$3" input="$4" setup="${5:-:}"
+  local case_dir="$TEST_TMP/main_e2e_tdd/${type}_$variant"
+  local conf_line label rc logs ref_var log_text
+  conf_line="$(config_keys_blank TDD_ENABLED)"
+  if [ -n "$extra_line" ]; then
+    conf_line="$conf_line"$'\n'"$extra_line"
+  fi
+  case "$variant" in
+    true) conf_line="$conf_line"$'\n''TDD_ENABLED="true"' ;;
+    vazio) conf_line="$conf_line"$'\n''TDD_ENABLED=""' ;;
+    TRUE) conf_line="$conf_line"$'\n''TDD_ENABLED="TRUE"' ;;
+    false) conf_line="$conf_line"$'\n''TDD_ENABLED="false"' ;;
+  esac
+  label="$type, TDD_ENABLED $variant"
+  rc="$(run_main "$case_dir" "$conf_line" "$input" "$setup")"
+  logs="$(logs_for_type "$case_dir/logs" "$type")"
+  log_text="$(tdd_log_text "$case_dir/logs" "$type")"
+  assert_eq "0" "$rc" "$label: main() termina com código 0"
+  assert_eq "1" "$(grep -c . <<< "$logs" || true)" "$label: gera exatamente um log ${type}_<timestamp>.md"
+  if [ "$variant" = "false" ]; then
+    ref_var="tdd_ref_${type}_off"
+    assert_eq "${!ref_var}" "$log_text" "$label: o prompt é idêntico à referência fixa do texto desligado"
+    assert_not_contains "$log_text" "TDD" "$label: o prompt não menciona TDD"
+    # shellcheck disable=SC2016
+    # Aspas simples intencionais: '${' é o texto literal buscado no prompt.
+    assert_not_contains "$log_text" '${' "$label: nenhuma variável \${...} sobra sem substituir no prompt"
+    case "$type" in
+      development)
+        assert_contains "$log_text" "se o projeto tiver uma suíte de testes automatizados" "$label: só manda rodar a suíte se o projeto tiver uma"
+        assert_not_contains "$log_text" "rode a suíte completa de testes (não só os novos)" "$label: não manda rodar a suíte completa incondicionalmente"
+        ;;
+      review)
+        assert_contains "$log_text" "pela forma de verificação descrita" "$label: valida cada critério pela forma de verificação descrita no plano"
+        ;;
+      *)
+        assert_contains "$log_text" "diga como ele será verificado" "$label: a regra de plano exige dizer como cada critério será verificado"
+        ;;
+    esac
+  else
+    ref_var="tdd_ref_${type}_on"
+    assert_eq "${!ref_var}" "$log_text" "$label: o prompt é idêntico à referência fixa (o texto de antes da flag)"
+  fi
+  case "$variant" in
+    sem_linha)
+      assert_eq "1" "$(count_warnings "$case_dir/output")" "$label: exatamente um aviso na saída"
+      assert_contains "$(cat "$case_dir/output" 2>/dev/null || true)" "$(missing_warning "$case_dir/cwd/.nick.conf" "$tdd_note_line" 'TDD_ENABLED="true"')" "$label: o aviso de chave ausente mostra o .nick.conf e só TDD_ENABLED, sugerindo \"true\""
+      ;;
+    TRUE)
+      assert_eq "1" "$(count_warnings "$case_dir/output")" "$label: exatamente um aviso na saída"
+      assert_contains "$(cat "$case_dir/output" 2>/dev/null || true)" "$(value_warning "$case_dir/cwd/.nick.conf:$(wc -l < "$case_dir/cwd/.nick.conf")" TDD_ENABLED TRUE "$tdd_note")" "$label: o aviso de valor mostra o .nick.conf, a linha e a nota de TDD_ENABLED"
+      ;;
+    *)
+      assert_eq "0" "$(count_warnings "$case_dir/output")" "$label: nenhum aviso na saída"
+      ;;
+  esac
+}
+
+# stdin de cada TYPE: a opção do menu, as respostas do roteiro e N pra recusar o envio. Com
+# Jira desligado, tech_leader é 3, development 4 e review 5; com Jira ligado,
+# tech_leader_jira é 5. O plano vazio usa o padrão docs/plans/SC-20_*.md.
+tdd_input_tech_leader=$'3\nSC-20\nTítulo de teste\nN'
+tdd_input_tech_leader_jira=$'5\nhttps://jira.example.com/browse/SC-20\n\nN'
+tdd_input_development=$'4\nSC-20\n\nN'
+tdd_input_review=$'5\nSC-20\n\nN'
+for tdd_variant in true vazio TRUE sem_linha false; do
+  check_tdd_e2e tech_leader "$tdd_variant" "" "$tdd_input_tech_leader" "EDITOR='$fake_editor'"
+  check_tdd_e2e tech_leader_jira "$tdd_variant" 'JIRA_ENABLED="true"' "$tdd_input_tech_leader_jira"
+  check_tdd_e2e development "$tdd_variant" "" "$tdd_input_development"
+  check_tdd_e2e review "$tdd_variant" "" "$tdd_input_review"
+done
+
+echo
+echo "== main(): projeto 'Nenhum' mantém a TDD ligada nos prompts de Tech Leader, Desenvolvimento e Review =="
+# cwd sem .nick.conf e PROJECTS_DIR vazio: o menu de projetos é 1) Nenhum 2) Sair (q). stdin:
+# Nenhum (1) e depois o roteiro do TYPE.
+for tdd_none_type in tech_leader development review; do
+  tdd_none_dir="$TEST_TMP/main_e2e_tdd_none/$tdd_none_type"
+  mkdir -p "$tdd_none_dir/cwd" "$tdd_none_dir/projects"
+  tdd_none_input_var="tdd_input_$tdd_none_type"
+  tdd_none_rc=0
+  timeout 5 bash -c "cd '$tdd_none_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$tdd_none_dir/logs'; PROJECTS_DIR='$tdd_none_dir/projects'; EDITOR='$fake_editor'; main" <<< "1"$'\n'"${!tdd_none_input_var}" > "$tdd_none_dir/output" 2>&1 || tdd_none_rc=$?
+  tdd_none_ref_var="tdd_ref_${tdd_none_type}_on"
+  assert_eq "0" "$tdd_none_rc" "Nenhum, $tdd_none_type: main() termina com código 0"
+  assert_eq "${!tdd_none_ref_var}" "$(tdd_log_text "$tdd_none_dir/logs" "$tdd_none_type")" "Nenhum, $tdd_none_type: o prompt é idêntico à referência fixa (TDD ligada)"
+  assert_eq "0" "$(count_warnings "$tdd_none_dir/output")" "Nenhum, $tdd_none_type: nenhum aviso na saída"
+done
+
+# Com "Nenhum", JIRA_ENABLED fica vazio e tech_leader_jira não aparece no menu. Por isso esse
+# TYPE é renderizado sem passar pelo menu: dá source, não carrega configuração, chama os
+# build_*_blocks na ordem em que main() os chama, exporta e roda o envsubst com a lista lida
+# do próprio script — os mesmos passos de main() depois de resolve_stack.
+tdd_none_builds="$(grep -E '^  build_[a-z_]+_blocks$' "$AUTO_SCRUM_SH" | tr -d ' ' | paste -sd ';' -)"
+tdd_none_envsubst_vars="$(grep -F "envsubst '" "$AUTO_SCRUM_SH" | sed -E "s/.*envsubst '([^']*)'.*/\1/")"
+tdd_none_jira_text="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $tdd_none_builds; JIRA_LINK='https://jira.example.com/browse/SC-20'; DESCRIPTION=''; export ${tdd_none_envsubst_vars//\$/}; envsubst '$tdd_none_envsubst_vars' < '$SCRIPT_DIR/../templates/tech_leader_jira.md'; printf '<FIM>'" 2>/dev/null || true)"
+assert_eq "$tdd_ref_tech_leader_jira_on" "$tdd_none_jira_text" "Nenhum, tech_leader_jira (renderizado sem o menu): o prompt é idêntico à referência fixa (TDD ligada)"
+
+echo
+echo "== build_tdd_blocks: só TDD_ENABLED=\"false\" exato desliga a TDD nos blocos de Tech Leader, Desenvolvimento e Review =="
+# tdd_block_exact <setup> <variável>: num bash separado, dá source, roda <setup>, monta os
+# blocos na ordem de main() (build_tdd_blocks antes de build_tech_leader_blocks, que embute
+# os blocos _TL) e imprime <variável> seguida do marcador <FIM>.
+tdd_block_exact() {
+  local setup="$1" var="$2"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $setup; build_tdd_blocks; build_tech_leader_blocks; printf '%s<FIM>' \"\${$var}\"" 2>/dev/null || true
+}
+
+# Qualquer valor diferente de "false" exato (inclusive o valor global padrão, que é o caso
+# "Nenhum") mantém os três blocos idênticos ao texto de antes da flag.
+for tdd_value_setup in "TDD_ENABLED='true'" "TDD_ENABLED=''" "TDD_ENABLED='TRUE'" "TDD_ENABLED='True'" "TDD_ENABLED='sim'" "TDD_ENABLED=' false'" "TDD_ENABLED='FALSE'" ":"; do
+  tdd_value_label="$tdd_value_setup"
+  if [ "$tdd_value_setup" = ":" ]; then
+    tdd_value_label="TDD_ENABLED com o valor global padrão"
+  fi
+  assert_eq "$tdd_tl_rules_on<FIM>" "$(tdd_block_exact "$tdd_value_setup" TECH_LEADER_PLAN_RULES_BLOCK)" "$tdd_value_label: TECH_LEADER_PLAN_RULES_BLOCK idêntico ao texto de antes da flag"
+  assert_eq "$tdd_dev_block_on<FIM>" "$(tdd_block_exact "$tdd_value_setup" TDD_BLOCK_DEV)" "$tdd_value_label: TDD_BLOCK_DEV é o texto ligado"
+  assert_eq "$tdd_review_block_on<FIM>" "$(tdd_block_exact "$tdd_value_setup" TDD_BLOCK_REVIEW)" "$tdd_value_label: TDD_BLOCK_REVIEW é o texto ligado"
+done
+
+for tdd_off_check in "TECH_LEADER_PLAN_RULES_BLOCK|$tdd_tl_rules_off" "TDD_BLOCK_DEV|$tdd_dev_block_off" "TDD_BLOCK_REVIEW|$tdd_review_block_off"; do
+  tdd_off_var="${tdd_off_check%%|*}"
+  tdd_off_block="$(tdd_block_exact "TDD_ENABLED='false'" "$tdd_off_var")"
+  assert_eq "${tdd_off_check#*|}<FIM>" "$tdd_off_block" "TDD_ENABLED=\"false\": $tdd_off_var idêntico à referência fixa do texto desligado"
+  assert_not_contains "$tdd_off_block" "TDD" "TDD_ENABLED=\"false\": $tdd_off_var não menciona TDD"
+  assert_not_contains "$tdd_off_block" $'\n\n\n' "TDD_ENABLED=\"false\": $tdd_off_var não deixa linha em branco sobrando"
+  # shellcheck disable=SC2016
+  # Aspas simples intencionais: '${' é o texto literal buscado no bloco.
+  assert_not_contains "$tdd_off_block" '${' "TDD_ENABLED=\"false\": $tdd_off_var não tem \${...} literal"
+done
 
 echo
 echo "== consistência: variáveis dos templates = lista do envsubst = lista do export =="

@@ -15,66 +15,9 @@ failures=0
 TEST_TMP="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMP"' EXIT
 
-# assert_eq <expected> <actual> <description>
-assert_eq() {
-  local expected="$1" actual="$2" description="$3"
-  if [ "$expected" = "$actual" ]; then
-    echo "  OK: $description"
-  else
-    echo "  FAIL: $description (esperado: '$expected', obtido: '$actual')"
-    failures=$((failures + 1))
-  fi
-}
-
-# assert_contains <haystack> <needle> <description>
-assert_contains() {
-  local haystack="$1" needle="$2" description="$3"
-  case "$haystack" in
-    *"$needle"*)
-      echo "  OK: $description"
-      ;;
-    *)
-      echo "  FAIL: $description (esperado conter: '$needle')"
-      failures=$((failures + 1))
-      ;;
-  esac
-}
-
-# assert_not_contains <haystack> <needle> <description>
-assert_not_contains() {
-  local haystack="$1" needle="$2" description="$3"
-  case "$haystack" in
-    *"$needle"*)
-      echo "  FAIL: $description (não deveria conter: '$needle')"
-      failures=$((failures + 1))
-      ;;
-    *)
-      echo "  OK: $description"
-      ;;
-  esac
-}
-
-# assert_exists <path> <description>
-assert_exists() {
-  local path="$1" description="$2"
-  if [ -e "$path" ]; then
-    echo "  OK: $description"
-  else
-    echo "  FAIL: $description (não existe: '$path')"
-    failures=$((failures + 1))
-  fi
-}
-
-# assert_not_exists <path> <description>
-assert_not_exists() {
-  local path="$1" description="$2"
-  if [ -e "$path" ]; then
-    echo "  FAIL: $description (não deveria existir: '$path')"
-    failures=$((failures + 1))
-  else
-    echo "  OK: $description"
-  fi
-}
+# Os assert_* (e o contador failures que eles incrementam) vêm do helper compartilhado.
+# shellcheck source=SCRIPTDIR/../../lib/tests/assert.sh
+source "$SCRIPT_DIR/../../lib/tests/assert.sh"
 
 # run_loader <config_file> <out_prefix> [setup]: dá source no auto_scrum.sh num bash
 # separado, roda [setup] (padrão: nada), chama load_project_config <config_file> com
@@ -113,11 +56,11 @@ run_init_project() {
 }
 
 # config_keys_blank [except_key]: imprime uma linha CHAVE="" pra cada chave de
-# PROJECT_CONFIG_KEYS (lida do próprio script), menos <except_key>. Serve pra montar
+# CONFIG_KEYS (registrada pelo próprio script), menos <except_key>. Serve pra montar
 # fixtures completas, que não disparam o aviso de chave ausente.
 config_keys_blank() {
   local except_key="${1:-}"
-  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; for key in \"\${PROJECT_CONFIG_KEYS[@]}\"; do [ \"\$key\" = '$except_key' ] || printf '%s=\"\"\n' \"\$key\"; done"
+  timeout 2 bash -c "source '$AUTO_SCRUM_SH'; for key in \"\${CONFIG_KEYS[@]}\"; do [ \"\$key\" = '$except_key' ] || printf '%s=\"\"\n' \"\$key\"; done"
 }
 
 # Nota de PRODUCTION_ENABLED: é a única chave com texto próprio nos avisos, porque o padrão
@@ -286,10 +229,10 @@ assert_eq "" "$(cat "$init_dir/skeleton_loader.err" 2>/dev/null || echo 'sem std
 assert_eq "true" "$(loaded_value "$init_cwd_file" TDD_ENABLED)" "esqueleto carregado pelo leitor: TDD_ENABLED vem \"true\""
 
 skeleton_keys="$(grep -oE '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null | tr -d '=' | sort || true)"
-config_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${PROJECT_CONFIG_KEYS[@]}\" | sort")"
-assert_eq "$config_keys" "$skeleton_keys" "chaves atribuídas no esqueleto são exatamente as de PROJECT_CONFIG_KEYS"
+config_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\" | sort")"
+assert_eq "$config_keys" "$skeleton_keys" "chaves atribuídas no esqueleto são exatamente as de CONFIG_KEYS"
 
-# Testes-guarda da regra liga/desliga (is_toggle_config_key): o esqueleto é o modelo, então
+# Testes-guarda da regra liga/desliga (config_is_toggle_key, em lib/config.sh): o esqueleto é o modelo, então
 # toda chave com "false" ou "true" nele precisa passar pela checagem de valor, e toda chave
 # com "" não. skeleton_toggle_lines guarda a linha inteira, com o padrão da chave.
 skeleton_guard_dir="$init_dir/skeleton_guard"
@@ -341,8 +284,8 @@ while IFS= read -r skeleton_line; do
   fi
 done <<< "$(grep -E '^  [A-Z_]+=' "$skeleton_guard_dir/empty.err" 2>/dev/null || true)"
 assert_eq "" "$skeleton_unmatched_lines" "cada linha sugerida pelo aviso de chave ausente é idêntica à linha do esqueleto"
-config_keys_ordered="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${PROJECT_CONFIG_KEYS[@]}\"")"
-assert_eq "$config_keys_ordered" "$(printf '%s' "$skeleton_suggested_keys")" "as chaves sugeridas pelo aviso de chave ausente são exatamente as de PROJECT_CONFIG_KEYS, na mesma ordem"
+config_keys_ordered="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"")"
+assert_eq "$config_keys_ordered" "$(printf '%s' "$skeleton_suggested_keys")" "as chaves sugeridas pelo aviso de chave ausente são exatamente as de CONFIG_KEYS, na mesma ordem"
 
 # Ida e volta: o bloco sugerido (o aviso menos a 1ª linha, inclusive as linhas de nota),
 # colado como está num arquivo novo, carrega sem nenhum aviso.
@@ -351,8 +294,8 @@ skeleton_pasted_result="$(run_loader "$skeleton_guard_dir/pasted.conf" "$skeleto
 assert_eq "|false|false|false|false" "$skeleton_pasted_result" "bloco do aviso de chave ausente colado num arquivo: as chaves carregam com o padrão do esqueleto"
 assert_eq "" "$(cat "$skeleton_guard_dir/pasted.err" 2>/dev/null || echo 'sem stderr')" "bloco do aviso de chave ausente colado num arquivo: carrega sem nenhum aviso"
 
-# Chave nova só em PROJECT_CONFIG_KEYS: entra nas duas checagens sem mudar a lógica.
-skeleton_new_setup='PROJECT_CONFIG_KEYS+=(NEW_FLAG_ENABLED NEW_TEXT)'
+# Chave nova só no registro (config_register_key): entra nas duas checagens sem mudar a lógica.
+skeleton_new_setup="config_register_key NEW_FLAG_ENABLED 'false' '' 'NEW_FLAG_ENABLED: flag nova.'; config_register_key NEW_TEXT '' '' 'NEW_TEXT: texto novo.'"
 skeleton_new_file="$skeleton_guard_dir/new_keys.conf"
 { cat "$init_cwd_file"; printf '%s\n' 'NEW_FLAG_ENABLED="sim"' 'NEW_TEXT="sim"'; } > "$skeleton_new_file"
 skeleton_new_line="$(grep -nxF 'NEW_FLAG_ENABLED="sim"' "$skeleton_new_file" | cut -d: -f1)"
@@ -621,14 +564,14 @@ miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
 miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
 assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
 assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de PROJECT_CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
 assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
 : > "$miss_dir/empty_file.conf"
 miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
 assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
 assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as seis chaves na ordem de PROJECT_CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as seis chaves na ordem de CONFIG_KEYS"
 
 # Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
 # outras chaves, então o bloco só pode listar a chave do caso.
@@ -1685,9 +1628,112 @@ assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates s�
 assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
 
 echo
-echo "== auto_scrum.sh: nenhuma linha source/. (config lida só por load_project_config) =="
-source_lines="$(grep -nE '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
-assert_eq "" "$source_lines" "auto_scrum.sh não tem nenhuma linha source/."
+echo "== auto_scrum.sh: a única linha source/. é a de lib/config.sh (config nunca é executada) =="
+# A configuração nunca é executada: o leitor (config_load) não usa source/eval, e lib/config.sh
+# não tem source, . nem eval (teste estrutural em lib/tests/test_config.sh). Aqui, a lista
+# inteira de linhas source/. tem de ser só a da biblioteca.
+# shellcheck disable=SC2016
+# Aspas simples intencionais: '$SCRIPT_DIR' é o texto literal buscado no código-fonte.
+source_lines="$(grep -E '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
+# shellcheck disable=SC2016
+assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"' "$source_lines" "auto_scrum.sh tem uma linha source/. só, a de lib/config.sh"
+
+echo
+echo "== auto_scrum.sh: carrega lib/config.sh com a diretiva do shellcheck logo acima =="
+# shellcheck disable=SC2016
+lib_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/config.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$lib_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/config.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/../lib/config.sh" "$( [ -n "$lib_source_number" ] && sed -n "$((lib_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/config.sh'"
+
+echo
+echo "== lib/config.sh: nenhuma chave concreta do auto_scrum na biblioteca nem nos testes dela =="
+# As chaves vêm do próprio registro do auto_scrum, então este teste cobre sozinho as chaves
+# futuras. -w não casa um nome mais longo (o _ conta como caractere de palavra).
+LIB_CONFIG_SH="$SCRIPT_DIR/../../lib/config.sh"
+LIB_TEST_CONFIG_SH="$SCRIPT_DIR/../../lib/tests/test_config.sh"
+registered_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"" 2>/dev/null || true)"
+# Só garante que o laço abaixo não roda vazio, sem fixar a quantidade de chaves.
+assert_eq "true" "$([ -n "$registered_keys" ] && echo true || echo false)" "o auto_scrum registra pelo menos uma chave"
+for registered_key in $registered_keys; do
+  assert_eq "" "$(grep -nw "$registered_key" "$LIB_CONFIG_SH" || true)" "lib/config.sh não cita $registered_key"
+  assert_eq "" "$(grep -nw "$registered_key" "$LIB_TEST_CONFIG_SH" || true)" "lib/tests/test_config.sh não cita $registered_key"
+done
+
+echo
+echo "== auto_scrum.sh: o namespace config_/CONFIG_ é só da biblioteca =="
+auto_scrum_code="$(grep -vE '^[[:space:]]*#' "$AUTO_SCRUM_SH" || true)"
+assert_eq "" "$(grep -nE '^[[:space:]]*(function[[:space:]]+)?config_[A-Za-z0-9_]*[[:space:]]*\(\)' <<< "$auto_scrum_code" || true)" "auto_scrum.sh não define função config_*"
+assert_eq "" "$(grep -nE '(^|[^A-Za-z0-9_])CONFIG_[A-Za-z0-9_]*(\[[^]]*\])?\+?=' <<< "$auto_scrum_code" || true)" "auto_scrum.sh não atribui global CONFIG_*"
+for old_name in is_toggle_config_key warn_malformed_config_line warn_invalid_toggle_value warn_missing_config_keys; do
+  assert_eq "" "$(grep -nE "^[[:space:]]*${old_name}[[:space:]]*\(\)" "$AUTO_SCRUM_SH" || true)" "não sobrou definição de $old_name"
+done
+for old_name in PROJECT_CONFIG_KEYS CWD_CONFIG_NAME; do
+  assert_eq "" "$(grep -nw "$old_name" "$AUTO_SCRUM_SH" || true)" "não sobrou $old_name"
+done
+
+echo
+echo "== auto_scrum.sh: as chaves são registradas num lugar só, um bloco contíguo no topo =="
+# register_block_problems <arquivo> <chaves>: imprime um problema por linha (nada, se o
+# registro de <arquivo> está certo), comparando com <chaves> (uma por linha, na ordem de
+# CONFIG_KEYS). Não recorta o bloco por linha em branco: o comentário de uma chave pode ter
+# linha vazia (o esqueleto a escreve como "#"). Usa os números de linha das próprias chamadas
+# "config_register_key" (fora de função, na coluna 0):
+#   - toda chamada fora de comentário está na coluna 0 e há uma por chave;
+#   - os nomes saem na ordem de <chaves>;
+#   - entre a primeira e a última chamada não há definição de função nem atribuição CHAVE=;
+#   - a última chamada vem antes da primeira função (o bloco fica no topo).
+register_block_problems() {
+  local file="$1" expected_keys="$2" code calls first last first_function
+  code="$(grep -vE '^[[:space:]]*#' "$file" || true)"
+  calls="$(grep -nE '^config_register_key [A-Z0-9_]+' "$file" || true)"
+  if [ "$(grep -cw 'config_register_key' <<< "$code" || true)" != "$(grep -c . <<< "$expected_keys" || true)" ]; then
+    echo "número de chamadas config_register_key diferente do número de chaves"
+  fi
+  if [ "$(cut -d' ' -f2 <<< "$calls")" != "$expected_keys" ]; then
+    echo "nomes das chamadas fora da ordem de CONFIG_KEYS"
+  fi
+  first="$(head -n1 <<< "$calls" | cut -d: -f1)"
+  last="$(tail -n1 <<< "$calls" | cut -d: -f1)"
+  first_function="$(grep -nE '^[a-z_]+\(\) \{' "$file" | head -n1 | cut -d: -f1 || true)"
+  if [ -z "$first" ] || [ -z "$first_function" ]; then
+    echo "sem chamada de registro ou sem função no arquivo"
+    return 0
+  fi
+  if sed -n "${first},${last}p" "$file" | grep -qE '^([a-z_]+\(\)|[A-Z_]+=)'; then
+    echo "código entre a primeira e a última chamada de registro"
+  fi
+  if [ "$last" -ge "$first_function" ]; then
+    echo "chamada de registro depois da primeira função"
+  fi
+}
+assert_eq "" "$(register_block_problems "$AUTO_SCRUM_SH" "$registered_keys")" "o bloco de registro é contíguo, no topo, com uma chamada por chave na ordem de CONFIG_KEYS e nenhuma fora dele"
+# Regressão: linha vazia dentro do comentário da primeira chave (depois da 1ª linha do
+# comentário) não quebra a checagem.
+register_dir="$TEST_TMP/register_block"
+mkdir -p "$register_dir"
+awk '{print} /^config_register_key /{found++} found == 1 && !done && !/^config_register_key /{print ""; done=1}' "$AUTO_SCRUM_SH" > "$register_dir/blank_comment_line.sh"
+assert_eq "1" "$(diff "$AUTO_SCRUM_SH" "$register_dir/blank_comment_line.sh" | grep -c '^> $' || true)" "cópia de regressão: tem uma linha vazia a mais, dentro do bloco de registro"
+assert_eq "" "$(register_block_problems "$register_dir/blank_comment_line.sh" "$registered_keys")" "linha vazia no comentário de uma chave: o bloco de registro continua válido"
+# Controle negativo: uma chamada a mais no fim do arquivo é pega.
+{ cat "$AUTO_SCRUM_SH"; printf '%s\n' "config_register_key LATE_ENABLED \"false\" \"\" 'LATE_ENABLED: tarde.'"; } > "$register_dir/late_key.sh"
+assert_contains "$(register_block_problems "$register_dir/late_key.sh" "$registered_keys")" "chamada de registro depois da primeira função" "chave registrada no fim do arquivo: a checagem acusa"
+skeleton_body="$(awk '/^print_project_skeleton\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
+assert_contains "$skeleton_body" "print_project_skeleton" "print_project_skeleton() existe"
+assert_eq "" "$(grep -E '^[[:space:]]*[A-Z_]+=' <<< "$skeleton_body" || true)" "o corpo de print_project_skeleton não tem nenhuma linha CHAVE="
+
+echo
+echo "== auto_scrum: chave nova só no registro aparece no esqueleto e nos dois avisos =="
+newkey_dir="$TEST_TMP/new_key"
+mkdir -p "$newkey_dir"
+newkey_setup="config_register_key NEW_X_ENABLED 'false' '' 'NEW_X_ENABLED: chave extra de teste.'"
+newkey_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $newkey_setup; print_project_skeleton" 2>/dev/null || true)"
+assert_contains "$newkey_skeleton" $'# NEW_X_ENABLED: chave extra de teste.\nNEW_X_ENABLED="false"' "a chave extra aparece no esqueleto, com o comentário e NEW_X_ENABLED=\"false\""
+config_keys_blank > "$newkey_dir/without.conf"
+run_loader "$newkey_dir/without.conf" "$newkey_dir/without" "$newkey_setup" >/dev/null
+assert_eq "$(missing_warning "$newkey_dir/without.conf" 'NEW_X_ENABLED="false"')" "$(cat "$newkey_dir/without.err" 2>/dev/null || true)" "a chave extra entra no aviso de chave ausente"
+printf '%s\n' "$(config_keys_blank)" 'NEW_X_ENABLED="sim"' > "$newkey_dir/invalid.conf"
+run_loader "$newkey_dir/invalid.conf" "$newkey_dir/invalid" "$newkey_setup" >/dev/null
+assert_eq "$(value_warning "$newkey_dir/invalid.conf:7" NEW_X_ENABLED sim "$default_off_note")" "$(cat "$newkey_dir/invalid.err" 2>/dev/null || true)" "a chave extra com \"sim\" recebe o aviso de valor"
 
 echo
 echo "== menus: \"Sair (q)\" é o último número; o número, q ou Q encerram com código 0 =="

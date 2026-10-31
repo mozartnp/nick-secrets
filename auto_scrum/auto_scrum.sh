@@ -8,12 +8,54 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
-CWD_CONFIG_NAME=".nick.conf"
-# Keys read from the project config by load_project_config. A toggle key ("true"/"false")
-# must end in _ENABLED: is_toggle_config_key is the only place that decides it. Every key
-# here must also be in print_project_skeleton, with its default from config_key_default
-# ("false" for a toggle, "true" for TDD_ENABLED, "" for a text key).
-PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED)
+# The project config reader (shared with the other nick tools) lives in lib/config.sh. The
+# path is relative to this script, so auto_scrum/ depends on its sibling lib/.
+# shellcheck source=SCRIPTDIR/../lib/config.sh
+source "$SCRIPT_DIR/../lib/config.sh"
+
+# Project config keys, in skeleton order — the only place that lists them (see ABOUT.md).
+# config_register_key <name> <default> <note> <skeleton comment>
+# A toggle key ("true"/"false") must end in _ENABLED (config_is_toggle_key) and default to
+# "false" ("true" only for TDD_ENABLED, on by default); a text key defaults to "". The note is
+# the key-specific text both config warnings show, and only two keys have one, each because
+# the generic text would mislead:
+#   - PRODUCTION_ENABLED is the only flag whose off default removes something the PO prompt
+#     already had. The note shows both ways out, "true" and "false", so a project without
+#     production doesn't turn the question on just to silence the warning. It must not
+#     repeat the PO question itself: end-to-end checks read stdout and stderr together and
+#     look for that question to tell whether it reached the prompt;
+#   - TDD_ENABLED is the only flag that is on by default: an absent or invalid value keeps
+#     TDD on, so the note says that instead of "a opção está desligada.".
+# A bad registration stops the script on load (set -e): it is a programming error.
+config_register_key STACK_DESCRIPTION "" "" \
+'STACK_DESCRIPTION: stack técnica usada no prompt do Tech Leader/Desenvolvimento
+(texto livre, sem ponto final no fim — o template já adiciona).
+Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"'
+config_register_key SENTRY_ENABLED "false" "" \
+'SENTRY_ENABLED: "true" se esse projeto usa Sentry — a opção "PO - Criar ticket a partir
+do Sentry" aparece no menu principal (o PO busca o issue pelo MCP do Sentry do .mcp.json
+do projeto alvo), e os prompts de PO e Tech Leader passam a mencionar links de erro
+externo. Padrão é opt-in: vazio ou "false" esconde a opção e tira a menção dos prompts.'
+config_register_key PERMISSION_ENABLED "false" "" \
+'PERMISSION_ENABLED: "true" se esse projeto tem um sistema de permissões — o PO passa a
+avaliar, pra cada pedido, se será necessário adicionar uma nova permissão. Padrão é
+opt-in: vazio ou "false" tira essa pergunta do prompt do PO.'
+config_register_key JIRA_ENABLED "false" "" \
+'JIRA_ENABLED: "true" se esse projeto tem o MCP do Jira configurado (.mcp.json do
+projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
+principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.'
+config_register_key PRODUCTION_ENABLED "false" \
+'a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.' \
+'PRODUCTION_ENABLED: "true" se esse projeto já está em produção — o PO passa a avaliar,
+pra cada pedido, se existe impacto em produção. Padrão é opt-in: vazio ou "false" tira
+essa pergunta do prompt do PO. Ligue ("true") quando o projeto entrar em produção.'
+config_register_key TDD_ENABLED "true" \
+'a metodologia TDD continua ligada nos prompts de Tech Leader, Desenvolvimento e Review. Use "false" só em projeto sem testes automatizados.' \
+'TDD_ENABLED: "true" mantém a metodologia TDD nos prompts de Tech Leader, Desenvolvimento
+e Review. Use "false" só em projeto sem testes automatizados (ex: site em HTML estático):
+o plano passa a dizer como cada critério de aceite será verificado, e a suíte só roda se
+existir. Ao contrário das outras chaves *_ENABLED, vazio ou valor inválido mantêm a TDD
+ligada — só "false" desliga.'
 
 TITLE=""
 DESCRIPTION=""
@@ -204,179 +246,20 @@ warn_legacy_project_files() {
   done
 }
 
-# load_project_config <file>
-# Reads a project config file without source/eval: the file may live in the target
-# project's repository, where anyone on that team can edit it, so it must never run code
-# in the shell of whoever runs auto_scrum. Only lines KEY="value" whose KEY is in
-# PROJECT_CONFIG_KEYS (exact match) are applied, and the value is assigned literally via
-# printf -v (no $VAR, $(...), backtick or escape expansion). Surrounding spaces/tabs (and
-# the \r of CRLF files) are trimmed first. Everything else — comments, blank lines,
-# unknown keys, commands — is ignored; a line for a known key that doesn't follow the
-# format (no quotes, quotes inside the value, trailing comment/command, but also the
-# "almost right" `export KEY=...` and `KEY = ...`) is ignored with a warning on stderr, so
-# a typo doesn't silently turn a flag off.
-# Two more checks warn on stderr and never stop the run (the function always returns 0):
-#   - every key of PROJECT_CONFIG_KEYS must be declared in the file. The missing ones get a
-#     single warning after the loop (warn_missing_config_keys), with the lines to add. A
-#     malformed line counts as present, since it already gets the format warning; a
-#     commented line or a lookalike key (JIRA_ENABLED_OLD, JIRA_ENABLE) doesn't, since the
-#     reader never sees the key in them;
-#   - an accepted line of a toggle key (is_toggle_config_key) whose value isn't "true",
-#     "false" or "" gets one warning per line (warn_invalid_toggle_value). The value is still
-#     assigned as is, so for the opt-in flags only "true" turns the option on, as before,
-#     and TDD_ENABLED (on by default) only turns off with "false" (build_tdd_blocks).
-# Both live here, the only reader, so they cover the cwd, --projeto= and the menu alike,
-# while "Nenhum" (no file loaded) never warns.
-# Local variables must stay lowercase: an uppercase local named like a key would make
-# printf -v set the local instead of the global.
+# load_project_config <file>: loads a project config file through config_load (lib/config.sh),
+# which holds the reader, its grammar and the three warnings (format, missing key, invalid
+# toggle value) — see the comment there. It stays here, as a thin call, because the tests
+# and the rest of the script call this name, and because this is the auto_scrum place to
+# record anything about the loaded file without putting a caller global inside the library.
 load_project_config() {
-  local file="$1"
-  local line="" line_number=0 key value seen_keys=" " missing_keys=()
-  while IFS= read -r line || [ -n "$line" ]; do
-    line_number=$((line_number + 1))
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    for key in "${PROJECT_CONFIG_KEYS[@]}"; do
-      case "$line" in
-        "$key"=*)
-          seen_keys+="$key "
-          ;;
-        # Only a space right after the name counts, so a lookalike key such as
-        # STACK_DESCRIPTION_EXTRA = "x" stays silently ignored.
-        "export $key"=* | "export $key"[[:space:]]* | "$key"[[:space:]]*=*)
-          seen_keys+="$key "
-          warn_malformed_config_line "$file:$line_number" "$key"
-          continue 2
-          ;;
-        *) continue ;;
-      esac
-      value="${line#"$key"=}"
-      case "$value" in
-        \"*\")
-          value="${value#\"}"
-          value="${value%\"}"
-          case "$value" in
-            *\"*) ;;
-            *)
-              printf -v "$key" '%s' "$value"
-              if is_toggle_config_key "$key"; then
-                case "$value" in
-                  true | false | "") ;;
-                  *) warn_invalid_toggle_value "$file:$line_number" "$key" "$value" ;;
-                esac
-              fi
-              continue 2
-              ;;
-          esac
-          ;;
-      esac
-      warn_malformed_config_line "$file:$line_number" "$key"
-    done
-  done < "$file"
-  for key in "${PROJECT_CONFIG_KEYS[@]}"; do
-    case "$seen_keys" in
-      *" $key "*) ;;
-      *) missing_keys+=("$key") ;;
-    esac
-  done
-  if [ "${#missing_keys[@]}" -gt 0 ]; then
-    warn_missing_config_keys "$file" "${missing_keys[@]}"
-  fi
-}
-
-# warn_malformed_config_line <file:line_number> <key>: the single warning text for a
-# known-key line that load_project_config ignores for not following KEY="value". The
-# location comes already joined — passing the bare "$file" here makes shellcheck think
-# the function writes to the file load_project_config is reading (SC2094).
-warn_malformed_config_line() {
-  local location="$1" key="$2"
-  echo "Aviso: $location: linha de $key ignorada (formato esperado: $key=\"valor\", sem aspas duplas dentro do valor)" >&2
-}
-
-# warn_invalid_toggle_value <file:line_number> <key> <value>: the single warning text for an
-# accepted toggle line whose value isn't "true", "false" or "". The value comes from a file
-# another team may edit and goes straight to the terminal, so control characters become "?"
-# ([:cntrl:], not [:print:], which under the C locale would also mangle the bytes of "não").
-# That is only for the text: the variable keeps the raw value. Only toggle keys get here, so
-# STACK_DESCRIPTION is never shown — it is free text that may name a client or hint at
-# infrastructure, and it is never validated. The location comes already joined, as in
-# warn_malformed_config_line (SC2094).
-warn_invalid_toggle_value() {
-  local location="$1" key="$2" value="$3" note
-  value="${value//[[:cntrl:]]/?}"
-  note="$(config_key_note "$key")"
-  echo "Aviso: $location: valor \"$value\" inválido para $key (valores aceitos: \"true\", \"false\" ou \"\") — ${note:-a opção está desligada.}" >&2
-}
-
-# is_toggle_config_key <key>: succeeds when <key> is a toggle ("true"/"false") key, i.e. its
-# name ends in _ENABLED. This is the only place with that rule — both checks and
-# config_key_default use it — instead of a separate key list, which would be one more place
-# to update for every new flag. The skeleton consistency test guards it: a key with "false"
-# or "true" in print_project_skeleton must be checked as a toggle, and a key with "" must not.
-is_toggle_config_key() {
-  case "$1" in
-    *_ENABLED) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# config_key_default <key>: prints the default value of <key> (without quotes) — the value
-# print_project_skeleton writes and the missing-key warning suggests. This is the only place
-# with a per-key default: "true" for TDD_ENABLED (the only toggle that is on by default),
-# "false" for the other toggles (is_toggle_config_key) and "" for text keys.
-config_key_default() {
-  case "$1" in
-    TDD_ENABLED) echo "true" ;;
-    *) if is_toggle_config_key "$1"; then echo "false"; fi ;;
-  esac
-}
-
-# config_key_note <key>: prints the note both warnings show for <key>, or nothing — the only
-# key-specific warning text. Without a note, the invalid-value warning ends with "a opção
-# está desligada.". Two keys have one, each because that generic text would mislead:
-#   - PRODUCTION_ENABLED is the only flag whose off default removes something the PO prompt
-#     already had. The note shows both ways out, "true" and "false", so a project without
-#     production doesn't turn the question on just to silence the warning. It must not
-#     repeat the PO question itself: end-to-end checks read stdout and stderr together and
-#     look for that question to tell whether it reached the prompt;
-#   - TDD_ENABLED is the only flag that is on by default: an absent or invalid value keeps
-#     TDD on, so the note says that instead of "a opção está desligada.".
-config_key_note() {
-  case "$1" in
-    PRODUCTION_ENABLED)
-      echo 'a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.'
-      ;;
-    TDD_ENABLED)
-      echo 'a metodologia TDD continua ligada nos prompts de Tech Leader, Desenvolvimento e Review. Use "false" só em projeto sem testes automatizados.'
-      ;;
-  esac
-}
-
-# warn_missing_config_keys <file> <key>...: the single warning for a loaded file that lacks
-# some keys — one block, and only its first line starts with "Aviso:". Each missing key gets
-# the line to add, with its default from config_key_default (the same line
-# print_project_skeleton writes), which keeps today's behavior: an absent key is empty, and
-# empty works like the default. A key note goes on a comment line before its key, not at the
-# end of the line, so the block can be pasted into the file as is (a trailing comment would
-# get the format warning). It never suggests --init: that overwrites the file and would wipe
-# the values already in it.
-warn_missing_config_keys() {
-  local file="$1" key note
-  shift
-  echo "Aviso: $file não tem todas as chaves da configuração — cada chave ausente funciona como o valor sugerido abaixo. Adicione ao arquivo:" >&2
-  for key in "$@"; do
-    note="$(config_key_note "$key")"
-    if [ -n "$note" ]; then
-      echo "  # $key: $note" >&2
-    fi
-    echo "  $key=\"$(config_key_default "$key")\"" >&2
-  done
+  config_load "$1"
 }
 
 # resolve_stack <project_name_via_argv_or_empty>
 # Sets the project config (STACK_DESCRIPTION and the *_ENABLED flags) via
 # load_project_config, searching in this order:
-#   1. $PWD/.nick.conf (CWD_CONFIG_NAME) — only the cwd itself, no parent directories.
+#   1. $PWD/.nick.conf (config_cwd_file, lib/config.sh) — only the cwd itself, no parent
+#      directories.
 #      When present it wins: no menu, no legacy warning, and a --projeto= name is ignored
 #      (with a warning on stderr, and not validated — the flag isn't used at all);
 #   2. auto_scrum/projects/<name>.conf, with the name passed as an argument (error if it
@@ -389,7 +272,8 @@ warn_missing_config_keys() {
 resolve_stack() {
   local project_arg="$1"
   local file
-  local cwd_config="$PWD/$CWD_CONFIG_NAME"
+  local cwd_config
+  cwd_config="$(config_cwd_file)"
 
   if [ -f "$cwd_config" ]; then
     if [ -n "$project_arg" ]; then
@@ -599,45 +483,12 @@ de review usa ela para validar o trabalho feito.${TDD_CRITERIA_BLOCK_TL}
 As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço."
 }
 
-# print_project_skeleton: prints (stdout) the project config skeleton, with the keys of
-# PROJECT_CONFIG_KEYS at their default value (config_key_default). Both init_project
-# destinations write this same output, so they can't drift apart. The file must stay
-# friendly to the target team's generic text hooks (pre-commit trailing-whitespace/
-# end-of-file-fixer/mixed-line-ending): no shebang, no trailing spaces, LF, ending with a
-# newline — covered by tests.
+# print_project_skeleton: prints (stdout) the project config skeleton — the keys registered
+# at the top of this script, at their default value, with their comments — through
+# config_print_skeleton (lib/config.sh), which holds the format rules. Both init_project
+# destinations write this same output, so they can't drift apart.
 print_project_skeleton() {
-  cat <<'EOF'
-# Config do projeto pro auto_scrum. Preencha as variáveis abaixo e salve.
-# Não é executado: o auto_scrum lê só linhas CHAVE="valor" (aspas duplas, sem aspas dentro do valor nem comentário no fim da linha) das chaves abaixo.
-# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".
-# STACK_DESCRIPTION: stack técnica usada no prompt do Tech Leader/Desenvolvimento
-# (texto livre, sem ponto final no fim — o template já adiciona).
-# Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"
-STACK_DESCRIPTION=""
-# SENTRY_ENABLED: "true" se esse projeto usa Sentry — a opção "PO - Criar ticket a partir
-# do Sentry" aparece no menu principal (o PO busca o issue pelo MCP do Sentry do .mcp.json
-# do projeto alvo), e os prompts de PO e Tech Leader passam a mencionar links de erro
-# externo. Padrão é opt-in: vazio ou "false" esconde a opção e tira a menção dos prompts.
-SENTRY_ENABLED="false"
-# PERMISSION_ENABLED: "true" se esse projeto tem um sistema de permissões — o PO passa a
-# avaliar, pra cada pedido, se será necessário adicionar uma nova permissão. Padrão é
-# opt-in: vazio ou "false" tira essa pergunta do prompt do PO.
-PERMISSION_ENABLED="false"
-# JIRA_ENABLED: "true" se esse projeto tem o MCP do Jira configurado (.mcp.json do
-# projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
-# principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.
-JIRA_ENABLED="false"
-# PRODUCTION_ENABLED: "true" se esse projeto já está em produção — o PO passa a avaliar,
-# pra cada pedido, se existe impacto em produção. Padrão é opt-in: vazio ou "false" tira
-# essa pergunta do prompt do PO. Ligue ("true") quando o projeto entrar em produção.
-PRODUCTION_ENABLED="false"
-# TDD_ENABLED: "true" mantém a metodologia TDD nos prompts de Tech Leader, Desenvolvimento
-# e Review. Use "false" só em projeto sem testes automatizados (ex: site em HTML estático):
-# o plano passa a dizer como cada critério de aceite será verificado, e a suíte só roda se
-# existir. Ao contrário das outras chaves *_ENABLED, vazio ou valor inválido mantêm a TDD
-# ligada — só "false" desliga.
-TDD_ENABLED="true"
-EOF
+  config_print_skeleton "auto_scrum"
 }
 
 # init_project: asks where to create the project config (select_menu, which also offers
@@ -650,11 +501,12 @@ EOF
 #      directory for nothing.
 # Either way, an existing file is only overwritten after confirmation.
 init_project() {
+  local choice name file="" confirm cwd_config
+  cwd_config="$(config_cwd_file)"
   local options=(
-    "Diretório atual ($PWD/$CWD_CONFIG_NAME) — versionado junto com o projeto"
+    "Diretório atual ($cwd_config) — versionado junto com o projeto"
     "auto_scrum/projects/<nome>.conf — só nesta máquina"
   )
-  local choice name file="" confirm
   echo "Onde criar a configuração do projeto?"
   # stdin closed during the menu (Ctrl+D, or an invalid option followed by EOF): no
   # destination was chosen, so stop here instead of failing on a redirect to "".
@@ -663,7 +515,7 @@ init_project() {
     return 1
   fi
   if [ "$choice" -eq 0 ]; then
-    file="$PWD/$CWD_CONFIG_NAME"
+    file="$cwd_config"
   else
     mkdir -p "$PROJECTS_DIR"
     read_required "Nome do projeto: " name

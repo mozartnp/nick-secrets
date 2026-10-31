@@ -7,9 +7,7 @@ O plano do trabalho está em ${PLAN_PATH} — se houver mais de um arquivo nesse
 ignore ${REVIEW_PATH} (é o resultado de um review anterior, não o plano).
 
 Faça um review de código completo, com o mesmo rigor que um(a) senior aplicaria —
-estilo, performance (ex.: N+1), legibilidade, segurança, o que mais for relevante. Isso
-inclui, no mínimo: rodar a suíte de testes e confirmar que passam, e validar se os
-critérios de aceite do plano foram cumpridos.
+estilo, performance (ex.: N+1), legibilidade, segurança, o que mais for relevante. ${TDD_BLOCK_REVIEW}
 
 Liste claramente os problemas encontrados (se houver), com sugestão de correção — não
 corrija o código você mesmo, quem aplica a correção é o(a) desenvolvedor(a) numa

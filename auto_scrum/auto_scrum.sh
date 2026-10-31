@@ -11,8 +11,9 @@ PROJECTS_DIR="$SCRIPT_DIR/projects"
 CWD_CONFIG_NAME=".nick.conf"
 # Keys read from the project config by load_project_config. A toggle key ("true"/"false")
 # must end in _ENABLED: is_toggle_config_key is the only place that decides it. Every key
-# here must also be in print_project_skeleton, a toggle with "false" and a text key with "".
-PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED)
+# here must also be in print_project_skeleton, with its default from config_key_default
+# ("false" for a toggle, "true" for TDD_ENABLED, "" for a text key).
+PROJECT_CONFIG_KEYS=(STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED)
 
 TITLE=""
 DESCRIPTION=""
@@ -33,6 +34,11 @@ PERMISSION_BLOCK_PO=""
 JIRA_ENABLED=""
 PRODUCTION_ENABLED=""
 PRODUCTION_BLOCK_PO=""
+TDD_ENABLED=""
+TDD_BLOCK_TL=""
+TDD_CRITERIA_BLOCK_TL=""
+TDD_BLOCK_DEV=""
+TDD_BLOCK_REVIEW=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
@@ -217,7 +223,8 @@ warn_legacy_project_files() {
 #     reader never sees the key in them;
 #   - an accepted line of a toggle key (is_toggle_config_key) whose value isn't "true",
 #     "false" or "" gets one warning per line (warn_invalid_toggle_value). The value is still
-#     assigned as is, so only "true" turns the option on, as before.
+#     assigned as is, so for the opt-in flags only "true" turns the option on, as before,
+#     and TDD_ENABLED (on by default) only turns off with "false" (build_tdd_blocks).
 # Both live here, the only reader, so they cover the cwd, --projeto= and the menu alike,
 # while "Nenhum" (no file loaded) never warns.
 # Local variables must stay lowercase: an uppercase local named like a key would make
@@ -297,15 +304,15 @@ warn_malformed_config_line() {
 warn_invalid_toggle_value() {
   local location="$1" key="$2" value="$3" note
   value="${value//[[:cntrl:]]/?}"
-  note="$(config_key_off_note "$key")"
+  note="$(config_key_note "$key")"
   echo "Aviso: $location: valor \"$value\" inválido para $key (valores aceitos: \"true\", \"false\" ou \"\") — ${note:-a opção está desligada.}" >&2
 }
 
 # is_toggle_config_key <key>: succeeds when <key> is a toggle ("true"/"false") key, i.e. its
-# name ends in _ENABLED. This is the only place with that rule — both checks and the default
-# of the suggested line use it — instead of a separate key list, which would be one more
-# place to update for every new flag. The skeleton consistency test guards it: a key with
-# "false" in print_project_skeleton must be checked as a toggle, and a key with "" must not.
+# name ends in _ENABLED. This is the only place with that rule — both checks and
+# config_key_default use it — instead of a separate key list, which would be one more place
+# to update for every new flag. The skeleton consistency test guards it: a key with "false"
+# or "true" in print_project_skeleton must be checked as a toggle, and a key with "" must not.
 is_toggle_config_key() {
   case "$1" in
     *_ENABLED) return 0 ;;
@@ -313,42 +320,56 @@ is_toggle_config_key() {
   esac
 }
 
-# config_key_off_note <key>: prints the note both warnings show for <key> when it is off, or
-# nothing — the only key-specific warning text. Only PRODUCTION_ENABLED has one: it is the
-# only flag whose off default removes something the PO prompt already had. The note shows
-# both ways out, "true" and "false", so a project without production doesn't turn the
-# question on just to silence the warning. It must not repeat the PO question itself:
-# end-to-end checks read stdout and stderr together and look for that question to tell
-# whether it reached the prompt.
-config_key_off_note() {
+# config_key_default <key>: prints the default value of <key> (without quotes) — the value
+# print_project_skeleton writes and the missing-key warning suggests. This is the only place
+# with a per-key default: "true" for TDD_ENABLED (the only toggle that is on by default),
+# "false" for the other toggles (is_toggle_config_key) and "" for text keys.
+config_key_default() {
+  case "$1" in
+    TDD_ENABLED) echo "true" ;;
+    *) if is_toggle_config_key "$1"; then echo "false"; fi ;;
+  esac
+}
+
+# config_key_note <key>: prints the note both warnings show for <key>, or nothing — the only
+# key-specific warning text. Without a note, the invalid-value warning ends with "a opção
+# está desligada.". Two keys have one, each because that generic text would mislead:
+#   - PRODUCTION_ENABLED is the only flag whose off default removes something the PO prompt
+#     already had. The note shows both ways out, "true" and "false", so a project without
+#     production doesn't turn the question on just to silence the warning. It must not
+#     repeat the PO question itself: end-to-end checks read stdout and stderr together and
+#     look for that question to tell whether it reached the prompt;
+#   - TDD_ENABLED is the only flag that is on by default: an absent or invalid value keeps
+#     TDD on, so the note says that instead of "a opção está desligada.".
+config_key_note() {
   case "$1" in
     PRODUCTION_ENABLED)
       echo 'a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.'
+      ;;
+    TDD_ENABLED)
+      echo 'a metodologia TDD continua ligada nos prompts de Tech Leader, Desenvolvimento e Review. Use "false" só em projeto sem testes automatizados.'
       ;;
   esac
 }
 
 # warn_missing_config_keys <file> <key>...: the single warning for a loaded file that lacks
 # some keys — one block, and only its first line starts with "Aviso:". Each missing key gets
-# the line to add, with the same default as print_project_skeleton ("false" for toggles, ""
-# for text), which keeps today's behavior since an absent key is empty. A key note goes on a
-# comment line before its key, not at the end of the line, so the block can be pasted into
-# the file as is (a trailing comment would get the format warning). It never suggests
-# --init: that overwrites the file and would wipe the values already in it.
+# the line to add, with its default from config_key_default (the same line
+# print_project_skeleton writes), which keeps today's behavior: an absent key is empty, and
+# empty works like the default. A key note goes on a comment line before its key, not at the
+# end of the line, so the block can be pasted into the file as is (a trailing comment would
+# get the format warning). It never suggests --init: that overwrites the file and would wipe
+# the values already in it.
 warn_missing_config_keys() {
-  local file="$1" key note default
+  local file="$1" key note
   shift
-  echo "Aviso: $file não tem todas as chaves da configuração — cada chave ausente vale como vazia (as opções \"true\"/\"false\" ficam desligadas). Adicione ao arquivo:" >&2
+  echo "Aviso: $file não tem todas as chaves da configuração — cada chave ausente funciona como o valor sugerido abaixo. Adicione ao arquivo:" >&2
   for key in "$@"; do
-    default='""'
-    if is_toggle_config_key "$key"; then
-      default='"false"'
-    fi
-    note="$(config_key_off_note "$key")"
+    note="$(config_key_note "$key")"
     if [ -n "$note" ]; then
       echo "  # $key: $note" >&2
     fi
-    echo "  $key=$default" >&2
+    echo "  $key=\"$(config_key_default "$key")\"" >&2
   done
 }
 
@@ -477,6 +498,56 @@ build_production_blocks() {
   fi
 }
 
+# build_tdd_blocks: assembles TDD_BLOCK_TL/TDD_CRITERIA_BLOCK_TL/TDD_BLOCK_DEV/
+# TDD_BLOCK_REVIEW from TDD_ENABLED (set in the project file), same mechanism as
+# build_production_blocks(). TDD_ENABLED is the only flag that is on by default: only "false"
+# (exact) turns TDD off, so a typo ("TRUE", "sim", " false") never removes TDD from a project
+# that has tests — any other value, empty and "Nenhum" included, keeps the text of before the
+# flag, byte for byte. A project without automated tests (e.g. a static HTML site) uses
+# "false": the plan then says how each acceptance criterion will be verified, and Dev and
+# Review only run a test suite if the project has one.
+#   - TDD_BLOCK_TL and TDD_CRITERIA_BLOCK_TL are embedded in TECH_LEADER_PLAN_RULES_BLOCK
+#     (build_tech_leader_blocks, which must run after this), so they are neither exported
+#     nor passed to envsubst. TDD_CRITERIA_BLOCK_TL starts with \n, so it leaves no blank
+#     line behind when empty;
+#   - TDD_BLOCK_DEV and TDD_BLOCK_REVIEW are referenced by development.md and review.md.
+build_tdd_blocks() {
+  if [ "$TDD_ENABLED" = "false" ]; then
+    TDD_BLOCK_TL='Quem vai executar o plano é um(a) desenvolvedor(a) IA em outra sessão — não é você. O
+plano não deve exigir testes automatizados nem planejar infraestrutura de testes que o
+ticket não peça.'
+    printf -v TDD_CRITERIA_BLOCK_TL '\n%s' 'Para cada critério, diga como ele será verificado (por exemplo, verificação manual ou
+visual, com o passo a passo) — é por essa descrição que o review vai validá-lo.'
+    TDD_BLOCK_DEV='Garanta que todos os critérios de aceite do plano sejam atendidos, verificando cada um
+pela forma descrita no plano.
+
+Antes de finalizar, se o projeto tiver uma suíte de testes automatizados, rode-a completa
+e confirme que passa. Se não tiver, não crie testes nem infraestrutura de testes que o
+plano não peça.
+
+No final, traga um resumo do que foi feito e, para cada critério de aceite, como ele foi
+verificado.'
+    TDD_BLOCK_REVIEW='Isso
+inclui, no mínimo: rodar a suíte de testes, se o projeto tiver uma, e confirmar que
+passam; e validar cada critério de aceite do plano pela forma de verificação descrita
+nele.'
+  else
+    TDD_BLOCK_TL='O plano deve ser pensado para ser executado usando a metodologia TDD. Quem vai executar o
+plano é um(a) desenvolvedor(a) IA em outra sessão — não é você.'
+    TDD_CRITERIA_BLOCK_TL=""
+    TDD_BLOCK_DEV='Siga a metodologia TDD e garanta que todos os critérios de aceite do plano sejam
+atendidos.
+
+Antes de finalizar, rode a suíte completa de testes (não só os novos) e confirme que
+passam.
+
+No final, traga um resumo do que foi feito, incluindo os testes criados/alterados.'
+    TDD_BLOCK_REVIEW='Isso
+inclui, no mínimo: rodar a suíte de testes e confirmar que passam, e validar se os
+critérios de aceite do plano foram cumpridos.'
+  fi
+}
+
 # build_po_blocks: assembles PO_VALIDATION_BLOCK/PO_TICKET_FORMAT_BLOCK — the parts of
 # the four PO templates that must stay identical no matter which entry point triggered
 # the PO (same role, same validity criteria), built once here instead of duplicated in
@@ -510,29 +581,30 @@ ${SENTRY_BLOCK_PO}"
 # dependem do dado de entrada específico (ex: a seção "DADOS DE ENTRADA" de cada um, ou a
 # frase que cita o nome do arquivo do plano, que em tech_leader_jira.md não pode usar
 # ${JIRA_ID} — ver comentário em tech_leader_jira.md) continuam com texto próprio em cada
-# arquivo.
+# arquivo. Precisa rodar depois de build_tdd_blocks, porque embute TDD_BLOCK_TL e
+# TDD_CRITERIA_BLOCK_TL já resolvidos (o trecho de TDD depende de TDD_ENABLED).
 build_tech_leader_blocks() {
-  printf -v TECH_LEADER_PLAN_RULES_BLOCK '%s' 'Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
+  printf -v TECH_LEADER_PLAN_RULES_BLOCK '%s' "Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
 não presuma.
 
-O plano deve ser pensado para ser executado usando a metodologia TDD. Quem vai executar o
-plano é um(a) desenvolvedor(a) IA em outra sessão — não é você.
+${TDD_BLOCK_TL}
 
 O plano deve terminar com estas duas seções:
 ## Critérios de aceite
 Se o ticket já trouxer critérios de aceite na descrição, não copie cegamente: avalie
 cada um à luz do plano técnico. Se algum não fizer mais sentido, remova e explique o
 porquê; se faltar algo que o plano exige, adicione. Essa seção é obrigatória — a etapa
-de review usa ela para validar o trabalho feito.
+de review usa ela para validar o trabalho feito.${TDD_CRITERIA_BLOCK_TL}
 ## Habilidades necessárias
-As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço.'
+As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço."
 }
 
-# print_project_skeleton: prints (stdout) the project config skeleton, with just the
-# (empty/"false") keys of PROJECT_CONFIG_KEYS. Both init_project destinations write this
-# same output, so they can't drift apart. The file must stay friendly to the target team's
-# generic text hooks (pre-commit trailing-whitespace/end-of-file-fixer/mixed-line-ending):
-# no shebang, no trailing spaces, LF, ending with a newline — covered by tests.
+# print_project_skeleton: prints (stdout) the project config skeleton, with the keys of
+# PROJECT_CONFIG_KEYS at their default value (config_key_default). Both init_project
+# destinations write this same output, so they can't drift apart. The file must stay
+# friendly to the target team's generic text hooks (pre-commit trailing-whitespace/
+# end-of-file-fixer/mixed-line-ending): no shebang, no trailing spaces, LF, ending with a
+# newline — covered by tests.
 print_project_skeleton() {
   cat <<'EOF'
 # Config do projeto pro auto_scrum. Preencha as variáveis abaixo e salve.
@@ -559,6 +631,12 @@ JIRA_ENABLED="false"
 # pra cada pedido, se existe impacto em produção. Padrão é opt-in: vazio ou "false" tira
 # essa pergunta do prompt do PO. Ligue ("true") quando o projeto entrar em produção.
 PRODUCTION_ENABLED="false"
+# TDD_ENABLED: "true" mantém a metodologia TDD nos prompts de Tech Leader, Desenvolvimento
+# e Review. Use "false" só em projeto sem testes automatizados (ex: site em HTML estático):
+# o plano passa a dizer como cada critério de aceite será verificado, e a suíte só roda se
+# existir. Ao contrário das outras chaves *_ENABLED, vazio ou valor inválido mantêm a TDD
+# ligada — só "false" desliga.
+TDD_ENABLED="true"
 EOF
 }
 
@@ -701,6 +779,7 @@ main() {
   build_permission_blocks
   build_production_blocks
   build_po_blocks
+  build_tdd_blocks
   build_tech_leader_blocks
   choose_type
 
@@ -717,7 +796,7 @@ main() {
 
   export TITLE DESCRIPTION JIRA_ID JIRA_LINK SENTRY_LINK PLAN_PATH REVIEW_PATH STACK_BLOCK_DEV \
     STACK_BLOCK_TL STACK_BLOCK_REVIEW SENTRY_BLOCK_TL PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK \
-    TECH_LEADER_PLAN_RULES_BLOCK
+    TECH_LEADER_PLAN_RULES_BLOCK TDD_BLOCK_DEV TDD_BLOCK_REVIEW
 
   mkdir -p "$LOGS_DIR"
   local timestamp log_file
@@ -727,7 +806,7 @@ main() {
   # shellcheck disable=SC2016
   # Intentional single quotes: this is the variable list for envsubst to expand, we
   # don't want bash expanding it first.
-  envsubst '$TITLE $DESCRIPTION $JIRA_ID $JIRA_LINK $SENTRY_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_TL $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK' \
+  envsubst '$TITLE $DESCRIPTION $JIRA_ID $JIRA_LINK $SENTRY_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_TL $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK $TDD_BLOCK_DEV $TDD_BLOCK_REVIEW' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
 
   echo

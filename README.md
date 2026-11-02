@@ -185,6 +185,23 @@ Só essas portas ficam acessíveis, e cada uma dá ao agente acesso total ao ser
 o `.nick.conf` é commitado com o projeto, o time inteiro herda a lista. Um valor fora do
 formato (vírgula, porta 0 ou acima de 65535) faz a ferramenta parar com erro.
 
+A rede da jail também é filtrada: além da lista padrão do ai-jail (a API do Claude, os
+registries de pacotes e o GitHub), o nick libera sempre os MCPs ligados no projeto e a sua
+**lista padrão**, em [`lib/jail/allow_hosts.txt`](lib/jail/allow_hosts.txt):
+documentações de uso geral (Claude, AWS, Google Cloud, Python, Django/DRF, PostgreSQL, Rust,
+MDN, React, OpenTofu etc.).
+Pra incluir um host que vale pra todo projeto, acrescente uma linha nesse arquivo: um host por
+linha, comentários com `#`, sem mexer no código nem nos testes (eles leem o arquivo e conferem
+o formato). Outro site é recusado com "proxy refused the connection". O que é de um projeto
+só vai na chave `JAIL_ALLOW_HOSTS`, separado por espaço:
+
+```bash
+JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"
+```
+
+Cada host libera também os subdomínios dele e é mais um canal de saída pro agente. Use só o
+nome do host: com `https://`, porta, caminho ou curinga (`*.`), a ferramenta para com erro.
+
 É opt-in por projeto, pela chave `JAIL_ENABLED` da configuração do projeto (`.nick.conf` ou
 `auto_scrum/projects/<nome>.conf`). Vazio ou `"false"` roda o agente direto, como antes. Com
 `"true"`, a ferramenta confere logo no início se a jail funciona nesta máquina e, se não
@@ -272,7 +289,8 @@ para você rodar.
 O ai-jail, por padrão, grava sozinho um `.ai-jail` no diretório onde roda, com o comando
 inteiro — no caso do nick, o prompt, com o conteúdo de tickets e erros. Por isso o nick sempre
 chama `ai-jail --no-save-config --no-status-bar [opções do JAIL_CLIPBOARD] [--map das
-toolchains] [--allow-host do MCP] [--forward-port do JAIL_FORWARD_PORTS] -- claude ...`: nada
+toolchains] [--allow-host do MCP, do JAIL_ALLOW_HOSTS e da lista padrão do nick]
+[--forward-port do JAIL_FORWARD_PORTS] -- claude ...`: nada
 é gravado no projeto, e o `.ai-jail` que você escreveu continua valendo. O `--no-status-bar`
 tira a barra de status do ai-jail, que mostra o comando (o prompt
 de novo) e se sobrepõe à interface do `claude`, bagunçando o terminal. O `--allow-host` libera
@@ -287,9 +305,9 @@ na raiz do projeto, sem `--no-save-config`, revise o `.ai-jail` gerado antes de 
 
 - O agente tem escrita no projeto inteiro, inclusive no `.git`, e os segredos dentro do
   projeto (ex: `.env`) continuam legíveis, a menos que o `.ai-jail` use `mask`/`deny_paths`.
-- A rede é filtrada, mas não fechada: a API do Claude e os registries de pacotes ficam
-  liberados por padrão, e cada host extra liberado (ex: o de um MCP) é mais um canal de
-  saída.
+- A rede é filtrada, mas não fechada: a API do Claude, os registries de pacotes e a lista
+  padrão do nick (`lib/jail/allow_hosts.txt`) ficam liberados, e cada host extra liberado
+  (ex: o de um MCP ou do `JAIL_ALLOW_HOSTS`) é mais um canal de saída.
 - O estado do `claude` (`~/.claude`, credenciais incluídas) é montado com escrita dentro da
   jail.
 - `git push` e outras ações remotas continuam possíveis por HTTPS, se houver credencial
@@ -334,10 +352,14 @@ outro ticket.
   (`mcp.atlassian.com` com `JIRA_ENABLED="true"`, `mcp.sentry.dev` com
   `SENTRY_ENABLED="true"`); confira se a chave do projeto está em `"true"`. Faça o login
   OAuth do MCP (`/mcp` no `claude`) fora da jail: lá dentro o navegador não abre. Outro
-  servidor (Jira ou Sentry self-hosted, MCP local) você libera: o host com `allow_hosts` no
-  `~/.ai-jail` global ou no `.ai-jail` de um projeto listado em `trust_project_config` (num
-  projeto não confiado, o `.ai-jail` só restringe) e, se o servidor sobe via `npx`/`uvx`, os
-  diretórios de cache que ele precisa (`rw_maps`).
+  servidor remoto (Jira ou Sentry self-hosted) você libera com o host dele em
+  `JAIL_ALLOW_HOSTS`. Um MCP local que sobe via `npx`/`uvx` precisa também dos diretórios de
+  cache dele (`rw_maps` no `~/.ai-jail` global ou no `.ai-jail` de um projeto listado em
+  `trust_project_config`; num projeto não confiado, o `.ai-jail` só restringe).
+- **Documentação ou site recusado** ("proxy refused the connection" no WebFetch): a jail só
+  libera a lista acima. Adicione o host em `JAIL_ALLOW_HOSTS` (ex:
+  `JAIL_ALLOW_HOSTS="docs.celeryq.dev"`) ou, se vale pra todo projeto, em
+  `lib/jail/allow_hosts.txt`. O agente avisa qual host faltou.
 - **Ctrl+V não cola dentro da jail:** o Ctrl+V do `claude` lê o clipboard direto do sistema,
   pelo socket do Wayland/X11, que a jail só abre no nível `"brando"` do `JAIL_CLIPBOARD`. Nos
   outros níveis, cole pelo terminal, com o botão direito → Colar. O Shift+Insert não serve: no

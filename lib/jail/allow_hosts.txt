@@ -1,0 +1,75 @@
+# Lista padrão do nick: hosts que a jail sempre libera na rede (--allow-host do ai-jail), em
+# todo projeto com JAIL_ENABLED="true". Um por linha; linhas em branco e o que vem depois de #
+# são ignorados. Pra incluir um link, acrescente o host aqui — não precisa mexer no código nem
+# nos testes (eles leem este arquivo e conferem o formato de cada host).
+#
+# Só o nome do host: sem https://, porta, caminho ou curinga (ex: docs.python.org, e não
+# https://docs.python.org/3/). Cada host libera também os subdomínios dele.
+#
+# Cada host é mais um lugar pra onde o agente consegue mandar dados: inclua só o que vale pra
+# todo projeto. O que é de um projeto só vai no JAIL_ALLOW_HOSTS da configuração dele.
+
+# Documentação do Claude e do Claude Code
+docs.claude.com
+code.claude.com
+docs.anthropic.com
+
+# AWS
+docs.aws.amazon.com
+
+# Google (Cloud e APIs/SDKs)
+cloud.google.com
+developers.google.com
+
+# Python
+docs.python.org
+
+# Rust (linguagem, std e crates)
+doc.rust-lang.org
+docs.rs
+
+# PostgreSQL (a documentação fica em www.postgresql.org/docs)
+postgresql.org
+
+# Django e Django REST Framework (o site do DRF fica em www., coberto pelo subdomínio)
+docs.djangoproject.com
+django-rest-framework.org
+drf-spectacular.readthedocs.io
+
+# Bibliotecas Python
+docs.pytest.org
+docs.astral.sh
+boto3.amazonaws.com
+www.psycopg.org
+docs.gunicorn.org
+
+# Web e front-end (JavaScript, TypeScript, React e ferramentas)
+developer.mozilla.org
+w3schools.com
+nodejs.org
+docs.npmjs.com
+typescriptlang.org
+react.dev
+tanstack.com
+vite.dev
+vitest.dev
+tailwindcss.com
+storybook.js.org
+playwright.dev
+eslint.org
+prettier.io
+
+# Infra e ferramentas
+opentofu.org
+docs.docker.com
+git-scm.com
+docs.sentry.io
+developer.atlassian.com
+
+# Linux: Arch e Debian (só os subdomínios de documentação; o domínio inteiro abriria o AUR e o
+# GitLab do Debian, onde qualquer um publica)
+wiki.archlinux.org
+man.archlinux.org
+wiki.debian.org
+www.debian.org
+manpages.debian.org

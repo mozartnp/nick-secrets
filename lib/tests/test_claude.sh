@@ -2,7 +2,7 @@
 #
 # test_claude: testes em bash puro (sem framework) da biblioteca lib/claude/claude.sh e do
 # arquivo de regras lib/claude/permissions.json. Cada caso roda num bash -c separado, que dá
-# source só em lib/claude/claude.sh — nunca em lib/config.sh nem em lib/jail.sh, o que prova
+# source só em lib/claude/claude.sh — nunca em lib/config.sh nem em lib/jail/jail.sh, o que prova
 # que as bibliotecas são independentes. A validação do JSON usa jq e/ou python3 (só aqui, nos
 # testes: a biblioteca não depende de nenhum dos dois). A integração com o auto_scrum (o argv
 # do claude) fica em auto_scrum/tests/test_auto_scrum.sh.
@@ -290,7 +290,7 @@ claude_refs="$(grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*' <<< "$claude_code" | sed -
 assert_eq "" "$(grep -vE '^(NICK_CLAUDE_[A-Z0-9_]+|__claude_[a-z_]+|BASH_SOURCE)$' <<< "$claude_refs" | grep . || true)" "só expande variáveis da própria biblioteca (nenhuma global do chamador)"
 
 echo
-echo "== independência: lib/claude/claude.sh não depende de lib/config.sh nem de lib/jail.sh =="
+echo "== independência: lib/claude/claude.sh não depende de lib/config.sh nem de lib/jail/jail.sh =="
 assert_eq "" "$(grep -nE 'config_|CONFIG_|jail_|JAIL_' <<< "$claude_code" || true)" "lib/claude/claude.sh não cita config_, CONFIG_, jail_ nem JAIL_ fora de comentário"
 assert_eq "" "$(grep -nE 'config\.sh|jail\.sh' <<< "$claude_code" || true)" "lib/claude/claude.sh não cita config.sh nem jail.sh fora de comentário"
 # O padrão não casa com a própria linha: o [^;]* para no ';' do colchete, e a descrição não

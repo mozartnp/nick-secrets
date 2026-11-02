@@ -564,14 +564,14 @@ miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
 miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
 assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
 assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
 assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
 : > "$miss_dir/empty_file.conf"
 miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
 assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
 assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as seis chaves na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as oito chaves na ordem de CONFIG_KEYS"
 
 # Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
 # outras chaves, então o bloco só pode listar a chave do caso.
@@ -721,7 +721,7 @@ val_file="$val_dir/invalid_and_missing.conf"
 printf '%s\n' 'JIRA_ENABLED="sim"' > "$val_file"
 run_loader "$val_file" "$val_dir/invalid_and_missing" >/dev/null
 assert_eq "2" "$(count_warnings "$val_dir/invalid_and_missing.err")" "valor inválido e chaves ausentes: dois avisos no stderr"
-assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
+assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
 
 val_file="$val_dir/control_char.conf"
 val_raw="a"$'\e'"[31mb"
@@ -857,7 +857,7 @@ printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_miss_projects/semlinh
 # rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
 rs_miss_expected() {
   local file="$1"
-  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"'
+  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""'
 }
 
 rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_incomplete")"
@@ -1628,15 +1628,15 @@ assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates s�
 assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
 
 echo
-echo "== auto_scrum.sh: a única linha source/. é a de lib/config.sh (config nunca é executada) =="
+echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh e lib/jail.sh (config nunca é executada) =="
 # A configuração nunca é executada: o leitor (config_load) não usa source/eval, e lib/config.sh
 # não tem source, . nem eval (teste estrutural em lib/tests/test_config.sh). Aqui, a lista
-# inteira de linhas source/. tem de ser só a da biblioteca.
+# inteira de linhas source/. tem de ser só a das duas bibliotecas, nesta ordem.
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '$SCRIPT_DIR' é o texto literal buscado no código-fonte.
 source_lines="$(grep -E '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 # shellcheck disable=SC2016
-assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"' "$source_lines" "auto_scrum.sh tem uma linha source/. só, a de lib/config.sh"
+assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail.sh"' "$source_lines" "auto_scrum.sh tem duas linhas source/., a de lib/config.sh e depois a de lib/jail.sh"
 
 echo
 echo "== auto_scrum.sh: carrega lib/config.sh com a diretiva do shellcheck logo acima =="
@@ -1644,6 +1644,13 @@ echo "== auto_scrum.sh: carrega lib/config.sh com a diretiva do shellcheck logo 
 lib_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/config.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
 assert_eq "true" "$([ -n "$lib_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/config.sh\""
 assert_eq "# shellcheck source=SCRIPTDIR/../lib/config.sh" "$( [ -n "$lib_source_number" ] && sed -n "$((lib_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/config.sh'"
+
+echo
+echo "== auto_scrum.sh: carrega lib/jail.sh com a diretiva do shellcheck logo acima =="
+# shellcheck disable=SC2016
+jail_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/jail.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$jail_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/jail.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/../lib/jail.sh" "$( [ -n "$jail_source_number" ] && sed -n "$((jail_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/jail.sh'"
 
 echo
 echo "== lib/config.sh: nenhuma chave concreta do auto_scrum na biblioteca nem nos testes dela =="
@@ -1733,7 +1740,7 @@ run_loader "$newkey_dir/without.conf" "$newkey_dir/without" "$newkey_setup" >/de
 assert_eq "$(missing_warning "$newkey_dir/without.conf" 'NEW_X_ENABLED="false"')" "$(cat "$newkey_dir/without.err" 2>/dev/null || true)" "a chave extra entra no aviso de chave ausente"
 printf '%s\n' "$(config_keys_blank)" 'NEW_X_ENABLED="sim"' > "$newkey_dir/invalid.conf"
 run_loader "$newkey_dir/invalid.conf" "$newkey_dir/invalid" "$newkey_setup" >/dev/null
-assert_eq "$(value_warning "$newkey_dir/invalid.conf:7" NEW_X_ENABLED sim "$default_off_note")" "$(cat "$newkey_dir/invalid.err" 2>/dev/null || true)" "a chave extra com \"sim\" recebe o aviso de valor"
+assert_eq "$(value_warning "$newkey_dir/invalid.conf:$(wc -l < "$newkey_dir/invalid.conf")" NEW_X_ENABLED sim "$default_off_note")" "$(cat "$newkey_dir/invalid.err" 2>/dev/null || true)" "a chave extra com \"sim\" recebe o aviso de valor"
 
 echo
 echo "== menus: \"Sair (q)\" é o último número; o número, q ou Q encerram com código 0 =="
@@ -1964,6 +1971,322 @@ assert_contains "$select_menu_body" "select " "a única linha select fica dentro
 # mostra um) pode ser chamado assim.
 menu_in_subshell="$(grep -nE '\$\((select_menu|choose_type|resolve_stack|init_project)\b' "$AUTO_SCRUM_SH" || true)"
 assert_eq "" "$menu_in_subshell" "nenhum menu é chamado dentro de \$(...)"
+echo
+echo "== JAIL_ENABLED: registrada na penúltima posição, padrão \"false\", com comentário no esqueleto =="
+jail_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"" 2>/dev/null || true)"
+assert_eq "JAIL_ENABLED"$'\n'"JAIL_CLIPBOARD" "$(tail -n2 <<< "$jail_keys")" "JAIL_ENABLED e JAIL_CLIPBOARD são as duas últimas chaves de CONFIG_KEYS"
+jail_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; print_project_skeleton" 2>/dev/null || true)"
+assert_contains "$jail_skeleton" 'JAIL_ENABLED="false"' "o esqueleto tem JAIL_ENABLED=\"false\""
+jail_skeleton_comment="$(awk '/^# JAIL_ENABLED:/{found=1} /^JAIL_ENABLED=/{found=0} found' <<< "$jail_skeleton")"
+for jail_word in ai-jail bubblewrap README --requisitos-jail JIRA_ENABLED SENTRY_ENABLED mcp.atlassian.com mcp.sentry.dev; do
+  assert_contains "$jail_skeleton_comment" "$jail_word" "o comentário de JAIL_ENABLED no esqueleto cita $jail_word"
+done
+assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_ENABLED" 2>/dev/null || true)" "JAIL_ENABLED não tem nota (o aviso de valor termina em \"a opção está desligada.\")"
+jail_reg_dir="$TEST_TMP/jail_register"
+mkdir -p "$jail_reg_dir"
+printf '%s\n' "$(config_keys_blank JAIL_ENABLED)" 'JAIL_ENABLED="sim"' > "$jail_reg_dir/invalid.conf"
+run_loader "$jail_reg_dir/invalid.conf" "$jail_reg_dir/invalid" >/dev/null
+assert_eq "$(value_warning "$jail_reg_dir/invalid.conf:$(wc -l < "$jail_reg_dir/invalid.conf")" JAIL_ENABLED sim "$default_off_note")" "$(cat "$jail_reg_dir/invalid.err" 2>/dev/null || true)" "JAIL_ENABLED=\"sim\": aviso de valor, terminando em \"a opção está desligada.\""
+config_keys_blank JAIL_ENABLED > "$jail_reg_dir/missing.conf"
+run_loader "$jail_reg_dir/missing.conf" "$jail_reg_dir/missing" >/dev/null
+assert_eq "$(missing_warning "$jail_reg_dir/missing.conf" 'JAIL_ENABLED="false"')" "$(cat "$jail_reg_dir/missing.err" 2>/dev/null || true)" "sem a linha JAIL_ENABLED: aviso de chave ausente sugerindo JAIL_ENABLED=\"false\""
+
+echo
+echo "== JAIL_CLIPBOARD: registrada por último, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
+assert_eq 'JAIL_CLIPBOARD=""' "$(tail -n1 <<< "$jail_skeleton")" "o esqueleto termina com JAIL_CLIPBOARD=\"\""
+clip_skeleton_comment="$(awk '/^# JAIL_CLIPBOARD:/{found=1} found' <<< "$jail_skeleton")"
+for clip_word in 'JAIL_ENABLED="true"' '"restrito"' '"medio"' '"brando"' --terminal-passthrough --display clipboard 'botão direito → Colar' Ctrl+V README; do
+  assert_contains "$clip_skeleton_comment" "$clip_word" "o comentário de JAIL_CLIPBOARD no esqueleto cita $clip_word"
+done
+# Shift+Insert no terminal do VS Code (Linux) cola a seleção primária, não o clipboard.
+assert_not_contains "$clip_skeleton_comment" "Shift+Insert" "o comentário de JAIL_CLIPBOARD não manda colar com Shift+Insert"
+# jail_print_status mostra só o nível; o risco fica no comentário e no README.
+assert_not_contains "$clip_skeleton_comment" "e o risco" "o comentário de JAIL_CLIPBOARD não promete mostrar o risco a cada execução"
+assert_contains "$clip_skeleton_comment" "mostra o nível a cada execução" "o comentário de JAIL_CLIPBOARD diz que o auto_scrum mostra o nível a cada execução"
+assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_CLIPBOARD" 2>/dev/null || true)" "JAIL_CLIPBOARD não tem nota"
+# Chave de texto: a config.sh não valida o valor (quem valida é jail_check, com a jail ligada).
+printf '%s\n' "$(config_keys_blank JAIL_CLIPBOARD)" 'JAIL_CLIPBOARD="total"' > "$jail_reg_dir/clip_invalid.conf"
+run_loader "$jail_reg_dir/clip_invalid.conf" "$jail_reg_dir/clip_invalid" >/dev/null
+assert_eq "" "$(cat "$jail_reg_dir/clip_invalid.err" 2>/dev/null || true)" "JAIL_CLIPBOARD=\"total\": a carga da configuração não avisa (a validação é da jail)"
+config_keys_blank JAIL_CLIPBOARD > "$jail_reg_dir/clip_missing.conf"
+run_loader "$jail_reg_dir/clip_missing.conf" "$jail_reg_dir/clip_missing" >/dev/null
+assert_eq "$(missing_warning "$jail_reg_dir/clip_missing.conf" 'JAIL_CLIPBOARD=""')" "$(cat "$jail_reg_dir/clip_missing.err" 2>/dev/null || true)" "sem a linha JAIL_CLIPBOARD: aviso de chave ausente sugerindo JAIL_CLIPBOARD=\"\""
+
+echo
+echo "== PROJECT_CONFIG_FILE: o arquivo carregado, pelos três caminhos (vazio com 'Nenhum') =="
+pcf_dir="$TEST_TMP/project_config_file"
+mkdir -p "$pcf_dir/cwd_with" "$pcf_dir/cwd_without" "$pcf_dir/projects"
+config_keys_blank > "$pcf_dir/cwd_with/.nick.conf"
+config_keys_blank > "$pcf_dir/projects/alpha.conf"
+# pcf_value <cwd> <project_arg> <stdin>: imprime PROJECT_CONFIG_FILE depois de resolve_stack.
+pcf_value() {
+  timeout 2 bash -c "cd '$1' || exit 99; source '$AUTO_SCRUM_SH'; PROJECTS_DIR='$pcf_dir/projects'; resolve_stack '$2' >/dev/null 2>&1; printf '%s' \"\$PROJECT_CONFIG_FILE\"" <<< "$3" 2>/dev/null || true
+}
+assert_eq "$pcf_dir/cwd_with/.nick.conf" "$(pcf_value "$pcf_dir/cwd_with" "" "")" "cwd: PROJECT_CONFIG_FILE é o .nick.conf do cwd"
+assert_eq "$pcf_dir/projects/alpha.conf" "$(pcf_value "$pcf_dir/cwd_without" alpha "")" "--projeto=alpha: PROJECT_CONFIG_FILE é projects/alpha.conf"
+assert_eq "$pcf_dir/projects/alpha.conf" "$(pcf_value "$pcf_dir/cwd_without" "" 1)" "menu (alpha): PROJECT_CONFIG_FILE é projects/alpha.conf"
+assert_eq "" "$(pcf_value "$pcf_dir/cwd_without" "" 2)" "menu ('Nenhum'): PROJECT_CONFIG_FILE fica vazia"
+
+# Stubs desta seção (diretórios próprios, no TEST_TMP desta suíte). O ai-jail grava o argv
+# de cada chamada (um argumento por linha) em $FAKE_JAIL_LOG_DIR/call_<n>.argv e o cwd em
+# call_<n>.cwd, pula as opções antes do "--" e, sem --no-save-config entre elas, cria um
+# .ai-jail no cwd (auto-save). Com "true" depois do "--", é a
+# verificação e sai com $FAKE_JAIL_RC (padrão 0); senão, faz exec do comando depois do
+# "--". O claude grava o argv em $FAKE_CLAUDE_LOG_DIR/argv e o cwd em .../cwd.
+jail_stub_dir="$TEST_TMP/jail_stub_ai_jail"
+jail_claude_dir="$TEST_TMP/jail_stub_claude"
+mkdir -p "$jail_stub_dir" "$jail_claude_dir"
+cat > "$jail_stub_dir/ai-jail" <<'EOF'
+#!/usr/bin/env bash
+n=1
+while [ -e "$FAKE_JAIL_LOG_DIR/call_$n.argv" ]; do n=$((n + 1)); done
+printf '%s\n' "$@" > "$FAKE_JAIL_LOG_DIR/call_$n.argv"
+pwd > "$FAKE_JAIL_LOG_DIR/call_$n.cwd"
+save=1
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+  [ "$1" = "--no-save-config" ] && save=0
+  shift
+done
+[ "$save" -eq 1 ] && : > .ai-jail
+[ "${1:-}" = "--" ] && shift
+[ "${1:-}" = "true" ] && exit "${FAKE_JAIL_RC:-0}"
+exec "$@"
+EOF
+cat > "$jail_claude_dir/claude" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE_CLAUDE_LOG_DIR/argv"
+pwd > "$FAKE_CLAUDE_LOG_DIR/cwd"
+EOF
+chmod +x "$jail_stub_dir/ai-jail" "$jail_claude_dir/claude"
+
+# jail_case_setup <case_dir> [extra]: o setup de run_main pra estes casos — stubs à frente do
+# PATH, diretórios de log dos stubs e [extra] (ex: sobrescrever JAIL_BIN).
+jail_case_setup() {
+  local case_dir="$1" extra="${2:-:}"
+  mkdir -p "$case_dir/jail" "$case_dir/claude"
+  printf '%s' "export PATH='$jail_stub_dir:$jail_claude_dir':\"\$PATH\" FAKE_JAIL_LOG_DIR='$case_dir/jail' FAKE_CLAUDE_LOG_DIR='$case_dir/claude'; $extra"
+}
+
+# jail_calls <case_dir>: imprime quantas vezes o stub do ai-jail foi chamado no caso.
+jail_calls() {
+  find "$1/jail" -name 'call_*.argv' 2>/dev/null | grep -c . || true
+}
+
+# jail_expected_argv <case_dir> <type>: o argv que o claude deve receber, um por linha — o
+# prompt gravado no log, precedido de --permission-mode auto na etapa development.
+jail_expected_argv() {
+  local case_dir="$1" type="$2" log
+  log="$(find "$case_dir/logs" -name "${type}_*.md" 2>/dev/null | head -n1)"
+  if [ -z "$log" ]; then
+    printf 'sem log'
+  elif [ "$type" = "development" ]; then
+    printf '%s\n' --permission-mode auto "$(cat "$log")"
+  else
+    printf '%s\n' "$(cat "$log")"
+  fi
+}
+
+# jail_input <type>: a entrada de main() até a confirmação (s) da etapa <type>.
+jail_input() {
+  case "$1" in
+    development) printf '%s' $'4\nSC-13\n\ns' ;;
+    *) printf '%s' $'2\nassunto de teste\ns' ;;
+  esac
+}
+
+echo
+echo "== main(): JAIL_ENABLED desligada — argv de hoje, ai-jail nunca chamado (nem pra verificar) =="
+for jail_variant in vazio false ausente TRUE; do
+  case "$jail_variant" in
+    vazio) jail_conf="$(config_keys_blank)" ;;
+    ausente) jail_conf="$(config_keys_blank JAIL_ENABLED)" ;;
+    *) jail_conf="$(config_keys_blank JAIL_ENABLED)"$'\n'"JAIL_ENABLED=\"$jail_variant\"" ;;
+  esac
+  for jail_type in po_discussion development; do
+    jail_dir="$TEST_TMP/jail_off_${jail_variant}_$jail_type"
+    jail_rc="$(run_main "$jail_dir" "$jail_conf" "$(jail_input "$jail_type")" "$(jail_case_setup "$jail_dir")")"
+    jail_label="JAIL_ENABLED $jail_variant, $jail_type"
+    assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
+    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv de antes da jail"
+    assert_eq "0" "$(jail_calls "$jail_dir")" "$jail_label: o ai-jail não é chamado nenhuma vez"
+    assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Jail (ai-jail): desligada" "$jail_label: a saída mostra 'Jail (ai-jail): desligada'"
+    assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "modo de clipboard" "$jail_label: nada sobre o modo de clipboard"
+  done
+done
+
+echo
+echo "== main(): JAIL_ENABLED=\"true\", jail funcionando — verifica fora do projeto e lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...' =="
+for jail_type in po_discussion development; do
+  jail_dir="$TEST_TMP/jail_on_$jail_type"
+  jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input "$jail_type")" "$(jail_case_setup "$jail_dir")")"
+  jail_label="JAIL_ENABLED \"true\", $jail_type"
+  assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
+  assert_eq "2" "$(jail_calls "$jail_dir")" "$jail_label: duas chamadas ao ai-jail (verificação e lançamento)"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a 1ª chamada é a verificação 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- true'"
+  jail_check_cwd="$(cat "$jail_dir/jail/call_1.cwd" 2>/dev/null || true)"
+  assert_eq "true" "$([ -n "$jail_check_cwd" ] && [ "$jail_check_cwd" != "$jail_dir/cwd" ] && [ ! -e "$jail_check_cwd" ] && echo true || echo false)" "$jail_label: a verificação roda fora do projeto, num diretório já removido"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough -- claude)" "$(head -n5 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...'"
+  assert_eq "false" "$([ -e "$jail_dir/cwd/.ai-jail" ] && echo true || echo false)" "$jail_label: nenhum .ai-jail gravado no projeto (o prompt não fica salvo)"
+  assert_eq "$jail_dir/cwd" "$(cat "$jail_dir/jail/call_2.cwd" 2>/dev/null || true)" "$jail_label: o lançamento roda no cwd do projeto"
+  assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o mesmo argv do caso desligado"
+  assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Jail (ai-jail): ativa" "$jail_label: a saída mostra 'Jail (ai-jail): ativa'"
+  assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "⚠️ Jail (ai-jail): ativa | modo de clipboard médio" "$jail_label: a saída mostra o modo médio (JAIL_CLIPBOARD vazio), com o ⚠️"
+done
+
+jail_output="$(cat "$TEST_TMP/jail_on_po_discussion/output" 2>/dev/null || true)"
+# A linha da jail aparece duas vezes: no começo, logo depois de carregar a configuração (antes
+# do menu principal), e de novo antes da confirmação.
+assert_eq "2" "$(grep -c '⚠️ Jail (ai-jail): ativa | modo de clipboard médio' <<< "$jail_output" || true)" "a linha da jail aparece duas vezes (no começo e antes da confirmação)"
+jail_first_status_line="$(grep -n 'Jail (ai-jail): ativa' <<< "$jail_output" | cut -d: -f1 | head -n1 || true)"
+jail_config_line="$(grep -n 'Configuração do projeto carregada de' <<< "$jail_output" | cut -d: -f1 | head -n1 || true)"
+jail_menu_line="$(grep -n 'Qual tipo de conversa' <<< "$jail_output" | cut -d: -f1 | head -n1 || true)"
+assert_eq "true" "$([ -n "$jail_config_line" ] && [ -n "$jail_first_status_line" ] && [ -n "$jail_menu_line" ] && [ "$jail_config_line" -lt "$jail_first_status_line" ] && [ "$jail_first_status_line" -lt "$jail_menu_line" ] && echo true || echo false)" "no começo: configuração carregada e a linha da jail, antes do menu principal"
+jail_status_line="$(grep -n 'Jail (ai-jail): ativa' <<< "$jail_output" | cut -d: -f1 | tail -n1 || true)"
+# O read -p só mostra "Confirma o envio" num terminal, então a ordem é conferida pelo fim do
+# prompt exibido (a linha de traços) e, no código, pela linha seguinte a jail_print_status.
+jail_prompt_end_line="$(grep -nxE -- '-+' <<< "$jail_output" | cut -d: -f1 | tail -n1 || true)"
+assert_eq "true" "$([ -n "$jail_status_line" ] && [ -n "$jail_prompt_end_line" ] && [ "$jail_prompt_end_line" -lt "$jail_status_line" ] && echo true || echo false)" "a última linha da jail aparece depois do prompt exibido"
+assert_contains "$(grep -A2 'jail_print_status' "$AUTO_SCRUM_SH" || true)" 'read -r -p "Confirma o envio para o claude? (s/N): "' "jail_print_status vem logo antes da pergunta 'Confirma o envio para o claude?'"
+# A primeira linha de código (fora comentários) depois do jail_check de main().
+jail_after_check="$(awk '/^  jail_check "\$JAIL_ENABLED"/{found=1; next} found && !/^[[:space:]]*#/{print; exit}' "$AUTO_SCRUM_SH")"
+# shellcheck disable=SC2016
+assert_eq '  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"' "$jail_after_check" "em main(), jail_print_status vem logo depois de jail_check (antes do menu principal)"
+jail_off_output="$(cat "$TEST_TMP/jail_off_vazio_po_discussion/output" 2>/dev/null || true)"
+jail_off_first_line="$(grep -n 'Jail (ai-jail): desligada' <<< "$jail_off_output" | cut -d: -f1 | head -n1 || true)"
+jail_off_menu_line="$(grep -n 'Qual tipo de conversa' <<< "$jail_off_output" | cut -d: -f1 | head -n1 || true)"
+assert_eq "true" "$([ -n "$jail_off_first_line" ] && [ -n "$jail_off_menu_line" ] && [ "$jail_off_first_line" -lt "$jail_off_menu_line" ] && echo true || echo false)" "jail desligada: a linha 'desligada' também aparece no começo, antes do menu principal"
+
+echo
+echo "== main(): JAIL_CLIPBOARD escolhe as opções do ai-jail e a linha do nível =="
+for jail_clip in medio restrito brando; do
+  case "$jail_clip" in
+    restrito) jail_clip_options=(--no-save-config --no-status-bar); jail_clip_line="⚠️ Jail (ai-jail): ativa | modo de clipboard restrito" ;;
+    brando) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough --display); jail_clip_line="⚠️ Jail (ai-jail): ativa | modo de clipboard brando" ;;
+    *) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough); jail_clip_line="⚠️ Jail (ai-jail): ativa | modo de clipboard médio" ;;
+  esac
+  for jail_type in po_discussion development; do
+    jail_dir="$TEST_TMP/jail_clip_${jail_clip}_$jail_type"
+    jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_CLIPBOARD=')"$'\n''JAIL_ENABLED="true"'$'\n'"JAIL_CLIPBOARD=\"$jail_clip\"" "$(jail_input "$jail_type")" "$(jail_case_setup "$jail_dir")")"
+    jail_label="JAIL_CLIPBOARD \"$jail_clip\", $jail_type"
+    assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
+    assert_eq "$(printf '%s\n' "${jail_clip_options[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_clip_options[*]}"
+    assert_eq "$(printf '%s\n' "${jail_clip_options[@]}" -- claude)" "$(head -n "$((${#jail_clip_options[@]} + 2))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_clip_options[*]}"
+    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o mesmo argv do caso desligado"
+    assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "$jail_clip_line" "$jail_label: a saída mostra a linha do nível"
+  done
+done
+
+echo
+echo "== main(): JIRA_ENABLED/SENTRY_ENABLED liberam na jail o host do MCP remoto (--allow-host) =="
+# Os MCPs do Jira e do Sentry são remotos (HTTP); a rede da jail só deixa sair pros hosts da
+# lista padrão do ai-jail, que não tem nenhum dos dois.
+for jail_mcp in jira sentry ambos; do
+  case "$jail_mcp" in
+    jira) jail_mcp_conf='JIRA_ENABLED="true"'; jail_mcp_except=JIRA_ENABLED; jail_mcp_hosts=(--allow-host mcp.atlassian.com) ;;
+    sentry) jail_mcp_conf='SENTRY_ENABLED="true"'; jail_mcp_except=SENTRY_ENABLED; jail_mcp_hosts=(--allow-host mcp.sentry.dev) ;;
+    ambos) jail_mcp_conf='JIRA_ENABLED="true"'$'\n''SENTRY_ENABLED="true"'; jail_mcp_except="" ;;
+  esac
+  [ "$jail_mcp" = "ambos" ] && jail_mcp_hosts=(--allow-host mcp.atlassian.com --allow-host mcp.sentry.dev)
+  jail_mcp_base="$(config_keys_blank JAIL_ENABLED | grep -vE "^(${jail_mcp_except:-JIRA_ENABLED|SENTRY_ENABLED})=")"
+  jail_dir="$TEST_TMP/jail_mcp_$jail_mcp"
+  jail_rc="$(run_main "$jail_dir" "$jail_mcp_base"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+  jail_label="MCP $jail_mcp com a jail"
+  assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_mcp_hosts[*]}"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" -- claude)" "$(head -n "$((${#jail_mcp_hosts[@]} + 5))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_mcp_hosts[*]}"
+  assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o mesmo argv de sempre"
+  # Sem a jail, o host não muda nada: o claude roda direto.
+  jail_dir="$TEST_TMP/jail_mcp_${jail_mcp}_off"
+  jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -vE "^(${jail_mcp_except:-JIRA_ENABLED|SENTRY_ENABLED})=")"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="false"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+  assert_eq "0" "$(jail_calls "$jail_dir")" "MCP $jail_mcp sem a jail: o ai-jail não é chamado"
+  assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "MCP $jail_mcp sem a jail: o claude recebe o argv de antes da jail"
+done
+# mcp_jail_hosts: só "true" exato liga cada host; a ordem é Jira, depois Sentry.
+for mcp_case in "true|true|mcp.atlassian.com mcp.sentry.dev" "true||mcp.atlassian.com" "|true|mcp.sentry.dev" "||" "TRUE|sim|" "false|false|"; do
+  IFS='|' read -r mcp_jira mcp_sentry mcp_expected <<< "$mcp_case"
+  assert_eq "$mcp_expected" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED='$mcp_jira'; SENTRY_ENABLED='$mcp_sentry'; mcp_jail_hosts" 2>&1)" "mcp_jail_hosts com JIRA_ENABLED=\"$mcp_jira\" e SENTRY_ENABLED=\"$mcp_sentry\": \"$mcp_expected\""
+done
+
+echo
+echo "== main(): JAIL_CLIPBOARD inválido com a jail ligada — para antes do menu, sem log e sem claude =="
+jail_dir="$TEST_TMP/jail_clip_invalid"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_CLIPBOARD=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_CLIPBOARD="total"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "exec 2>'$jail_dir/err'")")"
+assert_eq "1" "$jail_rc" "JAIL_CLIPBOARD \"total\": main() termina com código 1"
+assert_contains "$(cat "$jail_dir/err" 2>/dev/null || true)" "Erro: JAIL_CLIPBOARD=\"total\" em $jail_dir/cwd/.nick.conf não é um valor aceito." "JAIL_CLIPBOARD \"total\": o stderr cita o valor e o .nick.conf"
+assert_eq "0" "$(jail_calls "$jail_dir")" "JAIL_CLIPBOARD \"total\": o ai-jail não é chamado"
+assert_not_exists "$jail_dir/claude/argv" "JAIL_CLIPBOARD \"total\": o claude não é chamado"
+assert_not_exists "$jail_dir/logs" "JAIL_CLIPBOARD \"total\": nenhum log é criado"
+assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "JAIL_CLIPBOARD \"total\": parou antes do menu principal"
+jail_dir="$TEST_TMP/jail_clip_invalid_off"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_CLIPBOARD)"$'\n''JAIL_CLIPBOARD="total"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+assert_eq "0" "$jail_rc" "JAIL_CLIPBOARD \"total\" com a jail desligada: segue normalmente (a chave não tem efeito)"
+
+echo
+echo "== main(): JAIL_ENABLED=\"true\" com ai-jail ausente — para antes do menu, sem log e sem claude =="
+jail_dir="$TEST_TMP/jail_missing_cwd"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "JAIL_BIN='ai-jail-inexistente-nick-13'; exec 2>'$jail_dir/err'")")"
+jail_err="$(cat "$jail_dir/err" 2>/dev/null || true)"
+assert_eq "1" "$jail_rc" ".nick.conf com ai-jail ausente: main() termina com código 1"
+assert_not_exists "$jail_dir/logs" ".nick.conf com ai-jail ausente: nenhum log é criado"
+assert_not_exists "$jail_dir/claude/argv" ".nick.conf com ai-jail ausente: o claude não é chamado"
+assert_eq "0" "$(jail_calls "$jail_dir")" ".nick.conf com ai-jail ausente: o stub do ai-jail (outro nome) não é chamado"
+assert_contains "$jail_err" "JAIL_ENABLED=\"true\" em $jail_dir/cwd/.nick.conf" ".nick.conf com ai-jail ausente: o stderr cita o caminho do .nick.conf"
+assert_contains "$jail_err" "é compartilhado com o time do projeto" ".nick.conf com ai-jail ausente: aviso de arquivo compartilhado"
+assert_contains "$jail_err" "[falta] ai-jail" ".nick.conf com ai-jail ausente: o stderr termina com os requisitos"
+assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" ".nick.conf com ai-jail ausente: parou antes do menu principal"
+
+jail_dir="$TEST_TMP/jail_missing_projects"
+mkdir -p "$jail_dir/cwd" "$jail_dir/projects"
+printf '%s\n' "$(config_keys_blank JAIL_ENABLED)" 'JAIL_ENABLED="true"' > "$jail_dir/projects/alpha.conf"
+jail_rc=0
+timeout 5 bash -c "cd '$jail_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$jail_dir/logs'; PROJECTS_DIR='$jail_dir/projects'; $(jail_case_setup "$jail_dir" "JAIL_BIN='ai-jail-inexistente-nick-13'"); main --projeto=alpha" <<< "$(jail_input po_discussion)" > "$jail_dir/output" 2> "$jail_dir/err" || jail_rc=$?
+jail_err="$(cat "$jail_dir/err" 2>/dev/null || true)"
+assert_eq "1" "$jail_rc" "projects/alpha.conf com ai-jail ausente: main() termina com código 1"
+assert_contains "$jail_err" "JAIL_ENABLED=\"true\" em $jail_dir/projects/alpha.conf" "projects/alpha.conf com ai-jail ausente: o stderr cita o caminho de projects/alpha.conf"
+assert_not_contains "$jail_err" "compartilhado" "projects/alpha.conf com ai-jail ausente: sem aviso de arquivo compartilhado"
+assert_not_exists "$jail_dir/logs" "projects/alpha.conf com ai-jail ausente: nenhum log é criado"
+assert_not_exists "$jail_dir/claude/argv" "projects/alpha.conf com ai-jail ausente: o claude não é chamado"
+assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "projects/alpha.conf com ai-jail ausente: parou antes do menu principal"
+
+echo
+echo "== main --requisitos-jail: mostra os requisitos e sai com 0, sem carregar configuração =="
+for jail_variant in sem_config com_jail_true; do
+  jail_dir="$TEST_TMP/jail_requirements_$jail_variant"
+  mkdir -p "$jail_dir/cwd"
+  if [ "$jail_variant" = "com_jail_true" ]; then
+    printf '%s\n' "$(config_keys_blank JAIL_ENABLED)" 'JAIL_ENABLED="true"' > "$jail_dir/cwd/.nick.conf"
+  fi
+  jail_rc=0
+  timeout 5 bash -c "cd '$jail_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; LOGS_DIR='$jail_dir/logs'; PROJECTS_DIR='$jail_dir/projects'; $(jail_case_setup "$jail_dir"); main --requisitos-jail" < /dev/null > "$jail_dir/output" 2> "$jail_dir/err" || jail_rc=$?
+  jail_output="$(cat "$jail_dir/output" 2>/dev/null || true)"
+  assert_eq "0" "$jail_rc" "--requisitos-jail ($jail_variant): termina com código 0"
+  assert_contains "$jail_output" "Requisitos da jail" "--requisitos-jail ($jail_variant): a lista sai no stdout"
+  assert_contains "$jail_output" "ai-jail" "--requisitos-jail ($jail_variant): a lista cita o ai-jail"
+  assert_not_contains "$jail_output" "carregada de" "--requisitos-jail ($jail_variant): não carrega configuração"
+  assert_eq "" "$(cat "$jail_dir/err" 2>/dev/null || true)" "--requisitos-jail ($jail_variant): nada no stderr (nenhum aviso de configuração)"
+  assert_not_exists "$jail_dir/logs" "--requisitos-jail ($jail_variant): nenhum log é criado"
+  assert_not_exists "$jail_dir/claude/argv" "--requisitos-jail ($jail_variant): o claude não é chamado"
+  assert_eq "0" "$(jail_calls "$jail_dir")" "--requisitos-jail ($jail_variant): o ai-jail não é chamado"
+  assert_not_exists "$jail_dir/projects" "--requisitos-jail ($jail_variant): PROJECTS_DIR não é criado"
+done
+jail_usage="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; main --nao-existe" 2>&1 < /dev/null || true)"
+assert_contains "$jail_usage" "[--requisitos-jail]" "a mensagem de uso de argumento desconhecido cita [--requisitos-jail]"
+
+echo
+echo "== auto_scrum.sh: a jail passa só pelas funções jail_* de lib/jail.sh =="
+# Fora do bloco de registro (cujo comentário de esqueleto cita o ai-jail de propósito) e dos
+# comentários, nenhuma linha cita o ai-jail nem JAIL_BIN.
+jail_code="$(awk '/^config_register_key /{skip=1} skip && /^[A-Z_]+=/{skip=0} !skip' "$AUTO_SCRUM_SH" | grep -vE '^[[:space:]]*#' || true)"
+assert_contains "$jail_code" "jail_exec" "o recorte do código (fora do registro) inclui o resto do script"
+assert_eq "" "$(grep -nE 'ai-jail|JAIL_BIN' <<< "$jail_code" || true)" "nenhuma linha de código fora do registro cita ai-jail ou JAIL_BIN"
+assert_eq "" "$(grep -nE '(^|[^_])exec[[:space:]]+claude' "$AUTO_SCRUM_SH" || true)" "não sobrou nenhum 'exec claude' (o lançamento é jail_exec)"
+assert_eq "" "$(grep -nE '\$\((jail_check|jail_exec)\b' "$AUTO_SCRUM_SH" || true)" "jail_check e jail_exec nunca são chamadas dentro de \$(...)"
+main_body="$(awk '/^main\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
+jail_check_at="$(grep -n 'jail_check ' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
+jail_resolve_at="$(grep -n 'resolve_stack ' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
+jail_build_at="$(grep -n 'build_stack_blocks' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
+assert_eq "true" "$([ -n "$jail_check_at" ] && [ -n "$jail_resolve_at" ] && [ -n "$jail_build_at" ] && [ "$jail_resolve_at" -lt "$jail_check_at" ] && [ "$jail_check_at" -lt "$jail_build_at" ] && echo true || echo false)" "em main(), jail_check vem logo depois de resolve_stack e antes de build_stack_blocks"
+assert_eq "1" "$(grep -cE '^[[:space:]]*jail_check .*\|\| exit 1$' <<< "$main_body" || true)" "em main(), a falha de jail_check encerra com exit 1 (na própria linha da chamada)"
 
 echo
 if [ "$failures" -gt 0 ]; then

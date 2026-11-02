@@ -100,7 +100,19 @@ já existem passam a receber o aviso de chaves ausentes, com a linha a adicionar
   (`.nick.conf` no diretório atual, ou `auto_scrum/projects/<nome>.conf`, que pede o nome)
   e cria o arquivo com as chaves aceitas no valor padrão e comentários explicando cada
   uma. O conteúdo é o mesmo nos dois destinos. Abre e preenche depois. Se o arquivo já
-  existir, pergunta antes de sobrescrever.
+  existir, pergunta antes de sobrescrever. No destino `.nick.conf`, cria também a pasta de
+  troca `.nick/troca/` (abaixo).
+
+#### Troca de arquivos com os agentes (`.nick/troca/`)
+
+Pra mostrar um arquivo ao agente (uma print, um anexo) ou receber o que ele gera pra você
+conferir (ex: uma print de prova), use a pasta `.nick/troca/` na raiz do projeto alvo. O
+prompt de toda etapa termina dizendo isso ao agente. Ela fica dentro do projeto porque, com
+a jail ligada, o agente não enxerga nada fora dele (ex: `~/Downloads`).
+
+O nick cria a pasta no `--init` (destino `.nick.conf`) e, se ainda não existir, ao confirmar
+o envio do prompt, com um `.gitignore` próprio que ignora tudo: nada dela é versionado, e o
+`.gitignore` do projeto não é alterado. Um `.gitignore` que já esteja lá não é sobrescrito.
 - `./auto_scrum/auto_scrum.sh --requisitos-jail` mostra o que a jail precisa nesta máquina
   (ver [Sandbox (ai-jail)](#sandbox-ai-jail)) e sai, sem carregar configuração.
 - Só `--projeto=` (singular), `--init` e `--requisitos-jail` são reconhecidos — qualquer
@@ -143,6 +155,31 @@ diretório do projeto; o resto do sistema fica somente leitura, e `~/.ssh`, `~/.
 o estrago de uma prompt injection ou de um erro do agente, principalmente na etapa de
 Desenvolvimento, que roda em `--permission-mode auto`.
 
+Pra o projeto continuar rodando lá dentro, o nick monta sozinho, **somente leitura**, os
+gerenciadores de versão que existirem no seu home: `~/.pyenv`, `~/.nvm`, `~/.rbenv`, `~/.asdf`,
+`~/.local/share/mise`, `~/.local/share/uv/python`, `~/.sdkman` e `~/.volta` (sem eles, um venv
+que aponta pro Python do pyenv quebra com "arquivo inexistente"), e também os navegadores do
+Playwright (`~/.cache/ms-playwright`, ou o que estiver em `PLAYWRIGHT_BROWSERS_PATH`), pros
+testes E2E — esses aparecem em `~/.ms-playwright`, com `PLAYWRIGHT_BROWSERS_PATH` apontando pra
+lá. Nada de configuração ou credencial entra nessa lista, e você não precisa editar nada.
+Dentro da jail, o sandbox do próprio Chromium não funciona: ele roda com `--no-sandbox`, que já
+é o padrão do Playwright. O nick também avisa o agente (no system prompt do `claude`) de que
+ele está na jail: o que ele enxerga, o que não alcança e que, se faltar algo, a primeira
+hipótese é a jail — pra ele parar e te avisar, em vez de gastar tokens diagnosticando a
+máquina.
+
+Serviços da sua máquina em `localhost` (o banco do Docker que os testes usam, por exemplo)
+ficam inalcançáveis de dentro da jail, que tem a própria rede. Pra liberar, liste as portas
+na chave `JAIL_FORWARD_PORTS` da configuração do projeto, separadas por espaço:
+
+```bash
+JAIL_FORWARD_PORTS="54320 6379"
+```
+
+Só essas portas ficam acessíveis, e cada uma dá ao agente acesso total ao serviço dela. Como
+o `.nick.conf` é commitado com o projeto, o time inteiro herda a lista. Um valor fora do
+formato (vírgula, porta 0 ou acima de 65535) faz a ferramenta parar com erro.
+
 É opt-in por projeto, pela chave `JAIL_ENABLED` da configuração do projeto (`.nick.conf` ou
 `auto_scrum/projects/<nome>.conf`). Vazio ou `"false"` roda o agente direto, como antes. Com
 `"true"`, a ferramenta confere logo no início se a jail funciona nesta máquina e, se não
@@ -152,8 +189,12 @@ agente nunca roda sem a jail.
 Com a jail ligada, a chave `JAIL_CLIPBOARD` escolhe quanto do terminal e do clipboard a jail
 libera. A cada execução, a ferramenta mostra o nível numa linha, logo no começo, assim que
 carrega a configuração (antes de qualquer pergunta), e de novo antes da confirmação — por
-exemplo, `⚠️ Jail (ai-jail): ativa | modo de clipboard médio`. O brando aparece em vermelho no
-terminal (sem cor com `NO_COLOR` definida).
+exemplo, `⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio`. O brando
+aparece em vermelho no terminal (sem cor com `NO_COLOR` definida). O `Landlock` é a segunda
+camada da jail (um recurso do kernel que confere cada acesso a arquivo, além do isolamento do
+bubblewrap): `completo` é o normal; `parcial` (kernel mais antigo, sem parte das regras) e
+`inativo` (kernel sem suporte ou Landlock desligado) deixam a jail só com o bubblewrap. O
+ai-jail também mostra isso ao abrir, mas o `claude` limpa a tela em seguida.
 
 | Nível | Copiar de dentro do `claude` | Ctrl+V no `claude` | O que o agente ganha |
 |---|---|---|---|
@@ -196,33 +237,39 @@ para você rodar.
 
 1. Instale o que falta (acima).
 2. Defina `JAIL_ENABLED="true"` na configuração do projeto.
-3. Opcional: crie um `.ai-jail` na raiz do projeto alvo pra ajustar o acesso, ex:
+3. Opcional, caminho alternativo pra necessidades que o nick não cobre sozinho (o nick já
+   monta as toolchains e os navegadores do Playwright, libera os MCPs do Jira e do Sentry e as
+   portas de `JAIL_FORWARD_PORTS`): um `.ai-jail` na raiz do projeto alvo, o arquivo de
+   configuração do próprio ai-jail. Ex: liberar, somente leitura, um diretório de fora do
+   projeto e esconder do agente o `.env`:
 
    ```toml
    ro_maps = ["~/Projetos/libs-compartilhadas"]
-   rw_maps = ["~/.cache/uv"]
-   allow_hosts = ["sua-empresa.atlassian.net"]
+   mask = [".env"]
    ```
 
-   O ai-jail trata o `.ai-jail` do projeto como **não confiável**: por padrão ele só pode
-   *restringir* (`mask`, `deny_paths`). Mapas para fora do projeto e liberações de
-   capacidade (`ro_maps`, `rw_maps`, `allow_hosts`) só valem se o `~/.ai-jail` global
-   confiar no projeto:
+   O ai-jail trata o `.ai-jail` do projeto como **não confiável**, porque ele vem no
+   repositório: o que *restringe* (`mask`, `deny_paths`) vale sempre, mas o que *amplia* o
+   acesso (`ro_maps`, `rw_maps`, `allow_hosts`) só vale se o `~/.ai-jail` global de cada
+   pessoa confiar no projeto:
 
    ```toml
    trust_project_config = ["~/caminho/do/projeto"]
    ```
 
-   É assim que o projeto X vê o diretório Y e o projeto Z não. O nick não lê, não gera e não
-   altera nenhum dos dois arquivos.
+   Sem isso, o ai-jail ignora a liberação e avisa ao abrir ("project .ai-jail map ... outside
+   project ignored"). É assim que o projeto X vê o diretório Y e o projeto Z não. Como depende
+   do `~/.ai-jail` de cada um, quem não configurar fica sem a liberação: prefira o que o nick
+   já faz sozinho. O nick não lê, não gera e não altera nenhum dos dois arquivos.
 4. Confira com `ai-jail --dry-run claude`, rodado na raiz do projeto alvo (mostra o que
    seria montado, sem gravar nada).
 
 O ai-jail, por padrão, grava sozinho um `.ai-jail` no diretório onde roda, com o comando
 inteiro — no caso do nick, o prompt, com o conteúdo de tickets e erros. Por isso o nick sempre
-chama `ai-jail --no-save-config --no-status-bar [opções do JAIL_CLIPBOARD] [--allow-host do
-MCP] -- claude ...`: nada é gravado no projeto, e o `.ai-jail` que você escreveu continua
-valendo. O `--no-status-bar` tira a barra de status do ai-jail, que mostra o comando (o prompt
+chama `ai-jail --no-save-config --no-status-bar [opções do JAIL_CLIPBOARD] [--map das
+toolchains] [--allow-host do MCP] [--forward-port do JAIL_FORWARD_PORTS] -- claude ...`: nada
+é gravado no projeto, e o `.ai-jail` que você escreveu continua valendo. O `--no-status-bar`
+tira a barra de status do ai-jail, que mostra o comando (o prompt
 de novo) e se sobrepõe à interface do `claude`, bagunçando o terminal. O `--allow-host` libera
 na rede da jail o MCP remoto que o projeto usa: `mcp.atlassian.com` com `JIRA_ENABLED="true"`
 e `mcp.sentry.dev` com `SENTRY_ENABLED="true"` (os dois ficam fora da lista padrão do ai-jail,
@@ -251,9 +298,9 @@ outro ticket.
 ### Problemas comuns
 
 - **`bwrap` ausente:** instale o bubblewrap (acima).
-- **User namespaces bloqueados** (Ubuntu 24.04+, Debian 13+, com AppArmor): o `bwrap`
-  falha ao criar o namespace. Libere com `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`
-  ou com um perfil AppArmor pro `bwrap`, conforme o README do ai-jail.
+- **User namespaces bloqueados** (Ubuntu 24.04+, Debian 13+, com AppArmor): o `bwrap` falha ao
+  criar o namespace. Libere com `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` ou
+  com um perfil AppArmor pro `bwrap`, conforme o README do ai-jail.
 - **`bwrap` reprovado na validação de binário confiável:** o ai-jail só usa um `bwrap` com
   dono root e sem permissão de escrita pra grupo/outros; senão a verificação falha mesmo com
   tudo `[ok]` na lista de requisitos. Confira com `ls -l "$(command -v bwrap)"`. Dentro de um
@@ -267,6 +314,16 @@ outro ticket.
   instalado dentro do home (ex: `~/.local/bin`) pode não ser visível. Instale-o num caminho
   do sistema ou libere o diretório dele com `ro_maps` (com o projeto em
   `trust_project_config`).
+- **Serviço da máquina em `localhost` inacessível** (banco, servidor de desenvolvimento): a
+  jail tem a própria rede, e o `localhost` lá dentro não é o da sua máquina. Libere a porta
+  com `JAIL_FORWARD_PORTS` na configuração do projeto (acima) — ex: `JAIL_FORWARD_PORTS="54320"`
+  pro PostgreSQL do Docker que os testes usam.
+- **O agente não acha um arquivo de fora do projeto** (ex: uma print em `~/Downloads`): a
+  jail só mostra o projeto. Copie o arquivo pra `.nick/troca/` (ver
+  [Troca de arquivos com os agentes](#troca-de-arquivos-com-os-agentes-nicktroca)).
+- **Ferramenta instalada no home não encontrada** (fora dos gerenciadores de versão que o
+  nick monta, acima): o home da jail é privado. O agente avisa qual caminho faltou; abra um
+  ticket no nick pra avaliar incluí-lo na lista.
 - **MCP (Jira, Sentry) sem conexão:** a rede da jail só libera, por padrão, a API do Claude,
   os registries de pacotes e o GitHub. Os MCPs remotos oficiais o nick já libera sozinho
   (`mcp.atlassian.com` com `JIRA_ENABLED="true"`, `mcp.sentry.dev` com

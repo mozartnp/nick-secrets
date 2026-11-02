@@ -81,6 +81,16 @@ libera; o auto_scrum mostra o nível a cada execução:
   agente pode LER o seu clipboard (senhas, tokens) e abrir janelas na sua tela.
 Nos três, cole com o botão direito → Colar. Outro valor faz o auto_scrum parar com erro.
 Veja a seção "Sandbox (ai-jail)" do README.'
+# JAIL_FORWARD_PORTS is a text key too (a list of ports), checked by jail_check.
+config_register_key JAIL_FORWARD_PORTS "" "" \
+'JAIL_FORWARD_PORTS: só vale com JAIL_ENABLED="true". Portas de localhost da sua máquina
+que o claude alcança de dentro da jail (--forward-port do ai-jail), separadas por espaço —
+ex: o PostgreSQL do Docker que os testes usam. Exemplo:
+  JAIL_FORWARD_PORTS="54320 6379"
+Cada porta liberada dá ao agente acesso total ao serviço dela. Este arquivo é commitado
+com o projeto, então o time inteiro herda a lista. Vazio: nenhuma porta (o localhost da
+máquina fica inalcançável). Outro formato faz o auto_scrum parar com erro. Veja a seção
+"Sandbox (ai-jail)" do README.'
 
 TITLE=""
 DESCRIPTION=""
@@ -108,12 +118,18 @@ TDD_BLOCK_DEV=""
 TDD_BLOCK_REVIEW=""
 JAIL_ENABLED=""
 JAIL_CLIPBOARD=""
+JAIL_FORWARD_PORTS=""
 # The config file load_project_config loaded (empty with "Nenhum"): the jail error names it.
 PROJECT_CONFIG_FILE=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
 TYPE=""
+# Exchange dir: where the user and the agents trade files (screenshots, attachments), in the
+# target project (the cwd, like .nick.conf), so it stays writable with the jail on. Created by
+# exchange_dir_prepare with its own .gitignore, and announced at the end of every prompt
+# (exchange_block).
+EXCHANGE_DIR=".nick/troca"
 
 check_requirements() {
   local missing=()
@@ -580,6 +596,43 @@ init_project() {
   print_project_skeleton > "$file"
 
   echo "Projeto criado em $file — edite antes de usar."
+  # Only with option 1: the cwd is then the target project. With projects/ it may be anywhere,
+  # and the exchange dir is created by main() on the first launch instead.
+  if [ "$choice" -eq 0 ]; then
+    exchange_dir_prepare || return 1
+    echo "Pasta de troca de arquivos com os agentes: $EXCHANGE_DIR/ (não versionada)."
+  fi
+}
+
+# exchange_dir_prepare: creates $EXCHANGE_DIR in the cwd with a .gitignore of its own ("*"),
+# so nothing in it is versioned and the target project's .gitignore is never touched. An
+# existing .gitignore, and whatever else is in the dir, is kept. Prints an error and returns 1
+# when the dir can't be created.
+exchange_dir_prepare() {
+  local ignore="$EXCHANGE_DIR/.gitignore"
+  if mkdir -p "$EXCHANGE_DIR" 2>/dev/null; then
+    [ -e "$ignore" ] && return 0
+    printf '%s\n' "# Criado pelo nick: nada da pasta de troca com os agentes é versionado." '*' \
+      > "$ignore" 2>/dev/null && return 0
+  fi
+  echo "Erro: não foi possível criar a pasta de troca $EXCHANGE_DIR/ em $PWD." >&2
+  return 1
+}
+
+# exchange_block: the section that closes every stage's prompt, telling the agent where to
+# receive and deliver files. Outside the project the agent may see nothing (the jail), so files
+# the user mentions elsewhere (~/Downloads) are to be copied into the exchange dir.
+exchange_block() {
+  cat <<EOF
+## Troca de arquivos com o usuário
+
+Use a pasta \`$EXCHANGE_DIR/\`, na raiz do projeto, para trocar arquivos com o usuário:
+- é lá que ele coloca o que quer que você veja (prints, anexos, exemplos); quando ele citar um
+  arquivo de fora do projeto (ex: em ~/Downloads), peça para ele copiar para essa pasta, porque
+  fora do projeto você pode não ter acesso (ex: com a jail do nick ligada);
+- é lá que você salva o que entregar para ele conferir (ex: prints de prova, relatórios).
+O conteúdo dessa pasta não é versionado (ela tem um .gitignore próprio, criado pelo nick).
+EOF
 }
 
 # ask_questions_po: always the same two questions, whatever the project flags — a request
@@ -684,7 +737,7 @@ main() {
   local config_shared="false" jail_hosts
   [ "$PROJECT_CONFIG_FILE" = "$(config_cwd_file)" ] && config_shared="true"
   jail_hosts="$(mcp_jail_hosts)"
-  jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$PROJECT_CONFIG_FILE" "$config_shared" || exit 1
+  jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" "$PROJECT_CONFIG_FILE" "$config_shared" || exit 1
   # The jail status (and the JAIL_CLIPBOARD warning) shows up front, before anything else
   # runs, and again right before the confirmation.
   jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
@@ -722,6 +775,7 @@ main() {
   # don't want bash expanding it first.
   envsubst '$TITLE $DESCRIPTION $JIRA_ID $JIRA_LINK $SENTRY_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_TL $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK $TDD_BLOCK_DEV $TDD_BLOCK_REVIEW' \
     < "$TEMPLATES_DIR/$TYPE.md" > "$log_file"
+  { echo; exchange_block; } >> "$log_file"
 
   echo
   echo "----- Prompt final (salvo em $log_file) -----"
@@ -734,20 +788,27 @@ main() {
   read -r -p "Confirma o envio para o claude? (s/N): " confirm
   case "$confirm" in
     s|S|sim|Sim|SIM)
+      exchange_dir_prepare || exit 1
       local claude_args=()
       # Only the Development stage runs in auto mode — it's the only one where the
       # agent actually edits code/runs commands without stepping in at every turn;
       # PO/Tech Leader/Review are text conversations, no reason to let go of the wheel.
       [ "$TYPE" = "development" ] && claude_args+=(--permission-mode auto)
+      # With the jail on, the agent is told so (jail_agent_notice, lib/jail.sh): otherwise it
+      # spends tokens diagnosing the machine for what the jail hides (a toolchain, a home dir,
+      # a localhost service). Off, the argv stays the same as before the jail existed.
+      if [ "$JAIL_ENABLED" = "true" ]; then
+        claude_args+=(--append-system-prompt "$(jail_agent_notice "$jail_hosts" "$JAIL_FORWARD_PORTS")")
+      fi
       # Nothing to wire here for Sentry: the MCP server itself lives in the target
       # project's own .mcp.json (Claude Code auto-loads it from the cwd), not in
       # auto_scrum. On the MCP side, SENTRY_ENABLED just shows the po_sentry entry point
       # in the menu (choose_type), whose template (po_sentry.md) tells the PO to use that
       # tool.
       # With JAIL_ENABLED="true", jail_exec (lib/jail.sh) launches the same argv as
-      # 'ai-jail <jail_options of JAIL_CLIPBOARD and the MCP hosts> -- claude ...'; otherwise
-      # it runs claude directly, as before.
-      jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" claude "${claude_args[@]}" "$(cat "$log_file")"
+      # 'ai-jail <jail_options of JAIL_CLIPBOARD, the MCP hosts and JAIL_FORWARD_PORTS> --
+      # claude ...'; otherwise it runs claude directly, as before.
+      jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)
       echo "Cancelado. O prompt gerado continua salvo em: $log_file"

@@ -16,17 +16,14 @@ oriente o analista a recomeçar pela opção "Tech Leader - Criar plano" no menu
 `auto_scrum`, digitando ID, título e descrição diretamente por lá — não continue esta
 conversa tentando coletar esses dados aqui.
 
-Com o ticket em mãos, analise-o e monte o plano de ação em
-docs/plans/<ID-do-ticket>_<resumo-curto>.md — troque <ID-do-ticket> pelo ID do Jira que
-você acabou de buscar e <resumo-curto> por um resumo do título da tarefa (poucas
-palavras, kebab-case), escolhido por você. Esse resumo serve só para facilitar a leitura
-humana do nome do arquivo; o identificador único continua sendo o ID do Jira buscado.
+Com o ticket em mãos, analise-o e monte o plano de ação em .nick/docs/<ID-do-ticket>/plan.md
+— troque <ID-do-ticket> pelo ID do Jira que você acabou de buscar (ex: SC-123).
 
 ${TECH_LEADER_PLAN_RULES_BLOCK}
 
 ${SENTRY_BLOCK_TL}
 
-Se já existir um arquivo docs/plans/<ID-do-ticket>_*.md para o ID buscado, pergunte antes
+Se já existir o arquivo .nick/docs/<ID-do-ticket>/plan.md para o ID buscado, pergunte antes
 de sobrescrever.
 
 ---

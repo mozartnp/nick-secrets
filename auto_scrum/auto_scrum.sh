@@ -143,11 +143,17 @@ PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
 TYPE=""
-# Exchange dir: where the user and the agents trade files (screenshots, attachments), in the
-# target project (the cwd, like .nick.conf), so it stays writable with the jail on. Created by
-# exchange_dir_prepare with its own .gitignore, and announced at the end of every prompt
-# (exchange_block).
-EXCHANGE_DIR=".nick/troca"
+# The nick dir in the target project (the cwd): the project config (.nick/nick.conf, read by
+# lib/config.sh), the exchange dir and the per-ticket docs. Inside the project, so it stays
+# writable with the jail on. nick_dir_prepare creates its tree with a single .gitignore that
+# ignores everything but itself and nick.conf.
+NICK_DIR=".nick"
+# Exchange dir: where the user and the agents trade files (screenshots, attachments), announced
+# at the end of every prompt (exchange_block).
+EXCHANGE_DIR="$NICK_DIR/troca"
+# Docs dir: plan, review and validation screenshots of each ticket, in $NICK_DOCS_DIR/<ID>/
+# (created by the agent when it writes there).
+NICK_DOCS_DIR="$NICK_DIR/docs"
 
 check_requirements() {
   local missing=()
@@ -171,6 +177,30 @@ read_required() {
     [ -z "$value" ] && echo "Esse campo é obrigatório, tente de novo."
   done
   printf -v "$__resultvar" '%s' "$value"
+}
+
+# jira_id_valid <id>: returns 0 when <id> can name the ticket's docs dir ($NICK_DOCS_DIR/<id>/),
+# 1 otherwise, with no output. Refuses any /, any .., exactly ".", any whitespace and any
+# control character ([:cntrl:] and not [:print:], so an accent isn't refused under LC_ALL=C —
+# same reason as config_warn_invalid_toggle). Empty is read_required's job.
+jira_id_valid() {
+  case "$1" in
+    "" | . | */* | *..* | *[[:space:]]* | *[[:cntrl:]]*) return 1 ;;
+  esac
+  return 0
+}
+
+# read_jira_id <variable_name>: asks for the Jira ID (read_required) until jira_id_valid accepts
+# it. The message doesn't echo the value, which may carry control characters. Locals are
+# prefixed with __jira_ so they can't shadow the caller's <variable_name>.
+read_jira_id() {
+  local __jira_result="$1" __jira_value=""
+  while true; do
+    read_required "ID do Jira (ex: SC-123): " __jira_value
+    jira_id_valid "$__jira_value" && break
+    echo "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/). Tente de novo."
+  done
+  printf -v "$__jira_result" '%s' "$__jira_value"
 }
 
 # read_optional <prompt> <variable_name>
@@ -323,8 +353,11 @@ load_project_config() {
 
 # resolve_stack <project_name_via_argv_or_empty>
 # Sets the project config (STACK_DESCRIPTION and the *_ENABLED flags) via
-# load_project_config, searching in this order:
-#   1. $PWD/.nick.conf (config_cwd_file, lib/config.sh) — only the cwd itself, no parent
+# load_project_config. First of all, an old $PWD/.nick.conf without the new file stops the
+# script (config_cwd_legacy_check, lib/config.sh), whatever the path below: it used to win
+# over --projeto=, so going on with projects/ or "Nenhum" would run the project without its
+# config (and without its jail). Then it searches in this order:
+#   1. $PWD/.nick/nick.conf (config_cwd_file, lib/config.sh) — only the cwd itself, no parent
 #      directories.
 #      When present it wins: no menu, no legacy warning, and a --projeto= name is ignored
 #      (with a warning on stderr, and not validated — the flag isn't used at all);
@@ -339,6 +372,7 @@ resolve_stack() {
   local project_arg="$1"
   local file
   local cwd_config
+  config_cwd_legacy_check || exit 1
   cwd_config="$(config_cwd_file)"
 
   if [ -f "$cwd_config" ]; then
@@ -572,8 +606,15 @@ print_project_skeleton() {
 # init_project: asks where to create the project config (select_menu, which also offers
 # "Sair (q)") and writes the skeleton (print_project_skeleton) there. The user opens it and
 # fills it in afterwards.
-#   1. $PWD/.nick.conf — listed first since it's the recommended place: versioned with
-#      the target project, shared with its team. No name is asked;
+#   1. $PWD/.nick/nick.conf — listed first since it's the recommended place: versioned with
+#      the target project, shared with its team. No name is asked. After the overwrite
+#      confirmation, nick_dir_prepare creates the whole .nick/ tree (the team sees and versions
+#      it from the first commit), and the output shows it. An old $PWD/.nick.conf doesn't stop
+#      it (the user's choice: the old file is the source to copy the values from): the
+#      skeleton is written all the same, the old file is neither read nor touched, and a
+#      warning at the end says to copy its values into the new file and remove it — without
+#      it, the values would be lost silently. A normal run still stops on the old file alone
+#      (config_cwd_legacy_check, in resolve_stack);
 #   2. auto_scrum/projects/<name>.conf — local to this machine (gitignored). PROJECTS_DIR
 #      is only created in this branch, so neither option 1 nor "Sair (q)" creates a
 #      directory for nothing.
@@ -611,29 +652,47 @@ init_project() {
     esac
   fi
 
+  # Only with option 1: the cwd is then the target project. With projects/ it may be anywhere,
+  # and the .nick/ tree is created by main() on the first launch instead. Before the skeleton,
+  # since nick.conf lives inside .nick/.
+  if [ "$choice" -eq 0 ]; then
+    nick_dir_prepare || return 1
+  fi
+
   print_project_skeleton > "$file"
 
   echo "Projeto criado em $file — edite antes de usar."
-  # Only with option 1: the cwd is then the target project. With projects/ it may be anywhere,
-  # and the exchange dir is created by main() on the first launch instead.
   if [ "$choice" -eq 0 ]; then
-    exchange_dir_prepare || return 1
-    echo "Pasta de troca de arquivos com os agentes: $EXCHANGE_DIR/ (não versionada)."
+    cat <<EOF
+Estrutura do nick em $NICK_DIR/:
+  .gitignore   versionado: ignora tudo em $NICK_DIR/ menos ele e o nick.conf
+  nick.conf    versionado: configuração do projeto
+  troca/       não versionada: troca de arquivos com os agentes
+  docs/        não versionada: plano, review e prints de cada ticket (docs/<ID>/)
+Versione $CONFIG_CWD_FILE_NAME e $NICK_DIR/.gitignore junto com o projeto.
+EOF
+    if [ -e "$PWD/$CONFIG_CWD_LEGACY_FILE_NAME" ]; then
+      echo "Aviso: o arquivo antigo $PWD/$CONFIG_CWD_LEGACY_FILE_NAME não foi lido nem alterado — copie os valores dele para $file e apague o antigo." >&2
+    fi
   fi
 }
 
-# exchange_dir_prepare: creates $EXCHANGE_DIR in the cwd with a .gitignore of its own ("*"),
-# so nothing in it is versioned and the target project's .gitignore is never touched. An
-# existing .gitignore, and whatever else is in the dir, is kept. Prints an error and returns 1
-# when the dir can't be created.
-exchange_dir_prepare() {
-  local ignore="$EXCHANGE_DIR/.gitignore"
-  if mkdir -p "$EXCHANGE_DIR" 2>/dev/null; then
+# nick_dir_prepare: creates the $NICK_DIR tree in the cwd — $EXCHANGE_DIR, $NICK_DOCS_DIR and,
+# only if it doesn't exist yet, $NICK_DIR/.gitignore with exactly "*", "!.gitignore" and
+# "!nick.conf" (everything in .nick/ is ignored but the config and the .gitignore itself, so
+# the target project's own .gitignore is never touched). Not nick.conf (init_project's job)
+# nor docs/<ID>/ (the agent creates it when it writes there). An existing .gitignore, edited
+# or not, and whatever is already in troca/ and docs/ are kept; no .gitignore is created
+# inside troca/ or docs/. Prints an error and returns 1 when the tree can't be created.
+nick_dir_prepare() {
+  local ignore="$NICK_DIR/.gitignore"
+  if mkdir -p "$EXCHANGE_DIR" "$NICK_DOCS_DIR" 2>/dev/null; then
     [ -e "$ignore" ] && return 0
-    printf '%s\n' "# Criado pelo nick: nada da pasta de troca com os agentes é versionado." '*' \
-      > "$ignore" 2>/dev/null && return 0
+    # Grouped so the 2>/dev/null also covers the failing > "$ignore" (redirections apply left
+    # to right): the user sees only the message below, not bash's own error.
+    { printf '%s\n' '*' '!.gitignore' "!$(basename "$CONFIG_CWD_FILE_NAME")" > "$ignore"; } 2>/dev/null && return 0
   fi
-  echo "Erro: não foi possível criar a pasta de troca $EXCHANGE_DIR/ em $PWD." >&2
+  echo "Erro: não foi possível criar a estrutura $NICK_DIR/ (.gitignore, troca/ e docs/) em $PWD." >&2
   return 1
 }
 
@@ -648,8 +707,10 @@ Use a pasta \`$EXCHANGE_DIR/\`, na raiz do projeto, para trocar arquivos com o u
 - é lá que ele coloca o que quer que você veja (prints, anexos, exemplos); quando ele citar um
   arquivo de fora do projeto (ex: em ~/Downloads), peça para ele copiar para essa pasta, porque
   fora do projeto você pode não ter acesso (ex: com a jail do nick ligada);
-- é lá que você salva o que entregar para ele conferir (ex: prints de prova, relatórios).
-O conteúdo dessa pasta não é versionado (ela tem um .gitignore próprio, criado pelo nick).
+- é lá que você salva o que entregar para ele conferir (ex: relatórios), menos o que o prompt
+  mandar gravar em outro lugar (ex: os prints de validação de um ticket).
+O conteúdo dessa pasta não é versionado (o nick cria em \`$NICK_DIR/\` um .gitignore que ignora tudo
+ali, menos a configuração).
 EOF
 }
 
@@ -687,7 +748,7 @@ ask_questions_po_sentry() {
 }
 
 ask_questions_tech_leader() {
-  read_required "ID do Jira (ex: SC-123): " JIRA_ID
+  read_jira_id JIRA_ID
   read_required "Título da tarefa: " TITLE
   read_via_editor "Descrição / contexto" DESCRIPTION
 }
@@ -704,20 +765,39 @@ ask_questions_tech_leader_jira() {
   read_optional "Contexto extra (opcional, Enter para pular): " DESCRIPTION
 }
 
-ask_questions_development() {
-  read_required "ID do Jira / branch (ex: SC-123): " JIRA_ID
-  read_optional "Arquivo do plano (opcional, Enter para usar docs/plans/${JIRA_ID}_*.md): " PLAN_PATH
-  PLAN_PATH="${PLAN_PATH:-docs/plans/${JIRA_ID}_*.md}"
+# warn_legacy_plan: before this ticket, plans lived in docs/plans/<ID>_<summary>.md. When
+# $NICK_DOCS_DIR/$JIRA_ID/plan.md doesn't exist, warns on stderr (one line each) about every
+# docs/plans/<ID>_*.md in the cwd but <ID>_review.md (a review, not a plan), so the user can
+# type that path in the plan question that follows. Nothing is migrated. The ID is quoted in
+# the glob, and an unmatched glob is skipped.
+warn_legacy_plan() {
+  local new_plan="$NICK_DOCS_DIR/$JIRA_ID/plan.md" f
+  [ -e "$new_plan" ] && return 0
+  for f in docs/plans/"$JIRA_ID"_*.md; do
+    [ -e "$f" ] || continue
+    [ "$f" = "docs/plans/${JIRA_ID}_review.md" ] && continue
+    echo "Aviso: $new_plan não existe, mas há um plano no lugar antigo: $f — para usá-lo, informe esse caminho na pergunta abaixo." >&2
+  done
 }
 
-# ask_questions_review: besides the plan (same glob pattern as Dev, since the exact name
-# has the summary chosen by the Tech Leader), computes REVIEW_PATH — a fixed path, not
-# asked of the user, since it's always the same kind of content (review result).
+# ask_questions_development: the plan defaults to $NICK_DOCS_DIR/<ID>/plan.md, the fixed path
+# the Tech Leader writes to.
+ask_questions_development() {
+  read_jira_id JIRA_ID
+  warn_legacy_plan
+  read_optional "Arquivo do plano (opcional, Enter para usar $NICK_DOCS_DIR/$JIRA_ID/plan.md): " PLAN_PATH
+  PLAN_PATH="${PLAN_PATH:-$NICK_DOCS_DIR/$JIRA_ID/plan.md}"
+}
+
+# ask_questions_review: besides the plan (same default as Dev), computes REVIEW_PATH — a fixed
+# path next to the plan, not asked of the user, since it's always the same kind of content
+# (review result).
 ask_questions_review() {
-  read_required "ID do Jira / branch (ex: SC-123): " JIRA_ID
-  read_optional "Arquivo do plano (opcional, Enter para usar docs/plans/${JIRA_ID}_*.md): " PLAN_PATH
-  PLAN_PATH="${PLAN_PATH:-docs/plans/${JIRA_ID}_*.md}"
-  REVIEW_PATH="docs/plans/${JIRA_ID}_review.md"
+  read_jira_id JIRA_ID
+  warn_legacy_plan
+  read_optional "Arquivo do plano (opcional, Enter para usar $NICK_DOCS_DIR/$JIRA_ID/plan.md): " PLAN_PATH
+  PLAN_PATH="${PLAN_PATH:-$NICK_DOCS_DIR/$JIRA_ID/plan.md}"
+  REVIEW_PATH="$NICK_DOCS_DIR/$JIRA_ID/review.md"
 }
 
 main() {
@@ -750,7 +830,7 @@ main() {
   check_requirements
   resolve_stack "$project_arg"
   # First point where JAIL_ENABLED is known, before any question: with "true", a jail that
-  # doesn't work here stops the script (no log, no claude). The .nick.conf in the cwd is
+  # doesn't work here stops the script (no log, no claude). The .nick/nick.conf in the cwd is
   # shared with the target team, so the error warns about turning the jail off there.
   local config_shared="false" jail_hosts
   [ "$PROJECT_CONFIG_FILE" = "$(config_cwd_file)" ] && config_shared="true"
@@ -811,7 +891,7 @@ main() {
   read -r -p "Confirma o envio para o claude? (s/N): " confirm
   case "$confirm" in
     s|S|sim|Sim|SIM)
-      exchange_dir_prepare || exit 1
+      nick_dir_prepare || exit 1
       # The deny/ask rules come first, inline (the content, not a path: a path out of the
       # project may not exist inside the jail), in every stage and with or without the jail.
       local claude_args=(--settings "$NICK_CLAUDE_SETTINGS")

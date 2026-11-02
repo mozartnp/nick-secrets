@@ -26,7 +26,7 @@ etapa, monta o prompt final e já abre o `claude` com ele.
 ./auto_scrum/auto_scrum.sh [--projeto=<nome>]
 ```
 
-1. Configuração do projeto (stack e flags): vem do `.nick.conf` do diretório atual, se
+1. Configuração do projeto (stack e flags): vem do `.nick/nick.conf` do diretório atual, se
    existir (o script mostra de onde carregou); senão o script pergunta qual projeto usar.
    Veja "Stack por projeto" abaixo.
 2. Escolha o tipo de conversa no menu (PO, Tech Leader, Desenvolvimento ou Review).
@@ -66,17 +66,18 @@ Os prompts e o menu usam a configuração do projeto: a stack técnica (ex: "Dja
 PostgreSQL" ou "Rust, Actix") e flags opt-in que ligam ou desligam partes dos prompts e do
 menu. Essa configuração pode ficar em dois lugares, procurados nesta ordem:
 
-1. **`.nick.conf` na raiz do diretório atual** (o projeto alvo, de onde o script é
+1. **`.nick/nick.conf` no diretório atual** (o projeto alvo, de onde o script é
    rodado). Se existir, é usado e o script imprime
    `Configuração do projeto carregada de: <caminho>` — sem menu de projetos. Se
    `--projeto=` também for passado, ele é ignorado com um aviso (mesmo que o nome não
    exista em `auto_scrum/projects/`). Só o diretório atual é olhado, não os diretórios
-   pais.
+   pais. Um `.nick.conf` antigo na raiz (sem o `.nick/nick.conf`) faz o script parar com o
+   comando de migração — veja "Migração (`.nick/`)" abaixo.
 2. **`auto_scrum/projects/<nome>.conf`**, escolhido por `--projeto=<nome>` (erro claro se
    o arquivo não existir) ou, sem argumento, pelo menu com os projetos encontrados + a
    opção "Nenhum" (usa uma stack genérica).
 
-O formato de `.nick.conf` e de `auto_scrum/projects/<nome>.conf` é o mesmo. O exemplo
+O formato de `.nick/nick.conf` e de `auto_scrum/projects/<nome>.conf` é o mesmo. O exemplo
 completo é o arquivo gerado por `--init`: ele traz todas as chaves aceitas, com um
 comentário explicando cada uma. Uma linha preenchida fica assim:
 `STACK_DESCRIPTION="Django, DRF, PostgreSQL"`.
@@ -102,46 +103,97 @@ Os avisos não interrompem a execução. Quando uma chave nova é criada, as con
 já existem passam a receber o aviso de chaves ausentes, com a linha a adicionar.
 
 - Pra criar a configuração: `./auto_scrum/auto_scrum.sh --init` — pergunta o destino
-  (`.nick.conf` no diretório atual, ou `auto_scrum/projects/<nome>.conf`, que pede o nome)
-  e cria o arquivo com as chaves aceitas no valor padrão e comentários explicando cada
+  (`.nick/nick.conf` no diretório atual, ou `auto_scrum/projects/<nome>.conf`, que pede o
+  nome) e cria o arquivo com as chaves aceitas no valor padrão e comentários explicando cada
   uma. O conteúdo é o mesmo nos dois destinos. Abre e preenche depois. Se o arquivo já
-  existir, pergunta antes de sobrescrever. No destino `.nick.conf`, cria também a pasta de
-  troca `.nick/troca/` (abaixo).
-
-#### Troca de arquivos com os agentes (`.nick/troca/`)
-
-Pra mostrar um arquivo ao agente (uma print, um anexo) ou receber o que ele gera pra você
-conferir (ex: uma print de prova), use a pasta `.nick/troca/` na raiz do projeto alvo. O
-prompt de toda etapa termina dizendo isso ao agente. Ela fica dentro do projeto porque, com
-a jail ligada, o agente não enxerga nada fora dele (ex: `~/Downloads`).
-
-O nick cria a pasta no `--init` (destino `.nick.conf`) e, se ainda não existir, ao confirmar
-o envio do prompt, com um `.gitignore` próprio que ignora tudo: nada dela é versionado, e o
-`.gitignore` do projeto não é alterado. Um `.gitignore` que já esteja lá não é sobrescrito.
+  existir, pergunta antes de sobrescrever. No destino do diretório atual, cria também o resto
+  da pasta `.nick/` (abaixo) e mostra a estrutura na saída.
 - `./auto_scrum/auto_scrum.sh --requisitos-jail` mostra o que a jail precisa nesta máquina
   (ver [Sandbox (ai-jail)](#sandbox-ai-jail)) e sai, sem carregar configuração.
 - Só `--projeto=` (singular), `--init` e `--requisitos-jail` são reconhecidos — qualquer
   outra flag (ex: `--projetos=` com "s") dá erro claro em vez de ser ignorada
   silenciosamente.
 
-`.nick.conf` é feito pra ser versionado **no repositório do projeto alvo**, junto com o
+#### Pasta `.nick/` do projeto alvo
+
+Tudo o que o nick guarda no projeto alvo fica numa pasta só, na raiz dele:
+
+```
+.nick/
+├── .gitignore    # versionado: ignora tudo em .nick/ menos ele e o nick.conf
+├── nick.conf     # versionado: configuração do projeto
+├── troca/        # não versionada: troca de arquivos com os agentes
+└── docs/         # não versionada: plano, review e prints de cada ticket
+    └── <ID>/     # ex: docs/SC-123/plan.md e docs/SC-123/review.md
+```
+
+- **O que é versionado:** só `.nick/nick.conf` e `.nick/.gitignore`. O `.gitignore` tem três
+  linhas (`*`, `!.gitignore` e `!nick.conf`), então o `.gitignore` do projeto não precisa ser
+  alterado. O nick cria `.gitignore`, `troca/` e `docs/` no `--init` (destino no diretório
+  atual) e, se faltar algum, ao confirmar o envio do prompt; cancelar o envio não cria nada.
+  Um `.nick/.gitignore` que já exista, editado ou não, nunca é sobrescrito.
+- **Troca de arquivos (`.nick/troca/`):** pra mostrar um arquivo ao agente (uma print, um
+  anexo) ou receber o que ele gera pra você conferir (ex: um relatório). O prompt de toda
+  etapa termina dizendo isso ao agente. Ela fica dentro do projeto porque, com a jail ligada,
+  o agente não enxerga nada fora dele (ex: `~/Downloads`).
+- **Docs de cada ticket (`.nick/docs/<ID>/`):** o Tech Leader grava o plano em `plan.md`, o
+  Review grava o resultado em `review.md`, e Desenvolvimento e Review salvam ali os prints de
+  validação. O `<ID>` é o ID do Jira digitado (ele não pode ter `/`, `..`, espaço nem
+  caractere de controle, porque vira o nome da pasta). No Desenvolvimento e no Review, o
+  plano padrão é `.nick/docs/<ID>/plan.md`.
+- **Pra versionar os docs** (vale pro time inteiro, porque o `.nick/.gitignore` é
+  versionado), acrescente ao `.nick/.gitignore`:
+
+  ```
+  !docs/
+  !docs/**
+  ```
+
+  `!docs/` reabre a pasta e `!docs/**` reabre o que está dentro dela, inclusive as subpastas
+  `<ID>/`, que o `*` voltaria a ignorar. `troca/` continua ignorada.
+
+`.nick/nick.conf` é feito pra ser versionado **no repositório do projeto alvo**, junto com o
 código que ele descreve, e compartilhado com o time. Como o conteúdo dele entra no prompt
 enviado ao `claude`, revise mudanças nesse arquivo no PR como qualquer outro arquivo que
 influencia o agente (ex: `CLAUDE.md`) — não ser executado não o torna inofensivo. Já
 `auto_scrum/projects/` é gitignorado — é configuração local, específica desta máquina, não
-faz parte deste repositório (`.nick.conf` também é gitignorado aqui, pra nunca ser commitado
-neste repo por engano). O mesmo cuidado vale pro `JAIL_ENABLED` do `.nick.conf` e pro
+faz parte deste repositório (`.nick/` inteira também é gitignorada aqui, pra nunca ser
+commitada neste repo por engano). O mesmo cuidado vale pro `JAIL_ENABLED` do `.nick/nick.conf` e pro
 `.ai-jail` do projeto alvo: desligar a jail num PR tira a jail de todo o time, e o `.ai-jail`
 pode ampliar o acesso do agente quando o projeto é confiado (ver
 [Sandbox (ai-jail)](#sandbox-ai-jail)).
 
-**Migração:** arquivos antigos `auto_scrum/projects/<nome>.sh` não são mais lidos. O
+**Migração (`.nick/`):** a configuração do projeto saiu de `.nick.conf` pra
+`.nick/nick.conf`, e os planos saíram de `docs/plans/<ID>_<resumo>.md` pra
+`.nick/docs/<ID>/plan.md`. O `.nick.conf` antigo não é mais lido: se ele existir sem o
+`.nick/nick.conf`, o script para antes de qualquer pergunta, com o comando de migração. Há
+dois caminhos, na raiz do projeto alvo:
+
+- **mover o arquivo**, mantendo os valores; na execução seguinte, ao confirmar o envio, o nick
+  cria o resto da pasta (`.gitignore`, `troca/` e `docs/`):
+
+  ```bash
+  mkdir -p .nick && mv .nick.conf .nick/nick.conf
+  ```
+
+- **rodar o `--init`** com destino no diretório atual: ele cria a pasta `.nick/` inteira com o
+  `nick.conf` no padrão (todas as chaves, com os comentários) e não lê nem altera o antigo. No
+  fim, avisa pra copiar os valores do antigo pro novo e apagar o antigo.
+
+Faça commit do `.nick/nick.conf`, do `.nick/.gitignore` e da remoção do `.nick.conf` antigo
+(se ele era versionado). Com os dois arquivos, vale o novo, e o script avisa que o antigo pode
+ser apagado. Os planos de `docs/plans/` não são migrados: no Desenvolvimento e no Review,
+quando `.nick/docs/<ID>/plan.md` não existe e há um `docs/plans/<ID>_*.md`, o script avisa o
+caminho antes da pergunta do plano — é só informá-lo ali. Um `.nick/troca/.gitignore` antigo
+pode continuar onde está.
+
+**Migração (`projects/*.sh`):** arquivos antigos `auto_scrum/projects/<nome>.sh` não são mais lidos. O
 conteúdo não precisa mudar, só a extensão — o script avisa e sugere o comando pra cada um
 (`mv 'auto_scrum/projects/<nome>.sh' 'auto_scrum/projects/<nome>.conf'`).
 
 **Migração (`PRODUCTION_ENABLED`):** a pergunta de impacto em produção no prompt do PO
 passou a depender da chave `PRODUCTION_ENABLED` e fica desligada por padrão. Configurações
-criadas antes dela — tanto `.nick.conf` versionados nos projetos alvo quanto
+criadas antes dela — tanto `.nick/nick.conf` versionados nos projetos alvo quanto
 `auto_scrum/projects/<nome>.conf` — perdem a pergunta até ganharem
 `PRODUCTION_ENABLED="true"`. Enquanto o arquivo carregado não tiver essa linha, o aviso de
 chaves ausentes lista `PRODUCTION_ENABLED`, explicando que a pergunta está desligada; um
@@ -182,7 +234,7 @@ JAIL_FORWARD_PORTS="54320 6379"
 ```
 
 Só essas portas ficam acessíveis, e cada uma dá ao agente acesso total ao serviço dela. Como
-o `.nick.conf` é commitado com o projeto, o time inteiro herda a lista. Um valor fora do
+o `.nick/nick.conf` é commitado com o projeto, o time inteiro herda a lista. Um valor fora do
 formato (vírgula, porta 0 ou acima de 65535) faz a ferramenta parar com erro.
 
 A rede da jail também é filtrada: além da lista padrão do ai-jail (a API do Claude, os
@@ -202,7 +254,7 @@ JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"
 Cada host libera também os subdomínios dele e é mais um canal de saída pro agente. Use só o
 nome do host: com `https://`, porta, caminho ou curinga (`*.`), a ferramenta para com erro.
 
-É opt-in por projeto, pela chave `JAIL_ENABLED` da configuração do projeto (`.nick.conf` ou
+É opt-in por projeto, pela chave `JAIL_ENABLED` da configuração do projeto (`.nick/nick.conf` ou
 `auto_scrum/projects/<nome>.conf`). Vazio ou `"false"` roda o agente direto, como antes. Com
 `"true"`, a ferramenta confere logo no início se a jail funciona nesta máquina e, se não
 funcionar, para com uma mensagem dizendo o que falta. Não existe fallback: com `"true"` o
@@ -343,7 +395,7 @@ outro ticket.
   pro PostgreSQL do Docker que os testes usam.
 - **O agente não acha um arquivo de fora do projeto** (ex: uma print em `~/Downloads`): a
   jail só mostra o projeto. Copie o arquivo pra `.nick/troca/` (ver
-  [Troca de arquivos com os agentes](#troca-de-arquivos-com-os-agentes-nicktroca)).
+  [Pasta `.nick/` do projeto alvo](#pasta-nick-do-projeto-alvo)).
 - **Ferramenta instalada no home não encontrada** (fora dos gerenciadores de versão que o
   nick monta, acima): o home da jail é privado. O agente avisa qual caminho faltou; abra um
   ticket no nick pra avaliar incluí-lo na lista.

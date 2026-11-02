@@ -1,28 +1,33 @@
 # shellcheck shell=bash
 #
-# config.sh: reads the project config file (.nick.conf in the cwd, or any other file the
+# config.sh: reads the project config file (.nick/nick.conf in the cwd, or any other file the
 # caller picks) shared by the nick tools that run an AI agent — today only auto_scrum. The
 # tool registers its own keys (config_register_key) and this library does the rest: the
 # KEY="value" reader with no source/eval (config_load), its three warnings, the toggle rule
-# (*_ENABLED), the per-key default and note, where the cwd file lives (config_cwd_file) and
-# the skeleton format (config_print_skeleton). It knows no concrete key of any tool.
+# (*_ENABLED), the per-key default and note, where the cwd file lives (config_cwd_file, plus
+# the check for the old .nick.conf, config_cwd_legacy_check) and the skeleton format
+# (config_print_skeleton). It knows no concrete key of any tool.
 #
 # Rules (see ABOUT.md, "Código compartilhado entre ferramentas (lib/)"):
-#   - loading it only assigns CONFIG_CWD_FILE_NAME, creates the four empty registry arrays
-#     and defines functions: it prints nothing and runs no command;
+#   - loading it only assigns CONFIG_CWD_FILE_NAME and CONFIG_CWD_LEGACY_FILE_NAME, creates
+#     the four empty registry arrays and defines functions: it prints nothing and runs no
+#     command;
 #   - no shebang and no executable bit; no set -euo pipefail of its own, but it works with
 #     or without it in the caller;
 #   - every function is prefixed config_ and every global CONFIG_;
 #   - it never calls exit, and never uses source, . or eval;
 #   - it reads no global of the caller: everything comes in as a parameter or from the
-#     registry. $PWD (config_cwd_file) and the readonly attribute checked when registering
-#     (config_register_key) are shell state, not caller globals.
+#     registry. $PWD (config_cwd_file, config_cwd_legacy_check) and the readonly attribute
+#     checked when registering (config_register_key) are shell state, not caller globals.
 # The one documented exception: config_load writes, through printf -v, the globals of the
 # keys the caller registered — that is the reader's job. It writes nothing else, neither
 # another caller global nor a CONFIG_* one. Registering only writes to the CONFIG_* arrays
 # and never initializes the key globals: the caller owns them.
 
-CONFIG_CWD_FILE_NAME=".nick.conf"
+# Both relative to the cwd. The legacy name is never read: config_cwd_legacy_check only
+# tells the user to move it.
+CONFIG_CWD_FILE_NAME=".nick/nick.conf"
+CONFIG_CWD_LEGACY_FILE_NAME=".nick.conf"
 
 # The key registry, filled by config_register_key in registration order (which is the order
 # of the skeleton and of the missing-key warning). Parallel indexed arrays rather than an
@@ -297,12 +302,38 @@ config_warn_missing_keys() {
   done
 }
 
-# config_cwd_file: prints the path of the config file in the cwd ($PWD/.nick.conf) and always
+# config_cwd_file: prints the path of the config file in the cwd ($PWD/.nick/nick.conf) and always
 # returns 0, whether the file exists or not — testing it with [ -f ] is the caller's job.
 # Returning 1 for a missing file would make a caller's x="$(config_cwd_file)" stop under
 # set -e. Only the cwd itself: it never searches parent directories.
 config_cwd_file() {
   printf '%s\n' "$PWD/$CONFIG_CWD_FILE_NAME"
+}
+
+# config_cwd_legacy_check: looks for the old config file in the cwd ($PWD/.nick.conf), which
+# is no longer read. Only the old one → prints the error with the mv that migrates it on
+# stderr and returns 1 (stopping is the caller's job: this library never exits). Both → the
+# new one wins: prints a warning on stderr (whoever edited the old one by mistake would
+# otherwise see no effect) and returns 0. Otherwise silent, returns 0. Never reads, moves,
+# creates or removes anything.
+config_cwd_legacy_check() {
+  local legacy_file current_file
+  legacy_file="$PWD/$CONFIG_CWD_LEGACY_FILE_NAME"
+  current_file="$(config_cwd_file)"
+  if [ ! -e "$legacy_file" ]; then
+    return 0
+  fi
+  if [ -e "$current_file" ]; then
+    echo "Aviso: $legacy_file não é mais lido — a configuração vem de $current_file. Apague o arquivo antigo." >&2
+    return 0
+  fi
+  {
+    echo "Erro: a configuração do projeto agora fica em $CONFIG_CWD_FILE_NAME, e $legacy_file não é mais lido."
+    echo "Mova o arquivo e rode de novo (na raiz do projeto):"
+    echo "  mkdir -p $(dirname "$CONFIG_CWD_FILE_NAME") && mv $CONFIG_CWD_LEGACY_FILE_NAME $CONFIG_CWD_FILE_NAME"
+    echo "Depois, versione $CONFIG_CWD_FILE_NAME e o $(dirname "$CONFIG_CWD_FILE_NAME")/.gitignore que o nick cria na próxima execução."
+  } >&2
+  return 1
 }
 
 # config_print_skeleton <tool_name>: prints (stdout) the config skeleton of the registered

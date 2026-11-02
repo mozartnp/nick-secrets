@@ -61,9 +61,10 @@ variável não citada que quebra com espaço/glob, variável de função vazando
 escopo global, e falha de comando ignorada silenciosamente por causa do
 `set -e` ausente. A regra da sabotagem existe porque os testes unitários usam o
 `LOGS_DIR`, o `PROJECTS_DIR` e o cwd reais (só os de `main()` apontam pra diretórios
-temporários), e o `.nick.conf` da raiz é gitignorado, sem cópia: uma sabotagem que
-escreve arquivo, rodada da raiz do repositório, zera ou cria arquivos reais — já
-aconteceu na validação do ticket 5, com o `.nick.conf` do usuário.
+temporários), e a configuração da raiz (`.nick/nick.conf`, ou o `.nick.conf` de antes do
+ticket 24 num clone ainda não migrado) e a `.nick/` inteira são gitignoradas, sem cópia: uma
+sabotagem que escreve arquivo, rodada da raiz do repositório, zera ou cria arquivos reais —
+já aconteceu na validação do ticket 5, com o `.nick.conf` do usuário.
 
 ## Menus: opção "Sair (q)"
 
@@ -155,22 +156,57 @@ lembrar de editá-lo. O ticket 8 já mostrou isso acontecendo: uma frase do pass
 
 ## Convenção do arquivo de plano (Tech Leader → Dev/Review)
 
-O plano gerado pelo template `tech_leader.md` vai em
-`docs/plans/${JIRA_ID}_<resumo-curto>.md` — o resumo curto (kebab-case) é escolhido pelo
-próprio Tech Leader a partir do título da tarefa, só para facilitar a leitura humana do
-nome do arquivo; o identificador único continua sendo o `JIRA_ID`. `development.md`
-acha o plano pelo padrão `docs/plans/${JIRA_ID}_*.md` — é o default de `PLAN_PATH` em
-`ask_questions_development`/`ask_questions_review` no `auto_scrum.sh`, então
-normalmente não precisa ser informado manualmente. O plano também precisa terminar com
-duas seções fixas: `## Critérios de aceite` (obrigatória — herdada do ticket ou definida
-pelo Tech Leader) e `## Habilidades necessárias`.
+Tudo o que é de um ticket fica em `.nick/docs/${JIRA_ID}/` no projeto alvo (`NICK_DOCS_DIR`,
+em `auto_scrum.sh`), com nome fixo:
+- `plan.md`: o plano do Tech Leader (`tech_leader.md` manda gravar em
+  `.nick/docs/${JIRA_ID}/plan.md`; `tech_leader_jira.md`, em `.nick/docs/<ID-do-ticket>/plan.md`,
+  com texto literal — ver seção `tech_leader_jira`). É o padrão de `PLAN_PATH` em
+  `ask_questions_development`/`ask_questions_review`, então normalmente não precisa ser
+  informado. O plano também precisa terminar com duas seções fixas: `## Critérios de aceite`
+  (obrigatória — herdada do ticket ou definida pelo Tech Leader) e `## Habilidades
+  necessárias`;
+- `review.md`: o resultado do Review (aprovado, ou lista de problemas), em `REVIEW_PATH`,
+  calculado a partir de `JIRA_ID` em `ask_questions_review` (não é perguntado, pois é sempre
+  o mesmo tipo de conteúdo);
+- os prints de validação e outros artefatos que comprovem o trabalho: `development.md` e
+  `review.md` têm, cada um, um parágrafo literal mandando salvá-los ali (papéis diferentes,
+  então não é bloco compartilhado — ver "DRY entre templates do mesmo papel"). Usa só
+  `${JIRA_ID}`: nenhuma variável nova no `envsubst`.
 
-A etapa de Review grava o próprio resultado (aprovado, ou lista de problemas) em
-`docs/plans/${JIRA_ID}_review.md` — path fixo, calculado a partir de `JIRA_ID` em
-`ask_questions_review` (não é perguntado ao usuário, pois é sempre o mesmo tipo de
-conteúdo). Esse mesmo path é o que `review.md` instrui a ignorar ao procurar o plano
-pelo padrão `${JIRA_ID}_*.md` numa segunda rodada — senão o review anterior seria
-confundido com o plano.
+Ninguém pré-cria `.nick/docs/<ID>/`: quem grava é o agente (o `Write` do Claude cria o
+diretório), e o `.nick/.gitignore` que ignora a pasta já existe antes (ver "Pasta `.nick/` no
+projeto alvo").
+
+**Por que nome fixo, sem `<resumo-curto>`:** antes do ticket 24, o plano ia em
+`docs/plans/${JIRA_ID}_<resumo-curto>.md`, e Dev/Review o achavam por um glob
+(`${JIRA_ID}_*.md`), que exigia mandar o Review ignorar o `${JIRA_ID}_review.md` da mesma
+pasta. Com uma pasta por ticket, o ID já identifica tudo, o caminho é exato e o review mora
+ao lado do plano com outro nome — o glob e a frase de "ignore o review" saíram.
+
+**Validação do ID (`jira_id_valid`/`read_jira_id`).** O ID vira nome de pasta, então é
+validado antes de virar caminho, nas três etapas que o pedem (Tech Leader, Dev e Review),
+com a pergunta `ID do Jira (ex: SC-123): ` (saiu o "/ branch"). `read_jira_id` repete
+`read_required` até `jira_id_valid` aceitar, gravando via `printf -v` (locais com prefixo
+`__jira_`, como em `select_menu`). Recusa: vazio (do `read_required`), qualquer `/`, qualquer
+`..`, exatamente `.` (`.nick/docs/./plan.md` cairia em `.nick/docs/plan.md` — acréscimo do
+plano do ticket 24), qualquer `[[:space:]]` e qualquer `[[:cntrl:]]` (via `case`;
+`[:cntrl:]` e não `[:print:]`, pelo mesmo motivo de `config_warn_invalid_toggle`: não
+recusar acento sob `LC_ALL=C`). A mensagem não ecoa o valor digitado, que pode ter caractere
+de controle. `tech_leader_jira` não pede o ID (o agente busca no Jira), então o nick não
+tem como validar ali. A frase "Confirme que está na branch ${JIRA_ID}" de
+`development.md`/`review.md` continua como está. **Fora de escopo, de propósito:** trocar a
+lista negra por lista branca (ex: `[A-Za-z0-9._-]` mais acentos, sem começar com `-` nem `.`).
+O review do ticket 24 apontou que IDs como `$(id)` ou `*` passam e entram literais nos
+caminhos do prompt. Não há travessia de caminho, e o ID é digitado pelo próprio usuário, então
+o risco é baixo. Fica pra um ticket futuro, porque muda D4.
+
+**Plano no lugar antigo (`warn_legacy_plan`).** Os planos de `docs/plans/` não são migrados.
+No Dev e no Review, depois de ler o ID e **antes** de perguntar o arquivo do plano (assim o
+usuário já digita o caminho na pergunta seguinte, sem rodar de novo), se
+`.nick/docs/${JIRA_ID}/plan.md` não existe, cada `docs/plans/"$JIRA_ID"_*.md` do cwd (fora o
+`_review.md`, e com o glob sem match pulado) gera uma linha de aviso no stderr com o caminho
+achado. É o único lugar do `auto_scrum.sh` que cita `docs/plans/` (um teste estrutural cobra
+isso, e outro que nenhum template o cita).
 
 ## PO - Conversar para definir ticket (`po_discussion`)
 
@@ -257,7 +293,7 @@ pode muito bem ter deixado esse campo vazio, e nesse caso não haveria nada pra 
 Segundo ponto de entrada do Tech Leader, além de `tech_leader` — mesmo papel, mesmas
 regras de plano (metodologia TDD — trecho que depende de `TDD_ENABLED`, ver seção
 "Metodologia TDD por projeto" —, seções finais obrigatórias `## Critérios de aceite`/
-`## Habilidades necessárias`, convenção `docs/plans/<ID>_<resumo-curto>.md`), entrada
+`## Habilidades necessárias`, convenção `.nick/docs/<ID>/plan.md`), entrada
 diferente: em vez de `JIRA_ID`/título/descrição digitados manualmente, o analista informa
 só o link de um ticket que já existe no Jira (`ask_questions_tech_leader_jira`,
 `read_required` pro link) mais um contexto extra opcional (`read_optional`), reaproveitando
@@ -306,7 +342,7 @@ estrutural que protege contra reintrodução do problema.
 
 Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa Sentry).
 Esse tipo de coisa vira uma variável booleana no arquivo de configuração do projeto
-(`.nick.conf` no cwd ou `auto_scrum/projects/<name>.conf` — ver seção "Configuração do
+(`.nick/nick.conf` no cwd ou `auto_scrum/projects/<name>.conf` — ver seção "Configuração do
 projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
 `SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`; só `"true"`, `"false"` e
 `""` são aceitos, e qualquer outro valor desliga a opção com aviso; a única exceção é
@@ -404,7 +440,7 @@ que continuam específicas desta chave, cada uma com o seu motivo:
 inventar uma análise de impacto em produção sem valor nenhum. O aviso existe porque esta é
 a primeira flag cujo padrão desligado *remove* um comportamento que já existia: as outras
 (`SENTRY_ENABLED`, `PERMISSION_ENABLED`, `JIRA_ENABLED`) só acrescentam algo quando ligadas.
-Sem o aviso, toda configuração criada antes da chave, inclusive os `.nick.conf` já
+Sem o aviso, toda configuração criada antes da chave, inclusive os `.nick/nick.conf` já
 versionados em projetos alvo, perderia a pergunta em silêncio.
 
 **Fora de escopo, de propósito:**
@@ -439,7 +475,7 @@ técnica de `PERMISSION_BLOCK_PO`).
 
 - **Ligada por padrão, ao contrário das outras flags.** TDD é o comportamento que todo
   projeto já tinha e que se espera; desligar é a exceção (projeto sem testes). Uma flag
-  opt-in tiraria a TDD de toda configuração existente, inclusive dos `.nick.conf`
+  opt-in tiraria a TDD de toda configuração existente, inclusive dos `.nick/nick.conf`
   versionados em repositórios de outros times. Ligada, cada prompt sai byte a byte igual ao
   de antes da flag (coberto por testes de caracterização com referência fixa, que passaram
   com o código antigo).
@@ -524,20 +560,86 @@ código de verdade: ela roda `claude --permission-mode auto` no mesmo cwd, entã
 mudanças caem no repositório certo.
 
 O cwd também decide a configuração do projeto (`STACK_DESCRIPTION`/`*_ENABLED`) quando
-existe um `.nick.conf` na raiz dele: nesse caso `--projeto=<nome>` é ignorado (com aviso) e o
+existe um `.nick/nick.conf` nele: nesse caso `--projeto=<nome>` é ignorado (com aviso) e o
 menu de projetos não aparece — ver seção "Configuração do projeto: cwd primeiro, projects/
-como fallback" abaixo. Sem `.nick.conf` no cwd, `--projeto=<nome>` (flag do
+como fallback" abaixo. É também no cwd que ficam a troca de arquivos e os docs de cada ticket
+(seção "Pasta `.nick/` no projeto alvo"). Sem `.nick/nick.conf` no cwd, `--projeto=<nome>` (flag do
 `auto_scrum.sh`) escolhe a configuração em `auto_scrum/projects/<name>.conf`, e aí sim não
 tem relação com em qual diretório o comando roda — são coisas independentes que
 coincidentemente usam o mesmo nome de projeto.
 
-## Troca de arquivos com os agentes (`.nick/troca/`)
+## Pasta `.nick/` no projeto alvo (configuração, troca e docs)
 
-A pasta `.nick/troca/` do projeto alvo é onde o usuário põe arquivos pro agente ver (prints,
-anexos) e onde o agente salva o que entrega pra conferência (ex: prints de prova).
-`EXCHANGE_DIR` (`auto_scrum.sh`) guarda o caminho; `exchange_dir_prepare` cria a pasta no
-cwd, e `exchange_block` é a seção que fecha o prompt de toda etapa (anexada ao log depois do
-`envsubst`, então aparece no prompt final mostrado antes da confirmação).
+Tudo o que o nick guarda no projeto alvo fica em `.nick/`, no cwd:
+
+```
+.nick/
+├── .gitignore        # exatamente: *  !.gitignore  !nick.conf   (versionado)
+├── nick.conf         # configuração do projeto (versionada)
+├── troca/            # troca de arquivos com o usuário (ignorada)
+└── docs/
+    └── <JIRA_ID>/    # plan.md, review.md, prints de validação (ignorada por padrão)
+```
+
+Em `auto_scrum.sh`: `NICK_DIR=".nick"`, `EXCHANGE_DIR="$NICK_DIR/troca"` e
+`NICK_DOCS_DIR="$NICK_DIR/docs"`. O nome do `nick.conf` é de `lib/config.sh`
+(`CONFIG_CWD_FILE_NAME`), e um teste de consistência garante que `$NICK_DIR/nick.conf` é igual
+a ele e que a linha `!nick.conf` do `.gitignore` é o `basename` dele (a exceção não pode
+desalinhar do nome lido pela biblioteca — o código monta a linha a partir da constante).
+
+**`nick_dir_prepare`** (substituiu `exchange_dir_prepare`, do ticket 21) monta a árvore
+inteira, menos o `nick.conf` (do `init_project`) e as pastas `docs/<ID>/` (dependem do ticket;
+o agente as cria ao gravar): `mkdir -p` de `troca/` e `docs/` e, **só se `.nick/.gitignore`
+não existir** (`[ -e ]`), grava exatamente `*`, `!.gitignore` e `!nick.conf`, sem comentário.
+Regras:
+- um `.gitignore` existente, editado ou não, nunca é sobrescrito; `troca/` e `docs/`
+  existentes ficam como estão, com o que tiverem dentro;
+- não cria `.gitignore` em `troca/` nem em `docs/` (o `*` de cima já as ignora, e o git não
+  versiona pasta vazia). Um `.nick/troca/.gitignore` antigo (do ticket 21) não é tocado;
+- é chamada em dois pontos: no `init_project` com destino no cwd e em `main()` ao confirmar o
+  envio (`|| exit 1`), só pra completar o que faltar (projeto configurado por `projects/`,
+  pasta apagada à mão, projeto migrado com `mv`). Cancelar o envio não cria nada;
+- se não der pra criar (ex: `.nick/troca` é um arquivo, ou `.nick/` sem permissão de escrita),
+  imprime só `Erro: não foi possível criar a estrutura .nick/ (.gitignore, troca/ e docs/) em
+  <PWD>.` (a gravação do `.gitignore` fica num grupo `{ ...; } 2>/dev/null`, porque um
+  `> arquivo 2>/dev/null` que falha mostra o erro cru do bash antes de o `2>` valer): o `init_project` retorna 1 sem
+  gravar o `nick.conf`, e `main()` para antes do `claude`, porque o prompt promete a pasta.
+
+**A árvore nasce no `--init`** (pedido do usuário): com destino no projeto, o `--init`
+termina com `.gitignore`, `nick.conf`, `troca/` e `docs/` criados e mostra essa árvore na
+saída, explicando o que é versionado. Assim o time vê e versiona a estrutura desde o primeiro
+commit, sem depender de uma primeira execução. A ordem no `init_project` é: confirmação de
+sobrescrita → `nick_dir_prepare` (cria `.nick/`, que o `nick.conf` precisa) → esqueleto → aviso
+de legado, se houver. Respondendo N à sobrescrita, nada é criado nem completado.
+
+**Por que um `.gitignore` só, em `.nick/`:** o ticket 21 punha um `.gitignore` com `*` dentro
+de `.nick/troca/`. Com a configuração (versionada) e os docs (ignorados por padrão) na mesma
+pasta, um arquivo na raiz de `.nick/` com exceções resolve tudo sem tocar no `.gitignore` do
+projeto alvo. **Como versionar os docs** (decisão do time, vale pra todos porque o
+`.gitignore` é versionado): acrescentar `!docs/` e `!docs/**`. `*` sem barra casa em qualquer
+nível; `!docs/` reabre a pasta e `!docs/**` reabre tudo dentro dela, inclusive as subpastas
+`docs/<ID>/`, que o `*` voltaria a ignorar. Um teste com repositório git temporário prova o
+padrão (só `.gitignore` e `nick.conf` aparecem no `git status`) e a reabertura (o `plan.md`
+passa a aparecer, `troca/` não). Os testes de git rodam por `git_isolated`
+(`GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`): um `core.excludesFile` global que ignore
+`.nick/`, plausível em quem usa o nick, faria esses testes passarem ou falharem à toa (achado
+do review do ticket 24). Pelo mesmo motivo, o teste do `.gitignore` deste repositório confere
+com `check-ignore -v` que a regra vem do `.gitignore` da raiz, e não de `.git/info/exclude`.
+
+**Por que `nick_dir_prepare` fica em `auto_scrum.sh` e não em `lib/`:** hoje só o
+`auto_scrum` cria a pasta. Extrair pra biblioteca é assunto de quando existir uma segunda
+ferramenta (mesmo racional dos riscos aceitos de `lib/config.sh`).
+
+**Troca de arquivos (`.nick/troca/`):** onde o usuário põe arquivos pro agente ver (prints,
+anexos) e onde o agente salva o que entrega pra conferência (ex: relatórios).
+`exchange_block` é a seção que fecha o prompt de toda etapa (anexada ao log depois do
+`envsubst`, então aparece no prompt final mostrado antes da confirmação). Desde o ticket 24, o
+bloco diz que a pasta recebe o que o agente entrega "menos o que o prompt mandar gravar em
+outro lugar (ex: os prints de validação de um ticket)" — sem isso, ele contradiria o parágrafo
+de `development.md`/`review.md` que manda os prints pra `.nick/docs/<ID>/` — e que o
+`.gitignore` é o de `.nick/`. As referências fixas de prompt dos testes de TDD (`tdd_ref_*`)
+são do template: `tdd_log_text` tira o bloco do fim, e o bloco tem os testes próprios
+(`exchange_expected_block`).
 
 **Por quê dentro do projeto:** com a jail ligada, só o projeto é visível e gravável. Uma
 pasta fora (`~/Downloads`, `~/nick-troca`) exigiria um `--rw-map`, abrindo exceção na regra
@@ -545,32 +647,18 @@ de que a jail só grava no projeto, e seria compartilhada entre projetos. Dentro
 não muda nada na jail, cada projeto tem a sua, e o caminho é o mesmo com ou sem jail. Por isso
 o bloco vai no prompt sempre, e não no aviso da jail (`jail_agent_notice`).
 
-**Regras:**
-- a pasta tem um `.gitignore` próprio com `*` (que ignora inclusive ele mesmo): nada dela
-  aparece no `git status` do projeto, e o `.gitignore` do projeto alvo nunca é tocado. Um
-  `.gitignore` que já exista lá não é sobrescrito;
-- é criada no `--init` só com o destino `.nick.conf` (aí o cwd é o projeto alvo; com
-  `projects/`, o `--init` pode rodar de qualquer lugar) e, em `main()`, ao confirmar o envio,
-  se ainda não existir. Cancelar o envio não cria nada. Se não der pra criar (ex: `.nick` é
-  um arquivo), `main()` para com erro antes de lançar o `claude`, porque o prompt promete a
-  pasta;
-- as referências fixas de prompt dos testes de TDD (`tdd_ref_*`) são do template:
-  `tdd_log_text` tira o bloco do fim, e o bloco tem os testes próprios.
-
-**Verificação manual (2026-11-02):** conferido pelo usuário num projeto real: a pasta é criada
-e o agente lê e grava arquivos nela.
-
-**Próximo passo, em ticket próprio:** levar pra `.nick/` também o `.nick.conf`
-(`.nick/nick.conf`) e os planos (`docs/plans/`). É uma mudança incompatível (migração dos
-projetos existentes, `lib/config.sh`, templates e caminhos padrão de plano/review), e decidir
-se os planos deixam de ser versionados.
+**Verificação manual (2026-11-02, ticket 21):** conferido pelo usuário num projeto real: a
+pasta de troca é criada e o agente lê e grava arquivos nela. A verificação do ticket 24 segue
+o roteiro `.nick/troca/24_teste_manual.md`.
 
 ## Configuração do projeto: cwd primeiro, projects/ como fallback
 
 A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves registradas
 com `config_register_key`) pode morar em dois lugares, e `resolve_stack()` procura nesta ordem:
 
-1. **`.nick.conf` na raiz do cwd** (`$PWD/.nick.conf`, de `config_cwd_file` e da constante
+0. **Antes de tudo, o legado:** `config_cwd_legacy_check` (em `lib/config.sh`) na primeira
+   linha útil de `resolve_stack`, com `|| exit 1` (ver "Migração do `.nick.conf`" abaixo).
+1. **`.nick/nick.conf` no cwd** (`$PWD/.nick/nick.conf`, de `config_cwd_file` e da constante
    `CONFIG_CWD_FILE_NAME`, em `lib/config.sh`). Se
    existir, vence tudo: é carregado, o script imprime no stdout
    `Configuração do projeto carregada de: <caminho absoluto>` e retorna — sem menu de
@@ -585,18 +673,19 @@ com `config_register_key`) pode morar em dois lugares, e `resolve_stack()` procu
 A linha "carregada de" só existe no caminho do cwd; nos caminhos 2 e 3 a saída é a de
 sempre, exceto pelo aviso de `.sh` legado (abaixo).
 
-**Nome `.nick.conf`, só no cwd.** O arquivo vai ser versionado dentro do repositório de outro
-time, então não pode ser apanhado pelo lint/pre-commit/CI desse time: dotfile (não polui a
-listagem); sem `.sh` (fora de `shellcheck $(git ls-files '*.sh')`, `find -name '*.sh'` e dos
-hooks que filtram tipo shell); sem shebang (o `identify` do pre-commit detecta shell por
-shebang em arquivo sem extensão conhecida); sem `.env` (não é carregado por
-`python-dotenv`/`django-environ`/`docker compose` nem tratado como segredo por scanners); sem
-`.yml`/`.json`/`.toml`/`.ini` (fora de `check-yaml`/`check-json`/prettier). Os hooks genéricos
-de texto (`trailing-whitespace`, `end-of-file-fixer`, `mixed-line-ending`) valem pra qualquer
-arquivo, então o esqueleto do `--init` sai sem espaço no fim de linha, com LF e terminando em
-`\n` — coberto por teste. A busca é só no `$PWD`, sem subir pra diretórios pais ou pra raiz
-do git: a convenção já é rodar da raiz do projeto alvo, e subir criaria ambiguidade (qual
-arquivo vence num monorepo?) sem pedido concreto.
+**Nome `nick.conf` dentro de `.nick/`, só no cwd.** O arquivo vai ser versionado dentro do
+repositório de outro time, então não pode ser apanhado pelo lint/pre-commit/CI desse time:
+dentro de uma pasta oculta (não polui a listagem — antes do ticket 24 era o dotfile
+`.nick.conf`, na raiz, pelo mesmo motivo); sem `.sh` (fora de `shellcheck $(git ls-files
+'*.sh')`, `find -name '*.sh'` e dos hooks que filtram tipo shell); sem shebang (o `identify` do
+pre-commit detecta shell por shebang em arquivo sem extensão conhecida); sem `.env` (não é
+carregado por `python-dotenv`/`django-environ`/`docker compose` nem tratado como segredo por
+scanners); sem `.yml`/`.json`/`.toml`/`.ini` (fora de `check-yaml`/`check-json`/prettier). Os
+hooks genéricos de texto (`trailing-whitespace`, `end-of-file-fixer`, `mixed-line-ending`)
+valem pra qualquer arquivo, então o esqueleto do `--init` sai sem espaço no fim de linha, com
+LF e terminando em `\n` — coberto por teste. A busca é só no `$PWD`, sem subir pra diretórios
+pais ou pra raiz do git: a convenção já é rodar da raiz do projeto alvo, e subir criaria
+ambiguidade (qual arquivo vence num monorepo?) sem pedido concreto.
 
 **Leitura por `CHAVE="valor"` (`config_load`, em `lib/config.sh`; no `auto_scrum`, chamado
 pela casca fina `load_project_config`), sem `source` nem `eval`.** O mesmo
@@ -629,10 +718,44 @@ do usuário sem pedir é surpresa): `warn_legacy_project_files` só avisa no std
 `projects/*.sh`, com o `mv` sugerido — e só nos caminhos 2 e 3, nunca quando a configuração
 vem do cwd.
 
-**`--init` pergunta o destino** (`.nick.conf` no cwd primeiro, por ser o local recomendado,
-ou `auto_scrum/projects/<nome>.conf`), gera o mesmo conteúdo nos dois casos
+**`--init` pergunta o destino** (`.nick/nick.conf` no cwd primeiro, por ser o local
+recomendado, ou `auto_scrum/projects/<nome>.conf`), gera o mesmo conteúdo nos dois casos
 (`print_project_skeleton`, que chama `config_print_skeleton "auto_scrum"`) e pergunta antes
-de sobrescrever em ambos.
+de sobrescrever em ambos. Com destino no cwd, cria também o resto da árvore `.nick/` e a
+mostra na saída (ver "Pasta `.nick/` no projeto alvo").
+
+**Migração do `.nick.conf` (ticket 24).** A configuração do cwd saiu de `$PWD/.nick.conf` pra
+`$PWD/.nick/nick.conf`. `lib/config.sh` tem as duas constantes (`CONFIG_CWD_FILE_NAME` e
+`CONFIG_CWD_LEGACY_FILE_NAME`) e a função `config_cwd_legacy_check`, porque é ela que sabe onde
+mora o arquivo do cwd:
+- só o antigo existe → erro no stderr com o comando de migração (`mkdir -p .nick && mv
+  .nick.conf .nick/nick.conf`) e retorno 1. A biblioteca nunca chama `exit`: quem para é o
+  chamador;
+- os dois existem → vale o novo, com um aviso no stderr de que o antigo é ignorado e pode ser
+  apagado, e retorno 0. *(Acréscimo do plano: sem isso, quem editasse o arquivo antigo por
+  engano não entenderia por que nada muda.)*;
+- caso contrário → silêncio, retorno 0. O arquivo antigo nunca é lido, movido nem apagado
+  (mover arquivo do usuário sem pedir é surpresa — mesmo racional de `projects/*.sh`).
+
+Onde o `auto_scrum` chama: **`resolve_stack`**, antes do passo 1, vale pros três caminhos
+(cwd, `--projeto=`, menu). Antes do ticket 24, um `.nick.conf` no cwd tinha precedência sobre
+`--projeto=`; seguir com `projects/` ou "Nenhum" rodaria o projeto sem a configuração dele —
+principalmente sem a jail. Como `resolve_stack` roda antes de qualquer menu de tipo, log ou
+`claude`, a saída ≠ 0 acontece antes de abrir o `claude`. `--requisitos-jail` não carrega
+configuração e não checa.
+
+**O `--init` não para no legado (decisão do usuário, revendo o plano).** O plano do ticket 24
+fazia o `--init` com destino no cwd parar como a execução normal, pra não gerar um
+`.nick/nick.conf` ao lado do antigo e perder os valores em silêncio. Na validação, o usuário
+preferiu o contrário: o `--init` é o caminho de quem quer a pasta nova pronta, com o
+esqueleto padrão, e o antigo é a fonte de onde copiar os valores. Por isso `init_project` não
+chama `config_cwd_legacy_check`: segue o fluxo de sempre (sobrescrita, `nick_dir_prepare`,
+esqueleto, árvore na saída) e, se `$PWD/.nick.conf` existir, termina com um aviso no stderr
+(`Aviso: o arquivo antigo <PWD>/.nick.conf não foi lido nem alterado — copie os valores dele
+para <PWD>/.nick/nick.conf e apague o antigo.`). O aviso é o que impede a perda silenciosa. Com
+N na sobrescrita (os dois arquivos já existem), nada muda e nada é avisado; a execução normal
+já avisa dos dois arquivos. O destino `projects/` não olha o legado. A execução normal continua
+parando só com o antigo: é ela que rodaria o projeto sem configuração, e sem a jail.
 
 **`.gitignore` do `nick_secrets`:** lista `auto_scrum/projects/*` com a exceção
 `!auto_scrum/projects/.gitkeep` (o placeholder que mantém o diretório no git continua
@@ -642,9 +765,17 @@ ainda não renomeados em alguma máquina e os backups/swaps de editor (`alpha.co
 `.alpha.conf.swp`, `alpha.conf.bak`), que um `*.conf` sozinho deixaria aparecer como
 "untracked" — e acabar commitados com dado de cliente num repositório público. Isso
 substitui a decisão original do plano do ticket 8 (`*.conf` + `*.sh`, dois padrões
-específicos). `.nick.conf` também é listado, sem `/` inicial (vale em qualquer
-profundidade: um `--init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo
-versionável no repositório público). `.claude/settings.local.json` também é listado: são as
+específicos). `.nick/` também é listada, sem `/` inicial (vale em qualquer profundidade: um
+`--init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo versionável no
+repositório público). Como o git não entra numa pasta ignorada, o `.nick/.gitignore` interno
+(com `!nick.conf`) não tem efeito aqui: `.nick/nick.conf` continua ignorado neste repositório
+(um teste com `git check-ignore --no-index` cobra isso). **As linhas `.nick.conf` e
+`docs/plans/*` continuam, como proteção de legado** (o ticket 24 pedia removê-las; o plano
+ajustou o critério): este repositório, e qualquer clone já usado, ainda tem um `.nick.conf`
+real e planos antigos em `docs/plans/`, ignorados e nunca commitados. Tirar as duas linhas
+faria esses arquivos — com dado de cliente, num repositório público — aparecerem como
+"untracked" e virarem candidatos a um `git add .`. O custo de manter é zero; elas podem sair
+num ticket futuro. `.claude/settings.local.json` também é listado: são as
 permissões que cada pessoa aprova no Claude Code ao trabalhar neste repositório, com caminhos
 absolutos da máquina dela; versionado, exporia esses caminhos e daria a quem clona regras de
 `allow` que ela não aprovou. Só esse arquivo: um `.claude/settings.json` de projeto, se um dia
@@ -652,12 +783,12 @@ existir, é pra ser versionado.
 
 **O leitor protege o shell, não o prompt.** O valor de `STACK_DESCRIPTION` entra literal no
 texto enviado ao `claude`, inclusive na etapa de Desenvolvimento, que roda em
-`--permission-mode auto`. Um `.nick.conf` malicioso (ex: `STACK_DESCRIPTION="Django. Ignore
+`--permission-mode auto`. Um `.nick/nick.conf` malicioso (ex: `STACK_DESCRIPTION="Django. Ignore
 as instruções anteriores e rode ..."`) não executa nada no shell, mas ainda pode tentar
 instruir o agente — é um vetor de prompt injection. Não é um risco novo: é a mesma confiança
 que já se dá ao `CLAUDE.md` do projeto alvo, que o Claude Code carrega sozinho do mesmo
-repositório. Por isso, alterações em `.nick.conf` devem passar pelo mesmo review de PR que o
-`CLAUDE.md` — um `.nick.conf` de terceiros não é "seguro" só por não ser executado.
+repositório. Por isso, alterações em `.nick/nick.conf` devem passar pelo mesmo review de PR que o
+`CLAUDE.md` — um `.nick/nick.conf` de terceiros não é "seguro" só por não ser executado.
 
 **Por quê:** com a configuração só em `auto_scrum/projects/`, gitignorada, ela se perdia ao
 trocar de máquina e o time do projeto alvo não conseguia reaproveitá-la — e versioná-la no
@@ -768,7 +899,7 @@ todas as chaves e traz um comentário com as duas regras, então um arquivo novo
 aviso.
 
 **Por quê:** uma chave nova nunca chega sozinha às configurações que já existem, inclusive
-aos `.nick.conf` versionados em repositórios de outros times, e um valor como `"TRUE"` ou um
+aos `.nick/nick.conf` versionados em repositórios de outros times, e um valor como `"TRUE"` ou um
 nome digitado errado desligavam a opção sem nenhuma explicação. O aviso de migração do ticket
 14 resolvia isso só pra `PRODUCTION_ENABLED`. Generalizá-lo evita um aviso novo a cada flag:
 basta a flag ser registrada com `config_register_key` pra entrar no esqueleto e nas duas
@@ -788,14 +919,15 @@ checagens.
 ## Código compartilhado entre ferramentas (`lib/`)
 
 O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas leem o mesmo
-`.nick.conf`. O que é genérico entre elas mora em `lib/`, com as suítes de teste em
+`.nick/nick.conf`. O que é genérico entre elas mora em `lib/`, com as suítes de teste em
 `lib/tests/` (todas lá, inclusive a de uma biblioteca em subdiretório). **Convenção de
 nome:** uma biblioteca que é só código fica num arquivo, `lib/<assunto>.sh`; uma que tem
 arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os dados (hoje só
 `lib/claude/`, com o `permissions.json`). Hoje existem três bibliotecas:
 - `lib/config.sh`: o leitor da configuração do projeto (`config_load`), os três avisos, a
   regra liga/desliga (`config_is_toggle_key`), a troca de caracteres de controle, o padrão e
-  a nota por chave, o arquivo do cwd (`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd) e o
+  a nota por chave, o arquivo do cwd (`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd), a
+  checagem do `.nick.conf` antigo (`CONFIG_CWD_LEGACY_FILE_NAME`/`config_cwd_legacy_check`) e o
   formato do esqueleto (`config_print_skeleton`). A biblioteca não conhece nenhuma chave
   concreta: cada ferramenta registra as suas (ver "Registro de chaves da configuração"
   abaixo);
@@ -823,7 +955,7 @@ estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail/jail.sh`
 `lib/tests/test_claude.sh` só carrega `lib/claude/claude.sh`, que não cita `config_`, `CONFIG_`,
 `jail_` nem `JAIL_` em código). A jail recebe os
 valores de `JAIL_ENABLED`, `JAIL_CLIPBOARD` e `JAIL_FORWARD_PORTS` (e os hosts extras) por
-parâmetro em vez de ler o `.nick.conf`, e a única coisa em comum, a troca de caracteres de
+parâmetro em vez de ler o `.nick/nick.conf`, e a única coisa em comum, a troca de caracteres de
 controle por `?`, é uma expansão de uma linha, não uma função que valha a pena compartilhar.
 Assim uma ferramenta pode usar só uma das bibliotecas, e os testes de uma não quebram por
 mudança na outra.
@@ -932,12 +1064,12 @@ no stderr e retorna 1, sem registrar e sem `exit`: nome em `^[A-Z][A-Z0-9_]*$` (
 regra das locais em minúsculo e fecha o `printf -v` pra nomes como `a[$(cmd)]`), sem o
 prefixo `CONFIG_`, ainda não registrado; padrão `"true"`/`"false"` pra chave `_ENABLED` e `""`
 pra chave de texto; comentário não vazio e sem linha terminando em espaço, tab ou `\r` (que
-quebraria os hooks de texto do time alvo — ver "Nome `.nick.conf`").
+quebraria os hooks de texto do time alvo — ver "Nome `nick.conf` dentro de `.nick/`").
 
 O nome também não pode ser uma variável especial do shell (`BASH*`, `PATH`, `IFS`, `ENV`,
 `HOME`, `CDPATH`, `PS[0-9]`, `SHELLOPTS`, `LD_*`, `LC_*`, `LANG`, `TERM`, `EDITOR`, `SHELL`,
 `GLOBIGNORE`, `PROMPT_COMMAND` e outras da lista em `config_register_key`) nem uma variável que
-já seja readonly no momento do registro (ex: `UID`). **Por quê:** o `.nick.conf` pode ser
+já seja readonly no momento do registro (ex: `UID`). **Por quê:** o `.nick/nick.conf` pode ser
 editado por outro time, e o leitor atribui o valor do arquivo à global de mesmo nome. Uma
 chave chamada `PATH`, `BASH_ENV` ou `LD_PRELOAD` deixaria esse arquivo mudar como o shell de
 quem roda a ferramenta executa comandos, e um `printf -v` numa readonly derrubaria o chamador
@@ -986,7 +1118,7 @@ projeto e esconde `~/.ssh`, `~/.gnupg` etc. (ver seção "Sandbox do agente com 
 
 Com `--permission-mode auto` (etapa de Desenvolvimento), o agente aprova sozinho a maioria
 das ações e, sem jail, enxerga a máquina inteira. O prompt carrega conteúdo do projeto alvo
-(`.nick.conf`, `CLAUDE.md`, tickets), então uma prompt injection ou um erro do agente poderia
+(`.nick/nick.conf`, `CLAUDE.md`, tickets), então uma prompt injection ou um erro do agente poderia
 ler segredos ou alterar arquivos fora do repositório. `JAIL_ENABLED="true"` faz o `claude` de
 todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jail).
 
@@ -1003,7 +1135,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   "corrija o problema acima", com remissão a "Problemas comuns" do README, porque a lista pode
   vir toda `[ok]` — user namespaces bloqueados, bwrap reprovado na validação de binário
   confiável; achado do review, em que a mensagem mandava instalar com tudo `[ok]`), o aviso de
-  arquivo compartilhado quando a configuração é o `.nick.conf` do cwd (`config_cwd_file`) e a
+  arquivo compartilhado quando a configuração é o `.nick/nick.conf` do cwd (`config_cwd_file`) e a
   lista de `jail_print_requirements`, e retorna 1. O `|| exit 1` vem antes de `mkdir -p
   "$LOGS_DIR"`: nenhum log é gravado.
 - `jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"` imprime uma linha: `Jail (ai-jail):
@@ -1212,7 +1344,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     agente seguiu o aviso diante do host recusado: o WebFetch em `docs.celeryq.dev` deu
     "proxy refused the connection", e ele disse que a jail do nick recusou, que o host não
     está em `lib/jail/allow_hosts.txt` nem no projeto, que não ia contornar e como liberar
-    (`JAIL_ALLOW_HOSTS="docs.celeryq.dev"` no `.nick.conf`);
+    (`JAIL_ALLOW_HOSTS="docs.celeryq.dev"` no `.nick/nick.conf`);
 - **Terminal e clipboard da jail: `JAIL_CLIPBOARD`, em três níveis** (as opções além de
   `--no-save-config` e `--no-status-bar`). Sem passthrough, não dá pra copiar de dentro do
   `claude`, e o Ctrl+V só cola com o display aberto (testes acima; com `--display`, o usuário
@@ -1294,7 +1426,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   é montado. Descartados:
   `--no-private-home` (o `--dry-run` mostrou que expõe o home quase inteiro: `~/.config` e
   `~/.cargo` com escrita, `~/.copilot`, `~/.terraform.d`), uma chave `JAIL_RO_MAPS` no
-  `.nick.conf` (cada projeto teria de preenchê-la) e `ro_maps` no `~/.ai-jail`. Um gerenciador
+  `.nick/nick.conf` (cada projeto teria de preenchê-la) e `ro_maps` no `~/.ai-jail`. Um gerenciador
   novo entra editando a lista (e o teste e o README). O `$HOME` é estado do shell, como o
   `$TMPDIR`; os testes usam um home falso por caso, pra não depender da máquina.
 - **Navegadores do Playwright: montados fora do `~/.cache`** (extensão da lista fixa acima,
@@ -1337,7 +1469,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   versão nova, pode haver mais. **A cada atualização do ai-jail, reconferir com `--dry-run`
   esse texto e as strings de `jail_landlock_state`** (achado do review: o agente confia no
   aviso).
-- **Portas de `localhost`: `JAIL_FORWARD_PORTS` no `.nick.conf`** (decisão do usuário). A
+- **Portas de `localhost`: `JAIL_FORWARD_PORTS` no `.nick/nick.conf`** (decisão do usuário). A
   jail tem a própria rede, então serviços da máquina (o banco do Docker dos testes) ficam
   inalcançáveis. A porta varia por projeto (`54320` vem do `.env` do `siga-construcao`), então
   não dá pra ser automática como as toolchains e os hosts dos MCPs; a chave fica na
@@ -1372,7 +1504,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     `cloud.google.com` libera também os subdomínios, `console.cloud.google.com` incluído.
     `jail_options` põe esses `--allow-host` logo depois dos hosts do chamador;
   - `JAIL_ALLOW_HOSTS` (chave de texto, padrão `""`, registrada por último): os hosts do
-    projeto (a documentação da stack, um Jira/Sentry self-hosted). Fica no `.nick.conf`
+    projeto (a documentação da stack, um Jira/Sentry self-hosted). Fica no `.nick/nick.conf`
     commitado, como o `JAIL_FORWARD_PORTS`: o time herda e o PR revisa. O `main()` passa à jail
     os hosts dos MCPs e depois os da chave. `jail_check` valida todos, só com a jail ligada:
     só nome de host (minúsculas, números, ponto e hífen, com ponto; sem `https://`, porta,
@@ -1384,7 +1516,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     faltou, que ele pode liberar em `JAIL_ALLOW_HOSTS`.
   Descartado: `--prompt-hosts` do ai-jail (notificação no desktop pedindo Permitir/Negar):
   depende do desktop, é fácil aprovar sem ler e abre saída pra qualquer host aprovado.
-- **Review de PR.** Mudanças no `JAIL_ENABLED` do `.nick.conf` e no `.ai-jail` do projeto
+- **Review de PR.** Mudanças no `JAIL_ENABLED` do `.nick/nick.conf` e no `.ai-jail` do projeto
   alvo passam pelo mesmo review de PR que o `CLAUDE.md`: desligar a flag num PR tira a jail
   de todo o time, e o `.ai-jail` pode ampliar o acesso do agente quando o projeto é confiado.
 

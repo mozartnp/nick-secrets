@@ -468,7 +468,7 @@ done
 # Um host mal escrito no arquivo faria a jail parar em todo projeto: a lista real passa na
 # mesma validação dos hosts do chamador.
 docs_dir="$(new_case nick_hosts_real)"
-run_jail "$docs_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$docs_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0|" "$(file_of "$docs_dir/out")|$(file_of "$docs_dir/err")" "todo host de lib/jail/allow_hosts.txt passa na validação"
 assert_contains "$(head -n5 "$JAIL_HOSTS_TXT" 2>/dev/null)" "Um por linha" "o cabeçalho do arquivo explica o formato"
 
@@ -494,7 +494,7 @@ assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --allow-host mcp.sen
 # projeto).
 docs_dir="$(new_case nick_hosts_bad)"
 printf '%s\n' 'a.io' 'https://b.io' > "$docs_dir/hosts.txt"
-run_jail "$docs_dir" "JAIL_HOSTS_FILE='$docs_dir/hosts.txt'; jail_check true '' 'x.io' '' '/proj/.nick.conf' false || echo \"rc=\$?\""
+run_jail "$docs_dir" "JAIL_HOSTS_FILE='$docs_dir/hosts.txt'; jail_check true '' 'x.io' '' '/proj/.nick/nick.conf' false || echo \"rc=\$?\""
 assert_eq "rc=1" "$(file_of "$docs_dir/out")" "host inválido em JAIL_HOSTS_FILE: jail_check retorna 1"
 assert_eq "0" "$(jail_calls "$docs_dir")" "host inválido em JAIL_HOSTS_FILE: o ai-jail não é chamado"
 assert_contains "$(file_of "$docs_dir/err")" "Erro: $docs_dir/hosts.txt (lista padrão do nick) tem um host inválido: \"https://b.io\"." "host inválido em JAIL_HOSTS_FILE: o erro cita o arquivo e o host"
@@ -685,7 +685,7 @@ echo
 echo "== jail_check desligada: retorna 0 sem imprimir nada nem chamar o ai-jail =="
 for check_value in "" false TRUE; do
   check_dir="$(new_case "check_off_${check_value:-vazio}")"
-  run_jail "$check_dir" "jail_check '$check_value' total '' '' '/proj/.nick.conf' true; echo depois" "export FAKE_JAIL_RC=1"
+  run_jail "$check_dir" "jail_check '$check_value' total '' '' '/proj/.nick/nick.conf' true; echo depois" "export FAKE_JAIL_RC=1"
   assert_eq "0|depois|" "$(file_of "$check_dir/rc")|$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail_check \"$check_value\" (JAIL_CLIPBOARD inválido): código 0, nada impresso (só o 'depois' do teste)"
   assert_eq "0" "$(jail_calls "$check_dir")" "jail_check \"$check_value\": o ai-jail não é chamado"
 done
@@ -693,7 +693,7 @@ done
 echo
 echo "== jail_check ligada, jail funcionando: verifica num diretório temporário, removido em seguida =="
 check_dir="$(new_case check_ok)"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok: retorna 0 sem imprimir nada no stdout"
 assert_eq "" "$(file_of "$check_dir/err")" "jail ok: nada no stderr"
 assert_eq "1" "$(jail_calls "$check_dir")" "jail ok: uma chamada ao ai-jail"
@@ -707,40 +707,40 @@ check_ports_ok_case=0
 check_ports_bad_case=0
 # Verificação que passa: JAIL_LANDLOCK fica com o estado da saída do ai-jail, sem imprimir nada.
 check_dir="$(new_case check_landlock)"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$? landlock=\$JAIL_LANDLOCK\"" "export FAKE_JAIL_STDERR=\$'▸ Jail Active: /tmp/x\\n▸ Landlock: partially enforced'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false; echo \"rc=\$? landlock=\$JAIL_LANDLOCK\"" "export FAKE_JAIL_STDERR=\$'▸ Jail Active: /tmp/x\\n▸ Landlock: partially enforced'"
 assert_eq "rc=0 landlock=parcial|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail ok: JAIL_LANDLOCK=\"parcial\" e nada impresso"
 check_dir="$(new_case check_landlock_falha)"
-run_jail "$check_dir" "JAIL_LANDLOCK=completo; jail_check true '' '' '' '/proj/.nick.conf' false || echo \"rc=\$? landlock=[\$JAIL_LANDLOCK]\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='▸ Landlock: fully enforced'"
+run_jail "$check_dir" "JAIL_LANDLOCK=completo; jail_check true '' '' '' '/proj/.nick/nick.conf' false || echo \"rc=\$? landlock=[\$JAIL_LANDLOCK]\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='▸ Landlock: fully enforced'"
 assert_eq "rc=1 landlock=[]" "$(file_of "$check_dir/out")" "verificação que falha: JAIL_LANDLOCK fica vazia (mesmo com um estado de antes)"
 check_dir="$(new_case check_landlock_off)"
-run_jail "$check_dir" "JAIL_LANDLOCK=completo; jail_check false '' '' '' '/proj/.nick.conf' false; echo \"landlock=[\$JAIL_LANDLOCK]\""
+run_jail "$check_dir" "JAIL_LANDLOCK=completo; jail_check false '' '' '' '/proj/.nick/nick.conf' false; echo \"landlock=[\$JAIL_LANDLOCK]\""
 assert_eq "landlock=[]" "$(file_of "$check_dir/out")" "jail desligada: JAIL_LANDLOCK fica vazia (mesmo com um estado de antes)"
 # As portas também entram na verificação.
 check_dir="$(new_case check_ok_ports)"
-run_jail "$check_dir" "jail_check true '' '' '54320' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check true '' '' '54320' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok com portas: retorna 0"
 assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${docs_opts[@]}" --forward-port 54320 -- true)" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok com portas: a verificação usa o mesmo --forward-port do lançamento"
 for check_ports in "1" "65535" "54320 6379" "  54320  "; do
   check_ports_ok_case=$((check_ports_ok_case + 1))
   check_dir="$(new_case "check_ports_ok_${check_ports_ok_case}")"
-  run_jail "$check_dir" "jail_check true '' '' '$check_ports' '/proj/.nick.conf' false; echo \"rc=\$?\""
+  run_jail "$check_dir" "jail_check true '' '' '$check_ports' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
   assert_eq "rc=0|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "JAIL_FORWARD_PORTS \"$check_ports\": aceito"
 done
 for check_ports in abc 0 65536 054320 -1 "54320,6379" "54320 x" "99999999999999999999" $'54320\e[2J' "54320 6379 54320"; do
   check_ports_bad_case=$((check_ports_bad_case + 1))
   check_dir="$(new_case "check_ports_bad_${check_ports_bad_case}")"
   printf -v check_ports_q '%q' "$check_ports"
-  run_jail "$check_dir" "jail_check true '' '' $check_ports_q '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+  run_jail "$check_dir" "jail_check true '' '' $check_ports_q '/proj/um projeto/.nick/nick.conf' false || echo \"rc=\$?\"; echo depois"
   check_err="$(file_of "$check_dir/err")"
   check_label="JAIL_FORWARD_PORTS $check_ports_q"
   assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "$check_label: retorna 1, sem sair do shell"
   assert_eq "0" "$(jail_calls "$check_dir")" "$check_label: o ai-jail não é chamado"
-  assert_contains "$check_err" "Erro: JAIL_FORWARD_PORTS=\"${check_ports//[[:cntrl:]]/?}\" em /proj/um projeto/.nick.conf não é uma lista de portas válida." "$check_label: o erro cita o valor (controles trocados por '?') e o arquivo"
+  assert_contains "$check_err" "Erro: JAIL_FORWARD_PORTS=\"${check_ports//[[:cntrl:]]/?}\" em /proj/um projeto/.nick/nick.conf não é uma lista de portas válida." "$check_label: o erro cita o valor (controles trocados por '?') e o arquivo"
   assert_contains "$check_err" 'Use números de 1 a 65535, sem repetir, separados por espaço, ex: JAIL_FORWARD_PORTS="54320 6379".' "$check_label: o erro diz o formato aceito"
   assert_not_contains "$check_err" "Requisitos da jail" "$check_label: não mostra a lista de requisitos"
 done
 check_dir="$(new_case check_ports_off)"
-run_jail "$check_dir" "jail_check false '' '' abc '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check false '' '' abc '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail desligada: JAIL_FORWARD_PORTS inválido passa quieto (a chave não tem efeito)"
 # Hosts extras (os dos MCPs e os de JAIL_ALLOW_HOSTS): só nomes de host, que o ai-jail libera
 # com os subdomínios. URL, porta, caminho, curinga, maiúscula ou nome sem ponto param antes do
@@ -749,7 +749,7 @@ check_hosts_ok_case=0
 for check_hosts in "docs.djangoproject.com" "mcp.atlassian.com docs.djangoproject.com tailwindcss.com" "  a-b.c1.io  " "x.io x.io"; do
   check_hosts_ok_case=$((check_hosts_ok_case + 1))
   check_dir="$(new_case "check_hosts_ok_${check_hosts_ok_case}")"
-  run_jail "$check_dir" "jail_check true '' '$check_hosts' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+  run_jail "$check_dir" "jail_check true '' '$check_hosts' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
   assert_eq "rc=0|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "hosts \"$check_hosts\": aceitos"
 done
 check_hosts_bad_case=0
@@ -759,31 +759,31 @@ for check_hosts_case in "https://docs.djangoproject.com|https://docs.djangoproje
   check_hosts_bad_case=$((check_hosts_bad_case + 1))
   check_dir="$(new_case "check_hosts_bad_${check_hosts_bad_case}")"
   printf -v check_hosts_q '%q' "$check_hosts"
-  run_jail "$check_dir" "jail_check true '' $check_hosts_q '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+  run_jail "$check_dir" "jail_check true '' $check_hosts_q '' '/proj/um projeto/.nick/nick.conf' false || echo \"rc=\$?\"; echo depois"
   check_err="$(file_of "$check_dir/err")"
   check_label="hosts $check_hosts_q"
   assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "$check_label: retorna 1, sem sair do shell"
   assert_eq "0" "$(jail_calls "$check_dir")" "$check_label: o ai-jail não é chamado"
-  assert_contains "$check_err" "Erro: JAIL_ALLOW_HOSTS em /proj/um projeto/.nick.conf tem um host inválido: \"$check_bad_host\"." "$check_label: o erro cita o host errado (controles trocados por '?') e o arquivo"
+  assert_contains "$check_err" "Erro: JAIL_ALLOW_HOSTS em /proj/um projeto/.nick/nick.conf tem um host inválido: \"$check_bad_host\"." "$check_label: o erro cita o host errado (controles trocados por '?') e o arquivo"
   assert_contains "$check_err" 'Use só nomes de host (letras minúsculas, números, ponto e hífen), sem https://, porta ou caminho, separados por espaço, ex: JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com". Cada host libera também os subdomínios dele.' "$check_label: o erro diz o formato aceito"
   assert_not_contains "$check_err" "Requisitos da jail" "$check_label: não mostra a lista de requisitos"
 done
 check_dir="$(new_case check_hosts_off)"
-run_jail "$check_dir" "jail_check false '' 'https://x' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check false '' 'https://x' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail desligada: host inválido passa quieto (a chave não tem efeito)"
 # As toolchains também entram na verificação.
 check_dir="$(new_case check_ok_toolchains)"
 mkdir -p "$check_dir/home/.pyenv"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$check_dir/home/.pyenv" "${docs_opts[@]}" -- true)" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok com ~/.pyenv: a verificação usa o mesmo --map do lançamento"
 # Os hosts extras também entram na verificação: um ai-jail que recuse --allow-host falha aqui.
 check_dir="$(new_case check_ok_hosts)"
-run_jail "$check_dir" "jail_check true '' 'mcp.atlassian.com mcp.sentry.dev' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check true '' 'mcp.atlassian.com mcp.sentry.dev' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok com hosts: retorna 0"
 assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --allow-host mcp.atlassian.com --allow-host mcp.sentry.dev "${docs_opts[@]}" -- true)" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok com hosts: a verificação usa os mesmos --allow-host do lançamento"
 for check_clip in restrito brando; do
   check_dir="$(new_case "check_ok_$check_clip")"
-  run_jail "$check_dir" "jail_check true '$check_clip' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+  run_jail "$check_dir" "jail_check true '$check_clip' '' '' '/proj/.nick/nick.conf' false; echo \"rc=\$?\""
   assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok, JAIL_CLIPBOARD \"$check_clip\": retorna 0"
   assert_eq "$(jail_options_of "$check_clip")" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok, JAIL_CLIPBOARD \"$check_clip\": a verificação usa as opções do nível"
 done
@@ -793,12 +793,12 @@ echo "== jail_check ligada, JAIL_CLIPBOARD inválido: retorna 1 antes de chamar 
 for check_clip in total RESTRITO " medio" $'brando\e[2J'; do
   check_dir="$(new_case "check_bad_clip_$(printf '%s' "$check_clip" | tr -c 'a-zA-Z' '_')")"
   printf -v check_clip_q '%q' "$check_clip"
-  run_jail "$check_dir" "jail_check true $check_clip_q '' '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+  run_jail "$check_dir" "jail_check true $check_clip_q '' '' '/proj/um projeto/.nick/nick.conf' false || echo \"rc=\$?\"; echo depois"
   check_err="$(file_of "$check_dir/err")"
   check_label="JAIL_CLIPBOARD $check_clip_q"
   assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "$check_label: retorna 1, sem sair do shell"
   assert_eq "0" "$(jail_calls "$check_dir")" "$check_label: o ai-jail não é chamado"
-  assert_contains "$check_err" "Erro: JAIL_CLIPBOARD=\"${check_clip//[[:cntrl:]]/?}\" em /proj/um projeto/.nick.conf não é um valor aceito." "$check_label: o erro cita o valor (controles trocados por '?') e o arquivo"
+  assert_contains "$check_err" "Erro: JAIL_CLIPBOARD=\"${check_clip//[[:cntrl:]]/?}\" em /proj/um projeto/.nick/nick.conf não é um valor aceito." "$check_label: o erro cita o valor (controles trocados por '?') e o arquivo"
   assert_contains "$check_err" 'Valores aceitos: "restrito", "medio", "brando" ou "" (vazio, que vale "medio").' "$check_label: o erro lista os valores aceitos"
   assert_not_contains "$check_err" "Requisitos da jail" "$check_label: não mostra a lista de requisitos (não é problema de instalação)"
 done
@@ -806,12 +806,12 @@ done
 echo
 echo "== jail_check ligada, ai-jail ausente: retorna 1 (sem sair do shell) com a mensagem de erro =="
 check_dir="$(new_case check_missing)"
-run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/proj/um projeto/.nick/nick.conf' false || echo \"rc=\$?\"; echo depois"
 check_err="$(file_of "$check_dir/err")"
 assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "ai-jail ausente: retorna 1 e o shell continua (um comando depois da chamada roda)"
-assert_contains "$check_err" 'Erro: JAIL_ENABLED="true" em /proj/um projeto/.nick.conf' "ai-jail ausente: a mensagem cita o caminho da configuração"
+assert_contains "$check_err" 'Erro: JAIL_ENABLED="true" em /proj/um projeto/.nick/nick.conf' "ai-jail ausente: a mensagem cita o caminho da configuração"
 assert_contains "$check_err" "não encontrado" "ai-jail ausente: diz que o ai-jail não foi encontrado"
-assert_contains "$check_err" 'JAIL_ENABLED="false" em /proj/um projeto/.nick.conf' "ai-jail ausente: oferece JAIL_ENABLED=\"false\" no mesmo arquivo"
+assert_contains "$check_err" 'JAIL_ENABLED="false" em /proj/um projeto/.nick/nick.conf' "ai-jail ausente: oferece JAIL_ENABLED=\"false\" no mesmo arquivo"
 assert_contains "$check_err" "[falta] ai-jail" "ai-jail ausente: termina com a lista de requisitos ([falta] ai-jail)"
 assert_not_contains "$check_err" "Saída do ai-jail" "ai-jail ausente: sem bloco de saída do ai-jail"
 assert_contains "$check_err" "  1. instale o que falta (lista abaixo);" "ai-jail ausente: a saída 1 manda instalar o que falta"
@@ -821,12 +821,12 @@ assert_eq "0" "$(jail_calls "$check_dir")" "ai-jail ausente: o stub não é cham
 echo
 echo "== jail_check ligada, ai-jail falhando: retorna 1 com a saída do ai-jail na mensagem =="
 check_dir="$(new_case check_fail)"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || echo \"rc=\$?\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='bwrap: setting up uid map: Permission denied'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false || echo \"rc=\$?\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='bwrap: setting up uid map: Permission denied'"
 check_err="$(file_of "$check_dir/err")"
 assert_eq "rc=1" "$(file_of "$check_dir/out")" "ai-jail falhando: retorna 1"
 assert_contains "$check_err" "Saída do ai-jail:" "ai-jail falhando: a mensagem tem o bloco de saída"
 assert_contains "$check_err" "    bwrap: setting up uid map: Permission denied" "ai-jail falhando: a saída do ai-jail aparece, indentada"
-assert_contains "$check_err" 'JAIL_ENABLED="false" em /proj/.nick.conf' "ai-jail falhando: oferece JAIL_ENABLED=\"false\""
+assert_contains "$check_err" 'JAIL_ENABLED="false" em /proj/.nick/nick.conf' "ai-jail falhando: oferece JAIL_ENABLED=\"false\""
 assert_contains "$check_err" "Requisitos da jail" "ai-jail falhando: termina com a lista de requisitos"
 assert_not_contains "$check_err" "não encontrado" "ai-jail falhando: não diz que o ai-jail não foi encontrado"
 # Com o ai-jail instalado, a causa costuma não ser falta de nada (user namespaces bloqueados,
@@ -841,19 +841,19 @@ assert_not_exists "$check_dir/cwd/.ai-jail" "ai-jail falhando: nenhum .ai-jail n
 echo
 echo "== jail_check: caracteres de controle da saída viram '?', mantendo as quebras de linha =="
 check_dir="$(new_case check_control)"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || :" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR=\$'primeira \\e[2J linha\\nsegunda \\e[2J linha'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false || :" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR=\$'primeira \\e[2J linha\\nsegunda \\e[2J linha'"
 check_err="$(file_of "$check_dir/err")"
 assert_contains "$check_err" "    primeira ?[2J linha"$'\n'"    segunda ?[2J linha" "ESC vira '?' e cada linha da saída continua numa linha própria"
 assert_not_contains "$check_err" $'\e' "nenhum ESC chega ao terminal"
 check_dir="$(new_case check_control_c)"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || :" "export LC_ALL=C FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='falhou: não há namespace'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false || :" "export LC_ALL=C FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='falhou: não há namespace'"
 assert_contains "$(file_of "$check_dir/err")" "    falhou: não há namespace" "com LC_ALL=C, o 'não' da saída sai intacto"
 
 echo
 echo "== jail_check: aviso de arquivo compartilhado só com shared=\"true\" =="
 check_dir="$(new_case check_shared)"
-run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/proj/.nick.conf' true || :"
-assert_contains "$(file_of "$check_dir/err")" "Atenção: /proj/.nick.conf é compartilhado com o time do projeto" "shared=\"true\": aviso de arquivo compartilhado"
+run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/proj/.nick/nick.conf' true || :"
+assert_contains "$(file_of "$check_dir/err")" "Atenção: /proj/.nick/nick.conf é compartilhado com o time do projeto" "shared=\"true\": aviso de arquivo compartilhado"
 check_dir="$(new_case check_not_shared)"
 run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/nick/projects/alpha.conf' false || :"
 assert_not_contains "$(file_of "$check_dir/err")" "compartilhado" "shared=\"false\": sem aviso de arquivo compartilhado"
@@ -861,9 +861,9 @@ assert_not_contains "$(file_of "$check_dir/err")" "compartilhado" "shared=\"fals
 echo
 echo "== jail_check: não depende do set -e (chamada antes de ||, com mktemp falhando) =="
 check_dir="$(new_case check_mktemp)"
-run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || echo \"rc=\$?\"" "export TMPDIR='$TEST_TMP/nao-existe'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick/nick.conf' false || echo \"rc=\$?\"" "export TMPDIR='$TEST_TMP/nao-existe'"
 assert_eq "rc=1" "$(file_of "$check_dir/out")" "mktemp falhando: retorna 1 em vez de seguir como se a jail funcionasse"
-assert_contains "$(file_of "$check_dir/err")" 'JAIL_ENABLED="true" em /proj/.nick.conf' "mktemp falhando: mensagem de erro com o caminho"
+assert_contains "$(file_of "$check_dir/err")" 'JAIL_ENABLED="true" em /proj/.nick/nick.conf' "mktemp falhando: mensagem de erro com o caminho"
 assert_eq "0" "$(jail_calls "$check_dir")" "mktemp falhando: o ai-jail não é chamado"
 
 echo

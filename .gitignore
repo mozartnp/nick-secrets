@@ -3,3 +3,4 @@ auto_scrum/projects/*
 !auto_scrum/projects/.gitkeep
 .nick.conf
 docs/plans/*
+.claude/settings.local.json

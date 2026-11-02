@@ -9,12 +9,15 @@ TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
 # Code shared with the other nick tools lives in lib/: the project config reader
-# (lib/config.sh) and the ai-jail sandbox (lib/jail.sh). The paths are relative to this
-# script, so auto_scrum/ depends on its sibling lib/.
+# (lib/config.sh), the ai-jail sandbox (lib/jail.sh) and the Claude Code deny/ask rules
+# (lib/claude/claude.sh, which reads lib/claude/permissions.json). The paths are relative to
+# this script, so auto_scrum/ depends on its sibling lib/.
 # shellcheck source=SCRIPTDIR/../lib/config.sh
 source "$SCRIPT_DIR/../lib/config.sh"
 # shellcheck source=SCRIPTDIR/../lib/jail.sh
 source "$SCRIPT_DIR/../lib/jail.sh"
+# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
+source "$SCRIPT_DIR/../lib/claude/claude.sh"
 
 # Project config keys, in skeleton order — the only place that lists them (see ABOUT.md).
 # config_register_key <name> <default> <note> <skeleton comment>
@@ -121,6 +124,9 @@ JAIL_CLIPBOARD=""
 JAIL_FORWARD_PORTS=""
 # The config file load_project_config loaded (empty with "Nenhum"): the jail error names it.
 PROJECT_CONFIG_FILE=""
+# The content of lib/claude/permissions.json (claude_settings_load), passed inline to every
+# claude launch as --settings. Never CLAUDE_*: Claude Code reads CLAUDE_* from the environment.
+NICK_CLAUDE_SETTINGS=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
@@ -738,6 +744,10 @@ main() {
   [ "$PROJECT_CONFIG_FILE" = "$(config_cwd_file)" ] && config_shared="true"
   jail_hosts="$(mcp_jail_hosts)"
   jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" "$PROJECT_CONFIG_FILE" "$config_shared" || exit 1
+  # The Claude Code deny/ask rules (lib/claude/) go to every session, always: without them
+  # the script stops here, before any question, log or claude. --init and --requisitos-jail
+  # never open claude, so they exit above without loading them.
+  claude_settings_load NICK_CLAUDE_SETTINGS || exit 1
   # The jail status (and the JAIL_CLIPBOARD warning) shows up front, before anything else
   # runs, and again right before the confirmation.
   jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
@@ -789,7 +799,9 @@ main() {
   case "$confirm" in
     s|S|sim|Sim|SIM)
       exchange_dir_prepare || exit 1
-      local claude_args=()
+      # The deny/ask rules come first, inline (the content, not a path: a path out of the
+      # project may not exist inside the jail), in every stage and with or without the jail.
+      local claude_args=(--settings "$NICK_CLAUDE_SETTINGS")
       # Only the Development stage runs in auto mode — it's the only one where the
       # agent actually edits code/runs commands without stepping in at every turn;
       # PO/Tech Leader/Review are text conversations, no reason to let go of the wheel.
@@ -807,7 +819,8 @@ main() {
       # tool.
       # With JAIL_ENABLED="true", jail_exec (lib/jail.sh) launches the same argv as
       # 'ai-jail <jail_options of JAIL_CLIPBOARD, the MCP hosts and JAIL_FORWARD_PORTS> --
-      # claude ...'; otherwise it runs claude directly, as before.
+      # claude --settings <rules> ...'; otherwise it runs 'claude --settings <rules> ...'
+      # directly.
       jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)

@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_SCRUM_SH="$SCRIPT_DIR/../auto_scrum.sh"
 JAIL_LIB_SH="$SCRIPT_DIR/../../lib/jail.sh"
+PERMISSIONS_JSON="$SCRIPT_DIR/../../lib/claude/permissions.json"
 
 failures=0
 
@@ -1655,15 +1656,15 @@ assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates s�
 assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
 
 echo
-echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh e lib/jail.sh (config nunca é executada) =="
+echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh, lib/jail.sh e lib/claude/claude.sh (config nunca é executada) =="
 # A configuração nunca é executada: o leitor (config_load) não usa source/eval, e lib/config.sh
 # não tem source, . nem eval (teste estrutural em lib/tests/test_config.sh). Aqui, a lista
-# inteira de linhas source/. tem de ser só a das duas bibliotecas, nesta ordem.
+# inteira de linhas source/. tem de ser só a das três bibliotecas, nesta ordem.
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '$SCRIPT_DIR' é o texto literal buscado no código-fonte.
 source_lines="$(grep -E '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 # shellcheck disable=SC2016
-assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail.sh"' "$source_lines" "auto_scrum.sh tem duas linhas source/., a de lib/config.sh e depois a de lib/jail.sh"
+assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$source_lines" "auto_scrum.sh tem três linhas source/., a de lib/config.sh, a de lib/jail.sh e depois a de lib/claude/claude.sh"
 
 echo
 echo "== auto_scrum.sh: carrega lib/config.sh com a diretiva do shellcheck logo acima =="
@@ -1678,6 +1679,13 @@ echo "== auto_scrum.sh: carrega lib/jail.sh com a diretiva do shellcheck logo ac
 jail_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/jail.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
 assert_eq "true" "$([ -n "$jail_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/jail.sh\""
 assert_eq "# shellcheck source=SCRIPTDIR/../lib/jail.sh" "$( [ -n "$jail_source_number" ] && sed -n "$((jail_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/jail.sh'"
+
+echo
+echo "== auto_scrum.sh: carrega lib/claude/claude.sh com a diretiva do shellcheck logo acima =="
+# shellcheck disable=SC2016
+claude_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$claude_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/claude/claude.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh" "$( [ -n "$claude_source_number" ] && sed -n "$((claude_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh'"
 
 echo
 echo "== lib/config.sh: nenhuma chave concreta do auto_scrum na biblioteca nem nos testes dela =="
@@ -2120,10 +2128,11 @@ jail_calls() {
 }
 
 # jail_expected_argv <case_dir> <type> [jail [hosts [ports]]]: o argv que o claude deve
-# receber, um por linha — o prompt gravado no log, precedido de --permission-mode auto na
-# etapa development. Com "jail" (a jail ligada), antes do prompt vem também
-# '--append-system-prompt <aviso>', o aviso de jail_agent_notice com [hosts], [ports] e o HOME
-# do caso.
+# receber, um por linha — '--settings <conteúdo de lib/claude/permissions.json>' sempre
+# primeiro (as regras de deny/ask, inline), depois --permission-mode auto na etapa
+# development e, por último, o prompt gravado no log. Com "jail" (a jail ligada), antes do
+# prompt vem também '--append-system-prompt <aviso>', o aviso de jail_agent_notice com
+# [hosts], [ports] e o HOME do caso.
 jail_expected_argv() {
   local case_dir="$1" type="$2" jail="${3:-}" hosts="${4:-}" ports="${5:-}" log args=()
   log="$(find "$case_dir/logs" -name "${type}_*.md" 2>/dev/null | head -n1)"
@@ -2131,6 +2140,7 @@ jail_expected_argv() {
     printf 'sem log'
     return 0
   fi
+  args+=(--settings "$(cat "$PERMISSIONS_JSON")")
   [ "$type" = "development" ] && args+=(--permission-mode auto)
   if [ "$jail" = "jail" ]; then
     # Mesmo ambiente do main() do caso (jail_case_setup): HOME do caso e sem
@@ -2140,8 +2150,24 @@ jail_expected_argv() {
   printf '%s\n' "${args[@]}" "$(cat "$log")"
 }
 
-# jail_input <type>: a entrada de main() até a confirmação (s) da etapa <type>.
+# jail_input <type> [flags]: a entrada de main() até a confirmação (s) da etapa <type>. Sem
+# [flags], o menu é o de JIRA_ENABLED e SENTRY_ENABLED desligadas (só po_discussion e
+# development); com "flags", o das duas ligadas, com todas as etapas — nele, po e tech_leader
+# abrem o editor, e o caso precisa de EDITOR apontando para o editor falso.
 jail_input() {
+  if [ "${2:-}" = "flags" ]; then
+    case "$1" in
+      po) printf '%s' $'1\ntítulo de teste\ns' ;;
+      po_discussion) printf '%s' $'2\nassunto de teste\ns' ;;
+      po_jira) printf '%s' $'3\nhttps://exemplo.atlassian.net/browse/SC-21\n\ns' ;;
+      po_sentry) printf '%s' $'4\nhttps://exemplo.sentry.io/issues/21/\n\ns' ;;
+      tech_leader) printf '%s' $'5\nSC-21\ntítulo de teste\ns' ;;
+      tech_leader_jira) printf '%s' $'6\nhttps://exemplo.atlassian.net/browse/SC-21\n\ns' ;;
+      development) printf '%s' $'7\nSC-21\n\ns' ;;
+      review) printf '%s' $'8\nSC-21\n\ns' ;;
+    esac
+    return 0
+  fi
   case "$1" in
     development) printf '%s' $'4\nSC-13\n\ns' ;;
     *) printf '%s' $'2\nassunto de teste\ns' ;;
@@ -2202,10 +2228,14 @@ jail_status_line="$(grep -n 'Jail (ai-jail): ativa' <<< "$jail_output" | cut -d:
 jail_prompt_end_line="$(grep -nxE -- '-+' <<< "$jail_output" | cut -d: -f1 | tail -n1 || true)"
 assert_eq "true" "$([ -n "$jail_status_line" ] && [ -n "$jail_prompt_end_line" ] && [ "$jail_prompt_end_line" -lt "$jail_status_line" ] && echo true || echo false)" "a última linha da jail aparece depois do prompt exibido"
 assert_contains "$(grep -A2 'jail_print_status' "$AUTO_SCRUM_SH" || true)" 'read -r -p "Confirma o envio para o claude? (s/N): "' "jail_print_status vem logo antes da pergunta 'Confirma o envio para o claude?'"
-# A primeira linha de código (fora comentários) depois do jail_check de main().
+# A primeira linha de código (fora comentários) depois do jail_check de main() é a carga das
+# regras do claude (ticket 21), e a seguinte é jail_print_status: o status continua antes de
+# qualquer build_* e do menu principal.
 jail_after_check="$(awk '/^  jail_check "\$JAIL_ENABLED"/{found=1; next} found && !/^[[:space:]]*#/{print; exit}' "$AUTO_SCRUM_SH")"
+assert_eq '  claude_settings_load NICK_CLAUDE_SETTINGS || exit 1' "$jail_after_check" "em main(), claude_settings_load vem logo depois de jail_check"
+jail_after_load="$(awk '/^  claude_settings_load NICK_CLAUDE_SETTINGS/{found=1; next} found && !/^[[:space:]]*#/{print; exit}' "$AUTO_SCRUM_SH")"
 # shellcheck disable=SC2016
-assert_eq '  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"' "$jail_after_check" "em main(), jail_print_status vem logo depois de jail_check (antes do menu principal)"
+assert_eq '  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"' "$jail_after_load" "em main(), jail_print_status vem logo depois de claude_settings_load (antes do menu principal)"
 jail_off_output="$(cat "$TEST_TMP/jail_off_vazio_po_discussion/output" 2>/dev/null || true)"
 jail_off_first_line="$(grep -n 'Jail (ai-jail): desligada' <<< "$jail_off_output" | cut -d: -f1 | head -n1 || true)"
 jail_off_menu_line="$(grep -n 'Qual tipo de conversa' <<< "$jail_off_output" | cut -d: -f1 | head -n1 || true)"
@@ -2327,6 +2357,114 @@ assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo d
 jail_dir="$TEST_TMP/jail_clip_invalid_off"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_CLIPBOARD)"$'\n''JAIL_CLIPBOARD="total"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "JAIL_CLIPBOARD \"total\" com a jail desligada: segue normalmente (a chave não tem efeito)"
+
+echo
+echo "== main(): toda etapa recebe --settings <conteúdo de lib/claude/permissions.json>, com e sem jail =="
+# Todas as etapas do menu, com JIRA_ENABLED e SENTRY_ENABLED ligadas (po_jira, po_sentry e
+# tech_leader_jira só aparecem assim). HOME é o do caso (jail_case_setup): nada pode ser
+# criado nele nem no cwd (.claude/settings*.json).
+settings_content="$(cat "$PERMISSIONS_JSON" 2>/dev/null || echo 'sem permissions.json')"
+settings_lines="$(printf '%s\n' "$settings_content" | wc -l)"
+settings_base="$(config_keys_blank | grep -vE '^(JIRA_ENABLED|SENTRY_ENABLED|JAIL_ENABLED)=')"$'\n''JIRA_ENABLED="true"'$'\n''SENTRY_ENABLED="true"'
+for settings_jail in false true; do
+  for settings_type in po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review; do
+    settings_dir="$TEST_TMP/settings_${settings_jail}_$settings_type"
+    settings_rc="$(run_main "$settings_dir" "$settings_base"$'\n'"JAIL_ENABLED=\"$settings_jail\"" "$(jail_input "$settings_type" flags)" "$(jail_case_setup "$settings_dir" "EDITOR='$fake_editor'")")"
+    settings_label="JAIL_ENABLED \"$settings_jail\", $settings_type"
+    settings_argv="$(cat "$settings_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')"
+    assert_eq "0" "$settings_rc" "$settings_label: main() termina com código 0"
+    if [ "$settings_jail" = "true" ]; then
+      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type" jail "mcp.atlassian.com mcp.sentry.dev")" "$settings_argv" "$settings_label: o argv é --settings <regras>, o de antes e o aviso da jail"
+      assert_contains "$(cat "$settings_dir/jail/call_2.argv" 2>/dev/null || true)" $'\n--\nclaude\n--settings\n' "$settings_label: o lançamento é 'ai-jail <opções> -- claude --settings ...'"
+    else
+      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type")" "$settings_argv" "$settings_label: o argv é --settings <regras> e o de antes"
+      assert_eq "0" "$(jail_calls "$settings_dir")" "$settings_label: o ai-jail não é chamado"
+    fi
+    assert_eq "$(printf '%s\n' --settings "$settings_content")" "$(head -n "$((settings_lines + 1))" <<< "$settings_argv")" "$settings_label: --settings é o 1º argumento, seguido do conteúdo do permissions.json (igual ao cat)"
+    assert_not_contains "$settings_argv" "permissions.json" "$settings_label: o argumento é o conteúdo, não o caminho do arquivo"
+    if [ "$settings_type" = "development" ]; then
+      assert_eq "1" "$(grep -cx -- '--permission-mode' <<< "$settings_argv" || true)" "$settings_label: --permission-mode auto (só em development)"
+    else
+      assert_eq "0" "$(grep -cx -- '--permission-mode' <<< "$settings_argv" || true)" "$settings_label: sem --permission-mode"
+    fi
+    assert_not_exists "$settings_dir/cwd/.claude" "$settings_label: nenhum .claude/ (settings.json, settings.local.json) criado no cwd"
+    assert_not_exists "$settings_dir/home/.claude" "$settings_label: nada criado em \$HOME/.claude"
+  done
+done
+
+echo
+echo "== main(): regras do claude ausentes, ilegíveis ou vazias — para antes do menu, sem log e sem claude =="
+settings_variants=(ausente vazio)
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  PULADO: arquivo sem permissão de leitura (rodando como root, que lê mesmo com chmod 000)"
+else
+  settings_variants+=(ilegivel)
+fi
+for settings_variant in "${settings_variants[@]}"; do
+  for settings_jail in false true; do
+    settings_dir="$TEST_TMP/settings_bad_${settings_variant}_$settings_jail"
+    mkdir -p "$settings_dir/rules"
+    case "$settings_variant" in
+      ausente) settings_file="$settings_dir/rules/nao-existe.json" ;;
+      vazio) settings_file="$settings_dir/rules/vazio.json"; : > "$settings_file" ;;
+      ilegivel) settings_file="$settings_dir/rules/ilegivel.json"; cp "$PERMISSIONS_JSON" "$settings_file"; chmod 000 "$settings_file" ;;
+    esac
+    settings_rc="$(run_main "$settings_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n'"JAIL_ENABLED=\"$settings_jail\"" "$(jail_input po_discussion)" "$(jail_case_setup "$settings_dir" "NICK_CLAUDE_PERMISSIONS_FILE='$settings_file'; exec 2>'$settings_dir/err'")")"
+    settings_label="regras $settings_variant, JAIL_ENABLED \"$settings_jail\""
+    assert_eq "1" "$settings_rc" "$settings_label: main() termina com código 1"
+    assert_contains "$(cat "$settings_dir/err" 2>/dev/null || true)" "Erro: regras de permissão do Claude Code não encontradas ou ilegíveis: $settings_file" "$settings_label: o stderr cita o caminho esperado"
+    assert_not_contains "$(cat "$settings_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "$settings_label: parou antes do menu principal"
+    assert_not_exists "$settings_dir/logs" "$settings_label: nenhum log é criado"
+    assert_not_exists "$settings_dir/claude/argv" "$settings_label: o claude não é chamado"
+    assert_eq "" "$(grep -lx 'claude' "$settings_dir"/jail/call_*.argv 2>/dev/null || true)" "$settings_label: o ai-jail não lança o claude"
+    if [ "$settings_jail" = "true" ]; then
+      # A verificação da jail (jail_check) vem antes da carga das regras (decisão 4 do plano).
+      assert_eq "1" "$(jail_calls "$settings_dir")" "$settings_label: o ai-jail só roda a verificação (-- true)"
+    else
+      assert_eq "0" "$(jail_calls "$settings_dir")" "$settings_label: o ai-jail não é chamado"
+    fi
+    chmod -R u+rwx "$settings_dir/rules"
+  done
+done
+
+echo
+echo "== main(): --init e --requisitos-jail não carregam as regras do claude (não abrem o claude) =="
+settings_dir="$TEST_TMP/settings_requirements"
+mkdir -p "$settings_dir/cwd"
+settings_rc=0
+timeout 5 bash -c "cd '$settings_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; NICK_CLAUDE_PERMISSIONS_FILE='$settings_dir/nao-existe.json'; main --requisitos-jail" < /dev/null > "$settings_dir/output" 2>&1 || settings_rc=$?
+assert_eq "0" "$settings_rc" "--requisitos-jail sem as regras: termina com código 0"
+assert_not_contains "$(cat "$settings_dir/output" 2>/dev/null || true)" "regras de permissão" "--requisitos-jail sem as regras: nenhum erro de regras"
+settings_rc=0
+timeout 5 bash -c "cd '$settings_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; NICK_CLAUDE_PERMISSIONS_FILE='$settings_dir/nao-existe.json'; PROJECTS_DIR='$settings_dir/projects'; main --init" <<< $'q' > "$settings_dir/output_init" 2>&1 || settings_rc=$?
+assert_eq "0" "$settings_rc" "--init sem as regras (saindo pelo menu): termina com código 0"
+assert_not_contains "$(cat "$settings_dir/output_init" 2>/dev/null || true)" "regras de permissão" "--init sem as regras: nenhum erro de regras"
+
+echo
+echo "== main(): ordem estrutural — claude_settings_load depois de jail_check, antes dos build_*, do menu e do log =="
+# Números de linha dentro do corpo de main().
+main_line_of() {
+  awk -v pat="$1" '/^main\(\) \{/{inmain=1} inmain && index($0, pat){print NR; exit} inmain && /^\}/{exit}' "$AUTO_SCRUM_SH"
+}
+# shellcheck disable=SC2016
+# Aspas simples intencionais: '$JAIL_ENABLED' e '$LOGS_DIR' são texto literal do código-fonte.
+order_check="$(main_line_of '  jail_check "$JAIL_ENABLED"')"
+order_load="$(main_line_of '  claude_settings_load NICK_CLAUDE_SETTINGS || exit 1')"
+order_build="$(main_line_of '  build_stack_blocks')"
+order_menu="$(main_line_of '  choose_type')"
+# shellcheck disable=SC2016
+order_logs="$(main_line_of '  mkdir -p "$LOGS_DIR"')"
+assert_eq "true" "$([ -n "$order_check" ] && [ -n "$order_load" ] && [ -n "$order_build" ] && [ -n "$order_menu" ] && [ -n "$order_logs" ] && [ "$order_check" -lt "$order_load" ] && [ "$order_load" -lt "$order_build" ] && [ "$order_build" -lt "$order_menu" ] && [ "$order_menu" -lt "$order_logs" ] && echo true || echo false)" "em main(): jail_check < claude_settings_load ... || exit 1 < build_stack_blocks < choose_type < mkdir -p \$LOGS_DIR"
+assert_eq "1" "$(grep -c 'claude_settings_load' <<< "$auto_scrum_code" || true)" "claude_settings_load é chamada uma vez só no auto_scrum.sh"
+assert_eq "" "$(grep -nE '\$\([^)]*claude_settings_load' "$AUTO_SCRUM_SH" || true)" "claude_settings_load nunca roda dentro de \$( (o resultado volta por printf -v)"
+assert_eq "1" "$(grep -cx 'NICK_CLAUDE_SETTINGS=""' "$AUTO_SCRUM_SH" || true)" "NICK_CLAUDE_SETTINGS=\"\" está no bloco de globais do topo"
+assert_eq "" "$(grep -nE '(^|[^A-Za-z0-9_])CLAUDE_[A-Z0-9_]*=' <<< "$auto_scrum_code" || true)" "o auto_scrum.sh não atribui nenhuma global CLAUDE_* (o Claude Code lê CLAUDE_* do ambiente)"
+# shellcheck disable=SC2016
+assert_contains "$auto_scrum_code" 'claude_args=(--settings "$NICK_CLAUDE_SETTINGS")' "o argv do claude começa com --settings \"\$NICK_CLAUDE_SETTINGS\""
+
+echo
+echo "== nenhuma chave de configuração nova: CONFIG_KEYS igual à de antes do ticket 21 =="
+assert_eq "STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED JAIL_ENABLED JAIL_CLIPBOARD JAIL_FORWARD_PORTS" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s' \"\${CONFIG_KEYS[*]}\"" 2>/dev/null || true)" "CONFIG_KEYS não ganhou chave (as regras não têm flag para desligar)"
 
 echo
 echo "== main(): JAIL_ENABLED=\"true\" com ai-jail ausente — para antes do menu, sem log e sem claude =="

@@ -7,9 +7,12 @@
 # value here; only "true" exactly turns the jail on. JAIL_CLIPBOARD, the same kind of
 # convention, picks how much of the terminal and the clipboard the jail releases: "restrito",
 # "medio" (also the empty value, the default) or "brando" (jail_options). Each tool may also
-# pass extra hosts to release in the jail's network (the remote MCP servers it relies on, for
-# example), which become --allow-host, and ports of the machine's localhost to reach from
-# inside (a database in Docker, for example: JAIL_FORWARD_PORTS), which become --forward-port.
+# pass extra hosts to release in the jail's network (the remote MCP servers it relies on, the
+# docs of the project's stack: JAIL_ALLOW_HOSTS), which become --allow-host next to the Claude
+# documentation and the other hosts of the nick's own list, lib/jail/allow_hosts.txt, always
+# released (jail_nick_hosts), and ports of the machine's localhost to
+# reach from inside (a database in Docker, for example: JAIL_FORWARD_PORTS), which become
+# --forward-port.
 # The version managers found in the home (pyenv, nvm, ...) and Playwright's browsers are
 # mounted read-only (jail_toolchain_dirs, jail_playwright_browsers), and the agent is told it
 # runs inside the jail (jail_agent_notice). This library holds the mechanism: checking that the
@@ -20,16 +23,17 @@
 # lives there, under ai-jail's own trust rules.
 #
 # Rules (see ABOUT.md, "Código compartilhado entre ferramentas (lib/)"):
-#   - loading it only assigns JAIL_BIN, JAIL_OS_RELEASE_FILE and JAIL_LANDLOCK and defines
-#     functions: it prints nothing and runs no command;
+#   - loading it only assigns JAIL_BIN, JAIL_OS_RELEASE_FILE, JAIL_HOSTS_FILE and JAIL_LANDLOCK
+#     and defines functions: it prints nothing and runs no command but the builtins (cd, pwd)
+#     that make JAIL_HOSTS_FILE absolute, as lib/claude/claude.sh does for its rules file;
 #   - no shebang and no executable bit; no set -euo pipefail of its own, but it works with
 #     or without it in the caller;
 #   - every function is prefixed jail_ and every global JAIL_;
 #   - it never calls exit, and never uses source, . or eval;
 #   - it reads no global of the caller: the JAIL_ENABLED, JAIL_CLIPBOARD and
-#     JAIL_FORWARD_PORTS values, the extra hosts, the config path and whether that file is
-#     shared with the team all come in as parameters. $PWD, $HOME and the $TMPDIR that mktemp
-#     reads are shell state, not caller globals;
+#     JAIL_FORWARD_PORTS values, the extra hosts (MCPs and JAIL_ALLOW_HOSTS), the config path
+#     and whether that file is shared with the team all come in as parameters. $PWD, $HOME and
+#     the $TMPDIR that mktemp reads are shell state, not caller globals;
 #   - it doesn't depend on lib/config.sh (each library loads on its own).
 # The one documented exception: jail_exec replaces the shell with exec, so it never returns.
 # That is not an exit, it is its job — the last step of the tool.
@@ -39,6 +43,13 @@
 JAIL_BIN="ai-jail"
 # Where jail_print_requirements reads the Linux distribution from (overridden by the tests).
 JAIL_OS_RELEASE_FILE="/etc/os-release"
+# The nick's own list of hosts always released in the jail's network (jail_nick_hosts): a text
+# file next to this library, one host per line, so a dev adds one without touching the code.
+# Absolute, so it holds after a cd whatever path the library was loaded by; only builtins, so
+# it works with any PATH.
+JAIL_HOSTS_FILE="${BASH_SOURCE[0]%/*}"
+[ "$JAIL_HOSTS_FILE" != "${BASH_SOURCE[0]}" ] || JAIL_HOSTS_FILE="."
+JAIL_HOSTS_FILE="$(cd -- "$JAIL_HOSTS_FILE" > /dev/null && pwd)/allow_hosts.txt"
 # The Landlock state of the last check that passed ("completo", "parcial", "inativo" or "não
 # identificado"; jail_landlock_state), for jail_print_status to show. Empty until jail_check
 # passes with the jail on — the library's own state, not a caller global.
@@ -152,6 +163,35 @@ jail_playwright_browsers() {
   fi
 }
 
+# jail_nick_hosts: prints (one line, space separated) the hosts of JAIL_HOSTS_FILE, the nick's
+# own list, released in the jail's network whatever the caller passes (today the Claude
+# documentation, which ai-jail's default allowlist lacks). One host per line; blank lines,
+# everything after a # and the spaces around are ignored. A missing file is an empty list.
+# The list is kept by the nick, not the user's ~/.ai-jail; a project's own hosts are the
+# project's choice (auto_scrum: JAIL_ALLOW_HOSTS). jail_check validates each one.
+jail_nick_hosts() {
+  local line hosts=""
+  if [ -r "$JAIL_HOSTS_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%%#*}"
+      read -r line <<< "$line" || true
+      [ -n "$line" ] && hosts="${hosts:+$hosts }$line"
+    done < "$JAIL_HOSTS_FILE"
+  fi
+  echo "$hosts"
+}
+
+# jail_host_valid <host>: returns 0 when <host> is a plain host name — lowercase letters,
+# digits, dots and hyphens, with a dot, not starting or ending with either, no ".." nor a
+# hyphen next to a dot — and 1 otherwise (a scheme, port, path, wildcard or bare name).
+jail_host_valid() {
+  case "$1" in
+    *[!a-z0-9.-]* | [.-]* | *[.-] | *..* | *.-* | *-.*) return 1 ;;
+    *.*) return 0 ;;
+  esac
+  return 1
+}
+
 # jail_options <clipboard> [hosts] [ports]: prints (stdout, one per line) the ai-jail options
 # for a JAIL_CLIPBOARD level, the extra hosts and the localhost ports — the only options the
 # nick ever passes, all on the command line so none depends on anyone's ~/.ai-jail. Every
@@ -177,7 +217,8 @@ jail_playwright_browsers() {
 # read-only map lands inside it (seen with --dry-run), which would lose the pip/uv/npm caches.
 # Chromium's own sandbox doesn't work inside the jail; Playwright launches it with
 # --no-sandbox by default (chromiumSandbox: false).
-# Last, one --allow-host per host in [hosts] (space separated, in order): ai-jail adds each
+# Last, one --allow-host per host in [hosts] (space separated, in order; jail_check has
+# validated them), followed by the nick's own list (jail_nick_hosts): ai-jail adds each
 # one, and its subdomains, to its default network allowlist, which stays as it is. Then one
 # --forward-port per port in [ports] (space separated, in order; jail_check has validated
 # them): ai-jail exposes the machine's 127.0.0.1:<port> on the jail's own loopback, and only
@@ -197,7 +238,7 @@ jail_options() {
   if [ -n "$browsers" ] && [ -n "${HOME:-}" ]; then
     printf '%s\n' --map "$browsers:$HOME/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$HOME/.ms-playwright"
   fi
-  read -ra host_list <<< "${2:-}"
+  read -ra host_list <<< "${2:-} $(jail_nick_hosts)"
   for host in "${host_list[@]}"; do
     printf '%s\n' --allow-host "$host"
   done
@@ -216,7 +257,9 @@ jail_options() {
 # do instead: stop and tell the user. In PT-BR, like the prompts.
 jail_agent_notice() {
   local home="${HOME:-}" dir toolchains="" host_list hosts="" port_list ports="" localhost
-  local playwright=""
+  local playwright="" docs
+  docs="$(jail_nick_hosts)"
+  docs="${docs:+, os hosts liberados pelo nick (${docs// /, })}"
   while IFS= read -r dir; do
     if [ -n "$home" ] && [ "${dir#"$home"/}" != "$dir" ]; then
       # A literal ~ on purpose: it is text for the agent, not a path to expand.
@@ -250,10 +293,11 @@ jail_agent_notice() {
     echo "- o home é privado: fora do projeto, por padrão só aparece o que a jail monta (o estado do claude e a configuração do git); outros diretórios do home (~/.ssh, ~/.config, ~/.local etc.) não existem aqui, mesmo existindo na máquina;"
   fi
   if [ -n "$hosts" ]; then
-    echo "- por padrão, a rede só alcança a API do Claude, os registries de pacotes e o GitHub, e também: $hosts; $localhost;"
+    echo "- por padrão, a rede só alcança a API do Claude, os registries de pacotes e o GitHub$docs, e também: $hosts; $localhost;"
   else
-    echo "- por padrão, a rede só alcança a API do Claude, os registries de pacotes e o GitHub; $localhost;"
+    echo "- por padrão, a rede só alcança a API do Claude, os registries de pacotes e o GitHub$docs; $localhost;"
   fi
+  echo "- outro site (ex: a documentação de uma biblioteca) é recusado pela jail com \"proxy refused the connection\": não tente contornar; diga ao usuário qual host faltou, que ele pode liberar na chave JAIL_ALLOW_HOSTS da configuração do projeto;"
   if [ -n "$playwright" ]; then
     echo "$playwright"
   fi
@@ -281,24 +325,27 @@ jail_exec() {
 
 # jail_check <enabled> <clipboard> <hosts> <ports> <conf_path> <shared>: with <enabled> other
 # than "true" exactly, returns 0 and does nothing (not even command -v, nor checking
-# <clipboard> or <ports>). With "true", first rejects a <clipboard> other than "restrito",
-# "medio", "brando" or "" (a typo must never pick a level silently) and <ports> that aren't
-# space-separated numbers from 1 to 65535 without leading zeros nor repeats (a typo must never
-# open another port nor reach ai-jail as an option), then checks that the jail works on this
+# <clipboard>, <hosts> or <ports>). With "true", first rejects a <clipboard> other than
+# "restrito", "medio", "brando" or "" (a typo must never pick a level silently), <hosts> that
+# aren't plain host names (jail_host_valid; the nick's own list, jail_nick_hosts, is checked
+# the same way, first) and <ports> that aren't space-separated numbers from 1 to 65535
+# without leading zeros nor repeats (a typo must never open another host or port nor reach
+# ai-jail as an option), then checks that the jail works on this
 # machine by running '$JAIL_BIN <jail_options of clipboard, hosts and ports> -- true' — the
 # launch's own options, so an ai-jail that doesn't accept them fails here, before the launch —
 # with the cwd in a fresh temporary directory (a second guard: no .ai-jail ever lands in the
 # target project), and removes the directory afterwards, on success and on failure. Returns 0
 # quietly when the check passes; otherwise prints the error on stderr and returns 1:
-# jail_print_clipboard_error or jail_print_ports_error for the value, jail_print_check_error
-# for a missing ai-jail, a failing mktemp or a non-zero check (missing bwrap, blocked user
-# namespaces and unsupported systems all end up there, with ai-jail's output in the message).
+# jail_print_clipboard_error, jail_print_hosts_error or jail_print_ports_error for the value,
+# jail_print_check_error for a missing ai-jail, a failing mktemp or a non-zero check (missing
+# bwrap, blocked user namespaces and unsupported systems all end up there, with ai-jail's
+# output in the message).
 # There is no fallback: "true" never runs without the jail. Callers run it before || (it stops
 # the tool, without exit) and never inside $(...), so the message reaches the terminal. Being
 # before ||, set -e is off in here: every command that can fail is checked explicitly.
 jail_check() {
   local enabled="$1" clipboard="$2" hosts="$3" ports="$4" conf_path="$5" shared="$6" options
-  local tmp_dir output failed=0 port_list port seen=" " bad
+  local tmp_dir output failed=0 port_list port seen=" " bad host_list host
   JAIL_LANDLOCK=""
   [ "$enabled" = "true" ] || return 0
   case "$clipboard" in
@@ -308,6 +355,20 @@ jail_check() {
       return 1
       ;;
   esac
+  read -ra host_list <<< "$(jail_nick_hosts)"
+  for host in "${host_list[@]}"; do
+    if ! jail_host_valid "$host"; then
+      jail_print_hosts_error "$host" "$JAIL_HOSTS_FILE (lista padrão do nick)"
+      return 1
+    fi
+  done
+  read -ra host_list <<< "$hosts"
+  for host in "${host_list[@]}"; do
+    if ! jail_host_valid "$host"; then
+      jail_print_hosts_error "$host" "JAIL_ALLOW_HOSTS em $conf_path"
+      return 1
+    fi
+  done
   read -ra port_list <<< "$ports"
   for port in "${port_list[@]}"; do
     bad=0
@@ -365,6 +426,19 @@ jail_print_ports_error() {
   {
     echo "Erro: JAIL_FORWARD_PORTS=\"$ports\" em $conf_path não é uma lista de portas válida."
     echo "Use números de 1 a 65535, sem repetir, separados por espaço, ex: JAIL_FORWARD_PORTS=\"54320 6379\"."
+  } >&2
+}
+
+# jail_print_hosts_error <host> <source>: the error of jail_check for a host that is not a
+# plain host name (jail_host_valid), on stderr: where it came from, the host and the accepted
+# format. <source> is "JAIL_ALLOW_HOSTS em <conf_path>" for the caller's hosts (the MCPs' are
+# always valid, so the bad one came from that key) or the nick's own list file. No
+# requirements list: it is a typo. Control characters become "?".
+jail_print_hosts_error() {
+  local host="${1//[[:cntrl:]]/?}" origin="${2//[[:cntrl:]]/?}"
+  {
+    echo "Erro: $origin tem um host inválido: \"$host\"."
+    echo 'Use só nomes de host (letras minúsculas, números, ponto e hífen), sem https://, porta ou caminho, separados por espaço, ex: JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com". Cada host libera também os subdomínios dele.'
   } >&2
 }
 

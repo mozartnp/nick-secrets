@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_SCRUM_SH="$SCRIPT_DIR/../auto_scrum.sh"
-JAIL_LIB_SH="$SCRIPT_DIR/../../lib/jail.sh"
+JAIL_LIB_SH="$SCRIPT_DIR/../../lib/jail/jail.sh"
 PERMISSIONS_JSON="$SCRIPT_DIR/../../lib/claude/permissions.json"
 
 failures=0
@@ -586,14 +586,14 @@ miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
 miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
 assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
 assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
 assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
 : > "$miss_dir/empty_file.conf"
 miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
 assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
 assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as nove chaves na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as dez chaves na ordem de CONFIG_KEYS"
 
 # Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
 # outras chaves, então o bloco só pode listar a chave do caso.
@@ -743,7 +743,7 @@ val_file="$val_dir/invalid_and_missing.conf"
 printf '%s\n' 'JIRA_ENABLED="sim"' > "$val_file"
 run_loader "$val_file" "$val_dir/invalid_and_missing" >/dev/null
 assert_eq "2" "$(count_warnings "$val_dir/invalid_and_missing.err")" "valor inválido e chaves ausentes: dois avisos no stderr"
-assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
+assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
 
 val_file="$val_dir/control_char.conf"
 val_raw="a"$'\e'"[31mb"
@@ -879,7 +879,7 @@ printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_miss_projects/semlinh
 # rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
 rs_miss_expected() {
   local file="$1"
-  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""'
+  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""'
 }
 
 rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_incomplete")"
@@ -1656,7 +1656,7 @@ assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates s�
 assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
 
 echo
-echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh, lib/jail.sh e lib/claude/claude.sh (config nunca é executada) =="
+echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh, lib/jail/jail.sh e lib/claude/claude.sh (config nunca é executada) =="
 # A configuração nunca é executada: o leitor (config_load) não usa source/eval, e lib/config.sh
 # não tem source, . nem eval (teste estrutural em lib/tests/test_config.sh). Aqui, a lista
 # inteira de linhas source/. tem de ser só a das três bibliotecas, nesta ordem.
@@ -1664,7 +1664,7 @@ echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh, lib
 # Aspas simples intencionais: '$SCRIPT_DIR' é o texto literal buscado no código-fonte.
 source_lines="$(grep -E '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 # shellcheck disable=SC2016
-assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$source_lines" "auto_scrum.sh tem três linhas source/., a de lib/config.sh, a de lib/jail.sh e depois a de lib/claude/claude.sh"
+assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$source_lines" "auto_scrum.sh tem três linhas source/., a de lib/config.sh, a de lib/jail/jail.sh e depois a de lib/claude/claude.sh"
 
 echo
 echo "== auto_scrum.sh: carrega lib/config.sh com a diretiva do shellcheck logo acima =="
@@ -1674,11 +1674,11 @@ assert_eq "true" "$([ -n "$lib_source_number" ] && echo true || echo false)" "au
 assert_eq "# shellcheck source=SCRIPTDIR/../lib/config.sh" "$( [ -n "$lib_source_number" ] && sed -n "$((lib_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/config.sh'"
 
 echo
-echo "== auto_scrum.sh: carrega lib/jail.sh com a diretiva do shellcheck logo acima =="
+echo "== auto_scrum.sh: carrega lib/jail/jail.sh com a diretiva do shellcheck logo acima =="
 # shellcheck disable=SC2016
-jail_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/jail.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
-assert_eq "true" "$([ -n "$jail_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/jail.sh\""
-assert_eq "# shellcheck source=SCRIPTDIR/../lib/jail.sh" "$( [ -n "$jail_source_number" ] && sed -n "$((jail_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/jail.sh'"
+jail_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/jail/jail.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$jail_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/jail/jail.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/../lib/jail/jail.sh" "$( [ -n "$jail_source_number" ] && sed -n "$((jail_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/jail/jail.sh'"
 
 echo
 echo "== auto_scrum.sh: carrega lib/claude/claude.sh com a diretiva do shellcheck logo acima =="
@@ -2007,9 +2007,9 @@ assert_contains "$select_menu_body" "select " "a única linha select fica dentro
 menu_in_subshell="$(grep -nE '\$\((select_menu|choose_type|resolve_stack|init_project)\b' "$AUTO_SCRUM_SH" || true)"
 assert_eq "" "$menu_in_subshell" "nenhum menu é chamado dentro de \$(...)"
 echo
-echo "== JAIL_ENABLED: registrada na antepenúltima posição, padrão \"false\", com comentário no esqueleto =="
+echo "== JAIL_ENABLED: registrada na quarta posição a partir do fim, padrão \"false\", com comentário no esqueleto =="
 jail_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"" 2>/dev/null || true)"
-assert_eq "JAIL_ENABLED"$'\n'"JAIL_CLIPBOARD"$'\n'"JAIL_FORWARD_PORTS" "$(tail -n3 <<< "$jail_keys")" "JAIL_ENABLED, JAIL_CLIPBOARD e JAIL_FORWARD_PORTS são as três últimas chaves de CONFIG_KEYS"
+assert_eq "JAIL_ENABLED"$'\n'"JAIL_CLIPBOARD"$'\n'"JAIL_FORWARD_PORTS"$'\n'"JAIL_ALLOW_HOSTS" "$(tail -n4 <<< "$jail_keys")" "JAIL_ENABLED, JAIL_CLIPBOARD, JAIL_FORWARD_PORTS e JAIL_ALLOW_HOSTS são as quatro últimas chaves de CONFIG_KEYS"
 jail_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; print_project_skeleton" 2>/dev/null || true)"
 assert_contains "$jail_skeleton" 'JAIL_ENABLED="false"' "o esqueleto tem JAIL_ENABLED=\"false\""
 jail_skeleton_comment="$(awk '/^# JAIL_ENABLED:/{found=1} /^JAIL_ENABLED=/{found=0} found' <<< "$jail_skeleton")"
@@ -2048,8 +2048,8 @@ run_loader "$jail_reg_dir/clip_missing.conf" "$jail_reg_dir/clip_missing" >/dev/
 assert_eq "$(missing_warning "$jail_reg_dir/clip_missing.conf" 'JAIL_CLIPBOARD=""')" "$(cat "$jail_reg_dir/clip_missing.err" 2>/dev/null || true)" "sem a linha JAIL_CLIPBOARD: aviso de chave ausente sugerindo JAIL_CLIPBOARD=\"\""
 
 echo
-echo "== JAIL_FORWARD_PORTS: registrada por último, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
-assert_eq 'JAIL_FORWARD_PORTS=""' "$(tail -n1 <<< "$jail_skeleton")" "o esqueleto termina com JAIL_FORWARD_PORTS=\"\""
+echo "== JAIL_FORWARD_PORTS: chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
+assert_contains "$jail_skeleton" 'JAIL_FORWARD_PORTS=""' "o esqueleto tem JAIL_FORWARD_PORTS=\"\""
 ports_skeleton_comment="$(awk '/^# JAIL_FORWARD_PORTS:/{found=1} /^JAIL_FORWARD_PORTS=/{found=0} found' <<< "$jail_skeleton")"
 for ports_word in 'JAIL_ENABLED="true"' localhost --forward-port 'JAIL_FORWARD_PORTS="54320 6379"' "separadas por espaço" "commitado" README; do
   assert_contains "$ports_skeleton_comment" "$ports_word" "o comentário de JAIL_FORWARD_PORTS no esqueleto cita $ports_word"
@@ -2061,6 +2061,21 @@ assert_eq "" "$(cat "$jail_reg_dir/ports_invalid.err" 2>/dev/null || true)" "JAI
 config_keys_blank JAIL_FORWARD_PORTS > "$jail_reg_dir/ports_missing.conf"
 run_loader "$jail_reg_dir/ports_missing.conf" "$jail_reg_dir/ports_missing" >/dev/null
 assert_eq "$(missing_warning "$jail_reg_dir/ports_missing.conf" 'JAIL_FORWARD_PORTS=""')" "$(cat "$jail_reg_dir/ports_missing.err" 2>/dev/null || true)" "sem a linha JAIL_FORWARD_PORTS: aviso de chave ausente sugerindo JAIL_FORWARD_PORTS=\"\""
+
+echo
+echo "== JAIL_ALLOW_HOSTS: registrada por último, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
+assert_eq 'JAIL_ALLOW_HOSTS=""' "$(tail -n1 <<< "$jail_skeleton")" "o esqueleto termina com JAIL_ALLOW_HOSTS=\"\""
+hosts_skeleton_comment="$(awk '/^# JAIL_ALLOW_HOSTS:/{found=1} /^JAIL_ALLOW_HOSTS=/{found=0} found' <<< "$jail_skeleton")"
+for hosts_word in 'JAIL_ENABLED="true"' --allow-host 'JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"' "separados por espaço" "subdomínios" "lista padrão do nick" "lib/jail/allow_hosts.txt" "commitado" README; do
+  assert_contains "$hosts_skeleton_comment" "$hosts_word" "o comentário de JAIL_ALLOW_HOSTS no esqueleto cita $hosts_word"
+done
+assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_ALLOW_HOSTS" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS não tem nota"
+printf '%s\n' "$(config_keys_blank JAIL_ALLOW_HOSTS)" 'JAIL_ALLOW_HOSTS="https://x"' > "$jail_reg_dir/hosts_invalid.conf"
+run_loader "$jail_reg_dir/hosts_invalid.conf" "$jail_reg_dir/hosts_invalid" >/dev/null
+assert_eq "" "$(cat "$jail_reg_dir/hosts_invalid.err" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS=\"https://x\": a carga da configuração não avisa (a validação é da jail)"
+config_keys_blank JAIL_ALLOW_HOSTS > "$jail_reg_dir/hosts_missing.conf"
+run_loader "$jail_reg_dir/hosts_missing.conf" "$jail_reg_dir/hosts_missing" >/dev/null
+assert_eq "$(missing_warning "$jail_reg_dir/hosts_missing.conf" 'JAIL_ALLOW_HOSTS=""')" "$(cat "$jail_reg_dir/hosts_missing.err" 2>/dev/null || true)" "sem a linha JAIL_ALLOW_HOSTS: aviso de chave ausente sugerindo JAIL_ALLOW_HOSTS=\"\""
 
 echo
 echo "== PROJECT_CONFIG_FILE: o arquivo carregado, pelos três caminhos (vazio com 'Nenhum') =="
@@ -2150,6 +2165,14 @@ jail_expected_argv() {
   printf '%s\n' "${args[@]}" "$(cat "$log")"
 }
 
+# jail_docs_opts: os --allow-host da lista padrão do nick (lib/jail/allow_hosts.txt), que a jail
+# sempre libera depois dos outros hosts. Lidos do próprio arquivo (um por linha, sem
+# comentários nem linhas em branco): um dev acrescenta um host sem mexer nos testes.
+jail_docs_opts=()
+while IFS= read -r jail_docs_host; do
+  jail_docs_opts+=(--allow-host "$jail_docs_host")
+done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$SCRIPT_DIR/../../lib/jail/allow_hosts.txt" 2>/dev/null | grep .)
+
 # jail_input <type> [flags]: a entrada de main() até a confirmação (s) da etapa <type>. Sem
 # [flags], o menu é o de JIRA_ENABLED e SENTRY_ENABLED desligadas (só po_discussion e
 # development); com "flags", o das duas ligadas, com todas as etapas — nele, po e tech_leader
@@ -2202,10 +2225,10 @@ for jail_type in po_discussion development; do
   jail_label="JAIL_ENABLED \"true\", $jail_type"
   assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
   assert_eq "2" "$(jail_calls "$jail_dir")" "$jail_label: duas chamadas ao ai-jail (verificação e lançamento)"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a 1ª chamada é a verificação 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- true'"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a 1ª chamada é a verificação 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- true'"
   jail_check_cwd="$(cat "$jail_dir/jail/call_1.cwd" 2>/dev/null || true)"
   assert_eq "true" "$([ -n "$jail_check_cwd" ] && [ "$jail_check_cwd" != "$jail_dir/cwd" ] && [ ! -e "$jail_check_cwd" ] && echo true || echo false)" "$jail_label: a verificação roda fora do projeto, num diretório já removido"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough -- claude)" "$(head -n5 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...'"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((5 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...'"
   assert_eq "false" "$([ -e "$jail_dir/cwd/.ai-jail" ] && echo true || echo false)" "$jail_label: nenhum .ai-jail gravado no projeto (o prompt não fica salvo)"
   assert_eq "$jail_dir/cwd" "$(cat "$jail_dir/jail/call_2.cwd" 2>/dev/null || true)" "$jail_label: o lançamento roda no cwd do projeto"
   assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, mais o aviso da jail (--append-system-prompt) antes do prompt"
@@ -2249,6 +2272,7 @@ for jail_clip in medio restrito brando; do
     brando) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough --display); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard brando" ;;
     *) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio" ;;
   esac
+  jail_clip_options+=("${jail_docs_opts[@]}")
   for jail_type in po_discussion development; do
     jail_dir="$TEST_TMP/jail_clip_${jail_clip}_$jail_type"
     jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_CLIPBOARD=')"$'\n''JAIL_ENABLED="true"'$'\n'"JAIL_CLIPBOARD=\"$jail_clip\"" "$(jail_input "$jail_type")" "$(jail_case_setup "$jail_dir")")"
@@ -2279,8 +2303,8 @@ for jail_mcp in jira sentry ambos; do
   jail_rc="$(run_main "$jail_dir" "$jail_mcp_base"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
   jail_label="MCP $jail_mcp com a jail"
   assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_mcp_hosts[*]}"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" -- claude)" "$(head -n "$((${#jail_mcp_hosts[@]} + 5))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_mcp_hosts[*]}"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" "${jail_docs_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_mcp_hosts[*]}"
+  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_mcp_hosts[@]} + 5 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_mcp_hosts[*]}"
   assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "$jail_mcp_names")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv de sempre, mais o aviso da jail com os hosts do MCP"
   # Sem a jail, o host não muda nada: o claude roda direto.
   jail_dir="$TEST_TMP/jail_mcp_${jail_mcp}_off"
@@ -2303,7 +2327,7 @@ jail_dir="$TEST_TMP/jail_toolchain"
 mkdir -p "$jail_dir/home/.pyenv/versions"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "jail com ~/.pyenv no home: main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.pyenv" -- claude)" "$(head -n7 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com ~/.pyenv no home: o lançamento monta o ~/.pyenv (--map, somente leitura)"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.pyenv" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((7 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com ~/.pyenv no home: o lançamento monta o ~/.pyenv (--map, somente leitura)"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "(~/.pyenv)" "jail com ~/.pyenv no home: o aviso ao agente cita o ~/.pyenv"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "jail com ~/.pyenv no home: o claude recebe o argv de sempre, mais o aviso"
 
@@ -2312,7 +2336,7 @@ jail_dir="$TEST_TMP/jail_playwright"
 mkdir -p "$jail_dir/home/.cache/ms-playwright"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "jail com o Playwright no home: main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.cache/ms-playwright:$jail_dir/home/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$jail_dir/home/.ms-playwright" -- claude)" "$(head -n9 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com o Playwright no home: o lançamento monta os navegadores e define PLAYWRIGHT_BROWSERS_PATH"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.cache/ms-playwright:$jail_dir/home/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$jail_dir/home/.ms-playwright" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((9 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com o Playwright no home: o lançamento monta os navegadores e define PLAYWRIGHT_BROWSERS_PATH"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "jail com o Playwright no home: o claude recebe o argv de sempre, mais o aviso"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "navegadores do Playwright" "jail com o Playwright no home: o aviso ao agente cita os navegadores"
 
@@ -2327,8 +2351,8 @@ echo "== main(): JAIL_FORWARD_PORTS libera portas de localhost na jail (--forwar
 jail_dir="$TEST_TMP/jail_ports"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_FORWARD_PORTS=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_FORWARD_PORTS="54320 6379"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "JAIL_FORWARD_PORTS \"54320 6379\": main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --forward-port 54320 --forward-port 6379 -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": a verificação usa --forward-port 54320 --forward-port 6379"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --forward-port 54320 --forward-port 6379 -- claude)" "$(head -n9 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": o lançamento usa as mesmas portas"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" --forward-port 54320 --forward-port 6379 -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": a verificação usa --forward-port 54320 --forward-port 6379"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" --forward-port 54320 --forward-port 6379 -- claude)" "$(head -n "$((9 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": o lançamento usa as mesmas portas"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "" "54320 6379")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"54320 6379\": o claude recebe o argv de sempre, mais o aviso com as portas"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "(54320, 6379)" "JAIL_FORWARD_PORTS \"54320 6379\": o aviso ao agente cita as portas"
 jail_dir="$TEST_TMP/jail_ports_invalid"
@@ -2343,6 +2367,28 @@ jail_dir="$TEST_TMP/jail_ports_off"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_FORWARD_PORTS)"$'\n''JAIL_FORWARD_PORTS="abc"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: segue normalmente (a chave não tem efeito)"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: o claude recebe o argv de antes da jail"
+
+echo
+echo "== main(): JAIL_ALLOW_HOSTS libera hosts na rede da jail (--allow-host), depois dos MCPs =="
+jail_dir="$TEST_TMP/jail_allow_hosts"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -vE '^(JIRA_ENABLED|JAIL_ALLOW_HOSTS)=')"$'\n''JAIL_ENABLED="true"'$'\n''JIRA_ENABLED="true"'$'\n''JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+jail_allow_opts=(--allow-host mcp.atlassian.com --allow-host docs.djangoproject.com --allow-host tailwindcss.com "${jail_docs_opts[@]}")
+assert_eq "0" "$jail_rc" "JAIL_ALLOW_HOSTS com Jira: main() termina com código 0"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_allow_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: a verificação libera o MCP, os hosts da chave e a documentação do Claude, nessa ordem"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_allow_opts[@]}" -- claude)" "$(head -n "$((${#jail_allow_opts[@]} + 5))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: o lançamento usa os mesmos hosts"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "mcp.atlassian.com docs.djangoproject.com tailwindcss.com")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS com Jira: o aviso ao agente lista o MCP e os hosts da chave"
+assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "e também: mcp.atlassian.com, docs.djangoproject.com, tailwindcss.com" "JAIL_ALLOW_HOSTS com Jira: o aviso cita os hosts liberados"
+jail_dir="$TEST_TMP/jail_allow_hosts_bad"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_ALLOW_HOSTS=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_ALLOW_HOSTS="https://docs.djangoproject.com"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "exec 2>'$jail_dir/err'")")"
+assert_eq "1" "$jail_rc" "JAIL_ALLOW_HOSTS \"https://...\": main() termina com código 1"
+assert_contains "$(cat "$jail_dir/err" 2>/dev/null || true)" "Erro: JAIL_ALLOW_HOSTS em $jail_dir/cwd/.nick.conf tem um host inválido: \"https://docs.djangoproject.com\"." "JAIL_ALLOW_HOSTS \"https://...\": o stderr cita o host e o .nick.conf"
+assert_eq "0" "$(jail_calls "$jail_dir")" "JAIL_ALLOW_HOSTS \"https://...\": o ai-jail não é chamado"
+assert_not_exists "$jail_dir/claude/argv" "JAIL_ALLOW_HOSTS \"https://...\": o claude não é chamado"
+assert_not_exists "$jail_dir/logs" "JAIL_ALLOW_HOSTS \"https://...\": nenhum log é criado"
+jail_dir="$TEST_TMP/jail_allow_hosts_off"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ALLOW_HOSTS)"$'\n''JAIL_ALLOW_HOSTS="https://x"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+assert_eq "0" "$jail_rc" "JAIL_ALLOW_HOSTS inválido com a jail desligada: segue normalmente (a chave não tem efeito)"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS inválido com a jail desligada: o claude recebe o argv de antes da jail"
 
 echo
 echo "== main(): JAIL_CLIPBOARD inválido com a jail ligada — para antes do menu, sem log e sem claude =="
@@ -2464,7 +2510,7 @@ assert_contains "$auto_scrum_code" 'claude_args=(--settings "$NICK_CLAUDE_SETTIN
 
 echo
 echo "== nenhuma chave de configuração nova: CONFIG_KEYS igual à de antes do ticket 21 =="
-assert_eq "STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED JAIL_ENABLED JAIL_CLIPBOARD JAIL_FORWARD_PORTS" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s' \"\${CONFIG_KEYS[*]}\"" 2>/dev/null || true)" "CONFIG_KEYS não ganhou chave (as regras não têm flag para desligar)"
+assert_eq "STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED JAIL_ENABLED JAIL_CLIPBOARD JAIL_FORWARD_PORTS JAIL_ALLOW_HOSTS" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s' \"\${CONFIG_KEYS[*]}\"" 2>/dev/null || true)" "CONFIG_KEYS não ganhou chave (as regras não têm flag para desligar)"
 
 echo
 echo "== main(): JAIL_ENABLED=\"true\" com ai-jail ausente — para antes do menu, sem log e sem claude =="
@@ -2518,7 +2564,7 @@ jail_usage="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; main --nao-existe" 2>&
 assert_contains "$jail_usage" "[--requisitos-jail]" "a mensagem de uso de argumento desconhecido cita [--requisitos-jail]"
 
 echo
-echo "== auto_scrum.sh: a jail passa só pelas funções jail_* de lib/jail.sh =="
+echo "== auto_scrum.sh: a jail passa só pelas funções jail_* de lib/jail/jail.sh =="
 # Fora do bloco de registro (cujo comentário de esqueleto cita o ai-jail de propósito) e dos
 # comentários, nenhuma linha cita o ai-jail nem JAIL_BIN.
 jail_code="$(awk '/^config_register_key /{skip=1} skip && /^[A-Z_]+=/{skip=0} !skip' "$AUTO_SCRUM_SH" | grep -vE '^[[:space:]]*#' || true)"

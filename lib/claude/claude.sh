@@ -20,8 +20,8 @@
 #     prefix Claude Code itself reads from the environment;
 #   - it never calls exit, and never uses source, . or eval;
 #   - it reads no global of the caller: the destination variable name comes in as a parameter;
-#   - it doesn't depend on lib/config.sh nor on lib/jail.sh (each library loads on its own),
-#     and needs no new runtime dependency (no jq: the JSON is checked by the tests).
+#   - it doesn't depend on lib/config.sh nor on lib/jail/jail.sh (each library loads on its
+#     own), and needs no new runtime dependency (no jq: the JSON is checked by the tests).
 # No exceptions to these rules.
 
 # The rules file, found from this library's own path, so it doesn't depend on the cwd nor on

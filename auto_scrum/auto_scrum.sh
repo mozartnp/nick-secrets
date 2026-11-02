@@ -9,13 +9,13 @@ TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
 # Code shared with the other nick tools lives in lib/: the project config reader
-# (lib/config.sh), the ai-jail sandbox (lib/jail.sh) and the Claude Code deny/ask rules
+# (lib/config.sh), the ai-jail sandbox (lib/jail/jail.sh) and the Claude Code deny/ask rules
 # (lib/claude/claude.sh, which reads lib/claude/permissions.json). The paths are relative to
 # this script, so auto_scrum/ depends on its sibling lib/.
 # shellcheck source=SCRIPTDIR/../lib/config.sh
 source "$SCRIPT_DIR/../lib/config.sh"
-# shellcheck source=SCRIPTDIR/../lib/jail.sh
-source "$SCRIPT_DIR/../lib/jail.sh"
+# shellcheck source=SCRIPTDIR/../lib/jail/jail.sh
+source "$SCRIPT_DIR/../lib/jail/jail.sh"
 # shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
 source "$SCRIPT_DIR/../lib/claude/claude.sh"
 
@@ -94,6 +94,17 @@ Cada porta liberada dá ao agente acesso total ao serviço dela. Este arquivo é
 com o projeto, então o time inteiro herda a lista. Vazio: nenhuma porta (o localhost da
 máquina fica inalcançável). Outro formato faz o auto_scrum parar com erro. Veja a seção
 "Sandbox (ai-jail)" do README.'
+# JAIL_ALLOW_HOSTS is a text key too (a list of hosts), checked by jail_check.
+config_register_key JAIL_ALLOW_HOSTS "" "" \
+'JAIL_ALLOW_HOSTS: só vale com JAIL_ENABLED="true". Hosts que o claude alcança de dentro
+da jail (--allow-host do ai-jail), separados por espaço — ex: a documentação da stack do
+projeto. Exemplo:
+  JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"
+Cada host libera também os subdomínios dele. Já são liberados os hosts dos MCPs ligados
+acima e os da lista padrão do nick (lib/jail/allow_hosts.txt, com a documentação do
+Claude, de Python, Django etc.). Este arquivo é commitado com o projeto, então o time
+inteiro herda a lista. Vazio: nenhum host além desses. Outro formato (com https://, porta
+ou caminho) faz o auto_scrum parar com erro. Veja a seção "Sandbox (ai-jail)" do README.'
 
 TITLE=""
 DESCRIPTION=""
@@ -122,6 +133,7 @@ TDD_BLOCK_REVIEW=""
 JAIL_ENABLED=""
 JAIL_CLIPBOARD=""
 JAIL_FORWARD_PORTS=""
+JAIL_ALLOW_HOSTS=""
 # The config file load_project_config loaded (empty with "Nenhum"): the jail error names it.
 PROJECT_CONFIG_FILE=""
 # The content of lib/claude/permissions.json (claude_settings_load), passed inline to every
@@ -411,10 +423,10 @@ no plano.'
 }
 
 # mcp_jail_hosts: prints (space separated) the hosts of the remote MCP servers this project
-# relies on, for lib/jail.sh to release in the jail's network (--allow-host): ai-jail's default
-# allowlist has neither. JIRA_ENABLED="true" adds mcp.atlassian.com and SENTRY_ENABLED="true"
-# adds mcp.sentry.dev — the hosted servers; a self-hosted one is released by the user in the
-# ~/.ai-jail (README). Without the jail, the list changes nothing.
+# relies on, for lib/jail/jail.sh to release in the jail's network (--allow-host): ai-jail's
+# default allowlist has neither. JIRA_ENABLED="true" adds mcp.atlassian.com and
+# SENTRY_ENABLED="true" adds mcp.sentry.dev — the hosted servers; a self-hosted one goes in
+# JAIL_ALLOW_HOSTS (README). Without the jail, the list changes nothing.
 mcp_jail_hosts() {
   local hosts=()
   [ "$JIRA_ENABLED" = "true" ] && hosts+=(mcp.atlassian.com)
@@ -742,7 +754,8 @@ main() {
   # shared with the target team, so the error warns about turning the jail off there.
   local config_shared="false" jail_hosts
   [ "$PROJECT_CONFIG_FILE" = "$(config_cwd_file)" ] && config_shared="true"
-  jail_hosts="$(mcp_jail_hosts)"
+  # The MCP hosts first, then the project's own (JAIL_ALLOW_HOSTS); jail_check validates both.
+  jail_hosts="$(mcp_jail_hosts) $JAIL_ALLOW_HOSTS"
   jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" "$PROJECT_CONFIG_FILE" "$config_shared" || exit 1
   # The Claude Code deny/ask rules (lib/claude/) go to every session, always: without them
   # the script stops here, before any question, log or claude. --init and --requisitos-jail
@@ -806,9 +819,10 @@ main() {
       # agent actually edits code/runs commands without stepping in at every turn;
       # PO/Tech Leader/Review are text conversations, no reason to let go of the wheel.
       [ "$TYPE" = "development" ] && claude_args+=(--permission-mode auto)
-      # With the jail on, the agent is told so (jail_agent_notice, lib/jail.sh): otherwise it
-      # spends tokens diagnosing the machine for what the jail hides (a toolchain, a home dir,
-      # a localhost service). Off, the argv stays the same as before the jail existed.
+      # With the jail on, the agent is told so (jail_agent_notice, lib/jail/jail.sh):
+      # otherwise it spends tokens diagnosing the machine for what the jail hides (a
+      # toolchain, a home dir, a localhost service, a website). Off, the argv stays the same
+      # as before the jail existed.
       if [ "$JAIL_ENABLED" = "true" ]; then
         claude_args+=(--append-system-prompt "$(jail_agent_notice "$jail_hosts" "$JAIL_FORWARD_PORTS")")
       fi
@@ -817,10 +831,10 @@ main() {
       # auto_scrum. On the MCP side, SENTRY_ENABLED just shows the po_sentry entry point
       # in the menu (choose_type), whose template (po_sentry.md) tells the PO to use that
       # tool.
-      # With JAIL_ENABLED="true", jail_exec (lib/jail.sh) launches the same argv as
-      # 'ai-jail <jail_options of JAIL_CLIPBOARD, the MCP hosts and JAIL_FORWARD_PORTS> --
-      # claude --settings <rules> ...'; otherwise it runs 'claude --settings <rules> ...'
-      # directly.
+      # With JAIL_ENABLED="true", jail_exec (lib/jail/jail.sh) launches the same argv as
+      # 'ai-jail <jail_options of JAIL_CLIPBOARD, the MCP hosts, JAIL_ALLOW_HOSTS and
+      # JAIL_FORWARD_PORTS> -- claude --settings <rules> ...'; otherwise it runs
+      # 'claude --settings <rules> ...' directly.
       jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)

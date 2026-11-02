@@ -799,12 +799,13 @@ arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os da
   formato do esqueleto (`config_print_skeleton`). A biblioteca não conhece nenhuma chave
   concreta: cada ferramenta registra as suas (ver "Registro de chaves da configuração"
   abaixo);
-- `lib/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
+- `lib/jail/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
   (`jail_print_requirements`), status (`jail_print_status`), opções do ai-jail por nível
   (`jail_options`, a fonte única delas), toolchains montadas (`jail_toolchain_dirs`), aviso
   ao agente (`jail_agent_notice`), navegadores do Playwright (`jail_playwright_browsers`) e
-  lançamento (`jail_exec`). Ver
-  seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)";
+  lançamento (`jail_exec`), com a lista padrão de hosts da rede em `lib/jail/allow_hosts.txt`
+  (`jail_nick_hosts`). Mesmo formato do `lib/claude/`: pasta própria com o código e o dado,
+  testes em `lib/tests/`. Ver seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)";
 - `lib/claude/claude.sh` + `lib/claude/permissions.json`: as regras de deny/ask do Claude
   Code que toda sessão aberta pelo nick recebe. Ver seção "Regras de deny/ask do Claude Code
   (`lib/claude/`)". A divisão:
@@ -818,7 +819,7 @@ arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os da
 
 **As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a suíte
 de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config.sh`, e um teste
-estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail.sh`;
+estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail/jail.sh`;
 `lib/tests/test_claude.sh` só carrega `lib/claude/claude.sh`, que não cita `config_`, `CONFIG_`,
 `jail_` nem `JAIL_` em código). A jail recebe os
 valores de `JAIL_ENABLED`, `JAIL_CLIPBOARD` e `JAIL_FORWARD_PORTS` (e os hosts extras) por
@@ -837,7 +838,7 @@ nenhuma suíte define os seus.
   é `# shellcheck shell=bash`, seguida do cabeçalho em inglês;
 - não ativa `set -euo pipefail` (é de quem a carrega), mas funciona com ou sem ele no chamador;
 - **prefixo por biblioteca:** toda função `config_` e toda global `CONFIG_` em
-  `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail.sh`; toda função
+  `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail/jail.sh`; toda função
   `claude_` e toda global `NICK_CLAUDE_` em `lib/claude/claude.sh` (as locais, `__claude_`).
   As globais de `lib/claude/` **não** usam `CLAUDE_`: o Claude Code lê variáveis `CLAUDE_*` do
   ambiente (ex: `CLAUDE_CODE_DISABLE_MOUSE`), e um nome nosso nesse espaço poderia colidir com
@@ -876,8 +877,8 @@ arquivo ausente, ilegível ou vazio — mesmo racional de `JAIL_BIN`.
 ```bash
 # shellcheck source=SCRIPTDIR/../lib/config.sh
 source "$SCRIPT_DIR/../lib/config.sh"
-# shellcheck source=SCRIPTDIR/../lib/jail.sh
-source "$SCRIPT_DIR/../lib/jail.sh"
+# shellcheck source=SCRIPTDIR/../lib/jail/jail.sh
+source "$SCRIPT_DIR/../lib/jail/jail.sh"
 # shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
 source "$SCRIPT_DIR/../lib/claude/claude.sh"
 ```
@@ -989,7 +990,7 @@ das ações e, sem jail, enxerga a máquina inteira. O prompt carrega conteúdo 
 ler segredos ou alterar arquivos fora do repositório. `JAIL_ENABLED="true"` faz o `claude` de
 todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jail).
 
-**Como funciona** (`lib/jail.sh`; no `auto_scrum`, chamado em `main()`):
+**Como funciona** (`lib/jail/jail.sh`; no `auto_scrum`, chamado em `main()`):
 - `jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS"
   "$PROJECT_CONFIG_FILE" <compartilhado>` (`jail_hosts` vem de `mcp_jail_hosts`, ver "Hosts dos
   MCPs remotos" abaixo) roda logo depois de `resolve_stack`, antes de qualquer `build_*` e do
@@ -1023,10 +1024,10 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
 - **Integrar o ai-jail em vez de reimplementar.** Isolamento de sistema operacional é difícil
   de acertar, e a ferramenta já cobre Linux (bubblewrap + Landlock) e macOS (`sandbox-exec`).
 - **A jail é do nick inteiro.** `JAIL_ENABLED` é convenção de todas as ferramentas com IA:
-  cada uma registra a chave com `config_register_key` e passa o valor pra `lib/jail.sh`, que
-  aplica a mesma regra (só `"true"` exato liga) e cita `JAIL_ENABLED` nas mensagens. O
-  mecanismo mora em `lib/`, não no `auto_scrum`, porque toda ferramenta futura vai precisar
-  dele.
+  cada uma registra a chave com `config_register_key` e passa o valor pra
+  `lib/jail/jail.sh`, que aplica a mesma regra (só `"true"` exato liga) e cita `JAIL_ENABLED`
+  nas mensagens. O mecanismo mora em `lib/`, não no `auto_scrum`, porque toda ferramenta
+  futura vai precisar dele.
 - **Opt-in, como as outras flags** (padrão `"false"`, sem nota): exige instalar dependência
   por máquina, e ligar por padrão quebraria toda configuração existente. Valor inválido
   desliga com o aviso de valor ("a opção está desligada.", que descreve o efeito certo).
@@ -1084,7 +1085,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   `ID`/`ID_LIKE` do `/etc/os-release`, lido linha a linha, sem `source` e sem `config_load`,
   cujo formato é outro), mostra `[ok]`/`[falta]` por `command -v` e o comando de cada item que
   falta. Só mostra os comandos, nunca os roda (teste estrutural: nenhuma linha de código de
-  `lib/jail.sh` cita um instalador fora de string). O README repete os comandos, e um teste
+  `lib/jail/jail.sh` cita um instalador fora de string). O README repete os comandos, e um teste
   confere que cada comando do helper aparece literal no README — README genérico não tem
   teste próprio, e esta lista muda quando o upstream muda. Pelo mesmo motivo, outro teste
   confere que os três níveis do `JAIL_CLIPBOARD` e cada opção de `jail_options` aparecem
@@ -1199,6 +1200,19 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   - `--requisitos-jail` "antes" (simulado: `PATH` igual ao real, só sem o `ai-jail`, porque
     ele já estava instalado): `[falta] ai-jail  →  yay -S ai-jail-bin`, `[ok] bwrap`, rc 0;
     "depois" (`PATH` real): `[ok]` nos dois, rc 0.
+  - rede para documentação (`lib/jail/allow_hosts.txt` e `JAIL_ALLOW_HOSTS`), 2026-11-02:
+    `curl` dentro do ai-jail real, com as opções de `jail_options`, num diretório temporário
+    fora do repositório. (a) `docs.claude.com` e `code.claude.com` responderam (301/302),
+    onde antes o WebFetch tinha dado "proxy refused the connection"; (b) `docs.celeryq.dev`,
+    fora da lista, foi recusado (o `curl` sai com 7, conexão recusada); (c) o mesmo host
+    respondeu (302) passado como host extra, o caminho de `JAIL_ALLOW_HOSTS`. Os 36 hosts da
+    lista daquele momento, testados um a um na jail, responderam, menos o apex
+    `django-rest-framework.org`, que não responde nem fora da jail: o site fica em `www.`, que
+    passa por ser subdomínio (o arquivo comenta isso). Numa etapa real, pelo usuário, o
+    agente seguiu o aviso diante do host recusado: o WebFetch em `docs.celeryq.dev` deu
+    "proxy refused the connection", e ele disse que a jail do nick recusou, que o host não
+    está em `lib/jail/allow_hosts.txt` nem no projeto, que não ia contornar e como liberar
+    (`JAIL_ALLOW_HOSTS="docs.celeryq.dev"` no `.nick.conf`);
 - **Terminal e clipboard da jail: `JAIL_CLIPBOARD`, em três níveis** (as opções além de
   `--no-save-config` e `--no-status-bar`). Sem passthrough, não dá pra copiar de dentro do
   `claude`, e o Ctrl+V só cola com o display aberto (testes acima; com `--display`, o usuário
@@ -1339,20 +1353,50 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   nick passaria a ler um arquivo cheio de segredos) e não liberar (os testes de backend não
   rodariam na jail). Cada porta dá ao agente acesso total ao serviço dela; o comentário do
   esqueleto e o README dizem isso.
+- **Documentação e outros hosts: lista fixa do nick + `JAIL_ALLOW_HOSTS`** (decisão do
+  usuário, depois de um agente na jail não conseguir ler `docs.claude.com`: "proxy refused the
+  connection"). O WebFetch roda na máquina, então passa pelo proxy filtrado da jail; a
+  WebSearch não (roda no servidor da Anthropic). Duas partes:
+  - a lista padrão do nick, `lib/jail/allow_hosts.txt` (lida por `jail_nick_hosts`, caminho em
+    `JAIL_HOSTS_FILE`): sempre liberada com a jail ligada, por qualquer ferramenta. É um
+    arquivo de dados, e não código, a pedido do usuário: um dev inclui um host sem chamar o
+    agente. Um host por linha; linha em branco, `#` e espaços em volta são ignorados; arquivo
+    ausente é lista vazia. Os testes leem o próprio arquivo (incluir um host não quebra
+    nada), conferem que todo host passa na validação e que a documentação do Claude está
+    lá. `jail_check` valida a lista antes dos hosts do chamador, e um host errado nela para
+    com erro citando o arquivo, não a configuração do projeto. Conteúdo inicial, escolhido
+    com o usuário: documentação do Claude, AWS, Google Cloud, Python, Rust, PostgreSQL,
+    Django/DRF, OpenTofu e a stack do `siga-construcao` (pytest, uv, boto3, psycopg,
+    gunicorn, drf-spectacular, MDN, Node, TypeScript, React, TanStack, Vite, Vitest, Tailwind,
+    Storybook, Playwright, ESLint, Prettier, Docker, git, Sentry, Atlassian).
+    `cloud.google.com` libera também os subdomínios, `console.cloud.google.com` incluído.
+    `jail_options` põe esses `--allow-host` logo depois dos hosts do chamador;
+  - `JAIL_ALLOW_HOSTS` (chave de texto, padrão `""`, registrada por último): os hosts do
+    projeto (a documentação da stack, um Jira/Sentry self-hosted). Fica no `.nick.conf`
+    commitado, como o `JAIL_FORWARD_PORTS`: o time herda e o PR revisa. O `main()` passa à jail
+    os hosts dos MCPs e depois os da chave. `jail_check` valida todos, só com a jail ligada:
+    só nome de host (minúsculas, números, ponto e hífen, com ponto; sem `https://`, porta,
+    caminho ou curinga), e para com `jail_print_hosts_error`, que cita só o host errado (os
+    dos MCPs são sempre válidos, então o errado veio da chave). Host repetido é aceito (um
+    MCP também listado na chave não é erro).
+  - `jail_agent_notice` cita os hosts da lista padrão e diz ao agente que outro site é
+    recusado com "proxy refused the connection": não contornar, e avisar o usuário qual host
+    faltou, que ele pode liberar em `JAIL_ALLOW_HOSTS`.
+  Descartado: `--prompt-hosts` do ai-jail (notificação no desktop pedindo Permitir/Negar):
+  depende do desktop, é fácil aprovar sem ler e abre saída pra qualquer host aprovado.
 - **Review de PR.** Mudanças no `JAIL_ENABLED` do `.nick.conf` e no `.ai-jail` do projeto
   alvo passam pelo mesmo review de PR que o `CLAUDE.md`: desligar a flag num PR tira a jail
   de todo o time, e o `.ai-jail` pode ampliar o acesso do agente quando o projeto é confiado.
 
 **Fora de escopo, de propósito:** as regras de deny/ask do Claude Code, que não são da jail
 (ficam em `lib/claude/`, ver seção "Regras de deny/ask do Claude Code (`lib/claude/`)");
-`--lockdown`;
-flags de rede além do `--allow-host` dos MCPs e do `--forward-port` de `JAIL_FORWARD_PORTS`
-(ex: `--network`, `--allow-private-host`); forçar a jail numa máquina independente da
-configuração do projeto; ler, gerar ou validar o `.ai-jail` e o `~/.ai-jail`; rodar a
-verificação do `jail_check` no `--requisitos-jail` (ele só checa presença no `PATH`);
-detectar a versão do ai-jail ou do bubblewrap; verificar se o `claude` existe dentro da jail
-antes do lançamento; um executável wrapper (`bin/nick-jail`) enquanto não houver segunda
-ferramenta.
+`--lockdown`; flags de rede além do `--allow-host` (MCPs, `JAIL_ALLOW_HOSTS` e
+`lib/jail/allow_hosts.txt`) e do `--forward-port` de `JAIL_FORWARD_PORTS` (ex: `--network`,
+`--allow-private-host`); forçar a jail numa máquina independente da configuração do projeto;
+ler, gerar ou validar o `.ai-jail` e o `~/.ai-jail`; rodar a verificação do `jail_check` no
+`--requisitos-jail` (ele só checa presença no `PATH`); detectar a versão do ai-jail ou do
+bubblewrap; verificar se o `claude` existe dentro da jail antes do lançamento; um executável
+wrapper (`bin/nick-jail`) enquanto não houver segunda ferramenta.
 
 ## Regras de deny/ask do Claude Code (`lib/claude/`)
 
@@ -1407,8 +1451,9 @@ dá FAIL, e não PULADO, sem nenhum dos dois.
   `git push *`, e um teste garante que nenhuma regra está nas duas listas.
 - **Sintaxe atual do Claude Code**, conferida contra a versão instalada (2.1.312, 2026-11-02):
   `Bash(<padrão>)` com `*` como curinga em qualquer posição e `Read(<glob>)` com `~/` pro home e
-  `**` recursivo. A documentação online (docs.claude.com) não foi alcançável de dentro da jail;
-  a conferência foi no próprio binário: o `--help` documenta `--settings <file-or-json>` ("Path
+  `**` recursivo. A documentação online (docs.claude.com) não foi alcançável de dentro da jail
+  (antes da lista padrão de hosts, `lib/jail/allow_hosts.txt`, que hoje a libera); a
+  conferência foi no próprio binário: o `--help` documenta `--settings <file-or-json>` ("Path
   to a settings JSON file or a JSON string") e dá `"Bash(git *)"` como exemplo; o validador de
   settings diz "Use * for wildcards", com exemplos `Read(~/.zshrc)` e `Edit(docs/**)`, e trata o
   `:*` legado como prefixo só no fim do padrão ("has a :* that is not at the end, so it is
@@ -1452,7 +1497,7 @@ publicar no remote. Registrar aqui e no PR o resultado de cada um.
 
 **Fora de escopo, de propósito:** flag pra desligar; gravar em `.claude/settings*.json`;
 regras por projeto; hooks; regras de rede/MCP; `lib/ai/`; mudar `lib/config.sh` ou
-`lib/jail.sh`; qualquer dependência nova em runtime.
+`lib/jail/jail.sh`; qualquer dependência nova em runtime.
 
 ## Sentry via MCP na etapa de PO
 

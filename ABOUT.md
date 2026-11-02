@@ -644,7 +644,11 @@ ainda não renomeados em alguma máquina e os backups/swaps de editor (`alpha.co
 substitui a decisão original do plano do ticket 8 (`*.conf` + `*.sh`, dois padrões
 específicos). `.nick.conf` também é listado, sem `/` inicial (vale em qualquer
 profundidade: um `--init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo
-versionável no repositório público).
+versionável no repositório público). `.claude/settings.local.json` também é listado: são as
+permissões que cada pessoa aprova no Claude Code ao trabalhar neste repositório, com caminhos
+absolutos da máquina dela; versionado, exporia esses caminhos e daria a quem clona regras de
+`allow` que ela não aprovou. Só esse arquivo: um `.claude/settings.json` de projeto, se um dia
+existir, é pra ser versionado.
 
 **O leitor protege o shell, não o prompt.** O valor de `STACK_DESCRIPTION` entra literal no
 texto enviado ao `claude`, inclusive na etapa de Desenvolvimento, que roda em
@@ -784,8 +788,11 @@ checagens.
 ## Código compartilhado entre ferramentas (`lib/`)
 
 O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas leem o mesmo
-`.nick.conf`. O que é genérico entre elas mora em `lib/<assunto>.sh`, com testes em
-`lib/tests/`. Hoje existem duas bibliotecas:
+`.nick.conf`. O que é genérico entre elas mora em `lib/`, com as suítes de teste em
+`lib/tests/` (todas lá, inclusive a de uma biblioteca em subdiretório). **Convenção de
+nome:** uma biblioteca que é só código fica num arquivo, `lib/<assunto>.sh`; uma que tem
+arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os dados (hoje só
+`lib/claude/`, com o `permissions.json`). Hoje existem três bibliotecas:
 - `lib/config.sh`: o leitor da configuração do projeto (`config_load`), os três avisos, a
   regra liga/desliga (`config_is_toggle_key`), a troca de caracteres de controle, o padrão e
   a nota por chave, o arquivo do cwd (`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd) e o
@@ -797,11 +804,23 @@ O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas
   (`jail_options`, a fonte única delas), toolchains montadas (`jail_toolchain_dirs`), aviso
   ao agente (`jail_agent_notice`), navegadores do Playwright (`jail_playwright_browsers`) e
   lançamento (`jail_exec`). Ver
-  seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)".
+  seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)";
+- `lib/claude/claude.sh` + `lib/claude/permissions.json`: as regras de deny/ask do Claude
+  Code que toda sessão aberta pelo nick recebe. Ver seção "Regras de deny/ask do Claude Code
+  (`lib/claude/`)". A divisão:
+
+  | Fica em `lib/claude/` | Fica na ferramenta (`auto_scrum.sh`) |
+  |---|---|
+  | as regras (`permissions.json`, fonte única) | a global `NICK_CLAUDE_SETTINGS=""` que recebe o conteúdo |
+  | achar o arquivo pelo `BASH_SOURCE` (`NICK_CLAUDE_PERMISSIONS_FILE`) | quando carregar (`main()`, logo depois de `jail_check`, com `\|\| exit 1`) |
+  | ler o arquivo e entregar o conteúdo (`claude_settings_load`) | montar o argv: `claude_args=(--settings "$NICK_CLAUDE_SETTINGS")` |
+  | a mensagem de erro (`claude_print_settings_error`) | o resto do argv (`--permission-mode`, `--append-system-prompt`, prompt) |
 
 **As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a suíte
 de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config.sh`, e um teste
-estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail.sh`). A jail recebe os
+estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail.sh`;
+`lib/tests/test_claude.sh` só carrega `lib/claude/claude.sh`, que não cita `config_`, `CONFIG_`,
+`jail_` nem `JAIL_` em código). A jail recebe os
 valores de `JAIL_ENABLED`, `JAIL_CLIPBOARD` e `JAIL_FORWARD_PORTS` (e os hosts extras) por
 parâmetro em vez de ler o `.nick.conf`, e a única coisa em comum, a troca de caracteres de
 controle por `?`, é uma expansão de uma linha, não uma função que valha a pena compartilhar.
@@ -812,14 +831,20 @@ Os `assert_*` dos testes ficam em `lib/tests/assert.sh`, carregado por todas as 
 nenhuma suíte define os seus.
 
 **Regras de toda biblioteca em `lib/`** (cobertas por testes estruturais em
-`lib/tests/test_config.sh` e `lib/tests/test_jail.sh`):
+`lib/tests/test_config.sh`, `lib/tests/test_jail.sh` e `lib/tests/test_claude.sh`):
 - **só define ao ser carregada:** atribui as constantes, cria as globais vazias e define
   funções; não imprime nada e não roda comando. Sem shebang e sem bit de execução; a 1ª linha
   é `# shellcheck shell=bash`, seguida do cabeçalho em inglês;
 - não ativa `set -euo pipefail` (é de quem a carrega), mas funciona com ou sem ele no chamador;
 - **prefixo por biblioteca:** toda função `config_` e toda global `CONFIG_` em
-  `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail.sh`. O
-  `auto_scrum.sh` não define nada nesses namespaces;
+  `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail.sh`; toda função
+  `claude_` e toda global `NICK_CLAUDE_` em `lib/claude/claude.sh` (as locais, `__claude_`).
+  As globais de `lib/claude/` **não** usam `CLAUDE_`: o Claude Code lê variáveis `CLAUDE_*` do
+  ambiente (ex: `CLAUDE_CODE_DISABLE_MOUSE`), e um nome nosso nesse espaço poderia colidir com
+  uma variável dele, hoje ou numa versão futura, e mudar o comportamento do agente. Pelo mesmo
+  motivo, a global do `auto_scrum.sh` é `NICK_CLAUDE_SETTINGS`. Um teste estrutural proíbe
+  `CLAUDE_` sem `NICK_` na frente em código de `lib/claude/claude.sh`, e outro proíbe atribuir
+  global `CLAUDE_*` no `auto_scrum.sh`. O `auto_scrum.sh` não define nada nesses namespaces;
 - **nunca chama `exit`** e não usa `source`, `.` nem `eval`;
 - **não lê globais do chamador:** tudo entra por parâmetro ou pelo próprio registro (o `$PWD`
   de `config_cwd_file` é estado do shell, não global do chamador);
@@ -837,6 +862,15 @@ da biblioteca (hoje, `PROJECT_CONFIG_FILE`, o caminho usado na mensagem de erro 
 **Exceção de `exit`, documentada:** `jail_exec` termina com `exec` (dentro ou fora da jail) e
 por isso não retorna. Não é um `exit`: é o papel dela, o último passo da ferramenta.
 
+**Constantes atribuídas ao carregar:** `JAIL_BIN` e `JAIL_OS_RELEASE_FILE` (valores fixos) e
+`NICK_CLAUDE_PERMISSIONS_FILE`, calculada a partir de `${BASH_SOURCE[0]}`
+(`"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" > /dev/null && pwd)/permissions.json"`). O `cd`
+roda no subshell do `$(...)`: não muda o cwd de quem carrega, e a saída dele (que existe com
+`CDPATH` definido) vai pro `/dev/null`, então a regra "só define ao ser carregada" continua
+valendo. O caminho sai absoluto mesmo com a biblioteca carregada por caminho relativo de outro
+cwd (coberto por teste). É variável, e não texto fixo, só pra os testes apontarem pra um
+arquivo ausente, ilegível ou vazio — mesmo racional de `JAIL_BIN`.
+
 **Carga:** logo depois de `SCRIPT_DIR`, com
 
 ```bash
@@ -844,16 +878,18 @@ por isso não retorna. Não é um `exit`: é o papel dela, o último passo da fe
 source "$SCRIPT_DIR/../lib/config.sh"
 # shellcheck source=SCRIPTDIR/../lib/jail.sh
 source "$SCRIPT_DIR/../lib/jail.sh"
+# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
+source "$SCRIPT_DIR/../lib/claude/claude.sh"
 ```
 
 A diretiva usa `SCRIPTDIR/` e não `../lib/config.sh`: o caminho relativo puro só resolve se o
 `shellcheck` rodar de dentro de `auto_scrum/` (da raiz dá SC1091), e com `SCRIPTDIR` ele
 resolve de qualquer cwd. Rode `shellcheck -x`, pra ele seguir o `source`. O `SCRIPT_DIR` vem de
 `BASH_SOURCE[0]`, então o caminho também funciona quando os testes dão `source` no script de
-outro cwd. As duas linhas `source` das bibliotecas, nessa ordem, são as únicas linhas
-`source`/`.` do `auto_scrum.sh` (um teste compara a lista inteira); a garantia de que a
-configuração nunca é executada fica no teste estrutural de `lib/config.sh` e nos testes de
-gramática.
+outro cwd. As três linhas `source` das bibliotecas, nessa ordem (config → jail → claude),
+são as únicas linhas `source`/`.` do `auto_scrum.sh` (um teste compara a lista inteira); a
+garantia de que a configuração nunca é executada fica no teste estrutural de `lib/config.sh`
+e nos testes de gramática.
 
 **Riscos aceitos:**
 - a API de `lib/config.sh` nasce com um cliente só e pode mudar quando a segunda ferramenta
@@ -867,8 +903,9 @@ pro nick inteiro, e extrair antes dele custava só revisar aquele plano; depois,
 refazer código e testes do 13.
 
 **Como rodar as suítes** (cada uma sai com código 1 se houver `FAIL`; não há runner único):
-`bash auto_scrum/tests/test_auto_scrum.sh`, `bash lib/tests/test_config.sh` e
-`bash lib/tests/test_jail.sh`.
+`bash auto_scrum/tests/test_auto_scrum.sh`, `bash lib/tests/test_config.sh`,
+`bash lib/tests/test_jail.sh` e `bash lib/tests/test_claude.sh` (esta precisa de `jq` ou
+`python3` pra validar o JSON; sem nenhum dos dois, dá FAIL).
 
 ## Registro de chaves da configuração
 
@@ -932,13 +969,17 @@ somente quando `$TYPE = development`. PO, Tech Leader e Review sobem no modo pad
 
 **Por quê:** Desenvolvimento é a única etapa em que o agente de fato edita código e roda
 comandos — as outras três são conversas de avaliação/planejamento/revisão em texto, sem
-motivo pra soltar a supervisão. Regras de `deny` no `settings.json` continuam valendo em
-qualquer modo (deny > ask > allow > modo da sessão), então `auto` não contorna o que já
-estiver bloqueado ali — mas hoje o projeto não tem nenhuma regra de `deny` configurada,
-só `allow`. Vale definir uma deny list antes de confiar demais no modo `auto` (ticket
-separado, ainda pendente). Uma mitigação opcional já existe: com `JAIL_ENABLED="true"`, o
-agente roda dentro do sandbox ai-jail, que limita a escrita ao projeto e esconde `~/.ssh`,
-`~/.gnupg` etc. (ver seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)").
+motivo pra soltar a supervisão. Regras de `deny`/`ask` continuam valendo em qualquer modo
+(deny > ask > allow > modo da sessão), então `auto` não contorna o que estiver bloqueado ou
+marcado pra confirmação. Toda sessão aberta pelo nick, em todas as etapas, recebe as regras
+de `lib/claude/permissions.json` (`--settings`): `sudo`, `rm -rf`, `git push --force` e a
+leitura de `~/.ssh`/`~/.aws`/`~/.gnupg` são negados, e `git add`/`commit`/`push`, o que perde
+trabalho local e a leitura de `.env` pedem confirmação (ver seção "Regras de deny/ask do
+Claude Code (`lib/claude/`)"). As regras casam pelo texto do comando, então são uma grade de
+proteção contra erro, não um isolamento. O isolamento, opcional, é a jail: com
+`JAIL_ENABLED="true"`, o agente roda dentro do sandbox ai-jail, que limita a escrita ao
+projeto e esconde `~/.ssh`, `~/.gnupg` etc. (ver seção "Sandbox do agente com ai-jail
+(`JAIL_ENABLED`)").
 
 ## Sandbox do agente com ai-jail (`JAIL_ENABLED`)
 
@@ -1302,7 +1343,9 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   alvo passam pelo mesmo review de PR que o `CLAUDE.md`: desligar a flag num PR tira a jail
   de todo o time, e o `.ai-jail` pode ampliar o acesso do agente quando o projeto é confiado.
 
-**Fora de escopo, de propósito:** a deny list do Claude Code (ticket separado); `--lockdown`;
+**Fora de escopo, de propósito:** as regras de deny/ask do Claude Code, que não são da jail
+(ficam em `lib/claude/`, ver seção "Regras de deny/ask do Claude Code (`lib/claude/`)");
+`--lockdown`;
 flags de rede além do `--allow-host` dos MCPs e do `--forward-port` de `JAIL_FORWARD_PORTS`
 (ex: `--network`, `--allow-private-host`); forçar a jail numa máquina independente da
 configuração do projeto; ler, gerar ou validar o `.ai-jail` e o `~/.ai-jail`; rodar a
@@ -1310,6 +1353,106 @@ verificação do `jail_check` no `--requisitos-jail` (ele só checa presença no
 detectar a versão do ai-jail ou do bubblewrap; verificar se o `claude` existe dentro da jail
 antes do lançamento; um executável wrapper (`bin/nick-jail`) enquanto não houver segunda
 ferramenta.
+
+## Regras de deny/ask do Claude Code (`lib/claude/`)
+
+A jail isola a máquina, mas não protege o próprio repositório (`git reset --hard`, `git
+clean`), o remote (`git push --force`) nem impede commit ou push sem revisão; e é opt-in.
+Toda sessão do `claude` aberta pelo nick, em todas as etapas, com ou sem jail, recebe um
+conjunto fixo de regras de permissão do Claude Code:
+
+```
+claude --settings "<conteúdo de lib/claude/permissions.json>" [--permission-mode auto] [--append-system-prompt <aviso da jail>] "<prompt>"
+```
+
+Com a jail: `ai-jail <opções> -- claude --settings ...`. `--settings` vem sempre primeiro,
+antes do `--permission-mode`.
+
+**Como funciona:** `lib/claude/permissions.json` é `{"permissions": {"deny": [...], "ask":
+[...]}}`, sem `allow`, `defaultMode` nem outra chave. `claude_settings_load NICK_CLAUDE_SETTINGS
+|| exit 1` roda em `main()` logo depois de `jail_check` (antes de `jail_print_status`, dos
+`build_*`, do menu e do `mkdir -p "$LOGS_DIR"`): lê o arquivo dentro da função (`cat`, sem
+`jq`) e grava o conteúdo na global com `printf -v`. Arquivo ausente, ilegível ou vazio (só
+espaços, tabs e quebras de linha contam como vazio) → `Erro: regras de permissão do Claude Code não
+encontradas ou ilegíveis: <caminho>` no stderr e código 1: nenhuma pergunta, nenhum log,
+`claude` não aberto, com e sem jail. Com a jail ligada, a verificação dela (`ai-jail ... --
+true`) já rodou nesse ponto; o lançamento, não. `--init` e `--requisitos-jail` saem antes e
+não carregam as regras, porque não abrem o `claude`. A biblioteca não valida o JSON: isso
+fica na suíte (`jq` e/ou `python3 -m json.tool`, mais a checagem das chaves e dos tipos), que
+dá FAIL, e não PULADO, sem nenhum dos dois.
+
+**Decisões, cada uma com o motivo:**
+- **Regras num JSON separado, fonte única.** Nenhum `Bash(`/`Read(` em código de `claude.sh`
+  ou do `auto_scrum.sh` (teste). O JSON é o formato do próprio Claude Code, então pode ser
+  revisado, validado e copiado sem traduzir; e uma ferramenta futura do nick reaproveita o
+  mesmo arquivo pela mesma biblioteca.
+- **`--settings` inline, com o conteúdo, e não um caminho nem um arquivo de settings.** Um
+  caminho fora do projeto pode não existir dentro da jail (o home é privado). Gravar em
+  `.claude/settings*.json` do projeto alvo mexeria no repositório de outro time (e entraria no
+  git dele), e em `~/.claude/settings.json` mudaria o `claude` do usuário fora do nick. O
+  nick não cria nem altera nenhum desses (teste com cwd e `HOME` temporários). As regras de
+  `--settings` se somam às dos settings do usuário e do projeto, e deny/ask vencem allow.
+- **Sempre ativo, sem flag e sem fallback.** Nenhuma chave de configuração nova (`CONFIG_KEYS`
+  igual à de antes; teste), nenhuma pergunta "seguir sem as regras?". É o mesmo espírito da
+  jail: quem roda o nick nunca abre o agente sem a proteção por engano. Um projeto que precise
+  de uma ação bloqueada roda o `claude` fora do nick.
+- **deny = irreversível ou fora do projeto; ask = versionamento e perda de trabalho local.**
+  deny: privilégio (`sudo`, `su`, `doas`), destruição em massa (`rm -rf` e variantes de ordem e
+  de opção longa), reescrita do remote (`git push --force`/`-f`; `--force*` cobre
+  `--force-with-lease`) e segredos fora do projeto (`~/.ssh`, `~/.aws`, `~/.gnupg`). ask:
+  `git add`/`commit`/`push` (reforça a regra dos prompts de não versionar sem autorização —
+  `development.md` continua dizendo isso), `git reset --hard`, `git clean`, `git checkout --`,
+  `git restore`, `git branch -D` e a leitura de `.env`/`.env.*` do projeto (o `.env.example`
+  também pergunta; aceito). deny vence ask: `git push --force` é negado mesmo casando
+  `git push *`, e um teste garante que nenhuma regra está nas duas listas.
+- **Sintaxe atual do Claude Code**, conferida contra a versão instalada (2.1.312, 2026-11-02):
+  `Bash(<padrão>)` com `*` como curinga em qualquer posição e `Read(<glob>)` com `~/` pro home e
+  `**` recursivo. A documentação online (docs.claude.com) não foi alcançável de dentro da jail;
+  a conferência foi no próprio binário: o `--help` documenta `--settings <file-or-json>` ("Path
+  to a settings JSON file or a JSON string") e dá `"Bash(git *)"` como exemplo; o validador de
+  settings diz "Use * for wildcards", com exemplos `Read(~/.zshrc)` e `Edit(docs/**)`, e trata o
+  `:*` legado como prefixo só no fim do padrão ("has a :* that is not at the end, so it is
+  matched as a * wildcard"). Uma regra com sintaxe inválida pode ser ignorada sem aviso, então
+  **a cada atualização do Claude Code, reconferir a sintaxe** (e o teste manual abaixo).
+- **A biblioteca não devolve array.** Bash só faria isso com `eval` ou nameref, e imprimir um
+  argumento por linha quebraria com o JSON multilinha. A lib entrega o conteúdo; quem monta
+  `claude_args=(--settings "$NICK_CLAUDE_SETTINGS")` é o `auto_scrum.sh`, e o argv final é
+  coberto por teste em cada tipo de etapa.
+- **Sem abstração multi-agente** (`lib/ai/`, regras genéricas traduzidas pra cada agente): só
+  existe o Claude Code; o nome `lib/claude/` deixa claro de quem é o formato.
+
+**Limitação: o casamento é pelo texto do comando.** As regras são uma grade de proteção contra
+erro do agente, não um isolamento — quem quer contornar contorna. Exemplos que passam:
+`bash -c "sudo ..."`, `python -c 'import os; os.system("rm -rf ...")'`, `git -C . push -f`
+(o `-C` muda o começo do comando), `cat .env` (a regra `Read(...)` vale pra ferramenta de
+leitura, não pro `cat` no Bash) e o refspec com `+` (`git push origin +main`, um force push
+sem `--force`). O isolamento de verdade é a jail (seção "Sandbox do agente com ai-jail").
+
+**Riscos conhecidos:**
+- uma versão nova do Claude Code pode mudar a sintaxe ou a semântica das regras, e uma regra
+  inválida pode ser ignorada em silêncio — reconferir a cada atualização;
+- as regras do usuário ou do projeto alvo continuam valendo junto (um `deny` deles soma); um
+  `allow` deles não fura o deny/ask do nick, pela precedência;
+- `.env.example` (e qualquer `.env.*`) pede confirmação pra ser lido, o que pode irritar;
+- casamento por texto (acima).
+
+**Teste manual (roteiro; executado pelo usuário — resultado pendente):** num repositório
+descartável fora do nick_secrets, com o remote bare **dentro** do próprio projeto e escondido
+do git (`git init /tmp/nick21-proj && cd /tmp/nick21-proj`; `git init --bare .remoto.git`;
+`echo .remoto.git >> .git/info/exclude`; `git remote add origin ./.remoto.git`; um commit
+inicial e `git push -u origin HEAD` feitos à mão), abrir pelo nick uma sessão de
+Desenvolvimento (`--permission-mode auto`), uma vez com `JAIL_ENABLED="false"` e outra com
+`"true"`, e pedir ao agente: `sudo true` → bloqueado; `git push --force` → bloqueado; `git
+commit --allow-empty -m teste` → pede confirmação. O remote fica dentro do projeto porque, com
+a jail, só o projeto é visível: um remote fora dele faria todo `git push` falhar por erro do
+git, e o "bloqueado" passaria mesmo com a regra ignorada (achado do review). **Bloqueado**
+quer dizer recusa do Claude Code (permissão negada por regra, sem o comando rodar), não um
+erro do `sudo` ou do `git`; a contraprova é um `git push` comum, aprovado no ask, que tem de
+publicar no remote. Registrar aqui e no PR o resultado de cada um.
+
+**Fora de escopo, de propósito:** flag pra desligar; gravar em `.claude/settings*.json`;
+regras por projeto; hooks; regras de rede/MCP; `lib/ai/`; mudar `lib/config.sh` ou
+`lib/jail.sh`; qualquer dependência nova em runtime.
 
 ## Sentry via MCP na etapa de PO
 

@@ -65,3 +65,11 @@ docs.docker.com
 git-scm.com
 docs.sentry.io
 developer.atlassian.com
+
+# Linux: Arch e Debian (só os subdomínios de documentação; o domínio inteiro abriria o AUR e o
+# GitLab do Debian, onde qualquer um publica)
+wiki.archlinux.org
+man.archlinux.org
+wiki.debian.org
+www.debian.org
+manpages.debian.org

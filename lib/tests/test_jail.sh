@@ -87,18 +87,20 @@ chmod +x "$FAKE_UNAME_DIR/uname" "$FAKE_BWRAP_DIR/bwrap"
 new_case() {
   local dir="$TEST_TMP/$1"
   rm -rf "$dir"
-  mkdir -p "$dir/jail" "$dir/claude" "$dir/cwd"
+  mkdir -p "$dir/jail" "$dir/claude" "$dir/cwd" "$dir/home"
   printf '%s' "$dir"
 }
 
 # run_jail <case_dir> <commands> [env]: num bash separado, com set -euo pipefail, cwd em
 # <case_dir>/cwd e os stubs de ai-jail e claude à frente do PATH, roda [env] (atribuições,
 # antes do source), dá source só em lib/jail.sh e roda <commands>. stdout em
-# <case_dir>/out, stderr em <case_dir>/err e o código de saída em <case_dir>/rc. O
+# <case_dir>/out, stderr em <case_dir>/err e o código de saída em <case_dir>/rc. O HOME é
+# <case_dir>/home (vazio, a menos que o caso crie algo nele): as toolchains montadas pela jail
+# dependem do home, e o resultado não pode depender da máquina que roda os testes. O
 # '|| t_rc=$?' mantém a suíte rodando (e reportando FAIL) mesmo se o bash de dentro morrer.
 run_jail() {
   local case_dir="$1" commands="$2" env="${3:-:}" t_rc=0
-  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; export PATH='$FAKE_JAIL_DIR:$FAKE_CLAUDE_DIR':\"\$PATH\" FAKE_JAIL_LOG_DIR='$case_dir/jail' FAKE_CLAUDE_LOG_DIR='$case_dir/claude'; $env; set -euo pipefail; source '$JAIL_SH'; $commands" < /dev/null > "$case_dir/out" 2> "$case_dir/err" || t_rc=$?
+  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; unset PLAYWRIGHT_BROWSERS_PATH; export HOME='$case_dir/home' PATH='$FAKE_JAIL_DIR:$FAKE_CLAUDE_DIR':\"\$PATH\" FAKE_JAIL_LOG_DIR='$case_dir/jail' FAKE_CLAUDE_LOG_DIR='$case_dir/claude'; $env; set -euo pipefail; source '$JAIL_SH'; $commands" < /dev/null > "$case_dir/out" 2> "$case_dir/err" || t_rc=$?
   printf '%s' "$t_rc" > "$case_dir/rc"
 }
 
@@ -167,13 +169,13 @@ assert_eq "0" "$clean_rc" "source lib/jail.sh num bash limpo termina com código
 assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/jail.sh não imprime nada (stdout nem stderr)"
 clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE '_|BASH_.*|FUNCNAME|LINENO|PIPESTATUS' || true)"
 clean_new_funcs="$(comm -13 "$clean_dir/funcs_before" "$clean_dir/funcs_after" 2>/dev/null | sed 's/^declare -f //' || true)"
-assert_eq "JAIL_BIN"$'\n'"JAIL_OS_RELEASE_FILE" "$clean_new_vars" "as únicas variáveis novas são JAIL_BIN e JAIL_OS_RELEASE_FILE"
+assert_eq "JAIL_BIN"$'\n'"JAIL_LANDLOCK"$'\n'"JAIL_OS_RELEASE_FILE" "$clean_new_vars" "as únicas variáveis novas são JAIL_BIN, JAIL_LANDLOCK e JAIL_OS_RELEASE_FILE"
 assert_eq "" "$(grep -vE '^jail_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com jail_"
-for clean_func in jail_check jail_exec jail_options jail_print_requirements jail_print_status; do
+for clean_func in jail_agent_notice jail_check jail_landlock_state jail_exec jail_options jail_playwright_browsers jail_print_requirements jail_print_status jail_toolchain_dirs; do
   assert_contains "$clean_new_funcs" "$clean_func" "source lib/jail.sh define $clean_func"
 done
-clean_values="$(timeout 2 bash --norc --noprofile -c "source '$JAIL_SH'; printf '%s|%s' \"\$JAIL_BIN\" \"\$JAIL_OS_RELEASE_FILE\"" 2>/dev/null || true)"
-assert_eq "ai-jail|/etc/os-release" "$clean_values" "JAIL_BIN é ai-jail (nome no PATH, sem caminho) e JAIL_OS_RELEASE_FILE é /etc/os-release"
+clean_values="$(timeout 2 bash --norc --noprofile -c "source '$JAIL_SH'; printf '%s|%s|%s' \"\$JAIL_BIN\" \"\$JAIL_OS_RELEASE_FILE\" \"\$JAIL_LANDLOCK\"" 2>/dev/null || true)"
+assert_eq "ai-jail|/etc/os-release|" "$clean_values" "JAIL_BIN é ai-jail (nome no PATH, sem caminho), JAIL_OS_RELEASE_FILE é /etc/os-release e JAIL_LANDLOCK começa vazia"
 
 echo
 echo "== carga limpa: estrutura do arquivo (sem shebang, sem bit de execução, sem set/exit/source/eval) =="
@@ -182,6 +184,7 @@ assert_eq "sem bit de execução" "$([ -e "$JAIL_SH" ] && [ ! -x "$JAIL_SH" ] &&
 jail_code="$(code_lines "$JAIL_SH" 2>/dev/null || true)"
 assert_eq "" "$(grep -nE '(^|[;&|[:space:]])set[[:space:]]+[-+]' <<< "$jail_code" || true)" "nenhum set -e/set -o (nem outro set) fora de comentário"
 assert_eq "" "$(grep -nwE 'exit|source|eval' <<< "$jail_code" || true)" "nenhum exit, source ou eval fora de comentário"
+assert_eq "" "$(grep -nE '\[\[[[:space:]]' <<< "$jail_code" || true)" "nenhum teste com [[ ]] (a convenção do projeto é [ ])"
 assert_eq "" "$(grep -nE '(^|[;&|])[[:space:]]*\.[[:space:]]+[^[:space:]]' <<< "$jail_code" || true)" "nenhum '. arquivo' fora de comentário"
 
 echo
@@ -194,7 +197,7 @@ assert_eq "" "$(grep -nE 'source[^;]*config' <<< "$(code_lines "$0")" || true)" 
 
 echo
 echo "== estrutural: as opções do ai-jail saem só de jail_options; o nick não mexe no .ai-jail =="
-for jail_forbidden in --bootstrap --init --map --rw-map --network --exec; do
+for jail_forbidden in --bootstrap --init --rw-map --overlay-map --network --no-private-home --exec; do
   assert_eq "" "$(grep -nF -- "$jail_forbidden" <<< "$jail_code" || true)" "lib/jail.sh não cita $jail_forbidden fora de comentário"
 done
 # --allow-host (os hosts extras do chamador) só sai de jail_options, uma vez por host.
@@ -202,6 +205,17 @@ jail_options_body="$(awk '/^jail_options\(\) \{/{found=1} found{print} found && 
 assert_eq "1" "$(grep -cF -- --allow-host <<< "$jail_code" || true)" "lib/jail.sh cita --allow-host uma vez fora de comentário"
 # shellcheck disable=SC2016
 assert_contains "$jail_options_body" '--allow-host "$host"' "o --allow-host fica no corpo de jail_options"
+# --forward-port (as portas de localhost do chamador) só sai de jail_options.
+assert_eq "1" "$(grep -cF -- --forward-port <<< "$jail_code" || true)" "lib/jail.sh cita --forward-port uma vez fora de comentário"
+# shellcheck disable=SC2016
+assert_contains "$jail_options_body" '--forward-port "$port"' "o --forward-port fica no corpo de jail_options"
+# --map (somente leitura; nunca --rw-map) só sai de jail_options, pras toolchains.
+assert_eq "2" "$(grep -cE -- '(^|[[:space:]])--map([[:space:]]|$)' <<< "$jail_code" || true)" "lib/jail.sh cita --map duas vezes fora de comentário (toolchains e navegadores do Playwright)"
+assert_eq "1" "$(grep -cE -- '(^|[[:space:]])--env([[:space:]]|$)' <<< "$jail_code" || true)" "lib/jail.sh cita --env uma vez fora de comentário (PLAYWRIGHT_BROWSERS_PATH)"
+# shellcheck disable=SC2016
+assert_contains "$jail_options_body" '--env "PLAYWRIGHT_BROWSERS_PATH=$' "o --env fica no corpo de jail_options"
+# shellcheck disable=SC2016
+assert_contains "$jail_options_body" '--map "$dir"' "o --map fica no corpo de jail_options, com as toolchains de jail_toolchain_dirs"
 assert_eq "" "$(grep -nE '>[[:space:]]*[^[:space:]]*\.ai-jail' <<< "$jail_code" || true)" "lib/jail.sh não escreve em .ai-jail"
 assert_eq "" "$(grep -nE '(^|[^-])ai-jail[^[:space:]]* --[[:space:]]|exec[[:space:]]+ai-jail' <<< "$jail_code" || true)" "lib/jail.sh só chama o ai-jail por \$JAIL_BIN (nunca pelo nome literal)"
 # Toda chamada de "$JAIL_BIN" (fora o command -v) é '"$JAIL_BIN" "${options[@]}" -- ...': a
@@ -213,7 +227,7 @@ assert_eq "2" "$(grep -c . <<< "$jail_bin_calls" || true)" "lib/jail.sh chama \$
 # shellcheck disable=SC2016
 assert_eq "" "$(grep -vF '"$JAIL_BIN" "${options[@]}" -- ' <<< "$jail_bin_calls" || true)" "toda chamada de \$JAIL_BIN é '\$JAIL_BIN \"\${options[@]}\" -- ...'"
 # shellcheck disable=SC2016
-assert_eq "2" "$(grep -cF 'mapfile -t options < <(jail_options "$clipboard" "$hosts")' <<< "$jail_code" || true)" "a verificação e o lançamento montam options com jail_options"
+assert_eq "2" "$(grep -cF 'mapfile -t options < <(jail_options "$clipboard" "$hosts" "$ports")' <<< "$jail_code" || true)" "a verificação e o lançamento montam options com jail_options"
 assert_eq "" "$(grep -nE '(^|[[:space:]])options\+?=' <<< "$jail_code" || true)" "options nunca é montado à mão (só por jail_options)"
 
 echo
@@ -241,6 +255,32 @@ for status_value in true "" false TRUE; do
     assert_eq "0|" "$(file_of "$status_dir/rc")|$(file_of "$status_dir/err")" "$status_label: código 0 e nada no stderr"
   done
 done
+
+# Com JAIL_LANDLOCK preenchida (por jail_check), o estado entra entre o "ativa" e o modo.
+for status_landlock in completo parcial inativo; do
+  status_dir="$(new_case "status_landlock_$status_landlock")"
+  run_jail "$status_dir" "JAIL_LANDLOCK='$status_landlock'; jail_print_status true ''"
+  assert_eq "⚠️ Jail (ai-jail): ativa | Landlock: $status_landlock | modo de clipboard médio" "$(file_of "$status_dir/out")" "JAIL_LANDLOCK=\"$status_landlock\": a linha mostra 'Landlock: $status_landlock'"
+done
+status_dir="$(new_case status_landlock_off)"
+run_jail "$status_dir" "JAIL_LANDLOCK=completo; jail_print_status false ''"
+assert_eq "$status_off" "$(file_of "$status_dir/out")" "jail desligada: a linha não fala de Landlock"
+
+echo
+echo "== jail_landlock_state: o estado do Landlock na saída do ai-jail, resumido =="
+for landlock_case in "fully enforced|completo" "partially enforced|parcial" "partially enforced (ABI 3)|parcial" "not enforced|inativo" "not enforced (kernel sem suporte)|inativo" "algo novo|não identificado"; do
+  landlock_text="${landlock_case%%|*}"
+  landlock_expected="${landlock_case#*|}"
+  landlock_dir="$(new_case landlock_state)"
+  run_jail "$landlock_dir" "jail_landlock_state \$'▸ Jail Active: /proj\\n▸ Landlock: $landlock_text'"
+  assert_eq "$landlock_expected" "$(file_of "$landlock_dir/out")" "'▸ Landlock: $landlock_text' vira \"$landlock_expected\""
+done
+landlock_dir="$(new_case landlock_state_sem_linha)"
+run_jail "$landlock_dir" "jail_landlock_state '▸ Jail Active: /proj'"
+assert_eq "inativo" "$(file_of "$landlock_dir/out")" "sem a linha do Landlock (--no-landlock): \"inativo\""
+landlock_dir="$(new_case landlock_state_outra)"
+run_jail "$landlock_dir" "jail_landlock_state \$'▸ Landlock: ro map /x\\n▸ Landlock: fully enforced'"
+assert_eq "completo" "$(file_of "$landlock_dir/out")" "linhas de detalhe ('Landlock: ro map ...') não confundem: vale a do estado"
 
 echo
 echo "== jail_print_status num terminal: só o 'modo de clipboard brando' em vermelho (e nada com NO_COLOR) =="
@@ -291,6 +331,106 @@ for opt_hosts in "" " " "mcp.atlassian.com" "mcp.atlassian.com mcp.sentry.dev" "
   assert_eq "$(printf '%s\n' "${opt_expected[@]}")" "$(file_of "$opt_dir/out")" "jail_options brando \"$opt_hosts\": ${opt_expected[*]}"
 done
 
+# Portas (separadas por espaço): um --forward-port por porta, depois dos hosts.
+opt_dir="$(new_case options_ports)"
+run_jail "$opt_dir" "jail_options restrito 'mcp.sentry.dev' '  54320   6379 '"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --allow-host mcp.sentry.dev --forward-port 54320 --forward-port 6379)" "$(file_of "$opt_dir/out")" "jail_options com portas: um --forward-port por porta, na ordem, depois do --allow-host"
+opt_dir="$(new_case options_ports_vazio)"
+run_jail "$opt_dir" "jail_options restrito '' ' '"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar)" "$(file_of "$opt_dir/out")" "jail_options com portas só espaços: nenhum --forward-port"
+
+echo
+echo "== jail_toolchain_dirs: os gerenciadores de versão do home que existem, na ordem da lista =="
+tc_dir="$(new_case toolchains_vazio)"
+run_jail "$tc_dir" "jail_toolchain_dirs"
+assert_eq "0||" "$(file_of "$tc_dir/rc")|$(file_of "$tc_dir/out")|$(file_of "$tc_dir/err")" "home sem toolchains: nada impresso, código 0"
+tc_dir="$(new_case toolchains_todas)"
+tc_all=(.pyenv .nvm .rbenv .asdf .local/share/mise .local/share/uv/python .sdkman .volta)
+for tc_name in "${tc_all[@]}"; do mkdir -p "$tc_dir/home/$tc_name"; done
+run_jail "$tc_dir" "jail_toolchain_dirs"
+assert_eq "$(printf "$tc_dir/home/%s\n" "${tc_all[@]}")" "$(file_of "$tc_dir/out")" "todas existem: as oito, caminho absoluto, na ordem da lista"
+tc_dir="$(new_case toolchains_algumas)"
+mkdir -p "$tc_dir/home/.pyenv/versions" "$tc_dir/home/.local/share/uv/python" "$tc_dir/home/.local/share/uv/credentials" "$tc_dir/home/.ssh" "$tc_dir/home/.config"
+: > "$tc_dir/home/.nvm"
+run_jail "$tc_dir" "jail_toolchain_dirs"
+assert_eq "$tc_dir/home/.pyenv"$'\n'"$tc_dir/home/.local/share/uv/python" "$(file_of "$tc_dir/out")" "só os diretórios da lista que existem (do uv, só os interpretadores: nunca ~/.local/share/uv, onde o 'uv auth login' guarda credenciais) (um arquivo .nvm não conta; .ssh e .config nunca)"
+tc_dir="$(new_case toolchains_sem_home)"
+run_jail "$tc_dir" "jail_toolchain_dirs" "unset HOME"
+assert_eq "0|" "$(file_of "$tc_dir/rc")|$(file_of "$tc_dir/out")" "sem HOME: nada impresso (nunca monta /.pyenv), código 0"
+
+echo
+echo "== jail_playwright_browsers: o diretório dos navegadores do Playwright, se existir =="
+pw_dir="$(new_case pw_sem)"
+run_jail "$pw_dir" "jail_playwright_browsers"
+assert_eq "0||" "$(file_of "$pw_dir/rc")|$(file_of "$pw_dir/out")|$(file_of "$pw_dir/err")" "sem ~/.cache/ms-playwright: nada impresso, código 0"
+pw_dir="$(new_case pw_padrao)"
+mkdir -p "$pw_dir/home/.cache/ms-playwright"
+run_jail "$pw_dir" "jail_playwright_browsers"
+assert_eq "$pw_dir/home/.cache/ms-playwright" "$(file_of "$pw_dir/out")" "com ~/.cache/ms-playwright: imprime o caminho padrão do Linux"
+pw_dir="$(new_case pw_env)"
+mkdir -p "$pw_dir/home/.cache/ms-playwright" "$pw_dir/outro/navegadores"
+run_jail "$pw_dir" "jail_playwright_browsers" "export PLAYWRIGHT_BROWSERS_PATH='$pw_dir/outro/navegadores'"
+assert_eq "$pw_dir/outro/navegadores" "$(file_of "$pw_dir/out")" "PLAYWRIGHT_BROWSERS_PATH definida: vale ela, e não o padrão"
+for pw_value in 0 "$TEST_TMP/nao-existe-pw" "$TEST_TMP/com:dois-pontos" pw-relativo; do
+  pw_dir="$(new_case pw_ignorado)"
+  mkdir -p "$pw_dir/home/.cache/ms-playwright" "$TEST_TMP/com:dois-pontos" "$pw_dir/cwd/pw-relativo"
+  run_jail "$pw_dir" "jail_playwright_browsers" "export PLAYWRIGHT_BROWSERS_PATH='$pw_value'"
+  assert_eq "0|" "$(file_of "$pw_dir/rc")|$(file_of "$pw_dir/out")" "PLAYWRIGHT_BROWSERS_PATH=\"$pw_value\": nada (0 = navegadores no projeto; inexistente; ':' quebraria o --map ORIGEM:DESTINO; relativo seria ambíguo e já fica no projeto)"
+done
+pw_dir="$(new_case pw_sem_home)"
+run_jail "$pw_dir" "jail_playwright_browsers" "unset HOME"
+assert_eq "0|" "$(file_of "$pw_dir/rc")|$(file_of "$pw_dir/out")" "sem HOME e sem PLAYWRIGHT_BROWSERS_PATH: nada, código 0"
+
+echo
+echo "== jail_options: os navegadores do Playwright montados fora do ~/.cache, com PLAYWRIGHT_BROWSERS_PATH =="
+# Montar em ~/.cache/ms-playwright faria o ai-jail descartar o ~/.cache gravável que ele
+# mesmo monta (conferido com --dry-run): o destino é ~/.ms-playwright.
+opt_dir="$(new_case options_playwright)"
+mkdir -p "$opt_dir/home/.pyenv" "$opt_dir/home/.cache/ms-playwright"
+run_jail "$opt_dir" "jail_options restrito 'mcp.sentry.dev'"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --map "$opt_dir/home/.pyenv" --map "$opt_dir/home/.cache/ms-playwright:$opt_dir/home/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$opt_dir/home/.ms-playwright" --allow-host mcp.sentry.dev)" "$(file_of "$opt_dir/out")" "jail_options com Playwright: --map ORIGEM:~/.ms-playwright e --env PLAYWRIGHT_BROWSERS_PATH, depois das toolchains e antes dos hosts"
+
+echo
+echo "== jail_options: as toolchains entram como --map (somente leitura), antes dos hosts =="
+opt_dir="$(new_case options_toolchains)"
+mkdir -p "$opt_dir/home/.pyenv" "$opt_dir/home/.nvm"
+run_jail "$opt_dir" "jail_options restrito 'mcp.sentry.dev'"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --map "$opt_dir/home/.pyenv" --map "$opt_dir/home/.nvm" --allow-host mcp.sentry.dev)" "$(file_of "$opt_dir/out")" "jail_options com .pyenv e .nvm no home: um --map por toolchain, depois o --allow-host"
+
+echo
+echo "== jail_agent_notice: o aviso ao agente de que ele roda dentro da jail =="
+notice_dir="$(new_case notice_vazio)"
+run_jail "$notice_dir" "jail_agent_notice ''"
+notice_text="$(file_of "$notice_dir/out")"
+assert_eq "0|" "$(file_of "$notice_dir/rc")|$(file_of "$notice_dir/err")" "jail_agent_notice: código 0 e nada no stderr"
+# O '~/.ssh' é texto do aviso, não caminho a expandir.
+# shellcheck disable=SC2088
+for notice_word in "sandbox ai-jail" "nick" 'JAIL_ENABLED="true"' "só o diretório do projeto aceita escrita" "somente leitura" "o home é privado" '~/.ssh' "não existem aqui, mesmo existindo na máquina" "API do Claude" "registries de pacotes" "GitHub" "localhost" "não consegue ver nem conferir nada fora da jail" "a primeira hipótese é a jail, não a máquina" "não conclua que algo foi removido" "avise o usuário"; do
+  assert_contains "$notice_text" "$notice_word" "o aviso cita: $notice_word"
+done
+assert_not_contains "$notice_text" "gerenciadores de versão" "sem toolchain no home: o aviso não lista gerenciadores de versão"
+assert_not_contains "$notice_text" "e também:" "sem hosts extras: o aviso não lista hosts extras"
+assert_eq "" "$(LC_ALL=C grep -n '[[:cntrl:]]' <<< "$notice_text" | grep -v $'\t' || true)" "o aviso não tem caracteres de controle"
+notice_dir="$(new_case notice_completo)"
+mkdir -p "$notice_dir/home/.pyenv" "$notice_dir/home/.local/share/uv/python"
+run_jail "$notice_dir" "jail_agent_notice 'mcp.atlassian.com mcp.sentry.dev'"
+notice_text="$(file_of "$notice_dir/out")"
+assert_contains "$notice_text" "gerenciadores de versão desta máquina (~/.pyenv, ~/.local/share/uv/python)" "com toolchains: o aviso lista as montadas, com ~ no lugar do home"
+assert_contains "$notice_text" "e também: mcp.atlassian.com, mcp.sentry.dev" "com hosts: o aviso lista os hosts extras liberados"
+assert_not_contains "$notice_text" "portas liberadas" "sem portas: o aviso não lista portas"
+assert_not_contains "$notice_text" "Playwright" "sem os navegadores do Playwright: o aviso não fala deles"
+notice_dir="$(new_case notice_playwright)"
+mkdir -p "$notice_dir/home/.cache/ms-playwright"
+run_jail "$notice_dir" "jail_agent_notice '' ''"
+notice_text="$(file_of "$notice_dir/out")"
+assert_contains "$notice_text" "os navegadores do Playwright (PLAYWRIGHT_BROWSERS_PATH=~/.ms-playwright)" "com Playwright: o aviso diz onde estão os navegadores"
+assert_contains "$notice_text" "--no-sandbox" "com Playwright: o aviso diz que o sandbox do Chromium não funciona na jail"
+notice_dir="$(new_case notice_ports)"
+run_jail "$notice_dir" "jail_agent_notice '' '54320 6379'"
+notice_text="$(file_of "$notice_dir/out")"
+assert_contains "$notice_text" "dos serviços da máquina em localhost, só as portas liberadas pelo nick (54320, 6379) são alcançáveis" "com portas: o aviso lista as portas de localhost liberadas"
+
+
 echo
 echo "== jail_exec: desligada lança o comando direto; ligada lança 'ai-jail <opções> -- <comando>' =="
 # Argumentos difíceis: espaço, aspas, começando com '-', vazio, glob e várias linhas.
@@ -299,13 +439,13 @@ printf -v exec_call '%q ' "${exec_args[@]}"
 exec_expected="$(printf '%s\n' "${exec_args[@]}")"
 for exec_value in "" false TRUE; do
   exec_dir="$(new_case "exec_off_${exec_value:-vazio}")"
-  run_jail "$exec_dir" "jail_exec '$exec_value' brando '' claude $exec_call; echo 'não deveria chegar aqui'"
+  run_jail "$exec_dir" "jail_exec '$exec_value' brando '' '' claude $exec_call; echo 'não deveria chegar aqui'"
   assert_eq "$exec_expected" "$(file_of "$exec_dir/claude/argv")" "jail_exec \"$exec_value\": o claude recebe exatamente o argv passado"
   assert_eq "0" "$(jail_calls "$exec_dir")" "jail_exec \"$exec_value\": o ai-jail não é chamado"
   assert_not_contains "$(file_of "$exec_dir/out")" "não deveria chegar aqui" "jail_exec \"$exec_value\": faz exec (não retorna)"
 done
 exec_dir="$(new_case exec_on)"
-run_jail "$exec_dir" "jail_exec true '' '' claude $exec_call; echo 'não deveria chegar aqui'"
+run_jail "$exec_dir" "jail_exec true '' '' '' claude $exec_call; echo 'não deveria chegar aqui'"
 assert_eq "1" "$(jail_calls "$exec_dir")" "jail_exec \"true\": o ai-jail é chamado uma vez"
 assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough -- claude "${exec_args[@]}")" "$(file_of "$exec_dir/jail/call_1.argv")" "jail_exec \"true\" \"\": o ai-jail recebe '--no-save-config', '--no-status-bar', '--terminal-passthrough', '--', 'claude' e o argv intacto"
 assert_not_exists "$exec_dir/cwd/.ai-jail" "jail_exec \"true\": o lançamento não deixa .ai-jail no cwd (o prompt não fica gravado no projeto)"
@@ -315,7 +455,7 @@ assert_not_contains "$(file_of "$exec_dir/out")" "não deveria chegar aqui" "jai
 # Cada nível lança com as opções de jail_options.
 for exec_clip in medio restrito brando; do
   exec_dir="$(new_case "exec_on_$exec_clip")"
-  run_jail "$exec_dir" "jail_exec true '$exec_clip' '' claude $exec_call; echo 'não deveria chegar aqui'"
+  run_jail "$exec_dir" "jail_exec true '$exec_clip' '' '' claude $exec_call; echo 'não deveria chegar aqui'"
   case "$exec_clip" in
     restrito) exec_options=(--no-save-config --no-status-bar) ;;
     brando) exec_options=(--no-save-config --no-status-bar --terminal-passthrough --display) ;;
@@ -324,13 +464,22 @@ for exec_clip in medio restrito brando; do
   assert_eq "$(printf '%s\n' "${exec_options[@]}" -- claude "${exec_args[@]}")" "$(file_of "$exec_dir/jail/call_1.argv")" "jail_exec \"true\" \"$exec_clip\": opções ${exec_options[*]}"
   assert_eq "$exec_expected" "$(file_of "$exec_dir/claude/argv")" "jail_exec \"true\" \"$exec_clip\": o claude recebe o argv intacto"
 done
+# As portas viram --forward-port antes do "--".
+exec_dir="$(new_case exec_on_ports)"
+run_jail "$exec_dir" "jail_exec true '' '' '54320 6379' claude $exec_call; echo 'não deveria chegar aqui'"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --forward-port 54320 --forward-port 6379 -- claude "${exec_args[@]}")" "$(file_of "$exec_dir/jail/call_1.argv")" "jail_exec \"true\" com portas: um --forward-port por porta, antes do '--'"
+# As toolchains do home viram --map; com a jail desligada, não mudam nada.
+exec_dir="$(new_case exec_on_toolchains)"
+mkdir -p "$exec_dir/home/.pyenv"
+run_jail "$exec_dir" "jail_exec true '' '' '' claude $exec_call; echo 'não deveria chegar aqui'"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$exec_dir/home/.pyenv" -- claude "${exec_args[@]}")" "$(file_of "$exec_dir/jail/call_1.argv")" "jail_exec \"true\" com ~/.pyenv: --map da toolchain antes do '--'"
 # Os hosts extras viram --allow-host antes do "--"; com a jail desligada, não mudam nada.
 exec_dir="$(new_case exec_on_hosts)"
-run_jail "$exec_dir" "jail_exec true '' 'mcp.atlassian.com mcp.sentry.dev' claude $exec_call; echo 'não deveria chegar aqui'"
+run_jail "$exec_dir" "jail_exec true '' 'mcp.atlassian.com mcp.sentry.dev' '' claude $exec_call; echo 'não deveria chegar aqui'"
 assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --allow-host mcp.atlassian.com --allow-host mcp.sentry.dev -- claude "${exec_args[@]}")" "$(file_of "$exec_dir/jail/call_1.argv")" "jail_exec \"true\" com hosts: um --allow-host por host, antes do '--'"
 assert_eq "$exec_expected" "$(file_of "$exec_dir/claude/argv")" "jail_exec \"true\" com hosts: o claude recebe o argv intacto"
 exec_dir="$(new_case exec_off_hosts)"
-run_jail "$exec_dir" "jail_exec false '' 'mcp.atlassian.com mcp.sentry.dev' claude $exec_call; echo 'não deveria chegar aqui'"
+run_jail "$exec_dir" "jail_exec false '' 'mcp.atlassian.com mcp.sentry.dev' '' claude $exec_call; echo 'não deveria chegar aqui'"
 assert_eq "0" "$(jail_calls "$exec_dir")" "jail_exec \"false\" com hosts: o ai-jail não é chamado"
 assert_eq "$exec_expected" "$(file_of "$exec_dir/claude/argv")" "jail_exec \"false\" com hosts: o claude recebe exatamente o argv passado"
 
@@ -465,7 +614,7 @@ echo
 echo "== jail_check desligada: retorna 0 sem imprimir nada nem chamar o ai-jail =="
 for check_value in "" false TRUE; do
   check_dir="$(new_case "check_off_${check_value:-vazio}")"
-  run_jail "$check_dir" "jail_check '$check_value' total '' '/proj/.nick.conf' true; echo depois" "export FAKE_JAIL_RC=1"
+  run_jail "$check_dir" "jail_check '$check_value' total '' '' '/proj/.nick.conf' true; echo depois" "export FAKE_JAIL_RC=1"
   assert_eq "0|depois|" "$(file_of "$check_dir/rc")|$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail_check \"$check_value\" (JAIL_CLIPBOARD inválido): código 0, nada impresso (só o 'depois' do teste)"
   assert_eq "0" "$(jail_calls "$check_dir")" "jail_check \"$check_value\": o ai-jail não é chamado"
 done
@@ -473,7 +622,7 @@ done
 echo
 echo "== jail_check ligada, jail funcionando: verifica num diretório temporário, removido em seguida =="
 check_dir="$(new_case check_ok)"
-run_jail "$check_dir" "jail_check true '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok: retorna 0 sem imprimir nada no stdout"
 assert_eq "" "$(file_of "$check_dir/err")" "jail ok: nada no stderr"
 assert_eq "1" "$(jail_calls "$check_dir")" "jail ok: uma chamada ao ai-jail"
@@ -483,14 +632,58 @@ assert_eq "true" "$([ -n "$check_cwd" ] && [ "$check_cwd" != "sem arquivo" ] && 
 assert_not_exists "$check_dir/cwd/.ai-jail" "jail ok: nenhum .ai-jail criado no cwd do chamador"
 assert_eq "true" "$([ "$check_cwd" != "sem arquivo" ] && [ ! -e "$check_cwd" ] && echo true || echo false)" "jail ok: o diretório temporário da verificação foi removido"
 assert_eq "" "$(find "$check_dir/cwd" -mindepth 1 2>/dev/null || true)" "jail ok: nada criado no cwd do chamador"
+check_ports_ok_case=0
+check_ports_bad_case=0
+# Verificação que passa: JAIL_LANDLOCK fica com o estado da saída do ai-jail, sem imprimir nada.
+check_dir="$(new_case check_landlock)"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$? landlock=\$JAIL_LANDLOCK\"" "export FAKE_JAIL_STDERR=\$'▸ Jail Active: /tmp/x\\n▸ Landlock: partially enforced'"
+assert_eq "rc=0 landlock=parcial|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail ok: JAIL_LANDLOCK=\"parcial\" e nada impresso"
+check_dir="$(new_case check_landlock_falha)"
+run_jail "$check_dir" "JAIL_LANDLOCK=completo; jail_check true '' '' '' '/proj/.nick.conf' false || echo \"rc=\$? landlock=[\$JAIL_LANDLOCK]\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='▸ Landlock: fully enforced'"
+assert_eq "rc=1 landlock=[]" "$(file_of "$check_dir/out")" "verificação que falha: JAIL_LANDLOCK fica vazia (mesmo com um estado de antes)"
+check_dir="$(new_case check_landlock_off)"
+run_jail "$check_dir" "JAIL_LANDLOCK=completo; jail_check false '' '' '' '/proj/.nick.conf' false; echo \"landlock=[\$JAIL_LANDLOCK]\""
+assert_eq "landlock=[]" "$(file_of "$check_dir/out")" "jail desligada: JAIL_LANDLOCK fica vazia (mesmo com um estado de antes)"
+# As portas também entram na verificação.
+check_dir="$(new_case check_ok_ports)"
+run_jail "$check_dir" "jail_check true '' '' '54320' '/proj/.nick.conf' false; echo \"rc=\$?\""
+assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok com portas: retorna 0"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --forward-port 54320 -- true)" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok com portas: a verificação usa o mesmo --forward-port do lançamento"
+for check_ports in "1" "65535" "54320 6379" "  54320  "; do
+  check_ports_ok_case=$((check_ports_ok_case + 1))
+  check_dir="$(new_case "check_ports_ok_${check_ports_ok_case}")"
+  run_jail "$check_dir" "jail_check true '' '' '$check_ports' '/proj/.nick.conf' false; echo \"rc=\$?\""
+  assert_eq "rc=0|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "JAIL_FORWARD_PORTS \"$check_ports\": aceito"
+done
+for check_ports in abc 0 65536 054320 -1 "54320,6379" "54320 x" "99999999999999999999" $'54320\e[2J' "54320 6379 54320"; do
+  check_ports_bad_case=$((check_ports_bad_case + 1))
+  check_dir="$(new_case "check_ports_bad_${check_ports_bad_case}")"
+  printf -v check_ports_q '%q' "$check_ports"
+  run_jail "$check_dir" "jail_check true '' '' $check_ports_q '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+  check_err="$(file_of "$check_dir/err")"
+  check_label="JAIL_FORWARD_PORTS $check_ports_q"
+  assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "$check_label: retorna 1, sem sair do shell"
+  assert_eq "0" "$(jail_calls "$check_dir")" "$check_label: o ai-jail não é chamado"
+  assert_contains "$check_err" "Erro: JAIL_FORWARD_PORTS=\"${check_ports//[[:cntrl:]]/?}\" em /proj/um projeto/.nick.conf não é uma lista de portas válida." "$check_label: o erro cita o valor (controles trocados por '?') e o arquivo"
+  assert_contains "$check_err" 'Use números de 1 a 65535, sem repetir, separados por espaço, ex: JAIL_FORWARD_PORTS="54320 6379".' "$check_label: o erro diz o formato aceito"
+  assert_not_contains "$check_err" "Requisitos da jail" "$check_label: não mostra a lista de requisitos"
+done
+check_dir="$(new_case check_ports_off)"
+run_jail "$check_dir" "jail_check false '' '' abc '/proj/.nick.conf' false; echo \"rc=\$?\""
+assert_eq "rc=0|" "$(file_of "$check_dir/out")|$(file_of "$check_dir/err")" "jail desligada: JAIL_FORWARD_PORTS inválido passa quieto (a chave não tem efeito)"
+# As toolchains também entram na verificação.
+check_dir="$(new_case check_ok_toolchains)"
+mkdir -p "$check_dir/home/.pyenv"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$check_dir/home/.pyenv" -- true)" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok com ~/.pyenv: a verificação usa o mesmo --map do lançamento"
 # Os hosts extras também entram na verificação: um ai-jail que recuse --allow-host falha aqui.
 check_dir="$(new_case check_ok_hosts)"
-run_jail "$check_dir" "jail_check true '' 'mcp.atlassian.com mcp.sentry.dev' '/proj/.nick.conf' false; echo \"rc=\$?\""
+run_jail "$check_dir" "jail_check true '' 'mcp.atlassian.com mcp.sentry.dev' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
 assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok com hosts: retorna 0"
 assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --allow-host mcp.atlassian.com --allow-host mcp.sentry.dev -- true)" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok com hosts: a verificação usa os mesmos --allow-host do lançamento"
 for check_clip in restrito brando; do
   check_dir="$(new_case "check_ok_$check_clip")"
-  run_jail "$check_dir" "jail_check true '$check_clip' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
+  run_jail "$check_dir" "jail_check true '$check_clip' '' '' '/proj/.nick.conf' false; echo \"rc=\$?\""
   assert_eq "rc=0" "$(file_of "$check_dir/out")" "jail ok, JAIL_CLIPBOARD \"$check_clip\": retorna 0"
   assert_eq "$(jail_options_of "$check_clip")" "$(file_of "$check_dir/jail/call_1.argv")" "jail ok, JAIL_CLIPBOARD \"$check_clip\": a verificação usa as opções do nível"
 done
@@ -500,7 +693,7 @@ echo "== jail_check ligada, JAIL_CLIPBOARD inválido: retorna 1 antes de chamar 
 for check_clip in total RESTRITO " medio" $'brando\e[2J'; do
   check_dir="$(new_case "check_bad_clip_$(printf '%s' "$check_clip" | tr -c 'a-zA-Z' '_')")"
   printf -v check_clip_q '%q' "$check_clip"
-  run_jail "$check_dir" "jail_check true $check_clip_q '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+  run_jail "$check_dir" "jail_check true $check_clip_q '' '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
   check_err="$(file_of "$check_dir/err")"
   check_label="JAIL_CLIPBOARD $check_clip_q"
   assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "$check_label: retorna 1, sem sair do shell"
@@ -513,7 +706,7 @@ done
 echo
 echo "== jail_check ligada, ai-jail ausente: retorna 1 (sem sair do shell) com a mensagem de erro =="
 check_dir="$(new_case check_missing)"
-run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
+run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/proj/um projeto/.nick.conf' false || echo \"rc=\$?\"; echo depois"
 check_err="$(file_of "$check_dir/err")"
 assert_eq "rc=1"$'\n'"depois" "$(file_of "$check_dir/out")" "ai-jail ausente: retorna 1 e o shell continua (um comando depois da chamada roda)"
 assert_contains "$check_err" 'Erro: JAIL_ENABLED="true" em /proj/um projeto/.nick.conf' "ai-jail ausente: a mensagem cita o caminho da configuração"
@@ -528,7 +721,7 @@ assert_eq "0" "$(jail_calls "$check_dir")" "ai-jail ausente: o stub não é cham
 echo
 echo "== jail_check ligada, ai-jail falhando: retorna 1 com a saída do ai-jail na mensagem =="
 check_dir="$(new_case check_fail)"
-run_jail "$check_dir" "jail_check true '' '' '/proj/.nick.conf' false || echo \"rc=\$?\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='bwrap: setting up uid map: Permission denied'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || echo \"rc=\$?\"" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='bwrap: setting up uid map: Permission denied'"
 check_err="$(file_of "$check_dir/err")"
 assert_eq "rc=1" "$(file_of "$check_dir/out")" "ai-jail falhando: retorna 1"
 assert_contains "$check_err" "Saída do ai-jail:" "ai-jail falhando: a mensagem tem o bloco de saída"
@@ -548,27 +741,27 @@ assert_not_exists "$check_dir/cwd/.ai-jail" "ai-jail falhando: nenhum .ai-jail n
 echo
 echo "== jail_check: caracteres de controle da saída viram '?', mantendo as quebras de linha =="
 check_dir="$(new_case check_control)"
-run_jail "$check_dir" "jail_check true '' '' '/proj/.nick.conf' false || :" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR=\$'primeira \\e[2J linha\\nsegunda \\e[2J linha'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || :" "export FAKE_JAIL_RC=1 FAKE_JAIL_STDERR=\$'primeira \\e[2J linha\\nsegunda \\e[2J linha'"
 check_err="$(file_of "$check_dir/err")"
 assert_contains "$check_err" "    primeira ?[2J linha"$'\n'"    segunda ?[2J linha" "ESC vira '?' e cada linha da saída continua numa linha própria"
 assert_not_contains "$check_err" $'\e' "nenhum ESC chega ao terminal"
 check_dir="$(new_case check_control_c)"
-run_jail "$check_dir" "jail_check true '' '' '/proj/.nick.conf' false || :" "export LC_ALL=C FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='falhou: não há namespace'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || :" "export LC_ALL=C FAKE_JAIL_RC=1 FAKE_JAIL_STDERR='falhou: não há namespace'"
 assert_contains "$(file_of "$check_dir/err")" "    falhou: não há namespace" "com LC_ALL=C, o 'não' da saída sai intacto"
 
 echo
 echo "== jail_check: aviso de arquivo compartilhado só com shared=\"true\" =="
 check_dir="$(new_case check_shared)"
-run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '/proj/.nick.conf' true || :"
+run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/proj/.nick.conf' true || :"
 assert_contains "$(file_of "$check_dir/err")" "Atenção: /proj/.nick.conf é compartilhado com o time do projeto" "shared=\"true\": aviso de arquivo compartilhado"
 check_dir="$(new_case check_not_shared)"
-run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '/nick/projects/alpha.conf' false || :"
+run_jail "$check_dir" "JAIL_BIN='$MISSING_JAIL_BIN'; jail_check true '' '' '' '/nick/projects/alpha.conf' false || :"
 assert_not_contains "$(file_of "$check_dir/err")" "compartilhado" "shared=\"false\": sem aviso de arquivo compartilhado"
 
 echo
 echo "== jail_check: não depende do set -e (chamada antes de ||, com mktemp falhando) =="
 check_dir="$(new_case check_mktemp)"
-run_jail "$check_dir" "jail_check true '' '' '/proj/.nick.conf' false || echo \"rc=\$?\"" "export TMPDIR='$TEST_TMP/nao-existe'"
+run_jail "$check_dir" "jail_check true '' '' '' '/proj/.nick.conf' false || echo \"rc=\$?\"" "export TMPDIR='$TEST_TMP/nao-existe'"
 assert_eq "rc=1" "$(file_of "$check_dir/out")" "mktemp falhando: retorna 1 em vez de seguir como se a jail funcionasse"
 assert_contains "$(file_of "$check_dir/err")" 'JAIL_ENABLED="true" em /proj/.nick.conf' "mktemp falhando: mensagem de erro com o caminho"
 assert_eq "0" "$(jail_calls "$check_dir")" "mktemp falhando: o ai-jail não é chamado"

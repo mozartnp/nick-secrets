@@ -96,15 +96,15 @@ tem uma única linha `select`, dentro de `select_menu()`.
   estrutural garante que nem `select_menu` nem as três funções de menu aparecem depois de
   `$(`.
 
-**A saída:** `quit_from_menu` é o único caminho, com o texto `Saindo. Nada foi feito.`
-só nessa função, no **stdout**, e `exit 0`. Sair é uma ação normal, como responder `N` na
-confirmação de envio, que também usa stdout e código 0. É `exit`, e não `return`, porque o
-menu de projetos roda antes do principal, e voltar até `main()` exigiria um sinal a mais em
-cada chamador. Não há efeito colateral porque a ordem já garante isso: em `main()`, o
-`mkdir -p "$LOGS_DIR"`, o log e o lançamento do `claude` (`jail_exec`) só acontecem depois de `choose_type`; no
-`--init`, o arquivo e o `mkdir -p "$PROJECTS_DIR"` só acontecem depois da escolha do
-destino. Os testes de ponta a ponta (com um `claude` falso no `PATH` e um controle positivo
-que prova que o stub é usado) protegem essa ordem.
+**A saída:** `quit_from_menu` é o único caminho, com o texto `Saindo. Nada foi feito.` só nessa
+função, no **stdout**, e `exit 0`. Sair é uma ação normal, como responder `N` na confirmação de
+envio, que também usa stdout e código 0. É `exit`, e não `return`, porque o menu de projetos
+roda antes do principal, e voltar até `main()` exigiria um sinal a mais em cada chamador. Não
+há efeito colateral porque a ordem já garante isso: em `main()`, o `mkdir -p "$LOGS_DIR"`, o
+log e o lançamento do `claude` (`jail_exec`) só acontecem depois de `choose_type`; no `--init`,
+o arquivo e o `mkdir -p "$PROJECTS_DIR"` só acontecem depois da escolha do destino. Os testes
+de ponta a ponta (com um `claude` falso no `PATH` e um controle positivo que prova que o stub é
+usado) protegem essa ordem.
 
 **Ctrl+D continua igual** (fora do escopo do ticket, mas o caminho foi tocado e ganhou teste
 de regressão): no EOF, `select_menu` deixa a variável vazia e retorna 1, o mesmo status do
@@ -509,13 +509,12 @@ papel com mais de um ponto de entrada.
 
 ## auto_scrum roda com o cwd dentro do projeto alvo
 
-`auto_scrum.sh` não recebe (nem precisa de) um path do projeto alvo como argumento — ele
-espera ser executado com o diretório de trabalho já dentro do repositório desse projeto
-(ex: `cd ~/Projetos/git/siga-construcao && /caminho/pra/auto_scrum.sh`). O script não
-verifica nem avisa se isso não for respeitado; rodar de outro lugar simplesmente faz o
-`claude` (lançado por `jail_exec` no fim do script, dentro ou fora da jail) subir sem o `.mcp.json`,
-`CLAUDE.md` e demais config do projeto errado — ou sem nenhuma, se rodado de um
-diretório qualquer.
+`auto_scrum.sh` não recebe (nem precisa de) um path do projeto alvo como argumento — ele espera
+ser executado com o diretório de trabalho já dentro do repositório desse projeto (ex: `cd
+~/Projetos/git/siga-construcao && /caminho/pra/auto_scrum.sh`). O script não verifica nem avisa
+se isso não for respeitado; rodar de outro lugar simplesmente faz o `claude` (lançado por
+`jail_exec` no fim do script, dentro ou fora da jail) subir sem o `.mcp.json`, `CLAUDE.md` e
+demais config do projeto errado — ou sem nenhuma, se rodado de um diretório qualquer.
 
 **Por quê:** é o cwd que faz o Claude Code carregar sozinho o `.mcp.json` do projeto alvo
 (é assim que a etapa de PO enxerga o MCP do Sentry — ver seção "Sentry via MCP na etapa
@@ -531,6 +530,40 @@ como fallback" abaixo. Sem `.nick.conf` no cwd, `--projeto=<nome>` (flag do
 `auto_scrum.sh`) escolhe a configuração em `auto_scrum/projects/<name>.conf`, e aí sim não
 tem relação com em qual diretório o comando roda — são coisas independentes que
 coincidentemente usam o mesmo nome de projeto.
+
+## Troca de arquivos com os agentes (`.nick/troca/`)
+
+A pasta `.nick/troca/` do projeto alvo é onde o usuário põe arquivos pro agente ver (prints,
+anexos) e onde o agente salva o que entrega pra conferência (ex: prints de prova).
+`EXCHANGE_DIR` (`auto_scrum.sh`) guarda o caminho; `exchange_dir_prepare` cria a pasta no
+cwd, e `exchange_block` é a seção que fecha o prompt de toda etapa (anexada ao log depois do
+`envsubst`, então aparece no prompt final mostrado antes da confirmação).
+
+**Por quê dentro do projeto:** com a jail ligada, só o projeto é visível e gravável. Uma
+pasta fora (`~/Downloads`, `~/nick-troca`) exigiria um `--rw-map`, abrindo exceção na regra
+de que a jail só grava no projeto, e seria compartilhada entre projetos. Dentro do projeto
+não muda nada na jail, cada projeto tem a sua, e o caminho é o mesmo com ou sem jail. Por isso
+o bloco vai no prompt sempre, e não no aviso da jail (`jail_agent_notice`).
+
+**Regras:**
+- a pasta tem um `.gitignore` próprio com `*` (que ignora inclusive ele mesmo): nada dela
+  aparece no `git status` do projeto, e o `.gitignore` do projeto alvo nunca é tocado. Um
+  `.gitignore` que já exista lá não é sobrescrito;
+- é criada no `--init` só com o destino `.nick.conf` (aí o cwd é o projeto alvo; com
+  `projects/`, o `--init` pode rodar de qualquer lugar) e, em `main()`, ao confirmar o envio,
+  se ainda não existir. Cancelar o envio não cria nada. Se não der pra criar (ex: `.nick` é
+  um arquivo), `main()` para com erro antes de lançar o `claude`, porque o prompt promete a
+  pasta;
+- as referências fixas de prompt dos testes de TDD (`tdd_ref_*`) são do template:
+  `tdd_log_text` tira o bloco do fim, e o bloco tem os testes próprios.
+
+**Verificação manual (2026-11-02):** conferido pelo usuário num projeto real: a pasta é criada
+e o agente lê e grava arquivos nela.
+
+**Próximo passo, em ticket próprio:** levar pra `.nick/` também o `.nick.conf`
+(`.nick/nick.conf`) e os planos (`docs/plans/`). É uma mudança incompatível (migração dos
+projetos existentes, `lib/config.sh`, templates e caminhos padrão de plano/review), e decidir
+se os planos deixam de ser versionados.
 
 ## Configuração do projeto: cwd primeiro, projects/ como fallback
 
@@ -761,16 +794,19 @@ O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas
   abaixo);
 - `lib/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
   (`jail_print_requirements`), status (`jail_print_status`), opções do ai-jail por nível
-  (`jail_options`, a fonte única delas) e lançamento (`jail_exec`). Ver
+  (`jail_options`, a fonte única delas), toolchains montadas (`jail_toolchain_dirs`), aviso
+  ao agente (`jail_agent_notice`), navegadores do Playwright (`jail_playwright_browsers`) e
+  lançamento (`jail_exec`). Ver
   seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)".
 
-**As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a
-suíte de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config.sh`, e um
-teste estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail.sh`). A jail
-recebe os valores de `JAIL_ENABLED` e `JAIL_CLIPBOARD` (e os hosts extras) por parâmetro em
-vez de ler o `.nick.conf`, e a única coisa em comum, a troca de caracteres de controle por `?`, é uma
-expansão de uma linha, não uma função que valha a pena compartilhar. Assim uma ferramenta pode usar só uma das bibliotecas,
-e os testes de uma não quebram por mudança na outra.
+**As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a suíte
+de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config.sh`, e um teste
+estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail.sh`). A jail recebe os
+valores de `JAIL_ENABLED`, `JAIL_CLIPBOARD` e `JAIL_FORWARD_PORTS` (e os hosts extras) por
+parâmetro em vez de ler o `.nick.conf`, e a única coisa em comum, a troca de caracteres de
+controle por `?`, é uma expansão de uma linha, não uma função que valha a pena compartilhar.
+Assim uma ferramenta pode usar só uma das bibliotecas, e os testes de uma não quebram por
+mudança na outra.
 
 Os `assert_*` dos testes ficam em `lib/tests/assert.sh`, carregado por todas as suítes;
 nenhuma suíte define os seus.
@@ -815,8 +851,9 @@ A diretiva usa `SCRIPTDIR/` e não `../lib/config.sh`: o caminho relativo puro s
 resolve de qualquer cwd. Rode `shellcheck -x`, pra ele seguir o `source`. O `SCRIPT_DIR` vem de
 `BASH_SOURCE[0]`, então o caminho também funciona quando os testes dão `source` no script de
 outro cwd. As duas linhas `source` das bibliotecas, nessa ordem, são as únicas linhas
-`source`/`.` do `auto_scrum.sh` (um teste compara a lista inteira); a garantia de que a configuração nunca é executada fica no teste
-estrutural de `lib/config.sh` e nos testes de gramática.
+`source`/`.` do `auto_scrum.sh` (um teste compara a lista inteira); a garantia de que a
+configuração nunca é executada fica no teste estrutural de `lib/config.sh` e nos testes de
+gramática.
 
 **Riscos aceitos:**
 - a API de `lib/config.sh` nasce com um cliente só e pode mudar quando a segunda ferramenta
@@ -912,30 +949,32 @@ ler segredos ou alterar arquivos fora do repositório. `JAIL_ENABLED="true"` faz
 todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jail).
 
 **Como funciona** (`lib/jail.sh`; no `auto_scrum`, chamado em `main()`):
-- `jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$PROJECT_CONFIG_FILE"
-  <compartilhado>` (`jail_hosts` vem de `mcp_jail_hosts`, ver "Hosts dos MCPs remotos"
-  abaixo) roda logo depois de `resolve_stack`, antes de qualquer `build_*` e do menu
-  principal, com `|| exit 1`. Desligada, não faz nada (nem `command -v`). Ligada, roda
+- `jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS"
+  "$PROJECT_CONFIG_FILE" <compartilhado>` (`jail_hosts` vem de `mcp_jail_hosts`, ver "Hosts dos
+  MCPs remotos" abaixo) roda logo depois de `resolve_stack`, antes de qualquer `build_*` e do
+  menu principal, com `|| exit 1`. Desligada, não faz nada (nem `command -v`). Ligada, roda
   `ai-jail <opções> -- true` (as mesmas opções do lançamento) com o cwd num diretório
   temporário, removido em seguida. Se falhar (ai-jail ausente, `mktemp` falhando, bwrap
   ausente, user namespaces bloqueados, sistema sem suporte), imprime no stderr o caminho da
   configuração, a saída do ai-jail (controles trocados por `?`, linha a linha), as duas saídas
   (instalar ou `JAIL_ENABLED="false"`; quando a causa vem da saída do ai-jail, a primeira é
-  "corrija o problema acima", com remissão a "Problemas comuns" do README, porque a lista
-  pode vir toda `[ok]` — user namespaces bloqueados, bwrap reprovado na validação de binário
-  confiável; achado do review, em que a mensagem mandava instalar com tudo `[ok]`), o aviso
-  de arquivo compartilhado quando a configuração é o `.nick.conf` do cwd (`config_cwd_file`) e a lista de `jail_print_requirements`, e
-  retorna 1. O `|| exit 1` vem antes de `mkdir -p "$LOGS_DIR"`: nenhum log é gravado.
-- `jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"` imprime uma linha:
-  `Jail (ai-jail): desligada — ...` ou `Jail (ai-jail): ativa | modo de clipboard <nível>`,
+  "corrija o problema acima", com remissão a "Problemas comuns" do README, porque a lista pode
+  vir toda `[ok]` — user namespaces bloqueados, bwrap reprovado na validação de binário
+  confiável; achado do review, em que a mensagem mandava instalar com tudo `[ok]`), o aviso de
+  arquivo compartilhado quando a configuração é o `.nick.conf` do cwd (`config_cwd_file`) e a
+  lista de `jail_print_requirements`, e retorna 1. O `|| exit 1` vem antes de `mkdir -p
+  "$LOGS_DIR"`: nenhum log é gravado.
+- `jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"` imprime uma linha: `Jail (ai-jail):
+  desligada — ...` ou `Jail (ai-jail): ativa | Landlock: <estado> | modo de clipboard <nível>`,
   sempre com `⚠️ ` na frente quando a jail está ativa. Roda duas vezes: logo depois de
-  `jail_check`, antes do menu principal e de qualquer pergunta (pedido do usuário: o aviso tem de aparecer
-  no começo de tudo), e de novo logo antes de "Confirma o envio para o claude?", perto do
-  lançamento.
-- `jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" claude <args>` substitui o
-  `exec claude`: com `"true"`, `exec ai-jail --no-save-config --no-status-bar
-  [opções do nível] [--allow-host <host>...] -- claude <args>`; senão, `exec claude <args>`, com o argv idêntico
-  ao de antes (coberto por teste de caracterização, que passou com o código antigo).
+  `jail_check`, antes do menu principal e de qualquer pergunta (pedido do usuário: o aviso tem
+  de aparecer no começo de tudo), e de novo logo antes de "Confirma o envio para o claude?",
+  perto do lançamento.
+- `jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" claude
+  <args>` substitui o `exec claude`: com `"true"`, `exec ai-jail --no-save-config
+  --no-status-bar [opções do nível] [--map <toolchain>...] [--allow-host <host>...]
+  [--forward-port <porta>...] -- claude <args>`; senão, `exec claude <args>`, com o argv
+  idêntico ao de antes (coberto por teste de caracterização, que passou com o código antigo).
 - `--requisitos-jail` chama `jail_print_requirements` e sai com 0, antes de
   `check_requirements` e de `resolve_stack` (não carrega configuração nem roda o ai-jail).
 
@@ -955,32 +994,35 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   depois de carregar a configuração evita responder o roteiro à toa. O menu de projetos vem
   antes por necessidade (é ele que escolhe a configuração).
 - **Verificação com `true`, num diretório temporário.** Testa só a jail, serve pra qualquer
-  ferramenta e não toca no estado do `claude` (`~/.claude` é montado com escrita). O
-  diretório temporário é uma segunda proteção contra o auto-save (ver `--no-save-config`
-  abaixo): a verificação nunca deve gravar nada no projeto alvo. Se o `claude` não for encontrado
-  dentro da jail, o erro aparece no lançamento real (README, "Problemas comuns").
+  ferramenta e não toca no estado do `claude` (`~/.claude` é montado com escrita). O diretório
+  temporário é uma segunda proteção contra o auto-save (ver `--no-save-config` abaixo): a
+  verificação nunca deve gravar nada no projeto alvo. Se o `claude` não for encontrado dentro
+  da jail, o erro aparece no lançamento real (README, "Problemas comuns").
 - **Sem `--bootstrap` e sem `--init` do ai-jail** (o `--bootstrap` sobrescreveria o
   `~/.claude/settings.json` do usuário; o `--init` grava configuração), e sem repassar
-  `--map`, `--rw-map`, `--network`, `--exec` ou qualquer outra opção fora de
-  `jail_options` (teste estrutural: toda chamada de `$JAIL_BIN` é
+  `--rw-map`, `--overlay-map`, `--network`, `--no-private-home`, `--exec` ou qualquer outra
+  opção fora de `jail_options` (teste estrutural: toda chamada de `$JAIL_BIN` é
   `"$JAIL_BIN" "${options[@]}" -- ...`, e `options` só vem de `jail_options`, a fonte única das
-  opções: `--no-save-config` e `--no-status-bar` sempre, mais as do nível de `JAIL_CLIPBOARD`
-  e um `--allow-host` por host que o chamador passar — o único lugar onde `--allow-host`
-  aparece, também coberto por teste estrutural).
+  opções: `--no-save-config` e `--no-status-bar` sempre, mais as do nível de `JAIL_CLIPBOARD`,
+  um `--map` por toolchain de `jail_toolchain_dirs`, o `--map` e o `--env` dos navegadores do
+  Playwright, um `--allow-host` por host e um `--forward-port` por porta que o chamador passar
+  — os únicos lugares onde `--map`, `--env`, `--allow-host` e `--forward-port` aparecem,
+  também cobertos por teste estrutural).
   Todas vão na linha de comando, pra nenhuma depender do `~/.ai-jail` de cada pessoa.
-- **`--no-save-config` na verificação e no lançamento** — uma das exceções à regra acima
-  (as outras: `--no-status-bar`, as opções de `JAIL_CLIPBOARD` e o `--allow-host` dos MCPs),
-  decidida no passo 8 do ticket 13, depois da conferência com o ai-jail real (o plano dizia
-  "nenhuma opção"). Sem ela, num projeto ainda sem `.ai-jail`, o ai-jail grava no cwd (a raiz
-  do projeto alvo) um `.ai-jail` com o argv **inteiro** — o prompt do `auto_scrum` incluído,
-  com o conteúdo de tickets do Jira e erros do Sentry —, que pode ir pro git; e um `ai-jail`
-  sem comando, rodado ali depois, relança o `command` salvo (`claude --permission-mode auto`
-  com o prompt velho). A opção só impede a gravação: o `.ai-jail` do projeto continua lido
-  (conferido com `mask`). Não perde nada pro nick, que não passa outras opções pra serem
-  lembradas; quem quiser um `.ai-jail` de modelo gera com `ai-jail --init`, de propósito. A
-  alternativa (`no_save_config = true` no `~/.ai-jail` global) deixaria a proteção a cargo de
-  cada pessoa do time. Ela vai também na verificação pra um ai-jail que não aceite a opção
-  falhar ali, com a mensagem de erro, e não no lançamento.
+- **`--no-save-config` na verificação e no lançamento** — uma das exceções à regra acima (as
+  outras: `--no-status-bar`, as opções de `JAIL_CLIPBOARD`, o `--map` das toolchains, o
+  `--allow-host` dos MCPs e o `--forward-port` de `JAIL_FORWARD_PORTS`), decidida no passo 8 do
+  ticket 13, depois da conferência com o ai-jail real (o plano dizia "nenhuma opção"). Sem ela,
+  num projeto ainda sem `.ai-jail`, o ai-jail grava no cwd (a raiz do projeto alvo) um
+  `.ai-jail` com o argv **inteiro** — o prompt do `auto_scrum` incluído, com o conteúdo de
+  tickets do Jira e erros do Sentry —, que pode ir pro git; e um `ai-jail` sem comando, rodado
+  ali depois, relança o `command` salvo (`claude --permission-mode auto` com o prompt velho). A
+  opção só impede a gravação: o `.ai-jail` do projeto continua lido (conferido com `mask`). Não
+  perde nada pro nick, que não passa outras opções pra serem lembradas; quem quiser um
+  `.ai-jail` de modelo gera com `ai-jail --init`, de propósito. A alternativa (`no_save_config
+  = true` no `~/.ai-jail` global) deixaria a proteção a cargo de cada pessoa do time. Ela vai
+  também na verificação pra um ai-jail que não aceite a opção falhar ali, com a mensagem de
+  erro, e não no lançamento.
 - **`--no-status-bar` na verificação e no lançamento** — a segunda exceção, também do passo 8.
   Na primeira execução real (`po_discussion`, terminal do VS Code), a barra de status do
   ai-jail, que mostra `<cwd> | <comando>` (o prompt inteiro de novo) e desenha nas últimas
@@ -1015,10 +1057,10 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   atual esse arquivo é não confiável: só restringe, a menos que o `~/.ai-jail` global liste o
   projeto em `trust_project_config`. É uma decisão de segurança do próprio ai-jail, e o
   README ensina a usá-la.
-- **`--` antes do comando** (`ai-jail <opções> -- claude ...`): é o fim de opções documentado pelo
-  ai-jail (`ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]`), e garante que nenhum argumento do
-  `claude` (o prompt, `--permission-mode`) seja lido como opção do ai-jail. O comando continua
-  sendo `claude`, a primeira palavra depois do `--`, que o ai-jail usa pra achar o
+- **`--` antes do comando** (`ai-jail <opções> -- claude ...`): é o fim de opções documentado
+  pelo ai-jail (`ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]`), e garante que nenhum argumento
+  do `claude` (o prompt, `--permission-mode`) seja lido como opção do ai-jail. O comando
+  continua sendo `claude`, a primeira palavra depois do `--`, que o ai-jail usa pra achar o
   `agent_state`.
 - **Conferência manual com o ai-jail real** (ai-jail 2.14.0, Arch, 2026-11-01, em diretórios
   temporários fora do repositório):
@@ -1062,7 +1104,60 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     cada um, 401 (passou; falta só o token, que o `claude` manda). Daí "Hosts dos MCPs
     remotos", abaixo. Com essa mudança, o usuário confirmou pelo `auto_scrum` que o MCP do
     Jira e o do Sentry funcionam dentro da jail (autenticados antes, fora dela);
-  - não testado: `ro_maps` com `trust_project_config`; o README cobre em "Problemas comuns".
+  - rodar os testes do projeto (`make verify` no `siga-construcao`, pelo agente, dentro da
+    jail): o front passou, mas o pytest não rodou — o `venv/bin/python` aponta pro
+    `~/.pyenv/versions/3.12.12`, que o home privado da jail esconde. O agente, sem saber que
+    estava na jail, concluiu que o `~/.pyenv` "não existe mais" (existia), disse ter
+    conferido "fora do sandbox" (não consegue) e começou a propor um ticket de deploy. Daí
+    "Toolchains do home" e "Aviso ao agente", abaixo. `--map ~/.pyenv` conferido à mão: dentro
+    da jail o `python -V` deu 3.12.12 e o `touch` deu "somente leitura"; um `--map` de
+    caminho inexistente só avisa e segue (o nick nem o passa). Um serviço da máquina em
+    `localhost` (porta 5050, 302 fora) não responde de dentro da jail (`curl` rc 7);
+  - de novo, com o `~/.pyenv` montado e o aviso ao agente: o front passou (2099 testes do
+    Vitest), e o pytest falhou na conexão com o PostgreSQL do Docker (`localhost:54320`,
+    "Connection refused"). Desta vez o agente reconheceu a limitação da jail, interrompeu a
+    suíte em vez de esperar 3284 erros e não diagnosticou a máquina — o aviso funcionou. Com
+    `--forward-port 5050 --forward-port 54320`, os dois responderam de dentro da jail, e uma
+    porta não liberada (5051) foi recusada. Daí `JAIL_FORWARD_PORTS`, abaixo;
+  - de novo, com `JAIL_FORWARD_PORTS="54320"`: o banco conectou, o pytest rodou sem falha
+    (interrompido em 23%), o front passou; o E2E não rodou porque o Chromium do Playwright
+    fica em `~/.cache/ms-playwright`, que a jail não monta. Conferido à mão: com `--map` nesse
+    caminho, o Chromium headless roda (com `--no-sandbox`; sem ele, "No usable sandbox"), mas
+    o ai-jail avisa "ignoring rw-map that overlaps a read-only map destination" e deixa de
+    montar o `~/.cache` gravável dele (`--dry-run`). Montando em `~/.ms-playwright` com
+    `--env PLAYWRIGHT_BROWSERS_PATH`, o Chromium roda e o `~/.cache` continua gravável. Daí
+    "Navegadores do Playwright", abaixo;
+  - de novo, com os navegadores montados: rodou e passou tudo o que o agente rodou dentro da
+    jail — front (lint, tsc, 2099 testes do Vitest), testes com banco, de concorrência
+    (`transaction=True`), de integração (schema OpenAPI, PDF com WeasyPrint), E2E com
+    Playwright + `live_server` e os do Storybook — sem falha e sem teste pulado. Com isso, o
+    critério "consegue rodar os testes dele" está cumprido;
+  - as suítes do próprio nick rodadas pelo agente dentro da jail: 13 falhas no
+    `test_auto_scrum.sh`, todas do aviso esperado com a linha do Playwright. Era isolamento
+    dos testes: dentro da jail, `PLAYWRIGHT_BROWSERS_PATH` vem definida (pelo próprio nick), e
+    o helper `jail_expected_argv` herdava a variável, enquanto o `main()` do caso rodava sem
+    ela. O helper passou a rodar com `env -u PLAYWRIGHT_BROWSERS_PATH`, e as três suítes
+    passaram dentro do ai-jail real, com as opções que o nick gera;
+  - `ro_maps` com `trust_project_config` (o caminho alternativo do README), testado sem tocar
+    no `~/.ai-jail` do usuário: `HOME` falso com o próprio `.ai-jail` global, dois projetos de
+    teste e as opções de `jail_options`. Projeto A confiado, com `ro_maps =
+    ["~/jail-teste-ro"]`: o arquivo aparece, e a escrita é recusada; projeto B, sem `.ai-jail`:
+    não aparece; projeto A sem `trust_project_config`: não aparece, e o ai-jail avisa "project
+    .ai-jail map ... outside project ignored"; `trust_project_config` com `~/` também vale. O
+    `.ai-jail` do projeto continuou intacto (o `--no-save-config` não o regrava). O usuário
+    decidiu manter esse caminho no README como alternativo, pra necessidades que o nick não
+    cobre sozinho.
+  - etapa de Desenvolvimento (a única em `--permission-mode auto`) com a versão final, pelo
+    usuário: o cabeçalho mostrou `Landlock: completo` no começo e antes da confirmação, o
+    `claude` abriu com `--permission-mode auto` + `--append-system-prompt` + prompt sem erro,
+    e, perguntado sobre o ambiente, o agente descreveu certo o que o aviso diz (projeto
+    gravável, home privado com toolchains e Playwright, rede restrita, `localhost`
+    inalcançável). Ele também atribuiu à jail a falha do conector "Claude Docs" da conta
+    claude.ai (erro "Proxy"): conector da conta, não MCP do projeto, nenhuma etapa do nick o
+    usa — fica como limitação conhecida;
+  - `--requisitos-jail` "antes" (simulado: `PATH` igual ao real, só sem o `ai-jail`, porque
+    ele já estava instalado): `[falta] ai-jail  →  yay -S ai-jail-bin`, `[ok] bwrap`, rc 0;
+    "depois" (`PATH` real): `[ok]` nos dois, rc 0.
 - **Terminal e clipboard da jail: `JAIL_CLIPBOARD`, em três níveis** (as opções além de
   `--no-save-config` e `--no-status-bar`). Sem passthrough, não dá pra copiar de dentro do
   `claude`, e o Ctrl+V só cola com o display aberto (testes acima; com `--display`, o usuário
@@ -1130,12 +1225,86 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     dentro o navegador não abre); o token fica em `~/.claude`, que a jail monta.
   Mais um canal de saída por host liberado, como o README avisa em "O que a jail não
   protege".
+- **Toolchains do home: lista fixa no nick, somente leitura** (decisão do usuário: nada no
+  `~/.ai-jail` de cada pessoa — se alguém esquece, o problema demora a ser descoberto; o
+  nick mantém e controla). `jail_toolchain_dirs` devolve, dos diretórios `.pyenv`, `.nvm`,
+  `.rbenv`, `.asdf`, `.local/share/mise`, `.local/share/uv/python`, `.sdkman` e `.volta` do
+  `$HOME`, os que existem, e `jail_options` passa um `--map` (somente leitura) por diretório.
+  Só gerenciadores de versão: nunca diretório de configuração ou credencial. Do uv, só os
+  interpretadores (`uv/python`, pra onde o `venv/bin/python` aponta), e não o
+  `~/.local/share/uv` inteiro: lá o `uv auth login` guarda credenciais de índice em texto puro
+  (`credentials/`, sem keyring) — achado do review; leitura é justamente o risco. Risco aceito,
+  menor: um `npmrc` global dentro de uma instalação do node (`<prefixo>/etc/npmrc`, gravado
+  por `npm config set -g`) com token fica legível; o comum é o `~/.npmrc` do usuário, que não
+  é montado. Descartados:
+  `--no-private-home` (o `--dry-run` mostrou que expõe o home quase inteiro: `~/.config` e
+  `~/.cargo` com escrita, `~/.copilot`, `~/.terraform.d`), uma chave `JAIL_RO_MAPS` no
+  `.nick.conf` (cada projeto teria de preenchê-la) e `ro_maps` no `~/.ai-jail`. Um gerenciador
+  novo entra editando a lista (e o teste e o README). O `$HOME` é estado do shell, como o
+  `$TMPDIR`; os testes usam um home falso por caso, pra não depender da máquina.
+- **Navegadores do Playwright: montados fora do `~/.cache`** (extensão da lista fixa acima,
+  pelo mesmo motivo: o nick mantém, ninguém configura). `jail_playwright_browsers` acha o
+  diretório (`PLAYWRIGHT_BROWSERS_PATH` do ambiente do usuário, se definida; senão
+  `~/.cache/ms-playwright`, o padrão do Linux; nada se não for diretório, se não for
+  absoluto — `"0"`, os navegadores dentro do projeto, ou um caminho relativo, ambíguo pro
+  ai-jail e já dentro do projeto visível — ou se tiver `:`, que quebraria o
+  `--map ORIGEM:DESTINO`), e
+  `jail_options` passa `--map <origem>:~/.ms-playwright` e `--env
+  PLAYWRIGHT_BROWSERS_PATH=~/.ms-playwright`. Não vai pra `jail_toolchain_dirs` porque não
+  pode ser montado no mesmo caminho: o ai-jail monta um `~/.cache` gravável próprio e o
+  descarta quando um mapa somente leitura cai dentro dele, e os caches de pip/uv/npm se
+  perderiam. O sandbox do Chromium não funciona dentro da jail; o Playwright já lança com
+  `--no-sandbox` (`chromiumSandbox: false` é o padrão), e o aviso ao agente diz isso.
+- **Estado do Landlock na linha da jail** (pedido do usuário: o ai-jail mostra
+  "▸ Landlock: fully enforced" ao abrir, mas o `claude` limpa a tela em menos de um segundo).
+  A verificação (`ai-jail ... -- true`) imprime a mesma linha no stderr, que `jail_check` já
+  captura; ao passar, ela guarda em `JAIL_LANDLOCK` (global da própria biblioteca, vazia ao
+  carregar e zerada a cada `jail_check`) o estado resumido por `jail_landlock_state`:
+  `completo` (fully enforced), `parcial` (partially enforced), `inativo` (not enforced,
+  failed to apply ou nenhuma linha — `--no-landlock`) e `não identificado` (outro texto, pra
+  um texto novo do ai-jail nunca virar um falso "completo"; as linhas de detalhe, como
+  "Landlock: ro map ...", são ignoradas — textos tirados do binário 2.14.0).
+  `jail_print_status` mostra `| Landlock: <estado> |` entre o "ativa" e o modo de clipboard
+  quando `JAIL_LANDLOCK` tem valor, sem cor: o ⚠️ já está na linha.
+- **Aviso ao agente de que ele está na jail** (sugestão do usuário, depois do caso do
+  `~/.pyenv` acima). `jail_agent_notice <hosts> [ports]` gera o texto (PT-BR, como os prompts):
+  só o projeto aceita escrita, home privado (com as toolchains montadas e os hosts extras
+  listados), rede restrita, `localhost` da máquina inalcançável, nada fora da jail é
+  conferível, e, se faltar algo, a primeira hipótese é a jail — parar e avisar o usuário com o
+  caminho, serviço ou host, sem diagnosticar a máquina. O `auto_scrum` o passa ao `claude` por
+  `--append-system-prompt`, só com `JAIL_ENABLED="true"`: desligada, o argv continua o de antes
+  da jail. Pelo system prompt, e não por um bloco nos 8 templates, porque vale pra sessão
+  inteira, fica num lugar só e não depende da etapa. O texto fica na biblioteca (o conhecimento
+  sobre a jail é dela) e a ferramenta só decide como entregá-lo, porque `jail_exec` é genérico
+  sobre o comando e não pode injetar argumento do `claude`. O texto descreve o padrão do
+  ai-jail 2.14.0 (rede: API do Claude, registries e GitHub; home: estado do `claude` e
+  configuração do git), por isso diz "por padrão": com `allow_hosts` no `~/.ai-jail` ou numa
+  versão nova, pode haver mais. **A cada atualização do ai-jail, reconferir com `--dry-run`
+  esse texto e as strings de `jail_landlock_state`** (achado do review: o agente confia no
+  aviso).
+- **Portas de `localhost`: `JAIL_FORWARD_PORTS` no `.nick.conf`** (decisão do usuário). A
+  jail tem a própria rede, então serviços da máquina (o banco do Docker dos testes) ficam
+  inalcançáveis. A porta varia por projeto (`54320` vem do `.env` do `siga-construcao`), então
+  não dá pra ser automática como as toolchains e os hosts dos MCPs; a chave fica na
+  configuração do projeto, que é do nick e commitada — o time herda a lista, e ninguém mexe
+  no `~/.ai-jail`. Chave de texto (portas separadas por espaço, padrão `""`, registrada por
+  último); `jail_check` valida, só com a jail ligada, que cada porta é um número de 1 a 65535,
+  sem zero à esquerda e sem repetir (com `case`, sem `[[ =~ ]]`, pela convenção do projeto),
+  e para com `jail_print_ports_error` (valor, arquivo e formato, sem
+  lista de requisitos) — um erro de digitação nunca abre outra porta nem chega ao ai-jail
+  como opção. `jail_options` passa um `--forward-port` por porta, depois dos hosts, na
+  verificação e no lançamento, e `jail_agent_notice` diz ao agente quais portas de
+  `localhost` ele alcança. Descartados: ler as portas do `.env` (nomes e formatos variam, e o
+  nick passaria a ler um arquivo cheio de segredos) e não liberar (os testes de backend não
+  rodariam na jail). Cada porta dá ao agente acesso total ao serviço dela; o comentário do
+  esqueleto e o README dizem isso.
 - **Review de PR.** Mudanças no `JAIL_ENABLED` do `.nick.conf` e no `.ai-jail` do projeto
   alvo passam pelo mesmo review de PR que o `CLAUDE.md`: desligar a flag num PR tira a jail
   de todo o time, e o `.ai-jail` pode ampliar o acesso do agente quando o projeto é confiado.
 
 **Fora de escopo, de propósito:** a deny list do Claude Code (ticket separado); `--lockdown`;
-qualquer flag de rede passada pelo nick; forçar a jail numa máquina independente da
+flags de rede além do `--allow-host` dos MCPs e do `--forward-port` de `JAIL_FORWARD_PORTS`
+(ex: `--network`, `--allow-private-host`); forçar a jail numa máquina independente da
 configuração do projeto; ler, gerar ou validar o `.ai-jail` e o `~/.ai-jail`; rodar a
 verificação do `jail_check` no `--requisitos-jail` (ele só checa presença no `PATH`);
 detectar a versão do ai-jail ou do bubblewrap; verificar se o `claude` existe dentro da jail

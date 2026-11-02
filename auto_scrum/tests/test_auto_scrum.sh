@@ -7,6 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_SCRUM_SH="$SCRIPT_DIR/../auto_scrum.sh"
+JAIL_LIB_SH="$SCRIPT_DIR/../../lib/jail.sh"
 
 failures=0
 
@@ -61,6 +62,21 @@ run_init_project() {
 config_keys_blank() {
   local except_key="${1:-}"
   timeout 2 bash -c "source '$AUTO_SCRUM_SH'; for key in \"\${CONFIG_KEYS[@]}\"; do [ \"\$key\" = '$except_key' ] || printf '%s=\"\"\n' \"\$key\"; done"
+}
+
+# exchange_expected_block: o bloco da troca que fecha o prompt de toda etapa, escrito aqui à
+# mão (e não lido de auto_scrum.sh) para o teste pegar mudança no texto.
+exchange_expected_block() {
+  cat <<'EOF'
+## Troca de arquivos com o usuário
+
+Use a pasta `.nick/troca/`, na raiz do projeto, para trocar arquivos com o usuário:
+- é lá que ele coloca o que quer que você veja (prints, anexos, exemplos); quando ele citar um
+  arquivo de fora do projeto (ex: em ~/Downloads), peça para ele copiar para essa pasta, porque
+  fora do projeto você pode não ter acesso (ex: com a jail do nick ligada);
+- é lá que você salva o que entregar para ele conferir (ex: prints de prova, relatórios).
+O conteúdo dessa pasta não é versionado (ela tem um .gitignore próprio, criado pelo nick).
+EOF
 }
 
 # Nota de PRODUCTION_ENABLED: é a única chave com texto próprio nos avisos, porque o padrão
@@ -157,6 +173,9 @@ assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'TDD_ENABLED="true"' "dest
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'só "false" desliga.' "destino cwd: comentário do esqueleto diz que só \"false\" desliga a TDD"
 assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino cwd: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
 assert_not_exists "$init_projects_unused" "destino cwd: PROJECTS_DIR não é criado"
+assert_exists "$init_cwd_dest/.nick/troca/.gitignore" "destino cwd: cria também a pasta de troca .nick/troca/ no diretório alvo, com o .gitignore dela"
+assert_eq "*" "$(grep -v '^#' "$init_cwd_dest/.nick/troca/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "destino cwd: o .gitignore da troca ignora tudo"
+assert_contains "$(cat "$init_dir/cwd_dest.log" 2>/dev/null || true)" "Pasta de troca de arquivos com os agentes: .nick/troca/" "destino cwd: a saída cita a pasta de troca"
 
 init_rc="$(run_init_project "$init_projects_dest" "$init_projects" $'2\nprojeto-teste' "$init_dir/projects_dest.log")"
 init_projects_file="$init_projects/projeto-teste.conf"
@@ -170,6 +189,7 @@ assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'só "false" desliga.
 assert_contains "$(cat "$init_projects_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino projects/: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
 assert_not_exists "$init_projects/projeto-teste.sh" "destino projects/: não cria projeto-teste.sh"
 assert_not_exists "$init_projects_dest/.nick.conf" "destino projects/: não cria .nick.conf no diretório atual"
+assert_not_exists "$init_projects_dest/.nick" "destino projects/: não cria .nick/ no diretório atual (que pode não ser o projeto; a troca nasce no primeiro envio)"
 
 assert_eq "$(cat "$init_cwd_file" 2>/dev/null || echo 'sem cwd')" "$(cat "$init_projects_file" 2>/dev/null || echo 'sem projects')" "os dois destinos geram o mesmo conteúdo"
 assert_eq "igual" "$(cmp -s "$init_cwd_file" "$init_projects_file" && echo igual || echo diferente)" "os dois destinos geram arquivos idênticos byte a byte (cmp, inclusive \\n final)"
@@ -180,6 +200,7 @@ printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_overwrite/.nick.conf"
 run_init_project "$init_overwrite" "$init_projects_unused" $'1\nN' "$init_dir/overwrite_no.log" >/dev/null
 assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_overwrite/.nick.conf")" "destino cwd com .nick.conf existente e resposta N: arquivo inalterado"
 assert_contains "$(cat "$init_dir/overwrite_no.log")" "Cancelado." "destino cwd com .nick.conf existente e resposta N: cancela"
+assert_not_exists "$init_overwrite/.nick" "destino cwd com .nick.conf existente e resposta N: .nick/ não é criada (nada foi alterado)"
 run_init_project "$init_overwrite" "$init_projects_unused" $'1\ns' "$init_dir/overwrite_yes.log" >/dev/null
 assert_eq "igual" "$(cmp -s "$init_overwrite/.nick.conf" "$init_cwd_file" && echo igual || echo diferente)" "destino cwd com .nick.conf existente e resposta s: arquivo substituído pelo esqueleto"
 
@@ -564,14 +585,14 @@ miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
 miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
 assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
 assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
 assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
 : > "$miss_dir/empty_file.conf"
 miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
 assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
 assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as oito chaves na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as nove chaves na ordem de CONFIG_KEYS"
 
 # Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
 # outras chaves, então o bloco só pode listar a chave do caso.
@@ -721,7 +742,7 @@ val_file="$val_dir/invalid_and_missing.conf"
 printf '%s\n' 'JIRA_ENABLED="sim"' > "$val_file"
 run_loader "$val_file" "$val_dir/invalid_and_missing" >/dev/null
 assert_eq "2" "$(count_warnings "$val_dir/invalid_and_missing.err")" "valor inválido e chaves ausentes: dois avisos no stderr"
-assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
+assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
 
 val_file="$val_dir/control_char.conf"
 val_raw="a"$'\e'"[31mb"
@@ -857,7 +878,7 @@ printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_miss_projects/semlinh
 # rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
 rs_miss_expected() {
   local file="$1"
-  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""'
+  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""'
 }
 
 rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_incomplete")"
@@ -1467,12 +1488,18 @@ assert_eq "JIRA_ID PLAN_PATH STACK_BLOCK_DEV TDD_BLOCK_DEV" "$(template_vars "$S
 assert_eq "JIRA_ID PLAN_PATH REVIEW_PATH STACK_BLOCK_REVIEW TDD_BLOCK_REVIEW" "$(template_vars "$SCRIPT_DIR/../templates/review.md")" "review.md referencia exatamente as variáveis preenchidas pra esse TYPE"
 
 # tdd_log_text <logs_dir> <type>: imprime o único log <type>_<timestamp>.md de <logs_dir>
-# seguido do marcador <FIM> (só o marcador, se não houver log).
+# seguido do marcador <FIM> (só o marcador, se não houver log). O bloco da troca que fecha
+# todo prompt (exchange_expected_block, com a linha em branco antes) sai do texto: as
+# referências fixas são do template, e o bloco tem os testes dele (".nick/troca").
 tdd_log_text() {
-  local logs_dir="$1" type="$2" logs
+  local logs_dir="$1" type="$2" logs text suffix
   logs="$(logs_for_type "$logs_dir" "$type")"
-  cat "$(head -n1 <<< "$logs")" 2>/dev/null || true
-  printf '<FIM>'
+  text="$(cat "$(head -n1 <<< "$logs")" 2>/dev/null; printf '<FIM>')"
+  suffix=$'\n'"$(exchange_expected_block)"$'\n<FIM>'
+  if [ "${text%"$suffix"}" != "$text" ]; then
+    text="${text%"$suffix"}<FIM>"
+  fi
+  printf '%s' "$text"
 }
 
 # check_tdd_e2e <type> <variant> <extra_conf_line> <stdin> [setup]: roda main() com
@@ -1972,9 +1999,9 @@ assert_contains "$select_menu_body" "select " "a única linha select fica dentro
 menu_in_subshell="$(grep -nE '\$\((select_menu|choose_type|resolve_stack|init_project)\b' "$AUTO_SCRUM_SH" || true)"
 assert_eq "" "$menu_in_subshell" "nenhum menu é chamado dentro de \$(...)"
 echo
-echo "== JAIL_ENABLED: registrada na penúltima posição, padrão \"false\", com comentário no esqueleto =="
+echo "== JAIL_ENABLED: registrada na antepenúltima posição, padrão \"false\", com comentário no esqueleto =="
 jail_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"" 2>/dev/null || true)"
-assert_eq "JAIL_ENABLED"$'\n'"JAIL_CLIPBOARD" "$(tail -n2 <<< "$jail_keys")" "JAIL_ENABLED e JAIL_CLIPBOARD são as duas últimas chaves de CONFIG_KEYS"
+assert_eq "JAIL_ENABLED"$'\n'"JAIL_CLIPBOARD"$'\n'"JAIL_FORWARD_PORTS" "$(tail -n3 <<< "$jail_keys")" "JAIL_ENABLED, JAIL_CLIPBOARD e JAIL_FORWARD_PORTS são as três últimas chaves de CONFIG_KEYS"
 jail_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; print_project_skeleton" 2>/dev/null || true)"
 assert_contains "$jail_skeleton" 'JAIL_ENABLED="false"' "o esqueleto tem JAIL_ENABLED=\"false\""
 jail_skeleton_comment="$(awk '/^# JAIL_ENABLED:/{found=1} /^JAIL_ENABLED=/{found=0} found' <<< "$jail_skeleton")"
@@ -1992,9 +2019,9 @@ run_loader "$jail_reg_dir/missing.conf" "$jail_reg_dir/missing" >/dev/null
 assert_eq "$(missing_warning "$jail_reg_dir/missing.conf" 'JAIL_ENABLED="false"')" "$(cat "$jail_reg_dir/missing.err" 2>/dev/null || true)" "sem a linha JAIL_ENABLED: aviso de chave ausente sugerindo JAIL_ENABLED=\"false\""
 
 echo
-echo "== JAIL_CLIPBOARD: registrada por último, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
-assert_eq 'JAIL_CLIPBOARD=""' "$(tail -n1 <<< "$jail_skeleton")" "o esqueleto termina com JAIL_CLIPBOARD=\"\""
-clip_skeleton_comment="$(awk '/^# JAIL_CLIPBOARD:/{found=1} found' <<< "$jail_skeleton")"
+echo "== JAIL_CLIPBOARD: registrada na penúltima posição, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
+assert_contains "$jail_skeleton" 'JAIL_CLIPBOARD=""' "o esqueleto tem JAIL_CLIPBOARD=\"\""
+clip_skeleton_comment="$(awk '/^# JAIL_CLIPBOARD:/{found=1} /^JAIL_CLIPBOARD=/{found=0} found' <<< "$jail_skeleton")"
 for clip_word in 'JAIL_ENABLED="true"' '"restrito"' '"medio"' '"brando"' --terminal-passthrough --display clipboard 'botão direito → Colar' Ctrl+V README; do
   assert_contains "$clip_skeleton_comment" "$clip_word" "o comentário de JAIL_CLIPBOARD no esqueleto cita $clip_word"
 done
@@ -2011,6 +2038,21 @@ assert_eq "" "$(cat "$jail_reg_dir/clip_invalid.err" 2>/dev/null || true)" "JAIL
 config_keys_blank JAIL_CLIPBOARD > "$jail_reg_dir/clip_missing.conf"
 run_loader "$jail_reg_dir/clip_missing.conf" "$jail_reg_dir/clip_missing" >/dev/null
 assert_eq "$(missing_warning "$jail_reg_dir/clip_missing.conf" 'JAIL_CLIPBOARD=""')" "$(cat "$jail_reg_dir/clip_missing.err" 2>/dev/null || true)" "sem a linha JAIL_CLIPBOARD: aviso de chave ausente sugerindo JAIL_CLIPBOARD=\"\""
+
+echo
+echo "== JAIL_FORWARD_PORTS: registrada por último, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
+assert_eq 'JAIL_FORWARD_PORTS=""' "$(tail -n1 <<< "$jail_skeleton")" "o esqueleto termina com JAIL_FORWARD_PORTS=\"\""
+ports_skeleton_comment="$(awk '/^# JAIL_FORWARD_PORTS:/{found=1} /^JAIL_FORWARD_PORTS=/{found=0} found' <<< "$jail_skeleton")"
+for ports_word in 'JAIL_ENABLED="true"' localhost --forward-port 'JAIL_FORWARD_PORTS="54320 6379"' "separadas por espaço" "commitado" README; do
+  assert_contains "$ports_skeleton_comment" "$ports_word" "o comentário de JAIL_FORWARD_PORTS no esqueleto cita $ports_word"
+done
+assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_FORWARD_PORTS" 2>/dev/null || true)" "JAIL_FORWARD_PORTS não tem nota"
+printf '%s\n' "$(config_keys_blank JAIL_FORWARD_PORTS)" 'JAIL_FORWARD_PORTS="abc"' > "$jail_reg_dir/ports_invalid.conf"
+run_loader "$jail_reg_dir/ports_invalid.conf" "$jail_reg_dir/ports_invalid" >/dev/null
+assert_eq "" "$(cat "$jail_reg_dir/ports_invalid.err" 2>/dev/null || true)" "JAIL_FORWARD_PORTS=\"abc\": a carga da configuração não avisa (a validação é da jail)"
+config_keys_blank JAIL_FORWARD_PORTS > "$jail_reg_dir/ports_missing.conf"
+run_loader "$jail_reg_dir/ports_missing.conf" "$jail_reg_dir/ports_missing" >/dev/null
+assert_eq "$(missing_warning "$jail_reg_dir/ports_missing.conf" 'JAIL_FORWARD_PORTS=""')" "$(cat "$jail_reg_dir/ports_missing.err" 2>/dev/null || true)" "sem a linha JAIL_FORWARD_PORTS: aviso de chave ausente sugerindo JAIL_FORWARD_PORTS=\"\""
 
 echo
 echo "== PROJECT_CONFIG_FILE: o arquivo carregado, pelos três caminhos (vazio com 'Nenhum') =="
@@ -2049,7 +2091,10 @@ while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
 done
 [ "$save" -eq 1 ] && : > .ai-jail
 [ "${1:-}" = "--" ] && shift
-[ "${1:-}" = "true" ] && exit "${FAKE_JAIL_RC:-0}"
+if [ "${1:-}" = "true" ]; then
+  [ -n "${FAKE_LANDLOCK-fully enforced}" ] && printf '▸ Landlock: %s\n' "${FAKE_LANDLOCK-fully enforced}" >&2
+  exit "${FAKE_JAIL_RC:-0}"
+fi
 exec "$@"
 EOF
 cat > "$jail_claude_dir/claude" <<'EOF'
@@ -2060,11 +2105,13 @@ EOF
 chmod +x "$jail_stub_dir/ai-jail" "$jail_claude_dir/claude"
 
 # jail_case_setup <case_dir> [extra]: o setup de run_main pra estes casos — stubs à frente do
-# PATH, diretórios de log dos stubs e [extra] (ex: sobrescrever JAIL_BIN).
+# PATH, diretórios de log dos stubs, HOME em <case_dir>/home (vazio, a menos que o caso crie
+# algo nele: as toolchains que a jail monta vêm do home, e o resultado não pode depender da
+# máquina que roda os testes) e [extra] (ex: sobrescrever JAIL_BIN).
 jail_case_setup() {
   local case_dir="$1" extra="${2:-:}"
-  mkdir -p "$case_dir/jail" "$case_dir/claude"
-  printf '%s' "export PATH='$jail_stub_dir:$jail_claude_dir':\"\$PATH\" FAKE_JAIL_LOG_DIR='$case_dir/jail' FAKE_CLAUDE_LOG_DIR='$case_dir/claude'; $extra"
+  mkdir -p "$case_dir/jail" "$case_dir/claude" "$case_dir/home"
+  printf '%s' "unset PLAYWRIGHT_BROWSERS_PATH; export HOME='$case_dir/home' PATH='$jail_stub_dir:$jail_claude_dir':\"\$PATH\" FAKE_JAIL_LOG_DIR='$case_dir/jail' FAKE_CLAUDE_LOG_DIR='$case_dir/claude'; $extra"
 }
 
 # jail_calls <case_dir>: imprime quantas vezes o stub do ai-jail foi chamado no caso.
@@ -2072,18 +2119,25 @@ jail_calls() {
   find "$1/jail" -name 'call_*.argv' 2>/dev/null | grep -c . || true
 }
 
-# jail_expected_argv <case_dir> <type>: o argv que o claude deve receber, um por linha — o
-# prompt gravado no log, precedido de --permission-mode auto na etapa development.
+# jail_expected_argv <case_dir> <type> [jail [hosts [ports]]]: o argv que o claude deve
+# receber, um por linha — o prompt gravado no log, precedido de --permission-mode auto na
+# etapa development. Com "jail" (a jail ligada), antes do prompt vem também
+# '--append-system-prompt <aviso>', o aviso de jail_agent_notice com [hosts], [ports] e o HOME
+# do caso.
 jail_expected_argv() {
-  local case_dir="$1" type="$2" log
+  local case_dir="$1" type="$2" jail="${3:-}" hosts="${4:-}" ports="${5:-}" log args=()
   log="$(find "$case_dir/logs" -name "${type}_*.md" 2>/dev/null | head -n1)"
   if [ -z "$log" ]; then
     printf 'sem log'
-  elif [ "$type" = "development" ]; then
-    printf '%s\n' --permission-mode auto "$(cat "$log")"
-  else
-    printf '%s\n' "$(cat "$log")"
+    return 0
   fi
+  [ "$type" = "development" ] && args+=(--permission-mode auto)
+  if [ "$jail" = "jail" ]; then
+    # Mesmo ambiente do main() do caso (jail_case_setup): HOME do caso e sem
+    # PLAYWRIGHT_BROWSERS_PATH, que dentro da jail o próprio nick define.
+    args+=(--append-system-prompt "$(env -u PLAYWRIGHT_BROWSERS_PATH HOME="$case_dir/home" bash -c "source '$JAIL_LIB_SH'; jail_agent_notice '$hosts' '$ports'")")
+  fi
+  printf '%s\n' "${args[@]}" "$(cat "$log")"
 }
 
 # jail_input <type>: a entrada de main() até a confirmação (s) da etapa <type>.
@@ -2128,15 +2182,16 @@ for jail_type in po_discussion development; do
   assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough -- claude)" "$(head -n5 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...'"
   assert_eq "false" "$([ -e "$jail_dir/cwd/.ai-jail" ] && echo true || echo false)" "$jail_label: nenhum .ai-jail gravado no projeto (o prompt não fica salvo)"
   assert_eq "$jail_dir/cwd" "$(cat "$jail_dir/jail/call_2.cwd" 2>/dev/null || true)" "$jail_label: o lançamento roda no cwd do projeto"
-  assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o mesmo argv do caso desligado"
+  assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, mais o aviso da jail (--append-system-prompt) antes do prompt"
+  assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "dentro do sandbox ai-jail" "$jail_label: o aviso diz ao agente que ele está na jail"
   assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Jail (ai-jail): ativa" "$jail_label: a saída mostra 'Jail (ai-jail): ativa'"
-  assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "⚠️ Jail (ai-jail): ativa | modo de clipboard médio" "$jail_label: a saída mostra o modo médio (JAIL_CLIPBOARD vazio), com o ⚠️"
+  assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio" "$jail_label: a saída mostra o modo médio (JAIL_CLIPBOARD vazio), com o ⚠️"
 done
 
 jail_output="$(cat "$TEST_TMP/jail_on_po_discussion/output" 2>/dev/null || true)"
 # A linha da jail aparece duas vezes: no começo, logo depois de carregar a configuração (antes
 # do menu principal), e de novo antes da confirmação.
-assert_eq "2" "$(grep -c '⚠️ Jail (ai-jail): ativa | modo de clipboard médio' <<< "$jail_output" || true)" "a linha da jail aparece duas vezes (no começo e antes da confirmação)"
+assert_eq "2" "$(grep -c '⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio' <<< "$jail_output" || true)" "a linha da jail aparece duas vezes (no começo e antes da confirmação)"
 jail_first_status_line="$(grep -n 'Jail (ai-jail): ativa' <<< "$jail_output" | cut -d: -f1 | head -n1 || true)"
 jail_config_line="$(grep -n 'Configuração do projeto carregada de' <<< "$jail_output" | cut -d: -f1 | head -n1 || true)"
 jail_menu_line="$(grep -n 'Qual tipo de conversa' <<< "$jail_output" | cut -d: -f1 | head -n1 || true)"
@@ -2160,9 +2215,9 @@ echo
 echo "== main(): JAIL_CLIPBOARD escolhe as opções do ai-jail e a linha do nível =="
 for jail_clip in medio restrito brando; do
   case "$jail_clip" in
-    restrito) jail_clip_options=(--no-save-config --no-status-bar); jail_clip_line="⚠️ Jail (ai-jail): ativa | modo de clipboard restrito" ;;
-    brando) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough --display); jail_clip_line="⚠️ Jail (ai-jail): ativa | modo de clipboard brando" ;;
-    *) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough); jail_clip_line="⚠️ Jail (ai-jail): ativa | modo de clipboard médio" ;;
+    restrito) jail_clip_options=(--no-save-config --no-status-bar); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard restrito" ;;
+    brando) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough --display); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard brando" ;;
+    *) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio" ;;
   esac
   for jail_type in po_discussion development; do
     jail_dir="$TEST_TMP/jail_clip_${jail_clip}_$jail_type"
@@ -2171,7 +2226,7 @@ for jail_clip in medio restrito brando; do
     assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
     assert_eq "$(printf '%s\n' "${jail_clip_options[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_clip_options[*]}"
     assert_eq "$(printf '%s\n' "${jail_clip_options[@]}" -- claude)" "$(head -n "$((${#jail_clip_options[@]} + 2))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_clip_options[*]}"
-    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o mesmo argv do caso desligado"
+    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, mais o aviso da jail"
     assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "$jail_clip_line" "$jail_label: a saída mostra a linha do nível"
   done
 done
@@ -2187,6 +2242,8 @@ for jail_mcp in jira sentry ambos; do
     ambos) jail_mcp_conf='JIRA_ENABLED="true"'$'\n''SENTRY_ENABLED="true"'; jail_mcp_except="" ;;
   esac
   [ "$jail_mcp" = "ambos" ] && jail_mcp_hosts=(--allow-host mcp.atlassian.com --allow-host mcp.sentry.dev)
+  # Os mesmos hosts, sem o --allow-host: a lista que o aviso ao agente cita.
+  jail_mcp_names="$(printf '%s\n' "${jail_mcp_hosts[@]}" | grep -vxF -- --allow-host | paste -sd' ')"
   jail_mcp_base="$(config_keys_blank JAIL_ENABLED | grep -vE "^(${jail_mcp_except:-JIRA_ENABLED|SENTRY_ENABLED})=")"
   jail_dir="$TEST_TMP/jail_mcp_$jail_mcp"
   jail_rc="$(run_main "$jail_dir" "$jail_mcp_base"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
@@ -2194,18 +2251,68 @@ for jail_mcp in jira sentry ambos; do
   assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
   assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_mcp_hosts[*]}"
   assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" -- claude)" "$(head -n "$((${#jail_mcp_hosts[@]} + 5))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_mcp_hosts[*]}"
-  assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o mesmo argv de sempre"
+  assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "$jail_mcp_names")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv de sempre, mais o aviso da jail com os hosts do MCP"
   # Sem a jail, o host não muda nada: o claude roda direto.
   jail_dir="$TEST_TMP/jail_mcp_${jail_mcp}_off"
   jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -vE "^(${jail_mcp_except:-JIRA_ENABLED|SENTRY_ENABLED})=")"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="false"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
   assert_eq "0" "$(jail_calls "$jail_dir")" "MCP $jail_mcp sem a jail: o ai-jail não é chamado"
   assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "MCP $jail_mcp sem a jail: o claude recebe o argv de antes da jail"
 done
+# Landlock: o estado que o ai-jail informa na verificação entra na linha da jail, resumido.
+for landlock_case in "partially enforced|parcial" "not enforced|inativo" "|inativo"; do
+  landlock_text="${landlock_case%%|*}"
+  landlock_expected="${landlock_case#*|}"
+  jail_dir="$TEST_TMP/jail_landlock_${landlock_expected}_${#landlock_text}"
+  jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "export FAKE_LANDLOCK='$landlock_text'")")"
+  assert_eq "2" "$(grep -c "⚠️ Jail (ai-jail): ativa | Landlock: $landlock_expected | modo de clipboard médio" "$jail_dir/output" 2>/dev/null || true)" "Landlock '${landlock_text:-sem linha}': a linha da jail mostra 'Landlock: $landlock_expected', no começo e antes da confirmação"
+done
+
+# Toolchains do home (ex: o ~/.pyenv do venv do projeto): montadas com --map, somente
+# leitura, e citadas no aviso ao agente.
+jail_dir="$TEST_TMP/jail_toolchain"
+mkdir -p "$jail_dir/home/.pyenv/versions"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+assert_eq "0" "$jail_rc" "jail com ~/.pyenv no home: main() termina com código 0"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.pyenv" -- claude)" "$(head -n7 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com ~/.pyenv no home: o lançamento monta o ~/.pyenv (--map, somente leitura)"
+assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "(~/.pyenv)" "jail com ~/.pyenv no home: o aviso ao agente cita o ~/.pyenv"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "jail com ~/.pyenv no home: o claude recebe o argv de sempre, mais o aviso"
+
+# Navegadores do Playwright (E2E): montados em ~/.ms-playwright, com PLAYWRIGHT_BROWSERS_PATH.
+jail_dir="$TEST_TMP/jail_playwright"
+mkdir -p "$jail_dir/home/.cache/ms-playwright"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+assert_eq "0" "$jail_rc" "jail com o Playwright no home: main() termina com código 0"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.cache/ms-playwright:$jail_dir/home/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$jail_dir/home/.ms-playwright" -- claude)" "$(head -n9 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com o Playwright no home: o lançamento monta os navegadores e define PLAYWRIGHT_BROWSERS_PATH"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "jail com o Playwright no home: o claude recebe o argv de sempre, mais o aviso"
+assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "navegadores do Playwright" "jail com o Playwright no home: o aviso ao agente cita os navegadores"
+
 # mcp_jail_hosts: só "true" exato liga cada host; a ordem é Jira, depois Sentry.
 for mcp_case in "true|true|mcp.atlassian.com mcp.sentry.dev" "true||mcp.atlassian.com" "|true|mcp.sentry.dev" "||" "TRUE|sim|" "false|false|"; do
   IFS='|' read -r mcp_jira mcp_sentry mcp_expected <<< "$mcp_case"
   assert_eq "$mcp_expected" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED='$mcp_jira'; SENTRY_ENABLED='$mcp_sentry'; mcp_jail_hosts" 2>&1)" "mcp_jail_hosts com JIRA_ENABLED=\"$mcp_jira\" e SENTRY_ENABLED=\"$mcp_sentry\": \"$mcp_expected\""
 done
+
+echo
+echo "== main(): JAIL_FORWARD_PORTS libera portas de localhost na jail (--forward-port) =="
+jail_dir="$TEST_TMP/jail_ports"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_FORWARD_PORTS=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_FORWARD_PORTS="54320 6379"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+assert_eq "0" "$jail_rc" "JAIL_FORWARD_PORTS \"54320 6379\": main() termina com código 0"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --forward-port 54320 --forward-port 6379 -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": a verificação usa --forward-port 54320 --forward-port 6379"
+assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --forward-port 54320 --forward-port 6379 -- claude)" "$(head -n9 "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": o lançamento usa as mesmas portas"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "" "54320 6379")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"54320 6379\": o claude recebe o argv de sempre, mais o aviso com as portas"
+assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "(54320, 6379)" "JAIL_FORWARD_PORTS \"54320 6379\": o aviso ao agente cita as portas"
+jail_dir="$TEST_TMP/jail_ports_invalid"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_FORWARD_PORTS=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_FORWARD_PORTS="54320,6379"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "exec 2>'$jail_dir/err'")")"
+assert_eq "1" "$jail_rc" "JAIL_FORWARD_PORTS \"54320,6379\": main() termina com código 1"
+assert_contains "$(cat "$jail_dir/err" 2>/dev/null || true)" "Erro: JAIL_FORWARD_PORTS=\"54320,6379\" em $jail_dir/cwd/.nick.conf não é uma lista de portas válida." "JAIL_FORWARD_PORTS \"54320,6379\": o stderr cita o valor e o .nick.conf"
+assert_eq "0" "$(jail_calls "$jail_dir")" "JAIL_FORWARD_PORTS \"54320,6379\": o ai-jail não é chamado"
+assert_not_exists "$jail_dir/claude/argv" "JAIL_FORWARD_PORTS \"54320,6379\": o claude não é chamado"
+assert_not_exists "$jail_dir/logs" "JAIL_FORWARD_PORTS \"54320,6379\": nenhum log é criado"
+assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "JAIL_FORWARD_PORTS \"54320,6379\": parou antes do menu principal"
+jail_dir="$TEST_TMP/jail_ports_off"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_FORWARD_PORTS)"$'\n''JAIL_FORWARD_PORTS="abc"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
+assert_eq "0" "$jail_rc" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: segue normalmente (a chave não tem efeito)"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: o claude recebe o argv de antes da jail"
 
 echo
 echo "== main(): JAIL_CLIPBOARD inválido com a jail ligada — para antes do menu, sem log e sem claude =="
@@ -2287,6 +2394,53 @@ jail_resolve_at="$(grep -n 'resolve_stack ' <<< "$main_body" | cut -d: -f1 | hea
 jail_build_at="$(grep -n 'build_stack_blocks' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
 assert_eq "true" "$([ -n "$jail_check_at" ] && [ -n "$jail_resolve_at" ] && [ -n "$jail_build_at" ] && [ "$jail_resolve_at" -lt "$jail_check_at" ] && [ "$jail_check_at" -lt "$jail_build_at" ] && echo true || echo false)" "em main(), jail_check vem logo depois de resolve_stack e antes de build_stack_blocks"
 assert_eq "1" "$(grep -cE '^[[:space:]]*jail_check .*\|\| exit 1$' <<< "$main_body" || true)" "em main(), a falha de jail_check encerra com exit 1 (na própria linha da chamada)"
+
+echo
+echo "== main(): .nick/troca — pasta de troca de arquivos entre o usuário e os agentes =="
+# Ao confirmar o envio, com ou sem jail, o nick cria <projeto>/.nick/troca/ com um .gitignore
+# próprio ("*"), e o prompt de toda etapa termina dizendo ao agente que é lá que ele recebe e
+# entrega arquivos.
+for xchg_jail in off on; do
+  for xchg_type in po_discussion development; do
+    xchg_dir="$TEST_TMP/xchg_${xchg_jail}_$xchg_type"
+    xchg_conf="$(config_keys_blank JAIL_ENABLED)"$'\n'"JAIL_ENABLED=\"$([ "$xchg_jail" = on ] && echo true || echo false)\""
+    mkdir -p "$xchg_dir/cwd"
+    git -C "$xchg_dir/cwd" init -q 2>/dev/null || true
+    xchg_rc="$(run_main "$xchg_dir" "$xchg_conf" "$(jail_input "$xchg_type")" "$(jail_case_setup "$xchg_dir")")"
+    xchg_label="jail $xchg_jail, $xchg_type"
+    xchg_log="$(find "$xchg_dir/logs" -name "${xchg_type}_*.md" 2>/dev/null | head -n1)"
+    assert_eq "0" "$xchg_rc" "$xchg_label: main() termina com código 0"
+    assert_eq "true" "$([ -d "$xchg_dir/cwd/.nick/troca" ] && echo true || echo false)" "$xchg_label: .nick/troca/ é criada no projeto"
+    assert_eq "*" "$(grep -v '^#' "$xchg_dir/cwd/.nick/troca/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "$xchg_label: o .gitignore da troca ignora tudo (só '*', fora os comentários)"
+    assert_eq "" "$(git -C "$xchg_dir/cwd" status --porcelain --untracked-files=all 2>/dev/null | grep -F '.nick/' || true)" "$xchg_label: nada da troca aparece no git status do projeto"
+    assert_eq "$(exchange_expected_block)" "$(tail -n "$(exchange_expected_block | wc -l)" "$xchg_log" 2>/dev/null || echo 'sem log')" "$xchg_label: o prompt termina com o bloco da troca"
+    assert_contains "$(cat "$xchg_dir/claude/argv" 2>/dev/null || true)" ".nick/troca/" "$xchg_label: o agente recebe o bloco da troca no prompt"
+    assert_contains "$(cat "$xchg_dir/output" 2>/dev/null || true)" ".nick/troca/" "$xchg_label: o bloco aparece no prompt final mostrado antes da confirmação"
+  done
+done
+
+xchg_dir="$TEST_TMP/xchg_existing"
+mkdir -p "$xchg_dir/cwd/.nick/troca"
+printf '%s\n' '# do usuário' '*.png' > "$xchg_dir/cwd/.nick/troca/.gitignore"
+printf 'print antiga' > "$xchg_dir/cwd/.nick/troca/prova.png"
+xchg_rc="$(run_main "$xchg_dir" "$(config_keys_blank)" "$(jail_input po_discussion)" "$(jail_case_setup "$xchg_dir")")"
+assert_eq "0" "$xchg_rc" "troca já existente: main() termina com código 0"
+assert_eq "$(printf '%s\n' '# do usuário' '*.png')" "$(cat "$xchg_dir/cwd/.nick/troca/.gitignore" 2>/dev/null || true)" "troca já existente: o .gitignore dela não é sobrescrito"
+assert_eq "print antiga" "$(cat "$xchg_dir/cwd/.nick/troca/prova.png" 2>/dev/null || true)" "troca já existente: os arquivos dela continuam lá"
+
+xchg_dir="$TEST_TMP/xchg_cancel"
+xchg_rc="$(run_main "$xchg_dir" "$(config_keys_blank)" $'2\nassunto de teste\nN' "$(jail_case_setup "$xchg_dir")")"
+assert_eq "0" "$xchg_rc" "envio cancelado: main() termina com código 0"
+assert_not_exists "$xchg_dir/cwd/.nick" "envio cancelado: .nick/ não é criada"
+
+xchg_dir="$TEST_TMP/xchg_blocked"
+mkdir -p "$xchg_dir/cwd"
+printf 'arquivo no lugar da pasta' > "$xchg_dir/cwd/.nick"
+xchg_rc="$(run_main "$xchg_dir" "$(config_keys_blank)" "$(jail_input po_discussion)" "$(jail_case_setup "$xchg_dir")")"
+assert_eq "1" "$xchg_rc" "troca impossível de criar (.nick é um arquivo): main() termina com código 1"
+assert_contains "$(cat "$xchg_dir/output" 2>/dev/null || true)" "Erro: não foi possível criar a pasta de troca .nick/troca/" "troca impossível de criar: a saída explica o erro"
+assert_not_exists "$xchg_dir/claude/argv" "troca impossível de criar: o claude não é chamado"
+assert_eq "arquivo no lugar da pasta" "$(cat "$xchg_dir/cwd/.nick" 2>/dev/null || true)" "troca impossível de criar: o arquivo .nick do projeto fica intacto"
 
 echo
 if [ "$failures" -gt 0 ]; then

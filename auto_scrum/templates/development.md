@@ -7,6 +7,9 @@ ambiguidade ou faltar informação técnica pra implementar, pergunte antes de p
 Confirme que está na branch ${JIRA_ID} antes de começar; se não estiver, avise antes de
 prosseguir.
 ${TDD_BLOCK_DEV}
+
+Salve os prints de validação deste ticket (e outros artefatos que comprovem o trabalho) em .nick/docs/${JIRA_ID}/.
+
 Não faça git add, git commit ou git push sem a minha autorização expressa.
 
 Faça só isso e espere novos comandos.

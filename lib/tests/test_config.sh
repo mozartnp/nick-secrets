@@ -123,8 +123,8 @@ clean_new_funcs="$(comm -13 "$clean_dir/funcs_before" "$clean_dir/funcs_after" 2
 assert_contains "$clean_new_vars" "CONFIG_KEYS" "source lib/config.sh cria CONFIG_KEYS"
 assert_eq "" "$(grep -vE '^CONFIG_' <<< "$clean_new_vars" || true)" "toda variável nova começa com CONFIG_"
 assert_eq "" "$(grep -vE '^config_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com config_"
-clean_arrays="$(timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; printf '%s|%s|%s|%s|%s' \"\$CONFIG_CWD_FILE_NAME\" \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\"" 2>/dev/null || true)"
-assert_eq ".nick.conf|0|0|0|0" "$clean_arrays" "CONFIG_CWD_FILE_NAME é .nick.conf e os quatro arrays do registro nascem vazios"
+clean_arrays="$(timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; printf '%s|%s|%s|%s|%s|%s' \"\$CONFIG_CWD_FILE_NAME\" \"\$CONFIG_CWD_LEGACY_FILE_NAME\" \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\"" 2>/dev/null || true)"
+assert_eq ".nick/nick.conf|.nick.conf|0|0|0|0" "$clean_arrays" "CONFIG_CWD_FILE_NAME é .nick/nick.conf, CONFIG_CWD_LEGACY_FILE_NAME é .nick.conf e os quatro arrays do registro nascem vazios"
 
 echo
 echo "== carga limpa: estrutura do arquivo (sem shebang, sem bit de execução, sem set/exit/source/eval) =="
@@ -351,17 +351,55 @@ for nose_file in "$fmt_dir/case_5.conf" "$val_dir/invalid.conf" "$val_dir/contro
 done
 
 echo
-echo "== config_cwd_file: imprime <cwd>/.nick.conf e retorna 0, só no cwd =="
+echo "== config_cwd_file: imprime <cwd>/.nick/nick.conf e retorna 0, só no cwd =="
 cwd_dir="$TEST_TMP/cwd_file"
-mkdir -p "$cwd_dir/without" "$cwd_dir/with/sub"
-: > "$cwd_dir/with/.nick.conf"
+mkdir -p "$cwd_dir/without" "$cwd_dir/with/.nick" "$cwd_dir/with/sub"
+: > "$cwd_dir/with/.nick/nick.conf"
 # cwd_file <dir>: imprime "<saída de config_cwd_file>|<código>", com o cwd em <dir>.
 cwd_file() {
   (cd "$1" && run_fake "t_rc=0; t_out=\"\$(config_cwd_file)\" || t_rc=\$?; printf '%s|%s' \"\$t_out\" \"\$t_rc\"")
 }
-assert_eq "$(cd "$cwd_dir/without" && pwd)/.nick.conf|0" "$(cwd_file "$cwd_dir/without")" "sem o arquivo: imprime <cwd>/.nick.conf e retorna 0"
-assert_eq "$(cd "$cwd_dir/with" && pwd)/.nick.conf|0" "$(cwd_file "$cwd_dir/with")" "com o arquivo: imprime <cwd>/.nick.conf e retorna 0"
-assert_eq "$(cd "$cwd_dir/with/sub" && pwd)/.nick.conf|0" "$(cwd_file "$cwd_dir/with/sub")" "num subdiretório de um diretório com .nick.conf: imprime o caminho do subdiretório, sem subir para o pai"
+assert_eq "$(cd "$cwd_dir/without" && pwd)/.nick/nick.conf|0" "$(cwd_file "$cwd_dir/without")" "sem o arquivo: imprime <cwd>/.nick/nick.conf e retorna 0"
+assert_eq "$(cd "$cwd_dir/with" && pwd)/.nick/nick.conf|0" "$(cwd_file "$cwd_dir/with")" "com o arquivo: imprime <cwd>/.nick/nick.conf e retorna 0"
+assert_eq "$(cd "$cwd_dir/with/sub" && pwd)/.nick/nick.conf|0" "$(cwd_file "$cwd_dir/with/sub")" "num subdiretório de um diretório com .nick/nick.conf: imprime o caminho do subdiretório, sem subir para o pai"
+
+echo
+echo "== config_cwd_legacy_check: .nick.conf antigo no cwd =="
+legacy_dir="$TEST_TMP/legacy"
+mkdir -p "$legacy_dir/none" "$legacy_dir/new/.nick" "$legacy_dir/old" "$legacy_dir/both/.nick"
+: > "$legacy_dir/new/.nick/nick.conf"
+printf '%s\n' 'FAKE_TEXT="antigo"' > "$legacy_dir/old/.nick.conf"
+printf '%s\n' 'FAKE_TEXT="antigo"' > "$legacy_dir/both/.nick.conf"
+: > "$legacy_dir/both/.nick/nick.conf"
+# legacy_check <dir>: com o cwd em <dir>, chama config_cwd_legacy_check (stdout em
+# <dir>.out, stderr em <dir>.err) e imprime "<código>|depois"; o "depois" só sai se o shell
+# continuou depois da chamada (a função não pode chamar exit). Grava também a lista do
+# diretório antes e depois (<dir>.before/<dir>.after).
+legacy_check() {
+  (cd "$1" && find . | sort > "$1.before" && run_fake "t_rc=0; config_cwd_legacy_check >'$1.out' 2>'$1.err' || t_rc=\$?; printf '%s|depois' \"\$t_rc\"" && find . | sort > "$1.after")
+}
+for legacy_case in none new old both; do
+  legacy_rc="$(legacy_check "$legacy_dir/$legacy_case")"
+  case "$legacy_case" in
+    old) legacy_expected_rc="1|depois" ;;
+    *) legacy_expected_rc="0|depois" ;;
+  esac
+  assert_eq "$legacy_expected_rc" "$legacy_rc" "$legacy_case: código de retorno e o shell segue depois (sem exit)"
+  assert_eq "" "$(cat "$legacy_dir/$legacy_case.out" 2>/dev/null || echo 'sem stdout gravado')" "$legacy_case: nada no stdout"
+  assert_eq "igual" "$(cmp -s "$legacy_dir/$legacy_case.before" "$legacy_dir/$legacy_case.after" && echo igual || echo diferente)" "$legacy_case: não move, cria nem apaga nada no cwd"
+done
+assert_eq "" "$(cat "$legacy_dir/none.err" 2>/dev/null || echo 'sem stderr gravado')" "nenhum arquivo: nada no stderr"
+assert_eq "" "$(cat "$legacy_dir/new.err" 2>/dev/null || echo 'sem stderr gravado')" "só o novo: nada no stderr"
+legacy_old_pwd="$(cd "$legacy_dir/old" && pwd)"
+legacy_old_expected="Erro: a configuração do projeto agora fica em .nick/nick.conf, e $legacy_old_pwd/.nick.conf não é mais lido.
+Mova o arquivo e rode de novo (na raiz do projeto):
+  mkdir -p .nick && mv .nick.conf .nick/nick.conf
+Depois, versione .nick/nick.conf e o .nick/.gitignore que o nick cria na próxima execução."
+assert_eq "$legacy_old_expected" "$(cat "$legacy_dir/old.err" 2>/dev/null || true)" "só o antigo: erro exato no stderr, com a linha do mv"
+legacy_both_pwd="$(cd "$legacy_dir/both" && pwd)"
+assert_eq "Aviso: $legacy_both_pwd/.nick.conf não é mais lido — a configuração vem de $legacy_both_pwd/.nick/nick.conf. Apague o arquivo antigo." "$(cat "$legacy_dir/both.err" 2>/dev/null || true)" "os dois: aviso exato no stderr"
+assert_eq 'FAKE_TEXT="antigo"' "$(cat "$legacy_dir/old/.nick.conf")" "só o antigo: o arquivo antigo continua igual"
+assert_eq "1|depois" "$(cd "$legacy_dir/old" && timeout 2 bash -c "source '$FAKE_KEYS_SH'; config_cwd_legacy_check 2>/dev/null; printf '%s|depois' \"\$?\"" 2>/dev/null || true)" "só o antigo, sem set -e: retorna 1 e o shell segue"
 
 echo
 echo "== esqueleto: config_print_skeleton <tool_name> =="

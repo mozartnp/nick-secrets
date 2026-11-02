@@ -8,10 +8,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
-# The project config reader (shared with the other nick tools) lives in lib/config.sh. The
-# path is relative to this script, so auto_scrum/ depends on its sibling lib/.
+# Code shared with the other nick tools lives in lib/: the project config reader
+# (lib/config.sh) and the ai-jail sandbox (lib/jail.sh). The paths are relative to this
+# script, so auto_scrum/ depends on its sibling lib/.
 # shellcheck source=SCRIPTDIR/../lib/config.sh
 source "$SCRIPT_DIR/../lib/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/jail.sh
+source "$SCRIPT_DIR/../lib/jail.sh"
 
 # Project config keys, in skeleton order — the only place that lists them (see ABOUT.md).
 # config_register_key <name> <default> <note> <skeleton comment>
@@ -56,6 +59,28 @@ e Review. Use "false" só em projeto sem testes automatizados (ex: site em HTML 
 o plano passa a dizer como cada critério de aceite será verificado, e a suíte só roda se
 existir. Ao contrário das outras chaves *_ENABLED, vazio ou valor inválido mantêm a TDD
 ligada — só "false" desliga.'
+config_register_key JAIL_ENABLED "false" "" \
+'JAIL_ENABLED: "true" roda o claude de todas as etapas dentro do sandbox ai-jail: escrita
+só no diretório do projeto, o resto do sistema somente leitura e ~/.ssh, ~/.gnupg, ~/.aws
+e dados de navegador escondidos. Precisa do ai-jail e, no Linux, do bubblewrap (bwrap),
+instalados por você — veja a seção "Sandbox (ai-jail)" do README ou rode
+auto_scrum.sh --requisitos-jail. Se ligada e a jail não funcionar nesta máquina, o
+auto_scrum para antes de qualquer pergunta. A rede da jail é filtrada, e ela libera os
+MCPs remotos: mcp.atlassian.com quando JIRA_ENABLED="true" e mcp.sentry.dev
+quando SENTRY_ENABLED="true". Padrão é opt-in: vazio ou "false" roda o claude direto, como
+antes.'
+# JAIL_CLIPBOARD is a text key (three levels), so lib/config.sh doesn't check its value:
+# jail_check does, and only with JAIL_ENABLED="true", where it has an effect.
+config_register_key JAIL_CLIPBOARD "" "" \
+'JAIL_CLIPBOARD: só vale com JAIL_ENABLED="true". Quanto do terminal e do clipboard a jail
+libera; o auto_scrum mostra o nível a cada execução:
+  "restrito": não dá pra copiar de dentro do claude;
+  "medio" (ou vazio, o padrão): copia (--terminal-passthrough do ai-jail), mas o agente
+  pode escrever no seu clipboard e mandar sequências de controle ao terminal;
+  "brando": copia e o Ctrl+V do claude cola (--terminal-passthrough --display), mas o
+  agente pode LER o seu clipboard (senhas, tokens) e abrir janelas na sua tela.
+Nos três, cole com o botão direito → Colar. Outro valor faz o auto_scrum parar com erro.
+Veja a seção "Sandbox (ai-jail)" do README.'
 
 TITLE=""
 DESCRIPTION=""
@@ -81,6 +106,10 @@ TDD_BLOCK_TL=""
 TDD_CRITERIA_BLOCK_TL=""
 TDD_BLOCK_DEV=""
 TDD_BLOCK_REVIEW=""
+JAIL_ENABLED=""
+JAIL_CLIPBOARD=""
+# The config file load_project_config loaded (empty with "Nenhum"): the jail error names it.
+PROJECT_CONFIG_FILE=""
 PO_VALIDATION_BLOCK=""
 PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
@@ -250,8 +279,11 @@ warn_legacy_project_files() {
 # which holds the reader, its grammar and the three warnings (format, missing key, invalid
 # toggle value) — see the comment there. It stays here, as a thin call, because the tests
 # and the rest of the script call this name, and because this is the auto_scrum place to
-# record anything about the loaded file without putting a caller global inside the library.
+# record anything about the loaded file without putting a caller global inside the library:
+# PROJECT_CONFIG_FILE keeps its path (all three resolve_stack paths come through here), for
+# the jail error message.
 load_project_config() {
+  PROJECT_CONFIG_FILE="$1"
   config_load "$1"
 }
 
@@ -354,6 +386,18 @@ no plano.'
     SENTRY_BLOCK_PO=""
     SENTRY_BLOCK_TL=""
   fi
+}
+
+# mcp_jail_hosts: prints (space separated) the hosts of the remote MCP servers this project
+# relies on, for lib/jail.sh to release in the jail's network (--allow-host): ai-jail's default
+# allowlist has neither. JIRA_ENABLED="true" adds mcp.atlassian.com and SENTRY_ENABLED="true"
+# adds mcp.sentry.dev — the hosted servers; a self-hosted one is released by the user in the
+# ~/.ai-jail (README). Without the jail, the list changes nothing.
+mcp_jail_hosts() {
+  local hosts=()
+  [ "$JIRA_ENABLED" = "true" ] && hosts+=(mcp.atlassian.com)
+  [ "$SENTRY_ENABLED" = "true" ] && hosts+=(mcp.sentry.dev)
+  echo "${hosts[*]}"
 }
 
 # build_permission_blocks: assembles PERMISSION_BLOCK_PO from PERMISSION_ENABLED (set in
@@ -606,14 +650,15 @@ ask_questions_review() {
 }
 
 main() {
-  local project_arg="" arg init_flag=0
+  local project_arg="" arg init_flag=0 jail_requirements_flag=0
   for arg in "$@"; do
     case "$arg" in
       --projeto=*) project_arg="${arg#--projeto=}" ;;
       --init) init_flag=1 ;;
+      --requisitos-jail) jail_requirements_flag=1 ;;
       *)
         echo "Erro: argumento desconhecido: '$arg'" >&2
-        echo "Uso: $(basename "$0") [--projeto=<nome>] [--init]" >&2
+        echo "Uso: $(basename "$0") [--projeto=<nome>] [--init] [--requisitos-jail]" >&2
         exit 1
         ;;
     esac
@@ -624,8 +669,25 @@ main() {
     exit 0
   fi
 
+  # What the jail needs on this machine, before anyone turns JAIL_ENABLED on: no config is
+  # loaded, nothing runs and nothing is written.
+  if [ "$jail_requirements_flag" -eq 1 ]; then
+    jail_print_requirements
+    exit 0
+  fi
+
   check_requirements
   resolve_stack "$project_arg"
+  # First point where JAIL_ENABLED is known, before any question: with "true", a jail that
+  # doesn't work here stops the script (no log, no claude). The .nick.conf in the cwd is
+  # shared with the target team, so the error warns about turning the jail off there.
+  local config_shared="false" jail_hosts
+  [ "$PROJECT_CONFIG_FILE" = "$(config_cwd_file)" ] && config_shared="true"
+  jail_hosts="$(mcp_jail_hosts)"
+  jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$PROJECT_CONFIG_FILE" "$config_shared" || exit 1
+  # The jail status (and the JAIL_CLIPBOARD warning) shows up front, before anything else
+  # runs, and again right before the confirmation.
+  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
   build_stack_blocks
   build_sentry_blocks
   build_permission_blocks
@@ -667,6 +729,7 @@ main() {
   echo "----------------------------------------------"
   echo
 
+  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
   local confirm
   read -r -p "Confirma o envio para o claude? (s/N): " confirm
   case "$confirm" in
@@ -681,7 +744,10 @@ main() {
       # auto_scrum. On the MCP side, SENTRY_ENABLED just shows the po_sentry entry point
       # in the menu (choose_type), whose template (po_sentry.md) tells the PO to use that
       # tool.
-      exec claude "${claude_args[@]}" "$(cat "$log_file")"
+      # With JAIL_ENABLED="true", jail_exec (lib/jail.sh) launches the same argv as
+      # 'ai-jail <jail_options of JAIL_CLIPBOARD and the MCP hosts> -- claude ...'; otherwise
+      # it runs claude directly, as before.
+      jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" claude "${claude_args[@]}" "$(cat "$log_file")"
       ;;
     *)
       echo "Cancelado. O prompt gerado continua salvo em: $log_file"

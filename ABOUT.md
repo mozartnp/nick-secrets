@@ -50,7 +50,8 @@ O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
   `SC2016` da linha do `envsubst` em `main()`.
 - Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
   morde) só numa cópia descartável **fora do repositório**, com só `auto_scrum.sh`,
-  `templates/`, `tests/` e o `lib/` irmão, na mesma estrutura relativa (sem copiar
+  `templates/`, `tests/`, o `lib/` irmão e o `README.md` da raiz (lido pelo teste README ×
+  helper de `lib/tests/test_jail.sh`), na mesma estrutura relativa (sem copiar
   `projects/` nem `logs/`, que têm dados reais), e
   com o cwd dentro dessa cópia ao rodar a suíte. No fim, apagar a cópia e conferir com
   `git status --short --ignored` que nada mudou no repositório.
@@ -100,7 +101,7 @@ só nessa função, no **stdout**, e `exit 0`. Sair é uma ação normal, como r
 confirmação de envio, que também usa stdout e código 0. É `exit`, e não `return`, porque o
 menu de projetos roda antes do principal, e voltar até `main()` exigiria um sinal a mais em
 cada chamador. Não há efeito colateral porque a ordem já garante isso: em `main()`, o
-`mkdir -p "$LOGS_DIR"`, o log e o `exec claude` só acontecem depois de `choose_type`; no
+`mkdir -p "$LOGS_DIR"`, o log e o lançamento do `claude` (`jail_exec`) só acontecem depois de `choose_type`; no
 `--init`, o arquivo e o `mkdir -p "$PROJECTS_DIR"` só acontecem depois da escolha do
 destino. Os testes de ponta a ponta (com um `claude` falso no `PATH` e um controle positivo
 que prova que o stub é usado) protegem essa ordem.
@@ -455,7 +456,7 @@ técnica de `PERMISSION_BLOCK_PO`).
 - **Padrão por chave só no registro.** A chamada `config_register_key` de cada chave é o único
   lugar com o padrão dela (`"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga, `""`
   pras de texto); `config_key_default` (em `lib/config.sh`) só o devolve. Ele é usado pela
-  linha sugerida do aviso de ausente e pelo esqueleto (`TDD_ENABLED="true"`, última chave). Não
+  linha sugerida do aviso de ausente e pelo esqueleto (`TDD_ENABLED="true"`). Não
   há outro `case` por chave.
 - **Nota da chave no registro** (lida por `config_key_note`). Diz que a TDD continua ligada e
   que `"false"` é só pra projeto sem testes automatizados. Aparece antes de
@@ -512,7 +513,7 @@ papel com mais de um ponto de entrada.
 espera ser executado com o diretório de trabalho já dentro do repositório desse projeto
 (ex: `cd ~/Projetos/git/siga-construcao && /caminho/pra/auto_scrum.sh`). O script não
 verifica nem avisa se isso não for respeitado; rodar de outro lugar simplesmente faz o
-`claude` (chamado via `exec claude ...` no fim do script) subir sem o `.mcp.json`,
+`claude` (lançado por `jail_exec` no fim do script, dentro ou fora da jail) subir sem o `.mcp.json`,
 `CLAUDE.md` e demais config do projeto errado — ou sem nenhuma, se rodado de um
 diretório qualquer.
 
@@ -751,22 +752,38 @@ checagens.
 
 O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas leem o mesmo
 `.nick.conf`. O que é genérico entre elas mora em `lib/<assunto>.sh`, com testes em
-`lib/tests/`. Hoje existe `lib/config.sh`: o leitor da configuração do projeto
-(`config_load`), os três avisos, a regra liga/desliga (`config_is_toggle_key`), a troca de
-caracteres de controle, o padrão e a nota por chave, o arquivo do cwd
-(`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd) e o formato do esqueleto
-(`config_print_skeleton`). A biblioteca não conhece nenhuma chave concreta: cada ferramenta
-registra as suas (ver "Registro de chaves da configuração" abaixo). Os `assert_*` dos testes
-ficam em `lib/tests/assert.sh`, carregado por todas as suítes; nenhuma suíte define os seus.
+`lib/tests/`. Hoje existem duas bibliotecas:
+- `lib/config.sh`: o leitor da configuração do projeto (`config_load`), os três avisos, a
+  regra liga/desliga (`config_is_toggle_key`), a troca de caracteres de controle, o padrão e
+  a nota por chave, o arquivo do cwd (`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd) e o
+  formato do esqueleto (`config_print_skeleton`). A biblioteca não conhece nenhuma chave
+  concreta: cada ferramenta registra as suas (ver "Registro de chaves da configuração"
+  abaixo);
+- `lib/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
+  (`jail_print_requirements`), status (`jail_print_status`), opções do ai-jail por nível
+  (`jail_options`, a fonte única delas) e lançamento (`jail_exec`). Ver
+  seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)".
+
+**As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a
+suíte de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config.sh`, e um
+teste estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail.sh`). A jail
+recebe os valores de `JAIL_ENABLED` e `JAIL_CLIPBOARD` (e os hosts extras) por parâmetro em
+vez de ler o `.nick.conf`, e a única coisa em comum, a troca de caracteres de controle por `?`, é uma
+expansão de uma linha, não uma função que valha a pena compartilhar. Assim uma ferramenta pode usar só uma das bibliotecas,
+e os testes de uma não quebram por mudança na outra.
+
+Os `assert_*` dos testes ficam em `lib/tests/assert.sh`, carregado por todas as suítes;
+nenhuma suíte define os seus.
 
 **Regras de toda biblioteca em `lib/`** (cobertas por testes estruturais em
-`lib/tests/test_config.sh`):
+`lib/tests/test_config.sh` e `lib/tests/test_jail.sh`):
 - **só define ao ser carregada:** atribui as constantes, cria as globais vazias e define
   funções; não imprime nada e não roda comando. Sem shebang e sem bit de execução; a 1ª linha
   é `# shellcheck shell=bash`, seguida do cabeçalho em inglês;
 - não ativa `set -euo pipefail` (é de quem a carrega), mas funciona com ou sem ele no chamador;
 - **prefixo por biblioteca:** toda função `config_` e toda global `CONFIG_` em
-  `lib/config.sh`. O `auto_scrum.sh` não define nada nesse namespace;
+  `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail.sh`. O
+  `auto_scrum.sh` não define nada nesses namespaces;
 - **nunca chama `exit`** e não usa `source`, `.` nem `eval`;
 - **não lê globais do chamador:** tudo entra por parâmetro ou pelo próprio registro (o `$PWD`
   de `config_cwd_file` é estado do shell, não global do chamador);
@@ -779,21 +796,26 @@ escreve nos próprios arrays `CONFIG_*` e não inicializa as globais das chaves;
 `STACK_DESCRIPTION=""` etc. continuam no topo do `auto_scrum.sh`, que é o dono delas. Por isso
 `load_project_config` continua existindo no `auto_scrum` como chamada fina: é ali que a
 ferramenta guarda o que precisar sobre o arquivo carregado, sem pôr global de chamador dentro
-da biblioteca.
+da biblioteca (hoje, `PROJECT_CONFIG_FILE`, o caminho usado na mensagem de erro da jail).
+
+**Exceção de `exit`, documentada:** `jail_exec` termina com `exec` (dentro ou fora da jail) e
+por isso não retorna. Não é um `exit`: é o papel dela, o último passo da ferramenta.
 
 **Carga:** logo depois de `SCRIPT_DIR`, com
 
 ```bash
 # shellcheck source=SCRIPTDIR/../lib/config.sh
 source "$SCRIPT_DIR/../lib/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/jail.sh
+source "$SCRIPT_DIR/../lib/jail.sh"
 ```
 
 A diretiva usa `SCRIPTDIR/` e não `../lib/config.sh`: o caminho relativo puro só resolve se o
 `shellcheck` rodar de dentro de `auto_scrum/` (da raiz dá SC1091), e com `SCRIPTDIR` ele
 resolve de qualquer cwd. Rode `shellcheck -x`, pra ele seguir o `source`. O `SCRIPT_DIR` vem de
 `BASH_SOURCE[0]`, então o caminho também funciona quando os testes dão `source` no script de
-outro cwd. O `source` da biblioteca é a única linha `source`/`.` do `auto_scrum.sh` (um teste
-compara a lista inteira); a garantia de que a configuração nunca é executada fica no teste
+outro cwd. As duas linhas `source` das bibliotecas, nessa ordem, são as únicas linhas
+`source`/`.` do `auto_scrum.sh` (um teste compara a lista inteira); a garantia de que a configuração nunca é executada fica no teste
 estrutural de `lib/config.sh` e nos testes de gramática.
 
 **Riscos aceitos:**
@@ -808,7 +830,8 @@ pro nick inteiro, e extrair antes dele custava só revisar aquele plano; depois,
 refazer código e testes do 13.
 
 **Como rodar as suítes** (cada uma sai com código 1 se houver `FAIL`; não há runner único):
-`bash auto_scrum/tests/test_auto_scrum.sh` e `bash lib/tests/test_config.sh`.
+`bash auto_scrum/tests/test_auto_scrum.sh`, `bash lib/tests/test_config.sh` e
+`bash lib/tests/test_jail.sh`.
 
 ## Registro de chaves da configuração
 
@@ -875,7 +898,249 @@ comandos — as outras três são conversas de avaliação/planejamento/revisão
 motivo pra soltar a supervisão. Regras de `deny` no `settings.json` continuam valendo em
 qualquer modo (deny > ask > allow > modo da sessão), então `auto` não contorna o que já
 estiver bloqueado ali — mas hoje o projeto não tem nenhuma regra de `deny` configurada,
-só `allow`. Vale definir uma deny list antes de confiar demais no modo `auto`.
+só `allow`. Vale definir uma deny list antes de confiar demais no modo `auto` (ticket
+separado, ainda pendente). Uma mitigação opcional já existe: com `JAIL_ENABLED="true"`, o
+agente roda dentro do sandbox ai-jail, que limita a escrita ao projeto e esconde `~/.ssh`,
+`~/.gnupg` etc. (ver seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)").
+
+## Sandbox do agente com ai-jail (`JAIL_ENABLED`)
+
+Com `--permission-mode auto` (etapa de Desenvolvimento), o agente aprova sozinho a maioria
+das ações e, sem jail, enxerga a máquina inteira. O prompt carrega conteúdo do projeto alvo
+(`.nick.conf`, `CLAUDE.md`, tickets), então uma prompt injection ou um erro do agente poderia
+ler segredos ou alterar arquivos fora do repositório. `JAIL_ENABLED="true"` faz o `claude` de
+todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jail).
+
+**Como funciona** (`lib/jail.sh`; no `auto_scrum`, chamado em `main()`):
+- `jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$PROJECT_CONFIG_FILE"
+  <compartilhado>` (`jail_hosts` vem de `mcp_jail_hosts`, ver "Hosts dos MCPs remotos"
+  abaixo) roda logo depois de `resolve_stack`, antes de qualquer `build_*` e do menu
+  principal, com `|| exit 1`. Desligada, não faz nada (nem `command -v`). Ligada, roda
+  `ai-jail <opções> -- true` (as mesmas opções do lançamento) com o cwd num diretório
+  temporário, removido em seguida. Se falhar (ai-jail ausente, `mktemp` falhando, bwrap
+  ausente, user namespaces bloqueados, sistema sem suporte), imprime no stderr o caminho da
+  configuração, a saída do ai-jail (controles trocados por `?`, linha a linha), as duas saídas
+  (instalar ou `JAIL_ENABLED="false"`; quando a causa vem da saída do ai-jail, a primeira é
+  "corrija o problema acima", com remissão a "Problemas comuns" do README, porque a lista
+  pode vir toda `[ok]` — user namespaces bloqueados, bwrap reprovado na validação de binário
+  confiável; achado do review, em que a mensagem mandava instalar com tudo `[ok]`), o aviso
+  de arquivo compartilhado quando a configuração é o `.nick.conf` do cwd (`config_cwd_file`) e a lista de `jail_print_requirements`, e
+  retorna 1. O `|| exit 1` vem antes de `mkdir -p "$LOGS_DIR"`: nenhum log é gravado.
+- `jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"` imprime uma linha:
+  `Jail (ai-jail): desligada — ...` ou `Jail (ai-jail): ativa | modo de clipboard <nível>`,
+  sempre com `⚠️ ` na frente quando a jail está ativa. Roda duas vezes: logo depois de
+  `jail_check`, antes do menu principal e de qualquer pergunta (pedido do usuário: o aviso tem de aparecer
+  no começo de tudo), e de novo logo antes de "Confirma o envio para o claude?", perto do
+  lançamento.
+- `jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" claude <args>` substitui o
+  `exec claude`: com `"true"`, `exec ai-jail --no-save-config --no-status-bar
+  [opções do nível] [--allow-host <host>...] -- claude <args>`; senão, `exec claude <args>`, com o argv idêntico
+  ao de antes (coberto por teste de caracterização, que passou com o código antigo).
+- `--requisitos-jail` chama `jail_print_requirements` e sai com 0, antes de
+  `check_requirements` e de `resolve_stack` (não carrega configuração nem roda o ai-jail).
+
+**Decisões, cada uma com o motivo:**
+- **Integrar o ai-jail em vez de reimplementar.** Isolamento de sistema operacional é difícil
+  de acertar, e a ferramenta já cobre Linux (bubblewrap + Landlock) e macOS (`sandbox-exec`).
+- **A jail é do nick inteiro.** `JAIL_ENABLED` é convenção de todas as ferramentas com IA:
+  cada uma registra a chave com `config_register_key` e passa o valor pra `lib/jail.sh`, que
+  aplica a mesma regra (só `"true"` exato liga) e cita `JAIL_ENABLED` nas mensagens. O
+  mecanismo mora em `lib/`, não no `auto_scrum`, porque toda ferramenta futura vai precisar
+  dele.
+- **Opt-in, como as outras flags** (padrão `"false"`, sem nota): exige instalar dependência
+  por máquina, e ligar por padrão quebraria toda configuração existente. Valor inválido
+  desliga com o aviso de valor ("a opção está desligada.", que descreve o efeito certo).
+- **Verificação na inicialização, sem fallback.** Quem pede jail nunca roda sem: não existe
+  pergunta "seguir sem jail?" nem variável de ambiente que pule a verificação. Parar logo
+  depois de carregar a configuração evita responder o roteiro à toa. O menu de projetos vem
+  antes por necessidade (é ele que escolhe a configuração).
+- **Verificação com `true`, num diretório temporário.** Testa só a jail, serve pra qualquer
+  ferramenta e não toca no estado do `claude` (`~/.claude` é montado com escrita). O
+  diretório temporário é uma segunda proteção contra o auto-save (ver `--no-save-config`
+  abaixo): a verificação nunca deve gravar nada no projeto alvo. Se o `claude` não for encontrado
+  dentro da jail, o erro aparece no lançamento real (README, "Problemas comuns").
+- **Sem `--bootstrap` e sem `--init` do ai-jail** (o `--bootstrap` sobrescreveria o
+  `~/.claude/settings.json` do usuário; o `--init` grava configuração), e sem repassar
+  `--map`, `--rw-map`, `--network`, `--exec` ou qualquer outra opção fora de
+  `jail_options` (teste estrutural: toda chamada de `$JAIL_BIN` é
+  `"$JAIL_BIN" "${options[@]}" -- ...`, e `options` só vem de `jail_options`, a fonte única das
+  opções: `--no-save-config` e `--no-status-bar` sempre, mais as do nível de `JAIL_CLIPBOARD`
+  e um `--allow-host` por host que o chamador passar — o único lugar onde `--allow-host`
+  aparece, também coberto por teste estrutural).
+  Todas vão na linha de comando, pra nenhuma depender do `~/.ai-jail` de cada pessoa.
+- **`--no-save-config` na verificação e no lançamento** — uma das exceções à regra acima
+  (as outras: `--no-status-bar`, as opções de `JAIL_CLIPBOARD` e o `--allow-host` dos MCPs),
+  decidida no passo 8 do ticket 13, depois da conferência com o ai-jail real (o plano dizia
+  "nenhuma opção"). Sem ela, num projeto ainda sem `.ai-jail`, o ai-jail grava no cwd (a raiz
+  do projeto alvo) um `.ai-jail` com o argv **inteiro** — o prompt do `auto_scrum` incluído,
+  com o conteúdo de tickets do Jira e erros do Sentry —, que pode ir pro git; e um `ai-jail`
+  sem comando, rodado ali depois, relança o `command` salvo (`claude --permission-mode auto`
+  com o prompt velho). A opção só impede a gravação: o `.ai-jail` do projeto continua lido
+  (conferido com `mask`). Não perde nada pro nick, que não passa outras opções pra serem
+  lembradas; quem quiser um `.ai-jail` de modelo gera com `ai-jail --init`, de propósito. A
+  alternativa (`no_save_config = true` no `~/.ai-jail` global) deixaria a proteção a cargo de
+  cada pessoa do time. Ela vai também na verificação pra um ai-jail que não aceite a opção
+  falhar ali, com a mensagem de erro, e não no lançamento.
+- **`--no-status-bar` na verificação e no lançamento** — a segunda exceção, também do passo 8.
+  Na primeira execução real (`po_discussion`, terminal do VS Code), a barra de status do
+  ai-jail, que mostra `<cwd> | <comando>` (o prompt inteiro de novo) e desenha nas últimas
+  linhas da tela, brigou com a interface do `claude`: a tela encheu de cópias da linha do
+  comando. Com `ai-jail --no-save-config --no-status-bar -- claude "diga oi"` a tela ficou
+  normal (conferido pelo usuário). O próprio README do ai-jail indica `--no-status-bar` pra
+  sobreposição na parte de baixo da tela. Não usamos `--exec` (que tira também o proxy de
+  terminal do ai-jail): a documentação não diz que proteção o proxy dá, então a mudança
+  mínima é só tirar a barra. Perde-se só o indicador visual "Jail Active"; a linha
+  `Jail (ai-jail): ativa` do nick, antes da confirmação, continua dizendo que a jail está
+  ligada. Vai também na verificação pelo mesmo motivo da opção acima.
+- **O nick não instala, não baixa nem embute o binário** (mesma regra de `claude`/`envsubst`).
+  `JAIL_BIN="ai-jail"` é o nome no `PATH`, sem caminho absoluto; ele é variável só pra os
+  testes apontarem pra um nome inexistente no caso "ai-jail ausente", sem depender da máquina.
+  `JAIL_OS_RELEASE_FILE` existe pelo mesmo motivo.
+- **`jail_print_requirements` é a fonte única de "o que instalar e como"**: a mensagem de
+  erro e o `--requisitos-jail` usam a mesma função. Ela detecta a plataforma (`uname -s` e
+  `ID`/`ID_LIKE` do `/etc/os-release`, lido linha a linha, sem `source` e sem `config_load`,
+  cujo formato é outro), mostra `[ok]`/`[falta]` por `command -v` e o comando de cada item que
+  falta. Só mostra os comandos, nunca os roda (teste estrutural: nenhuma linha de código de
+  `lib/jail.sh` cita um instalador fora de string). O README repete os comandos, e um teste
+  confere que cada comando do helper aparece literal no README — README genérico não tem
+  teste próprio, e esta lista muda quando o upstream muda. Pelo mesmo motivo, outro teste
+  confere que os três níveis do `JAIL_CLIPBOARD` e cada opção de `jail_options` aparecem
+  literal no README (que repete as flags de cada nível na tabela), e que existem as seções
+  "Sandbox (ai-jail)" e "Problemas comuns", citadas na mensagem de erro.
+- **`PROJECT_CONFIG_FILE` fica no `auto_scrum`** (atribuída em `load_project_config`, pelos
+  três caminhos; vazia com "Nenhum"), porque `lib/config.sh` não guarda o caminho carregado.
+  Quem decide se o arquivo é compartilhado com o time também é o `auto_scrum`
+  (`config_cwd_file`), não a biblioteca da jail.
+- **Personalização só pelo `.ai-jail` do projeto**, que o nick não lê nem escreve. No ai-jail
+  atual esse arquivo é não confiável: só restringe, a menos que o `~/.ai-jail` global liste o
+  projeto em `trust_project_config`. É uma decisão de segurança do próprio ai-jail, e o
+  README ensina a usá-la.
+- **`--` antes do comando** (`ai-jail <opções> -- claude ...`): é o fim de opções documentado pelo
+  ai-jail (`ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]`), e garante que nenhum argumento do
+  `claude` (o prompt, `--permission-mode`) seja lido como opção do ai-jail. O comando continua
+  sendo `claude`, a primeira palavra depois do `--`, que o ai-jail usa pra achar o
+  `agent_state`.
+- **Conferência manual com o ai-jail real** (ai-jail 2.14.0, Arch, 2026-11-01, em diretórios
+  temporários fora do repositório):
+  - `ai-jail -- true` sai com 0 (Landlock ativo);
+  - o auto-save existe (`--save-config` é o padrão): sem `.ai-jail`, grava um com
+    `command = [<argv inteiro>]`; com `.ai-jail` existente, só o reformata e mantém o
+    `command` dele; `--dry-run` não grava nada; com `--no-save-config`, nada é gravado;
+  - o comando da linha de comando vence o `command` de um `.ai-jail` existente; `ai-jail`
+    sem comando roda o `command` salvo;
+  - o argv depois do `--` chega intacto (espaço, `;`, `$HOME` e aspas no mesmo argumento);
+  - a rede padrão é filtrada (`--allow-host` de `api.anthropic.com`, registries de pacotes e
+    GitHub, conforme o comando: com `curl`, o `api.anthropic.com` fica de fora); um
+    `--allow-host` na linha de comando soma à lista padrão, que segue valendo (`--dry-run`);
+  - primeira execução real do `auto_scrum` (`po_discussion`, `JAIL_ENABLED="true"`): o
+    `claude` subiu e rodou comandos dentro da jail, mas a barra de status bagunçou o terminal
+    (daí o `--no-status-bar`, acima);
+  - roteiro manual com a versão final (`po_discussion`, terminal do VS Code), feito pelo
+    usuário: `ls ~/.ssh` não teve acesso; `touch ~/Projetos/fora-do-projeto` "funcionou" só no
+    home privado da jail (tmpfs) — o arquivo não existe na máquina; `touch` na raiz do
+    projeto funcionou; `curl` pra fora foi bloqueado; nenhum `.ai-jail` ficou no projeto;
+  - copiar, colar e rolar dentro da jail (testes do usuário, com o `claude` fora da jail
+    copiando e colando normalmente):
+    - modo do nick: rola; não copia (o filtro de terminal do ai-jail barra o OSC 52 do
+      `claude`, e a seleção do terminal não pega porque o `claude` controla o mouse); o
+      Ctrl+V do `claude` não cola, mas botão direito → Colar cola; o Shift+Insert colou num
+      teste e não em outro, provavelmente porque no terminal do VS Code no Linux ele cola a
+      seleção primária (o último texto selecionado com o mouse), e não o clipboard — por
+      isso as mensagens e o README só indicam o botão direito;
+    - `--terminal-passthrough`: copia; o Ctrl+V continua sem colar;
+    - `--exec`: o ai-jail exige `--terminal-passthrough` junto e o resultado é o mesmo;
+    - `CLAUDE_CODE_DISABLE_MOUSE=1` (variável achada no binário do `claude`, não
+      documentada): a seleção do terminal copia, mas a rolagem some;
+      `CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1`: nada seleciona;
+    - `--terminal-passthrough --display`: copia, e o Ctrl+V cola normal — o `claude` lê o
+      clipboard pelo socket do Wayland/X11, que a jail esconde sem `--display`, e não pelo
+      terminal; colar imagem o usuário não faz nem fora da jail (passa o caminho).
+  - MCP (Jira, Sentry): o usuário não conseguiu ler o Jira nem o Sentry pelo MCP dentro da
+    jail. Os dois são remotos (HTTP com OAuth, `.mcp.json` dos projetos alvo):
+    `mcp.atlassian.com` e `mcp.sentry.dev`. Com `curl` dentro da jail, os dois deram
+    `CONNECT tunnel failed, response 403` (o proxy da jail recusou); com `--allow-host` de
+    cada um, 401 (passou; falta só o token, que o `claude` manda). Daí "Hosts dos MCPs
+    remotos", abaixo. Com essa mudança, o usuário confirmou pelo `auto_scrum` que o MCP do
+    Jira e o do Sentry funcionam dentro da jail (autenticados antes, fora dela);
+  - não testado: `ro_maps` com `trust_project_config`; o README cobre em "Problemas comuns".
+- **Terminal e clipboard da jail: `JAIL_CLIPBOARD`, em três níveis** (as opções além de
+  `--no-save-config` e `--no-status-bar`). Sem passthrough, não dá pra copiar de dentro do
+  `claude`, e o Ctrl+V só cola com o display aberto (testes acima; com `--display`, o usuário
+  confirmou que o Ctrl+V colou). O caminho até aqui, decidido com o usuário:
+  - a primeira versão deixava a liberação no `~/.ai-jail` global de cada pessoa; descartada
+    porque um dev novo que não editasse o arquivo ficaria sem copiar e tenderia a desligar a
+    jail inteira (`JAIL_ENABLED="false"`), o que é muito pior que o risco do passthrough;
+  - depois, `JAIL_TERMINAL_PASSTHROUGH_ENABLED` (liga/desliga, ligada por padrão); a proposta
+    de uma segunda flag pro display (`JAIL_DISPLAY_ENABLED`) foi trocada por uma chave só,
+    porque os níveis são cumulativos (display sem passthrough colaria sem copiar, combinação
+    sem uso) e uma chave com níveis é mais fácil de entender. Nenhuma das duas chegou à `main`.
+  Os níveis (`jail_options`, fonte única das opções):
+  - `"restrito"`: nada além da base. Não copia; cola-se pelo botão direito → Colar;
+  - `"medio"` (e vazio, o padrão): `--terminal-passthrough`. Copia. O agente pode escrever no
+    clipboard (trocar o que o usuário copiou, por exemplo por um comando) e mandar sequências
+    de controle direto pro terminal;
+  - `"brando"`: `--terminal-passthrough --display`. Copia, e o Ctrl+V do `claude` cola. O
+    `--display` monta só o socket do Wayland (`--dry-run` no Arch, sessão Wayland com
+    XWayland: `/run/user/1000/wayland-1`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`; nem
+    `/tmp/.X11-unix` nem `DISPLAY`). O agente pode **ler** o clipboard (senhas, tokens),
+    abrir janelas na tela e, em compositores com o protocolo de teclado virtual, digitar em
+    outras janelas.
+  Decisões da chave:
+  - `jail_print_status` mostra, a **cada** execução (pedido do usuário), o nível numa linha
+    curta — no começo, antes do menu principal, e de novo antes da confirmação. A primeira
+    versão tinha um parágrafo de risco por nível; o usuário achou texto demais e pediu o
+    formato `⚠️ Jail (ai-jail): ativa | modo de clipboard médio`, com o ⚠️ em todo nível
+    (a primeira versão deixava o restrito sem; o usuário pediu o ⚠️ sempre que a jail estiver
+    ativa) e o brando em vermelho. O risco de cada nível
+    ficou no README e no comentário do esqueleto. O vermelho (`\e[31m`) só sai com stdout
+    num terminal (`[ -t 1 ]`) e `NO_COLOR` vazia (convenção no-color.org), pra pipes e logs
+    ficarem limpos; o teste simula o terminal com o `script` do util-linux e se declara
+    PULADO sem ele;
+  - chave de texto, e não `*_ENABLED`, porque tem três valores. Por isso o padrão registrado
+    é `""` (regra da `config.sh` pra chave de texto), e vazio vale `"medio"`; e a `config.sh`
+    não valida o valor (não pode ser alterada neste ticket);
+  - quem valida é `jail_check`, só com `JAIL_ENABLED="true"` (desligada, a chave não tem
+    efeito e um valor errado passa quieto): outro valor (inclusive `"MEDIO"` ou com espaço)
+    para a ferramenta com `jail_print_clipboard_error` — o valor, o arquivo e os valores
+    aceitos, sem a lista de requisitos, porque não é problema de instalação. Um erro de
+    digitação nunca escolhe um nível sozinho, no mesmo espírito do "sem fallback" da jail;
+  - o nome cita o clipboard, e não "modo da jail", porque arquivos, rede e `~/.ssh` são iguais
+    nos três níveis; os valores são os níveis que o usuário propôs (escolhidos entre esses,
+    valores descritivos como `"copiar"`, e `JAIL_MODE`);
+  - sendo opção de linha de comando, a chave vence o `~/.ai-jail`.
+  Descartados: `--exec` (o ai-jail exige `--terminal-passthrough` junto e o resultado é o
+  mesmo) e `CLAUDE_CODE_DISABLE_MOUSE` (não é documentada e troca o copiar pela rolagem).
+- **Hosts dos MCPs remotos: liberados pelas chaves que já existem** (decisão do usuário,
+  depois do teste acima). `mcp_jail_hosts`, no `auto_scrum`, devolve `mcp.atlassian.com` com
+  `JIRA_ENABLED="true"` e `mcp.sentry.dev` com `SENTRY_ENABLED="true"` (só `"true"` exato,
+  nessa ordem), e `main()` passa a lista, separada por espaço, a `jail_check` e `jail_exec`,
+  que a repassam a `jail_options`: um `--allow-host` por host, depois das opções do nível,
+  na verificação e no lançamento. Motivos:
+  - mesma razão do `JAIL_CLIPBOARD`: liberação na linha de comando, sem depender do
+    `~/.ai-jail` de cada pessoa — um dev novo que ligasse a jail ficaria sem Jira e Sentry e
+    tenderia a desligá-la;
+  - as chaves já dizem que o projeto usa aquele MCP (é o que mostra as opções no menu), então
+    não precisa de chave nova; alternativas descartadas: uma chave `JAIL_ALLOW_HOSTS` (cada
+    projeto teria de preenchê-la) e só documentar;
+  - a lista fica no `auto_scrum` (é ele que sabe o que as chaves significam); a biblioteca só
+    recebe hosts por parâmetro, sem ler global do chamador. O `--allow-host` libera também os
+    subdomínios e soma à lista padrão do ai-jail;
+  - limite: são os servidores hospedados oficiais. Jira ou Sentry self-hosted, ou MCP local,
+    o usuário libera no `~/.ai-jail` (README). O login OAuth do MCP é feito fora da jail (lá
+    dentro o navegador não abre); o token fica em `~/.claude`, que a jail monta.
+  Mais um canal de saída por host liberado, como o README avisa em "O que a jail não
+  protege".
+- **Review de PR.** Mudanças no `JAIL_ENABLED` do `.nick.conf` e no `.ai-jail` do projeto
+  alvo passam pelo mesmo review de PR que o `CLAUDE.md`: desligar a flag num PR tira a jail
+  de todo o time, e o `.ai-jail` pode ampliar o acesso do agente quando o projeto é confiado.
+
+**Fora de escopo, de propósito:** a deny list do Claude Code (ticket separado); `--lockdown`;
+qualquer flag de rede passada pelo nick; forçar a jail numa máquina independente da
+configuração do projeto; ler, gerar ou validar o `.ai-jail` e o `~/.ai-jail`; rodar a
+verificação do `jail_check` no `--requisitos-jail` (ele só checa presença no `PATH`);
+detectar a versão do ai-jail ou do bubblewrap; verificar se o `claude` existe dentro da jail
+antes do lançamento; um executável wrapper (`bin/nick-jail`) enquanto não houver segunda
+ferramenta.
 
 ## Sentry via MCP na etapa de PO
 

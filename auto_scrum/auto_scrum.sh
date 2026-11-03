@@ -583,6 +583,16 @@ build_tech_leader_blocks() {
   printf -v TECH_LEADER_PLAN_RULES_BLOCK '%s' "Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
 não presuma.
 
+Antes de planejar, procure no projeto o que já existe e pode ser reaproveitado: classes,
+funções, componentes e afins; bibliotecas que o projeto já usa como dependência (não planeje
+uma nova que faça o mesmo); e os padrões e convenções da base (o código novo deve ser escrito
+do mesmo jeito que o código parecido que já existe). Prefira reaproveitar a criar algo novo.
+Se o existente quase serve, prefira adaptá-lo: a adaptação entra no escopo do ticket, mas não
+pode mudar o comportamento do que já funciona. Reaproveite só quando houver reuso real — a
+semelhança superficial não justifica forçar uma abstração comum. O plano deve dizer o que
+será reaproveitado, qual adaptação no código existente é necessária e como verificar que o
+comportamento anterior se manteve; inclua essa verificação nos critérios de aceite.
+
 ${TDD_BLOCK_TL}
 
 O plano deve terminar com estas duas seções:

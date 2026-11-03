@@ -478,7 +478,9 @@ técnica de `PERMISSION_BLOCK_PO`).
   opt-in tiraria a TDD de toda configuração existente, inclusive dos `.nick/nick.conf`
   versionados em repositórios de outros times. Ligada, cada prompt sai byte a byte igual ao
   de antes da flag (coberto por testes de caracterização com referência fixa, que passaram
-  com o código antigo).
+  com o código antigo). Depois, no ticket 26, essas referências fixas (`tdd_tl_rules_*`,
+  `tdd_ref_*`) incorporaram o parágrafo de reaproveitamento de cada papel, montado a partir
+  das constantes `reuse_*_text` — ver seção "Reaproveitar o que já existe antes de criar".
 - **Só `"false"` exato desliga.** `"true"`, vazio, chave ausente, "Nenhum" e qualquer valor
   inválido (`"TRUE"`, `"False"`, `" false"`, `"sim"`) mantêm a TDD ligada. Um erro de digitação
   nunca pode remover a TDD de um projeto que tem testes; o erro contrário (TDD ligada num
@@ -521,11 +523,12 @@ uma vez, numa função `build_*_blocks()` em `auto_scrum.sh` — `build_po_block
 `envsubst`. O template referencia a variável; nunca repete o texto.
 
 Exemplo: `TECH_LEADER_PLAN_RULES_BLOCK` (regra de perguntar se faltar informação técnica,
-metodologia TDD — trecho que depende de `TDD_ENABLED`, embutido via `TDD_BLOCK_TL`/
-`TDD_CRITERIA_BLOCK_TL` —, as duas seções finais obrigatórias) é montada em
-`build_tech_leader_blocks()` e usada tanto em `tech_leader.md` quanto em
-`tech_leader_jira.md` — antes da extração, esse parágrafo existia duplicado, palavra por
-palavra, nos dois arquivos.
+regra de reaproveitar o que já existe antes de planejar algo novo — ver seção
+"Reaproveitar o que já existe antes de criar" —, metodologia TDD — trecho que depende de
+`TDD_ENABLED`, embutido via `TDD_BLOCK_TL`/`TDD_CRITERIA_BLOCK_TL` —, as duas seções finais
+obrigatórias) é montada em `build_tech_leader_blocks()` e usada tanto em `tech_leader.md`
+quanto em `tech_leader_jira.md` — antes da extração, esse parágrafo existia duplicado,
+palavra por palavra, nos dois arquivos.
 
 **O que não entra num bloco compartilhado:** partes que dependem do dado de entrada
 específico daquele ponto de entrada, mesmo que pareçam parecidas à primeira vista — ex: a
@@ -542,6 +545,62 @@ templates que a usam — texto duplicado diverge com o tempo, quando alguém edi
 esquece do outro. É o mesmo racional de `build_po_blocks()`/`PO_VALIDATION_BLOCK`
 (documentado em "PO - Conversar para definir ticket" acima), generalizado pra qualquer
 papel com mais de um ponto de entrada.
+
+## Reaproveitar o que já existe antes de criar (Tech Leader, Dev e Review)
+
+**A regra.** Antes de criar algo novo, os três papéis procuram o que já existe no projeto
+alvo e preferem reaproveitar. Conta como existente: o código do projeto (classes, funções,
+componentes e afins), as bibliotecas que o projeto já usa como dependência (não se adiciona
+uma nova que faça o mesmo) e os padrões e convenções da base (o código novo é escrito do
+mesmo jeito que o código parecido que já existe). Se o existente quase serve, a preferência é
+adaptá-lo, e a adaptação entra no escopo do ticket, mas não pode mudar o comportamento do
+que já funciona. Só vale com reuso real: semelhança superficial não justifica forçar uma
+abstração comum. O que cabe a cada papel:
+- **Tech Leader:** mapeia o reaproveitamento e o põe no plano: o que será reaproveitado, qual
+  adaptação no código existente é necessária e como verificar que o comportamento anterior se
+  manteve, com essa verificação nos critérios de aceite;
+- **Desenvolvimento:** segue o reaproveitamento do plano; pro que o plano não previu, procura
+  antes de criar; e avisa o analista antes de adaptar código existente de um jeito que o plano
+  não previu;
+- **Review:** trata como problema o código novo que duplica algo existente e a dependência
+  nova que faz o mesmo que uma já presente, dizendo na sugestão de correção o que
+  reaproveitar, e confere que as adaptações em código existente mantiveram o comportamento.
+
+**Onde mora o texto.** O do Tech Leader fica em `TECH_LEADER_PLAN_RULES_BLOCK`
+(`build_tech_leader_blocks()`), porque vale pros dois templates do papel (`tech_leader.md`,
+`tech_leader_jira.md` — ver "DRY entre templates do mesmo papel"); entra logo depois da regra
+de perguntar se faltar informação e antes do trecho de TDD. O de Desenvolvimento e o de Review
+são literais em `development.md` e `review.md` (um template cada, papéis diferentes, textos
+diferentes). Nenhuma variável nova no `envsubst`, nenhuma função nova. Os testes guardam o
+texto exato de cada papel (`reuse_tl_text`, `reuse_dev_text`, `reuse_review_text` em
+`test_auto_scrum.sh`), as duas frases-chave comuns aos três ("não pode mudar o comportamento
+do que já funciona" e "semelhança superficial não justifica forçar uma abstração comum",
+comparadas com as quebras de linha trocadas por espaço) e a ausência da regra nos prompts do
+PO.
+
+**Por quê:** num projeto que usa o nick, o Dev precisava criar uma página muito parecida com
+uma que já existia e, em vez de extrair uma base comum, duplicou boa parte do código. Nenhum
+prompt mandava procurar o que já existe: o Tech Leader planejava sem mapear o reaproveitamento,
+o Dev seguia o plano e o Review não tratava duplicação como problema.
+
+**Por que não tem flag.** É padrão do nick pra todo projeto. `TDD_ENABLED` existe porque nem
+todo projeto tem suíte de testes; não existe projeto em que duplicar código seja o
+comportamento desejado.
+
+**Como a verificação segue `TDD_ENABLED` sem texto condicional.** O texto da regra é uma
+constante, o mesmo byte a byte com a TDD ligada ou desligada e com qualquer
+`STACK_DESCRIPTION`. A verificação de que o comportamento anterior se manteve não ganha texto
+próprio por flag: o Tech Leader a põe nos critérios de aceite, e os blocos de TDD já decidem
+como cada critério é verificado (ligada, pela suíte; desligada, pela forma descrita no plano,
+via `TDD_CRITERIA_BLOCK_TL`/`TDD_BLOCK_DEV`/`TDD_BLOCK_REVIEW`). `build_tdd_blocks()` não muda.
+Por isso o texto da regra não pode citar "TDD" (a variante desligada cobra que o prompt não
+menciona TDD) nem ter `${`.
+
+**Fora de escopo, de propósito:**
+- prompts do PO (o PO não escreve código);
+- uma flag pra desligar a regra;
+- refatorar código existente sem relação com o ticket: a regra só manda reaproveitar e adaptar
+  o que o próprio ticket precisa.
 
 ## auto_scrum roda com o cwd dentro do projeto alvo
 

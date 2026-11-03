@@ -125,6 +125,38 @@ production_note_line="# PRODUCTION_ENABLED: $production_note"
 # ligada (e não "a opção está desligada.").
 tdd_note='a metodologia TDD continua ligada nos prompts de Tech Leader, Desenvolvimento e Review. Use "false" só em projeto sem testes automatizados.'
 tdd_note_line="# TDD_ENABLED: $tdd_note"
+
+# Parágrafos de reaproveitamento de Tech Leader, Desenvolvimento e Review: o mesmo texto em
+# qualquer projeto (não dependem de TDD_ENABLED nem de STACK_DESCRIPTION). As referências
+# fixas dos prompts são montadas a partir deles.
+reuse_tl_text='Antes de planejar, procure no projeto o que já existe e pode ser reaproveitado: classes,
+funções, componentes e afins; bibliotecas que o projeto já usa como dependência (não planeje
+uma nova que faça o mesmo); e os padrões e convenções da base (o código novo deve ser escrito
+do mesmo jeito que o código parecido que já existe). Prefira reaproveitar a criar algo novo.
+Se o existente quase serve, prefira adaptá-lo: a adaptação entra no escopo do ticket, mas não
+pode mudar o comportamento do que já funciona. Reaproveite só quando houver reuso real — a
+semelhança superficial não justifica forçar uma abstração comum. O plano deve dizer o que
+será reaproveitado, qual adaptação no código existente é necessária e como verificar que o
+comportamento anterior se manteve; inclua essa verificação nos critérios de aceite.'
+reuse_dev_text='Siga o reaproveitamento previsto no plano. Se precisar de algo que o plano não previu,
+procure antes no projeto o que já existe — classes, funções, componentes e afins,
+bibliotecas que o projeto já usa como dependência (não adicione uma nova que faça o mesmo)
+e os padrões e convenções da base (escreva do mesmo jeito que o código parecido que já
+existe) — e prefira reaproveitar a criar algo novo. Reaproveite só quando houver reuso real:
+a semelhança superficial não justifica forçar uma abstração comum. Adaptar código existente
+não pode mudar o comportamento do que já funciona. Se o reaproveitamento exigir adaptar
+código existente de um jeito que o plano não previu, avise o analista antes de fazer a
+adaptação.'
+reuse_review_text='Trate como problema o código novo que duplica algo que já existe no projeto (classes,
+funções, componentes e afins, ou um padrão/convenção da base escrito de outro jeito) e a
+dependência nova que faz o mesmo que uma já presente; na sugestão de correção, diga o que
+reaproveitar. Só é duplicação quando há reuso real: a semelhança superficial não justifica
+forçar uma abstração comum. Adaptar código existente não pode mudar o comportamento do que
+já funciona: confira que as adaptações feitas em código existente mantiveram o
+comportamento anterior.'
+# Frases-chave que os três papéis compartilham, comparadas com as quebras de linha do prompt
+# trocadas por espaço (no texto, cada uma quebra linha em lugar diferente).
+reuse_key_phrases=('não pode mudar o comportamento do que já funciona' 'semelhança superficial não justifica forçar uma abstração comum')
 # "Aviso de chave ausente" é o bloco do stderr cuja 1ª linha contém missing_marker.
 missing_marker="não tem todas as chaves da configuração"
 
@@ -511,6 +543,7 @@ tl_rules_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; build_tdd_blocks;
 assert_contains "$tl_rules_result" "## Critérios de aceite" "TECH_LEADER_PLAN_RULES_BLOCK inclui a seção Critérios de aceite"
 assert_contains "$tl_rules_result" "## Habilidades necessárias" "TECH_LEADER_PLAN_RULES_BLOCK inclui a seção Habilidades necessárias"
 assert_contains "$tl_rules_result" "metodologia TDD" "TECH_LEADER_PLAN_RULES_BLOCK menciona a metodologia TDD"
+assert_contains "$tl_rules_result" "$reuse_tl_text" "TECH_LEADER_PLAN_RULES_BLOCK inclui a regra de reaproveitar o que já existe"
 
 echo
 echo "== main(): TECH_LEADER_PLAN_RULES_BLOCK exportada e na lista do envsubst =="
@@ -533,6 +566,7 @@ for tpl in "$TECH_LEADER_TEMPLATE" "$TECH_LEADER_JIRA_TEMPLATE"; do
   # no fonte do template, não uma variável pra expandir aqui.
   assert_contains "$tpl_src" '${TECH_LEADER_PLAN_RULES_BLOCK}' "$(basename "$tpl") usa \${TECH_LEADER_PLAN_RULES_BLOCK} em vez de repetir o texto"
   assert_not_contains "$tpl_src" "O plano deve ser pensado para ser executado usando a metodologia TDD" "$(basename "$tpl") não duplica o texto da regra de TDD (deve vir só de TECH_LEADER_PLAN_RULES_BLOCK)"
+  assert_not_contains "$tpl_src" "Antes de planejar, procure no projeto o que já existe" "$(basename "$tpl") não duplica o texto da regra de reaproveitamento (deve vir só de TECH_LEADER_PLAN_RULES_BLOCK)"
 done
 
 echo
@@ -1576,9 +1610,11 @@ assert_eq "0" "$(count_warnings "$none_dir/output")" "Nenhum (com alpha.conf inc
 echo
 echo "== main(): TDD_ENABLED de ponta a ponta nos prompts de Tech Leader, Desenvolvimento e Review =="
 # Referências fixas dos blocos que dependem de TDD_ENABLED. Com a TDD ligada, cada uma é o
-# texto de antes da flag.
+# texto de antes da flag (o de Tech Leader, com o parágrafo de reaproveitamento do ticket 26).
 tdd_tl_rules_on='Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
 não presuma.
+
+'"$reuse_tl_text"'
 
 O plano deve ser pensado para ser executado usando a metodologia TDD. Quem vai executar o
 plano é um(a) desenvolvedor(a) IA em outra sessão — não é você.
@@ -1605,6 +1641,8 @@ critérios de aceite do plano foram cumpridos.'
 # forma descrita no plano.
 tdd_tl_rules_off='Se faltar informação técnica essencial para montar o plano, pergunte antes de concluir —
 não presuma.
+
+'"$reuse_tl_text"'
 
 Quem vai executar o plano é um(a) desenvolvedor(a) IA em outra sessão — não é você. O
 plano não deve exigir testes automatizados nem planejar infraestrutura de testes que o
@@ -1700,6 +1738,8 @@ Foi te atribuído o serviço descrito em .nick/docs/SC-20/plan.md. Se o plano ti
 ambiguidade ou faltar informação técnica pra implementar, pergunte antes de prosseguir
 — não presuma.
 
+'"$reuse_dev_text"'
+
 Confirme que está na branch SC-20 antes de começar; se não estiver, avise antes de
 prosseguir.
 '"$tdd_dev_block_on"'
@@ -1720,6 +1760,8 @@ O plano do trabalho está em .nick/docs/SC-20/plan.md.
 
 Faça um review de código completo, com o mesmo rigor que um(a) senior aplicaria —
 estilo, performance (ex.: N+1), legibilidade, segurança, o que mais for relevante. '"$tdd_review_block_on"'
+
+'"$reuse_review_text"'
 
 Liste claramente os problemas encontrados (se houver), com sugestão de correção — não
 corrija o código você mesmo, quem aplica a correção é o(a) desenvolvedor(a) numa
@@ -1772,7 +1814,7 @@ tdd_log_text() {
 check_tdd_e2e() {
   local type="$1" variant="$2" extra_line="$3" input="$4" setup="${5:-:}"
   local case_dir="$TEST_TMP/main_e2e_tdd/${type}_$variant"
-  local conf_line label rc logs ref_var log_text
+  local conf_line label rc logs ref_var log_text phrase
   conf_line="$(config_keys_blank TDD_ENABLED)"
   if [ -n "$extra_line" ]; then
     conf_line="$conf_line"$'\n'"$extra_line"
@@ -1789,6 +1831,9 @@ check_tdd_e2e() {
   log_text="$(tdd_log_text "$case_dir/logs" "$type")"
   assert_eq "0" "$rc" "$label: main() termina com código 0"
   assert_eq "1" "$(grep -c . <<< "$logs" || true)" "$label: gera exatamente um log ${type}_<timestamp>.md"
+  for phrase in "${reuse_key_phrases[@]}"; do
+    assert_contains "$(tr '\n' ' ' <<< "$log_text")" "$phrase" "$label: o prompt contém a frase-chave do reaproveitamento \"$phrase\""
+  done
   if [ "$variant" = "false" ]; then
     ref_var="tdd_ref_${type}_off"
     assert_eq "${!ref_var}" "$log_text" "$label: o prompt é idêntico à referência fixa do texto desligado"
@@ -1865,6 +1910,37 @@ tdd_none_builds="$(grep -E '^  build_[a-z_]+_blocks$' "$AUTO_SCRUM_SH" | tr -d '
 tdd_none_envsubst_vars="$(grep -F "envsubst '" "$AUTO_SCRUM_SH" | sed -E "s/.*envsubst '([^']*)'.*/\1/")"
 tdd_none_jira_text="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $tdd_none_builds; JIRA_LINK='https://jira.example.com/browse/SC-20'; DESCRIPTION=''; export ${tdd_none_envsubst_vars//\$/}; envsubst '$tdd_none_envsubst_vars' < '$SCRIPT_DIR/../templates/tech_leader_jira.md'; printf '<FIM>'" 2>/dev/null || true)"
 assert_eq "$tdd_ref_tech_leader_jira_on" "$tdd_none_jira_text" "Nenhum, tech_leader_jira (renderizado sem o menu): o prompt é idêntico à referência fixa (TDD ligada)"
+
+echo
+echo "== reaproveitamento: o parágrafo de cada papel é o mesmo com e sem STACK_DESCRIPTION, com a TDD ligada e desligada =="
+# Renderiza sem o menu, com os mesmos passos de tdd_none_jira_text, cada template de Tech
+# Leader, Desenvolvimento e Review. A STACK_DESCRIPTION preenchida não pode citar "TDD": a
+# variante false de check_tdd_e2e cobra que o prompt não menciona TDD.
+for reuse_stack in "" "stack de exemplo"; do
+  for reuse_tdd in true false; do
+    for reuse_check in "tech_leader|$reuse_tl_text" "tech_leader_jira|$reuse_tl_text" "development|$reuse_dev_text" "review|$reuse_review_text"; do
+      reuse_type="${reuse_check%%|*}"
+      reuse_text="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; STACK_DESCRIPTION='$reuse_stack'; TDD_ENABLED='$reuse_tdd'; $tdd_none_builds; JIRA_ID='SC-20'; TITLE='Título de teste'; DESCRIPTION=''; JIRA_LINK='https://jira.example.com/browse/SC-20'; PLAN_PATH='.nick/docs/SC-20/plan.md'; REVIEW_PATH='.nick/docs/SC-20/review.md'; export ${tdd_none_envsubst_vars//\$/}; envsubst '$tdd_none_envsubst_vars' < '$SCRIPT_DIR/../templates/$reuse_type.md'" 2>/dev/null || true)"
+      assert_contains "$reuse_text" "${reuse_check#*|}" "$reuse_type, STACK_DESCRIPTION \"$reuse_stack\", TDD_ENABLED \"$reuse_tdd\": o prompt traz o parágrafo de reaproveitamento exato do papel"
+    done
+  done
+done
+
+echo
+echo "== reaproveitamento: os prompts do PO não ganham a regra (templates po*.md e blocos de build_po_blocks) =="
+for reuse_po_tpl in "$SCRIPT_DIR"/../templates/po*.md; do
+  for reuse_po_word in "reaproveit" "abstração comum"; do
+    assert_not_contains "$(cat "$reuse_po_tpl")" "$reuse_po_word" "$(basename "$reuse_po_tpl") não menciona \"$reuse_po_word\""
+  done
+done
+# Com as flags do PO ligadas, os blocos trazem todo o texto que podem embutir.
+for reuse_po_block in PO_VALIDATION_BLOCK PO_TICKET_FORMAT_BLOCK; do
+  reuse_po_text="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; SENTRY_ENABLED='true'; PERMISSION_ENABLED='true'; PRODUCTION_ENABLED='true'; build_sentry_blocks; build_permission_blocks; build_production_blocks; build_po_blocks; printf '%s<FIM>' \"\$$reuse_po_block\"" 2>/dev/null || true)"
+  assert_contains "$reuse_po_text" "<FIM>" "$reuse_po_block foi montado (amostra válida)"
+  for reuse_po_word in "reaproveit" "abstração comum"; do
+    assert_not_contains "$reuse_po_text" "$reuse_po_word" "$reuse_po_block não menciona \"$reuse_po_word\""
+  done
+done
 
 echo
 echo "== build_tdd_blocks: só TDD_ENABLED=\"false\" exato desliga a TDD nos blocos de Tech Leader, Desenvolvimento e Review =="

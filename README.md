@@ -158,9 +158,9 @@ enviado ao `claude`, revise mudanças nesse arquivo no PR como qualquer outro ar
 influencia o agente (ex: `CLAUDE.md`) — não ser executado não o torna inofensivo. Já
 `auto_scrum/projects/` é gitignorado — é configuração local, específica desta máquina, não
 faz parte deste repositório (`.nick/` inteira também é gitignorada aqui, pra nunca ser
-commitada neste repo por engano). O mesmo cuidado vale pro `JAIL_ENABLED` do `.nick/nick.conf` e pro
-`.ai-jail` do projeto alvo: desligar a jail num PR tira a jail de todo o time, e o `.ai-jail`
-pode ampliar o acesso do agente quando o projeto é confiado (ver
+commitada neste repo por engano). O mesmo cuidado vale pras chaves da jail do `.nick/nick.conf`
+(`JAIL_ENABLED`, `JAIL_ALLOW_HOSTS`, `JAIL_FORWARD_PORTS`): desligar a jail num PR tira a jail de
+todo o time, e cada host ou porta liberado amplia o acesso do agente (ver
 [Sandbox (ai-jail)](#sandbox-ai-jail)).
 
 **Migração (`.nick/`):** a configuração do projeto saiu de `.nick.conf` pra
@@ -211,6 +211,15 @@ diretório do projeto; o resto do sistema fica somente leitura, e `~/.ssh`, `~/.
 `~/.aws` e os dados de navegador ficam escondidos (o `$HOME` da jail é privado). Isso limita
 o estrago de uma prompt injection ou de um erro do agente, principalmente na etapa de
 Desenvolvimento, que roda em `--permission-mode auto`.
+
+As credenciais da máquina também ficam fora: o token do GitHub (`GH_TOKEN`/`GITHUB_TOKEN` e o
+`~/.config/gh`), o SSH (chaves e agente), AWS, kube, gcloud, a configuração e o socket do Docker
+e o resto do ambiente do seu shell. O git local funciona normalmente dentro da jail (`status`,
+`diff`, `log`, `commit`), e o `git fetch` de repositório público também. O que exige a sua
+conta do GitHub (`git push`, `fetch` de repositório privado, `gh`, abrir PR) falha por falta de
+credencial e fica com você, fora da jail: sem terminal, o git sai na hora com "could not read
+Username"; num terminal, ele fica parado pedindo `Username for 'https://github.com':` até você
+interromper. O nick avisa o agente disso.
 
 Pra o projeto continuar rodando lá dentro, o nick monta sozinho, **somente leitura**, os
 gerenciadores de versão que existirem no seu home: `~/.pyenv`, `~/.nvm`, `~/.rbenv`, `~/.asdf`,
@@ -290,16 +299,20 @@ Primeiro, rode:
 ./auto_scrum/auto_scrum.sh --requisitos-jail
 ```
 
-Ele mostra o sistema detectado, o que já está instalado (`[ok]`), o que falta (`[falta]`) e
-o comando de instalação de cada item que falta. O nick não instala nada: os comandos são
-para você rodar.
+Ele mostra o sistema detectado, o que já está instalado (`[ok]`, com a versão do ai-jail), o
+que falta (`[falta]`), o que precisa ser atualizado (`[atualizar]`) e o comando de cada item.
+O nick não instala nada: os comandos são para você rodar.
 
-- **ai-jail:**
+- **ai-jail**, na versão 3.2.0 ou mais nova da série 3.x (o 2.x e o 4.x não são suportados: com
+  outra versão, a ferramenta para logo no início, dizendo a versão encontrada e como
+  atualizar). Confira com `ai-jail --version`. Pra instalar:
   - Arch e derivadas (AUR): `yay -S ai-jail-bin` (com outro helper do AUR, o pacote é o
     mesmo);
   - macOS: `brew tap akitaonrails/tap && brew install ai-jail`;
   - outras plataformas: `cargo install --locked ai-jail`, ou o binário dos Releases do
     GitHub (https://github.com/akitaonrails/ai-jail/releases).
+
+  Pra atualizar, o mesmo comando da instalação, menos no macOS: `brew upgrade ai-jail`.
 - **bubblewrap** (só Linux; o macOS usa o `sandbox-exec` do sistema):
   - Arch: `sudo pacman -S bubblewrap`;
   - Debian/Ubuntu: `sudo apt install bubblewrap`;
@@ -311,61 +324,81 @@ para você rodar.
 
 1. Instale o que falta (acima).
 2. Defina `JAIL_ENABLED="true"` na configuração do projeto.
-3. Opcional, caminho alternativo pra necessidades que o nick não cobre sozinho (o nick já
-   monta as toolchains e os navegadores do Playwright, libera os MCPs do Jira e do Sentry e as
-   portas de `JAIL_FORWARD_PORTS`): um `.ai-jail` na raiz do projeto alvo, o arquivo de
-   configuração do próprio ai-jail. Ex: liberar, somente leitura, um diretório de fora do
-   projeto e esconder do agente o `.env`:
+3. Opcional, pra necessidades que o nick não cobre sozinho (o nick já monta as toolchains e os
+   navegadores do Playwright, libera os MCPs do Jira e do Sentry, os hosts e as portas da
+   configuração do projeto): a configuração global do ai-jail, `~/.config/ai-jail/config.toml`,
+   que é sua (fica fora do repositório e vale pra todo projeto). Ela vale no que o nick não
+   define na linha de comando. Ex: liberar, somente leitura, um diretório de fora do projeto e
+   esconder do agente o `.env`:
 
    ```toml
    ro_maps = ["~/Projetos/libs-compartilhadas"]
    mask = [".env"]
    ```
 
-   O ai-jail trata o `.ai-jail` do projeto como **não confiável**, porque ele vem no
-   repositório: o que *restringe* (`mask`, `deny_paths`) vale sempre, mas o que *amplia* o
-   acesso (`ro_maps`, `rw_maps`, `allow_hosts`) só vale se o `~/.ai-jail` global de cada
-   pessoa confiar no projeto:
-
-   ```toml
-   trust_project_config = ["~/caminho/do/projeto"]
-   ```
-
-   Sem isso, o ai-jail ignora a liberação e avisa ao abrir ("project .ai-jail map ... outside
-   project ignored"). É assim que o projeto X vê o diretório Y e o projeto Z não. Como depende
-   do `~/.ai-jail` de cada um, quem não configurar fica sem a liberação: prefira o que o nick
-   já faz sozinho. O nick não lê, não gera e não altera nenhum dos dois arquivos.
+   O que o nick fecha explicitamente (token do GitHub, SSH, as outras credenciais, a herança
+   do ambiente) não abre por esse arquivo: a linha de comando vence. Como cada pessoa tem o
+   seu, quem não configurar fica sem a liberação: prefira o que o nick já faz sozinho. O nick
+   não lê, não gera e não altera esse arquivo. O `.ai-jail` na raiz do projeto e o
+   `~/.ai-jail` são formatos do ai-jail 2.x: o 3.x os migra (e apaga) quando roda sem o nick, e,
+   pelo nick, eles não valem.
 4. Confira com `ai-jail --dry-run claude`, rodado na raiz do projeto alvo (mostra o que
    seria montado, sem gravar nada).
 
-O ai-jail, por padrão, grava sozinho um `.ai-jail` no diretório onde roda, com o comando
-inteiro — no caso do nick, o prompt, com o conteúdo de tickets e erros. Por isso o nick sempre
-chama `ai-jail --no-save-config --no-status-bar [opções do JAIL_CLIPBOARD] [--map das
-toolchains] [--allow-host do MCP, do JAIL_ALLOW_HOSTS e da lista padrão do nick]
-[--forward-port do JAIL_FORWARD_PORTS] -- claude ...`: nada
-é gravado no projeto, e o `.ai-jail` que você escreveu continua valendo. O `--no-status-bar`
-tira a barra de status do ai-jail, que mostra o comando (o prompt
-de novo) e se sobrepõe à interface do `claude`, bagunçando o terminal. O `--allow-host` libera
-na rede da jail o MCP remoto que o projeto usa: `mcp.atlassian.com` com `JIRA_ENABLED="true"`
-e `mcp.sentry.dev` com `SENTRY_ENABLED="true"` (os dois ficam fora da lista padrão do ai-jail,
-que segue valendo). São as únicas opções que o nick passa, todas na linha de comando: nenhuma
-depende do seu `~/.ai-jail`. Se você rodar o ai-jail à mão
-na raiz do projeto, sem `--no-save-config`, revise o `.ai-jail` gerado antes de commitá-lo; um
-`ai-jail` sem comando, rodado ali, relança o `command` salvo nele.
+O nick sempre chama `ai-jail --no-save-config --no-status-bar --clean --agent-state
+--toolchains --no-github --no-ssh --no-aws --no-kube --no-gcloud --no-docker-config --no-docker
+--no-inherit-env [opções do JAIL_CLIPBOARD] [--map das toolchains] [--allow-host do MCP, do
+JAIL_ALLOW_HOSTS e da lista padrão do nick] [--forward-port do JAIL_FORWARD_PORTS] -- claude
+...`. São as únicas opções que o nick passa, todas na linha de comando:
+- `--no-save-config`: sem ela, o ai-jail grava sozinho a configuração do projeto, com o comando
+  inteiro — no caso do nick, o prompt, com o conteúdo de tickets e erros;
+- `--no-status-bar`: tira a barra de status do ai-jail, que mostra o comando (o prompt de novo)
+  e se sobrepõe à interface do `claude`, bagunçando o terminal;
+- `--clean`: desde o 3.x, a primeira execução do `claude` num projeto abre a tela de aprovação
+  do ai-jail ("Configure claude for this project"), cujo preset sugerido ("For developers")
+  libera o token do GitHub. Com `--clean`, a tela não aparece e o ai-jail ignora o perfil que
+  ela salva: o que vale é só a linha de comando do nick. Se você já salvou um perfil pela tela,
+  ele fica em `~/.config/ai-jail/projects/` (um `.toml` por projeto) e só vale quando você roda
+  o ai-jail sem o nick. Pra rever ou mudar, `ai-jail configure claude` na raiz do projeto; pra
+  remover, apague o `.toml` dele. O nick não lê, não altera e não apaga esse perfil;
+- `--agent-state`: monta o login e o estado do `claude` (`~/.claude`, `~/.claude.json`), pra
+  ele abrir já logado;
+- `--toolchains`: as ferramentas de dependência do próprio ai-jail: os caches dele (pip, npm,
+  cargo etc.), graváveis e separados dos da sua máquina, mas guardados nela
+  (`~/.local/share/ai-jail/cache/`) e compartilhados por todos os projetos e sessões da jail; e,
+  somente leitura, toolchains como `~/.cargo/bin` e `~/.rustup`, quando existem;
+- `--no-github`, `--no-ssh`, `--no-aws`, `--no-kube`, `--no-gcloud`, `--no-docker-config`,
+  `--no-docker` e `--no-inherit-env`: fecham as credenciais e o ambiente (acima), mesmo que a
+  sua configuração global do ai-jail os abra. O socket do Docker daria ao agente root na
+  máquina;
+- `--allow-host`: libera na rede da jail o MCP remoto que o projeto usa (`mcp.atlassian.com`
+  com `JIRA_ENABLED="true"` e `mcp.sentry.dev` com `SENTRY_ENABLED="true"`), os hosts do
+  `JAIL_ALLOW_HOSTS` e a lista padrão do nick, somados à lista padrão do ai-jail, que segue
+  valendo.
+
+Se você rodar o ai-jail à mão, sem o nick, ele abre a tela de aprovação e grava o que você
+escolher em `~/.config/ai-jail/projects/`; revise o que fica aberto antes de salvar.
 
 ### O que a jail não protege
 
 - O agente tem escrita no projeto inteiro, inclusive no `.git`, e os segredos dentro do
-  projeto (ex: `.env`) continuam legíveis, a menos que o `.ai-jail` use `mask`/`deny_paths`.
+  projeto (ex: `.env`) continuam legíveis, a menos que a sua configuração global do ai-jail
+  use `mask`/`deny_paths` (ver "Como ativar").
 - A rede é filtrada, mas não fechada: a API do Claude, os registries de pacotes e a lista
   padrão do nick (`lib/jail/allow_hosts.txt`) ficam liberados, e cada host extra liberado
   (ex: o de um MCP ou do `JAIL_ALLOW_HOSTS`) é mais um canal de saída.
 - O estado do `claude` (`~/.claude`, credenciais incluídas) é montado com escrita dentro da
   jail.
-- `git push` e outras ações remotas continuam possíveis por HTTPS, se houver credencial
-  acessível. Por SSH não funcionam (ver abaixo).
+- Os caches de dependência da jail (`--toolchains`, acima) persistem entre as sessões e são os
+  mesmos em todo projeto: um agente que for enganado num projeto pode deixar ali um pacote
+  adulterado, que outro projeto vai instalar pela jail numa sessão seguinte. Pra zerar, apague
+  `~/.local/share/ai-jail/cache/` fora da jail.
+- O `github.com` está na rede da jail, mas sem credencial: o `git fetch` de repositório público
+  funciona, e o `git push` (e o `fetch` de repositório privado) por HTTPS falha pedindo usuário
+  e senha. Um token que o próprio agente achar no projeto (ex: num `.env`) passaria a valer.
+  Por SSH, nada funciona (ver abaixo).
 - Só um conjunto mínimo de variáveis de ambiente entra na jail, mas o que for repassado
-  explicitamente (`--env`, `env_pass`) fica visível ao agente.
+  explicitamente (`env_pass` na configuração global do ai-jail) fica visível ao agente.
 
 A lista de `deny` do Claude Code (regras no `settings.json`) é outro mecanismo, tratado em
 outro ticket.
@@ -383,12 +416,19 @@ outro ticket.
   jail não sobe: rode o nick fora dele.
 - **Landlock indisponível** (kernel antigo ou sem o LSM ativo): o ai-jail segue sem ele,
   com uma camada a menos.
-- **SSH e GPG inacessíveis dentro da jail:** `git push`/`git pull` por SSH e commits
-  assinados falham. Faça essas ações fora da jail.
+- **SSH, GPG e token do GitHub inacessíveis dentro da jail:** `git push`/`git pull` por SSH,
+  `git push` por HTTPS, `gh` e commits assinados falham. Faça essas ações fora da jail. Num
+  terminal, o `git push` por HTTPS fica parado em `Username for 'https://github.com':`:
+  interrompa com Ctrl+C.
+- **`network = true` na configuração global do ai-jail:** a verificação falha com "--network
+  and --allow-host/--allow-private-host are mutually exclusive ... cannot be combined", porque o
+  nick sempre filtra a rede com `--allow-host`. Tire a linha do
+  `~/.config/ai-jail/config.toml`.
+- **Versão do ai-jail não suportada:** a ferramenta para com a versão encontrada e a
+  suportada (3.2.0 ou mais nova da série 3.x). Atualize com o comando do `--requisitos-jail`.
 - **`claude` não encontrado dentro da jail:** o `$HOME` da jail é privado, então um `claude`
   instalado dentro do home (ex: `~/.local/bin`) pode não ser visível. Instale-o num caminho
-  do sistema ou libere o diretório dele com `ro_maps` (com o projeto em
-  `trust_project_config`).
+  do sistema ou libere o diretório dele com `ro_maps` na configuração global do ai-jail.
 - **Serviço da máquina em `localhost` inacessível** (banco, servidor de desenvolvimento): a
   jail tem a própria rede, e o `localhost` lá dentro não é o da sua máquina. Libere a porta
   com `JAIL_FORWARD_PORTS` na configuração do projeto (acima) — ex: `JAIL_FORWARD_PORTS="54320"`
@@ -406,8 +446,7 @@ outro ticket.
   OAuth do MCP (`/mcp` no `claude`) fora da jail: lá dentro o navegador não abre. Outro
   servidor remoto (Jira ou Sentry self-hosted) você libera com o host dele em
   `JAIL_ALLOW_HOSTS`. Um MCP local que sobe via `npx`/`uvx` precisa também dos diretórios de
-  cache dele (`rw_maps` no `~/.ai-jail` global ou no `.ai-jail` de um projeto listado em
-  `trust_project_config`; num projeto não confiado, o `.ai-jail` só restringe).
+  cache dele (`rw_maps` na configuração global do ai-jail, `~/.config/ai-jail/config.toml`).
 - **Documentação ou site recusado** ("proxy refused the connection" no WebFetch): a jail só
   libera a lista acima. Adicione o host em `JAIL_ALLOW_HOSTS` (ex:
   `JAIL_ALLOW_HOSTS="docs.celeryq.dev"`) ou, se vale pra todo projeto, em

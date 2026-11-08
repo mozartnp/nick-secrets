@@ -993,8 +993,9 @@ arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os da
 - `lib/jail/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
   (`jail_print_requirements`), status (`jail_print_status`), opções do ai-jail por nível
   (`jail_options`, a fonte única delas), toolchains montadas (`jail_toolchain_dirs`), aviso
-  ao agente (`jail_agent_notice`), navegadores do Playwright (`jail_playwright_browsers`) e
-  lançamento (`jail_exec`), com a lista padrão de hosts da rede em `lib/jail/allow_hosts.txt`
+  ao agente (`jail_agent_notice`), navegadores do Playwright (`jail_playwright_browsers`),
+  versão do ai-jail (`jail_version_output`, `jail_version_of`, `jail_version_supported`, com a
+  versão mínima em `JAIL_VERSION_MIN`) e lançamento (`jail_exec`), com a lista padrão de hosts da rede em `lib/jail/allow_hosts.txt`
   (`jail_nick_hosts`). Mesmo formato do `lib/claude/`: pasta própria com o código e o dado,
   testes em `lib/tests/`. Ver seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)";
 - `lib/claude/claude.sh` + `lib/claude/permissions.json`: as regras de deny/ask do Claude
@@ -1054,7 +1055,8 @@ da biblioteca (hoje, `PROJECT_CONFIG_FILE`, o caminho usado na mensagem de erro 
 **Exceção de `exit`, documentada:** `jail_exec` termina com `exec` (dentro ou fora da jail) e
 por isso não retorna. Não é um `exit`: é o papel dela, o último passo da ferramenta.
 
-**Constantes atribuídas ao carregar:** `JAIL_BIN` e `JAIL_OS_RELEASE_FILE` (valores fixos) e
+**Constantes atribuídas ao carregar:** `JAIL_BIN`, `JAIL_VERSION_MIN` e `JAIL_OS_RELEASE_FILE`
+(valores fixos) e
 `NICK_CLAUDE_PERMISSIONS_FILE`, calculada a partir de `${BASH_SOURCE[0]}`
 (`"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" > /dev/null && pwd)/permissions.json"`). O `cd`
 roda no subshell do `$(...)`: não muda o cwd de quem carrega, e a saída dele (que existe com
@@ -1185,7 +1187,10 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
 - `jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS"
   "$PROJECT_CONFIG_FILE" <compartilhado>` (`jail_hosts` vem de `mcp_jail_hosts`, ver "Hosts dos
   MCPs remotos" abaixo) roda logo depois de `resolve_stack`, antes de qualquer `build_*` e do
-  menu principal, com `|| exit 1`. Desligada, não faz nada (nem `command -v`). Ligada, roda
+  menu principal, com `|| exit 1`. Desligada, não faz nada (nem `command -v`, nem `--version`).
+  Ligada, depois de validar os valores e do `command -v`, confere a versão (`ai-jail
+  --version`; fora de `>= 3.2.0` e `< 4.0.0`, ou ilegível, para com a versão encontrada, a
+  suportada e "atualize o ai-jail" como saída 1, sem rodar nada em sandbox — ticket 27) e roda
   `ai-jail <opções> -- true` (as mesmas opções do lançamento) com o cwd num diretório
   temporário, removido em seguida. Se falhar (ai-jail ausente, `mktemp` falhando, bwrap
   ausente, user namespaces bloqueados, sistema sem suporte), imprime no stderr o caminho da
@@ -1205,11 +1210,14 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   perto do lançamento.
 - `jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" claude
   <args>` substitui o `exec claude`: com `"true"`, `exec ai-jail --no-save-config
-  --no-status-bar [opções do nível] [--map <toolchain>...] [--allow-host <host>...]
+  --no-status-bar --clean --agent-state --toolchains --no-github --no-ssh --no-aws --no-kube
+  --no-gcloud --no-docker-config --no-docker --no-inherit-env [opções do nível] [--map
+  <toolchain>...] [--allow-host <host>...]
   [--forward-port <porta>...] -- claude <args>`; senão, `exec claude <args>`, com o argv
   idêntico ao de antes (coberto por teste de caracterização, que passou com o código antigo).
 - `--requisitos-jail` chama `jail_print_requirements` e sai com 0, antes de
-  `check_requirements` e de `resolve_stack` (não carrega configuração nem roda o ai-jail).
+  `check_requirements` e de `resolve_stack` (não carrega configuração nem roda o ai-jail em
+  sandbox; só o `ai-jail --version`, desde o ticket 27).
 
 **Decisões, cada uma com o motivo:**
 - **Integrar o ai-jail em vez de reimplementar.** Isolamento de sistema operacional é difícil
@@ -1233,24 +1241,33 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   da jail, o erro aparece no lançamento real (README, "Problemas comuns").
 - **Sem `--bootstrap` e sem `--init` do ai-jail** (o `--bootstrap` sobrescreveria o
   `~/.claude/settings.json` do usuário; o `--init` grava configuração), e sem repassar
-  `--rw-map`, `--overlay-map`, `--network`, `--no-private-home`, `--exec` ou qualquer outra
-  opção fora de `jail_options` (teste estrutural: toda chamada de `$JAIL_BIN` é
-  `"$JAIL_BIN" "${options[@]}" -- ...`, e `options` só vem de `jail_options`, a fonte única das
-  opções: `--no-save-config` e `--no-status-bar` sempre, mais as do nível de `JAIL_CLIPBOARD`,
+  `--rw-map`, `--overlay-map`, `--network`, `--no-network`, `--no-private-home`, `--exec`, as
+  opções que abrem credencial ou autoridade do host (`--github`, `--ssh`, `--aws`, `--kube`,
+  `--gcloud`, `--docker-config`, `--docker`, `--inherit-env`), `--no-agent-state` ou qualquer
+  outra opção fora de `jail_options` (teste estrutural: toda chamada de `$JAIL_BIN` é
+  `"$JAIL_BIN" "${options[@]}" -- ...`, fora a única `"$JAIL_BIN" --version 2>/dev/null` de
+  `jail_version_output`, que não abre sandbox; e `options` só vem de `jail_options`, a fonte
+  única das opções: `--no-save-config`, `--no-status-bar` e as do ticket 27 (`--clean
+  --agent-state --toolchains` e os oito `--no-*`) sempre, cada uma só no corpo de
+  `jail_options`, mais as do nível de `JAIL_CLIPBOARD`,
   um `--map` por toolchain de `jail_toolchain_dirs`, o `--map` e o `--env` dos navegadores do
   Playwright, um `--allow-host` por host e um `--forward-port` por porta que o chamador passar
   — os únicos lugares onde `--map`, `--env`, `--allow-host` e `--forward-port` aparecem,
   também cobertos por teste estrutural).
   Todas vão na linha de comando, pra nenhuma depender do `~/.ai-jail` de cada pessoa.
 - **`--no-save-config` na verificação e no lançamento** — uma das exceções à regra acima (as
-  outras: `--no-status-bar`, as opções de `JAIL_CLIPBOARD`, o `--map` das toolchains, o
-  `--allow-host` dos MCPs e o `--forward-port` de `JAIL_FORWARD_PORTS`), decidida no passo 8 do
+  outras: `--no-status-bar`, as do ticket 27 — `--clean`, `--agent-state`, `--toolchains`,
+  `--no-github`, `--no-ssh`, `--no-aws`, `--no-kube`, `--no-gcloud`, `--no-docker-config`,
+  `--no-docker`, `--no-inherit-env`, ver abaixo —, as opções de `JAIL_CLIPBOARD`, o `--map` das
+  toolchains, o `--allow-host` dos MCPs e o `--forward-port` de `JAIL_FORWARD_PORTS`), decidida no passo 8 do
   ticket 13, depois da conferência com o ai-jail real (o plano dizia "nenhuma opção"). Sem ela,
   num projeto ainda sem `.ai-jail`, o ai-jail grava no cwd (a raiz do projeto alvo) um
   `.ai-jail` com o argv **inteiro** — o prompt do `auto_scrum` incluído, com o conteúdo de
   tickets do Jira e erros do Sentry —, que pode ir pro git; e um `ai-jail` sem comando, rodado
   ali depois, relança o `command` salvo (`claude --permission-mode auto` com o prompt velho). A
-  opção só impede a gravação: o `.ai-jail` do projeto continua lido (conferido com `mask`). Não
+  opção só impede a gravação: o `.ai-jail` do projeto continua lido (conferido com `mask`, no
+  2.14.0; no 3.x, com o `--clean` do ticket 27, o perfil do projeto, salvo ou legado, não vale
+  pelo nick). Não
   perde nada pro nick, que não passa outras opções pra serem lembradas; quem quiser um
   `.ai-jail` de modelo gera com `ai-jail --init`, de propósito. A alternativa (`no_save_config
   = true` no `~/.ai-jail` global) deixaria a proteção a cargo de cada pessoa do time. Ela vai
@@ -1286,17 +1303,22 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   três caminhos; vazia com "Nenhum"), porque `lib/config.sh` não guarda o caminho carregado.
   Quem decide se o arquivo é compartilhado com o time também é o `auto_scrum`
   (`config_cwd_file`), não a biblioteca da jail.
-- **Personalização só pelo `.ai-jail` do projeto**, que o nick não lê nem escreve. No ai-jail
-  atual esse arquivo é não confiável: só restringe, a menos que o `~/.ai-jail` global liste o
-  projeto em `trust_project_config`. É uma decisão de segurança do próprio ai-jail, e o
-  README ensina a usá-la.
+- **Personalização só pela configuração global do ai-jail** (`~/.config/ai-jail/config.toml`,
+  de cada pessoa, que o nick não lê nem escreve), no que o nick não define na linha de
+  comando (ex: `ro_maps`, `mask`; chaves conferidas no README do ai-jail 3.2.0 instalado). Até
+  o ticket 27 era o `.ai-jail` do projeto, com o `trust_project_config` do `~/.ai-jail` global
+  pra ampliar acesso; no 3.x esses dois são formatos legados (o ai-jail os migra e apaga numa
+  execução com escrita, sem o nick), e com o `--clean` o perfil do projeto, salvo ou legado,
+  não vale pelo nick (ajuda do 3.2.0: "Ignore saved and legacy project policy"). O README não
+  ensina mais esse caminho (teste: não cita `trust_project_config = `).
 - **`--` antes do comando** (`ai-jail <opções> -- claude ...`): é o fim de opções documentado
   pelo ai-jail (`ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]`), e garante que nenhum argumento
   do `claude` (o prompt, `--permission-mode`) seja lido como opção do ai-jail. O comando
   continua sendo `claude`, a primeira palavra depois do `--`, que o ai-jail usa pra achar o
   `agent_state`.
 - **Conferência manual com o ai-jail real** (ai-jail 2.14.0, Arch, 2026-11-01, em diretórios
-  temporários fora do repositório):
+  temporários fora do repositório; histórico: o 2.x deixou de ser suportado no ticket 27, ver
+  a conferência com o 3.2.0 logo abaixo):
   - `ai-jail -- true` sai com 0 (Landlock ativo);
   - o auto-save existe (`--save-config` é o padrão): sem `.ai-jail`, grava um com
     `command = [<argv inteiro>]`; com `.ai-jail` existente, só o reformata e mantém o
@@ -1404,6 +1426,66 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     "proxy refused the connection", e ele disse que a jail do nick recusou, que o host não
     está em `lib/jail/allow_hosts.txt` nem no projeto, que não ia contornar e como liberar
     (`JAIL_ALLOW_HOSTS="docs.celeryq.dev"` no `.nick/nick.conf`);
+- **Conferência manual com o ai-jail real (ai-jail 3.2.0, Arch, 2026-11-08, ticket 27)**, em
+  diretórios temporários fora do repositório, com um terminal simulado pelo `script` do
+  util-linux e um `claude` de sonda (script chamado `claude`, fora do `PATH`, que imprime o que
+  enxerga), `GH_TOKEN`/`GITHUB_TOKEN` falsos e uma variável qualquer no ambiente do host. A
+  configuração do ai-jail ficou num `XDG_CONFIG_HOME` temporário, menos onde indicado. Roteiro,
+  saídas e prints em `.nick/docs/27/` (`teste_manual.md`):
+  - `--dry-run` com as opções de `jail_options`: todas aceitas; lista padrão de hosts do
+    ai-jail (`api.anthropic.com`, os registries, `github.com`, `codeload.github.com`,
+    `objects.githubusercontent.com`) mais a do nick; `~/.claude` e `~/.claude.json` montados;
+    nenhum `~/.ssh` ou `~/.config/gh`. O `--toolchains` monta também `~/.rustup` e
+    `~/.cargo/bin` (somente leitura) e caches do próprio ai-jail (`~/.cache`, `~/.npm`,
+    `~/.cargo/registry`), graváveis: daí a menção aos caches no aviso ao agente;
+  - verificação `-- true`: rc 0, `▸ Landlock: fully enforced` e a linha nova `⚠ Mask: ... rule
+    not applied`, que `jail_landlock_state` ignora ("completo"). O binário traz linhas de
+    detalhe novas (`Landlock: system paths ro`, `docker socket rw`, `disabled by config/flag`
+    etc.) que não aparecem na saída normal; se aparecessem sem a linha de estado, dariam "não
+    identificado" (o lado seguro) — fica pra um ticket se um dia aparecerem;
+  - controle, com as opções de antes do ticket e um terminal: a tela "Configure claude for
+    this project" abriu (o processo ficou parado nela);
+  - (a) projeto sem perfil, opções novas, terminal: nenhuma tela; `~/.claude` presente; sem
+    `GH_TOKEN`, `GITHUB_TOKEN`, `~/.config/gh`, `~/.ssh`, `SSH_AUTH_SOCK`, socket do Docker e
+    sem a variável do host (`--no-inherit-env`); `api.anthropic.com` e `github.com` responderam,
+    `example.com` foi recusado (rc 7). Igual com a configuração real do usuário. Observação: o
+    ai-jail regrava o `~/.config/ai-jail/config.toml` real a cada lançamento com escrita (mtime
+    novo, conteúdo igual), também pelo nick — comportamento dele, não gravação do nick;
+  - (b) perfil salvo pela tela: `ai-jail configure claude` no modo sequencial do próprio ai-jail
+    (`TERM=dumb`, "as mesmas decisões de segurança" da tela, segundo o README dele), preset
+    "For developers" aceito, `OPEN` confirmado, salvo: `[grants] github = true`. Com as opções
+    de antes do ticket, o `GH_TOKEN` entrou na jail; com as do nick, não. O perfil não foi
+    alterado pelo lançamento;
+  - (c) `config.toml` global com `github = true` / `ssh = true` (pelo usuário, fora da jail,
+    com `.nick/docs/27/teste_9_2c.sh`): no controle (`--clean` sem os `--no-*`), o `github =
+    true` pôs o `GH_TOKEN` na jail e o `ssh = true` deu acesso a um agente SSH com chave; com as
+    opções do nick, token, `~/.config/gh`, `~/.ssh` e agente ficaram de fora nos dois casos — os
+    `--no-*` explícitos fecham o que a configuração global abre, mesmo com `--clean`;
+  - (d) `config.toml` global com `network = true`: a verificação do nick falha com "--network
+    and --allow-host/--allow-private-host are mutually exclusive ... cannot be combined"
+    (README, "Problemas comuns");
+  - versão fora da faixa (um `ai-jail` falso que responde `ai-jail 2.14.0`): o `jail_check`
+    para antes da verificação, com "encontrada 2.14.0; suportada: 3.2.0 ou mais nova da série
+    3.x", "atualize o ai-jail" e `[atualizar] ai-jail 2.14.0  →  yay -S ai-jail-bin ...`; o
+    `--requisitos-jail` mostra `[atualizar]` (com o falso) e `[ok]    ai-jail 3.2.0` (com o
+    real);
+  - git por HTTPS dentro da jail (`credential.helper=cache` no `.gitconfig` do usuário, cujo
+    socket fica no `~/.cache` da máquina, que a jail troca pelo dela; sem `~/.git-credentials`):
+    `ls-remote` e `fetch` de repositório público funcionam; de repositório inexistente (o
+    GitHub responde como a um privado) e `push --dry-run` pedem credencial. Num terminal, o git
+    **trava** em `Username for 'https://github.com':` (cortado por timeout de 20 s); sem
+    terminal (`setsid`), falha na hora com "could not read Username" (rc 128). `status`,
+    `commit` e `log` funcionam. Mudar `GIT_TERMINAL_PROMPT` ficou fora do escopo; o README e o
+    aviso ao agente dizem isso;
+  - num projeto real (`siga-construcao`, `JAIL_ENABLED="true"`), pelo `auto_scrum`, com o
+    `claude` de verdade, seguindo o roteiro de `.nick/docs/27/teste_manual.md` (abrir direto e
+    logado, sem tela; git local; token e SSH ausentes; fetch/push por HTTPS): o usuário
+    confirmou que está tudo ok, sem anexar a saída de cada comando;
+  - as quatro suítes do nick rodadas dentro do ai-jail real com as opções novas (cwd no
+    repositório, sem nada gravado nele): mesmo resultado de fora da jail.
+  Duas tentativas foram negadas pelo ambiente da sessão e não foram feitas: conferir na
+  prática que o `mask` de um `.ai-jail` legado do projeto deixa de valer com `--clean` (a
+  afirmação vem da ajuda do 3.2.0) e rodar as suítes numa cópia do repositório.
 - **Terminal e clipboard da jail: `JAIL_CLIPBOARD`, em três níveis** (as opções além de
   `--no-save-config` e `--no-status-bar`). Sem passthrough, não dá pra copiar de dentro do
   `claude`, e o Ctrl+V só cola com o display aberto (testes acima; com `--display`, o usuário
@@ -1466,8 +1548,8 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   - a lista fica no `auto_scrum` (é ele que sabe o que as chaves significam); a biblioteca só
     recebe hosts por parâmetro, sem ler global do chamador. O `--allow-host` libera também os
     subdomínios e soma à lista padrão do ai-jail;
-  - limite: são os servidores hospedados oficiais. Jira ou Sentry self-hosted, ou MCP local,
-    o usuário libera no `~/.ai-jail` (README). O login OAuth do MCP é feito fora da jail (lá
+  - limite: são os servidores hospedados oficiais. Jira ou Sentry self-hosted vão em
+    `JAIL_ALLOW_HOSTS`; os caches de um MCP local, no `config.toml` global do ai-jail (README). O login OAuth do MCP é feito fora da jail (lá
     dentro o navegador não abre); o token fica em `~/.claude`, que a jail monta.
   Mais um canal de saída por host liberado, como o README avisa em "O que a jail não
   protege".
@@ -1509,7 +1591,9 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   `completo` (fully enforced), `parcial` (partially enforced), `inativo` (not enforced,
   failed to apply ou nenhuma linha — `--no-landlock`) e `não identificado` (outro texto, pra
   um texto novo do ai-jail nunca virar um falso "completo"; as linhas de detalhe, como
-  "Landlock: ro map ...", são ignoradas — textos tirados do binário 2.14.0).
+  "Landlock: ro map ...", são ignoradas — textos tirados do binário 2.14.0; no 3.2.0, a linha
+  nova "⚠ Mask: ... rule not applied" da verificação não tem "Landlock: " e é ignorada, coberto
+  por teste).
   `jail_print_status` mostra `| Landlock: <estado> |` entre o "ativa" e o modo de clipboard
   quando `JAIL_LANDLOCK` tem valor, sem cor: o ⚠️ já está na linha.
 - **Aviso ao agente de que ele está na jail** (sugestão do usuário, depois do caso do
@@ -1523,9 +1607,10 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   inteira, fica num lugar só e não depende da etapa. O texto fica na biblioteca (o conhecimento
   sobre a jail é dela) e a ferramenta só decide como entregá-lo, porque `jail_exec` é genérico
   sobre o comando e não pode injetar argumento do `claude`. O texto descreve o padrão do
-  ai-jail 2.14.0 (rede: API do Claude, registries e GitHub; home: estado do `claude` e
-  configuração do git), por isso diz "por padrão": com `allow_hosts` no `~/.ai-jail` ou numa
-  versão nova, pode haver mais. **A cada atualização do ai-jail, reconferir com `--dry-run`
+  ai-jail (rede: API do Claude, registries e GitHub; home: estado do `claude`, configuração do
+  git e, desde o ticket 27, os caches de dependência do `--toolchains`; reconferido no 3.2.0 com
+  `--dry-run`), por isso diz "por padrão": com `allow_hosts` na configuração global do
+  ai-jail (`~/.config/ai-jail/config.toml`) ou numa versão nova, pode haver mais. **A cada atualização do ai-jail, reconferir com `--dry-run`
   esse texto e as strings de `jail_landlock_state`** (achado do review: o agente confia no
   aviso).
 - **Portas de `localhost`: `JAIL_FORWARD_PORTS` no `.nick/nick.conf`** (decisão do usuário). A
@@ -1533,7 +1618,7 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   inalcançáveis. A porta varia por projeto (`54320` vem do `.env` do `siga-construcao`), então
   não dá pra ser automática como as toolchains e os hosts dos MCPs; a chave fica na
   configuração do projeto, que é do nick e commitada — o time herda a lista, e ninguém mexe
-  no `~/.ai-jail`. Chave de texto (portas separadas por espaço, padrão `""`, registrada por
+  na configuração do ai-jail. Chave de texto (portas separadas por espaço, padrão `""`, registrada por
   último); `jail_check` valida, só com a jail ligada, que cada porta é um número de 1 a 65535,
   sem zero à esquerda e sem repetir (com `case`, sem `[[ =~ ]]`, pela convenção do projeto),
   e para com `jail_print_ports_error` (valor, arquivo e formato, sem
@@ -1575,19 +1660,99 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     faltou, que ele pode liberar em `JAIL_ALLOW_HOSTS`.
   Descartado: `--prompt-hosts` do ai-jail (notificação no desktop pedindo Permitir/Negar):
   depende do desktop, é fácil aprovar sem ler e abre saída pra qualquer host aprovado.
-- **Review de PR.** Mudanças no `JAIL_ENABLED` do `.nick/nick.conf` e no `.ai-jail` do projeto
-  alvo passam pelo mesmo review de PR que o `CLAUDE.md`: desligar a flag num PR tira a jail
-  de todo o time, e o `.ai-jail` pode ampliar o acesso do agente quando o projeto é confiado.
+- **ai-jail 3.x: sem tela de aprovação, credenciais fechadas (ticket 27).** Desde o 3.x, a
+  primeira execução de um harness conhecido (`claude` como primeira palavra depois do `--`)
+  num terminal abre a tela "Configure claude for this project", cujo preset sugerido ("For
+  developers") abre o token do GitHub (OPEN). A linha de comando do nick de antes não a
+  evitava. Decisões, com o motivo:
+  - **versão suportada: `>= 3.2.0` e `< 4.0.0`**, numa constante só (`JAIL_VERSION_MIN="3.2.0"`
+    no topo de `lib/jail/jail.sh`), de onde saem a checagem, as mensagens ("3.2.0 ou mais nova
+    da série 3.x", com a série calculada da própria constante) e o teste README × helper. O
+    2.14 deixou de ser suportado: o comportamento que o nick usa só foi conferido no 3.2.0, a
+    semântica do `--clean` e o onboarding mudaram dentro do 3.x, e suportar as duas exigiria
+    opções diferentes por versão sem como testá-las. O teto existe porque a tela veio numa
+    major: uma major nova pode trazer outra pergunta; quando sair o 4.x, um ticket confere e
+    sobe o teto;
+  - **checagem de versão no `jail_check`**, só com a jail ligada, depois das validações de
+    valor e do `command -v`, antes do `mktemp`: `ai-jail --version` (só o stdout;
+    `jail_version_output`). O formato aceito é exatamente `ai-jail X.Y.Z` (uma quebra de linha
+    no fim, partes numéricas sem zero à esquerda e com até 9 dígitos, sem sufixo como `-rc1`;
+    `jail_version_of`), e a comparação é numérica (`3.10.0` > `3.2.0`;
+    `jail_version_supported`). Fora da faixa, ilegível ou com `--version` falhando, para com
+    `jail_print_check_error`: a versão encontrada (ou "não identificada", com a saída, controles
+    trocados por `?`), a suportada, "atualize o ai-jail" no lugar da saída 1 (o 5º parâmetro
+    opcional `[way_out]`; sem ele, o texto é byte a byte o de antes) e a lista de requisitos.
+    Isso revoga o "detectar a versão do ai-jail" do fora de escopo;
+  - **`--requisitos-jail` mostra a versão**: `[ok]    ai-jail 3.2.0` na faixa, `[atualizar]
+    ai-jail <versão ou (versão não identificada)>  →  <comando>` fora dela (o de instalação,
+    menos no macOS: `brew upgrade ai-jail`), e sempre a linha "Versão suportada do ai-jail:
+    ...". Com `[falta]`, igual a antes, sem `--version`;
+  - **o perfil salvo pela tela é ignorado (`--clean`)**: o lançamento sai sempre com o GitHub
+    fechado, haja ou não perfil (conferido). O nick não lê, não apaga nem altera o perfil; o
+    README diz onde ele fica e como removê-lo, pra quem usa o ai-jail sem o nick;
+  - **opções novas em `jail_options`**, logo depois de `--no-save-config --no-status-bar` e
+    antes das do `JAIL_CLIPBOARD` (a ordem das demais não mudou): `--clean` (sem tela e sem
+    perfil do projeto, salvo ou legado), `--agent-state` (login do `claude` liberado pelo nick,
+    não pela tela), `--toolchains` (o "Dependency tools" da tela; as toolchains do home seguem
+    no `--map` de `jail_toolchain_dirs`) e `--no-github
+    --no-ssh --no-aws --no-kube --no-gcloud --no-docker-config --no-docker --no-inherit-env`.
+    Os `--no-*` são explícitos porque a configuração global (`~/.config/ai-jail/config.toml`) é
+    confiável pro ai-jail e continua valendo com `--clean`: um `github = true` global abriu o
+    token mesmo com `--clean` (conferência do Tech Leader); o socket do Docker dá root no host,
+    e a herança do ambiente levaria um `GH_TOKEN` do shell pra dentro;
+  - **trade-off do `--toolchains`** (achado do review): ele monta, graváveis, os caches do
+    próprio ai-jail (`~/.local/share/ai-jail/cache/` da máquina, vistos como `~/.cache`,
+    `~/.npm`, `~/.cargo/registry`, `~/.cargo/git`) e, somente leitura, `~/.rustup` e
+    `~/.cargo/bin` da máquina (`--dry-run` do 3.2.0). Antes o home da jail era um tmpfs e nada
+    escrito fora do projeto sobrevivia à sessão; agora esses caches persistem e são
+    compartilhados entre projetos e sessões, então um agente sob prompt injection num projeto
+    pode deixar um pacote adulterado que outro projeto instala depois. Risco aceito: sem os
+    caches, cada sessão baixaria tudo de novo (era o "Dependency tools" que a tela já oferecia
+    ligado), e o ai-jail os separa dos caches reais da máquina. O README diz isso em "O que a
+    jail não protege" e como zerar (apagar o diretório fora da jail). O `jail_agent_notice`
+    cita esses caches e toolchains (`~/.cargo/bin`, `~/.rustup`) como exemplo, sem tentar
+    listar tudo o que o `--toolchains` monta: a lista é interna do ai-jail (cargo, go, maven,
+    pnpm, bun, mise...) e só sai rodando ele; por isso o aviso não diz mais que `~/.local`
+    inteiro "não existe";
+  - **aviso ao agente**: uma linha diz que o token do GitHub e o SSH não estão na jail, que o
+    git local e o fetch de repositório público funcionam e que o resto (gh, push, PR, fetch de
+    repositório privado) fica com o usuário — inclusive que o git pode ficar esperando usuário
+    e senha. Mesmo racional do aviso: o agente não gasta tokens diagnosticando um push que
+    falha;
+  - **`git fetch`/`push` por HTTPS**: conferido (ver a conferência com o 3.2.0): a rede alcança o
+    `github.com`, mas não há credencial; público faz fetch, privado e push falham pedindo
+    usuário e senha — travando num terminal. Só documentado (README e aviso), sem mexer em
+    `GIT_TERMINAL_PROMPT`.
+  Descartados: `--no-network` (com `--allow-host`, derruba a lista padrão do ai-jail; nem a API
+  do Claude respondeu); `--network` (não combina com `--allow-host`; um `network = true` global
+  faz a verificação falhar, e o README diz pra tirar a linha); `--harness claude`,
+  `--claude-dir` e `-- /usr/bin/claude` (não evitam a tela e não são necessários); `-- env
+  claude`/`-- bash -c 'claude ...'` (evitam a tela porque o ai-jail não reconhece o harness, mas
+  perdem a detecção do estado do `claude`); `--no-agent-state` (o `claude` subiria deslogado).
+  Achado no caminho: o teste "README × `jail_options`" nunca conferia nada (a suíte não carrega
+  a biblioteca, então `jail_options` dava "comando não encontrado" dentro do `< <(...)`); passou
+  a rodar num bash que carrega a biblioteca, com uma guarda que falha se o laço conferir menos
+  opções que as da base.
+- **Review de PR.** Mudanças nas chaves da jail do `.nick/nick.conf` (`JAIL_ENABLED`,
+  `JAIL_ALLOW_HOSTS`, `JAIL_FORWARD_PORTS`) passam pelo mesmo review de PR que o `CLAUDE.md`:
+  desligar a flag num PR tira a jail de todo o time, e cada host ou porta amplia o acesso do
+  agente. (O `.ai-jail` do projeto saiu daqui no ticket 27: pelo nick, no 3.x, ele não vale.)
 
 **Fora de escopo, de propósito:** as regras de deny/ask do Claude Code, que não são da jail
 (ficam em `lib/claude/`, ver seção "Regras de deny/ask do Claude Code (`lib/claude/`)");
 `--lockdown`; flags de rede além do `--allow-host` (MCPs, `JAIL_ALLOW_HOSTS` e
 `lib/jail/allow_hosts.txt`) e do `--forward-port` de `JAIL_FORWARD_PORTS` (ex: `--network`,
-`--allow-private-host`); forçar a jail numa máquina independente da configuração do projeto;
-ler, gerar ou validar o `.ai-jail` e o `~/.ai-jail`; rodar a verificação do `jail_check` no
-`--requisitos-jail` (ele só checa presença no `PATH`); detectar a versão do ai-jail ou do
-bubblewrap; verificar se o `claude` existe dentro da jail antes do lançamento; um executável
-wrapper (`bin/nick-jail`) enquanto não houver segunda ferramenta.
+`--allow-private-host`, `--no-network`); forçar a jail numa máquina independente da
+configuração do projeto; ler, gerar, validar ou apagar o `.ai-jail`, o `~/.ai-jail`, o perfil
+do projeto (`~/.config/ai-jail/projects/`) e o `config.toml` global; rodar a verificação do
+`jail_check` no `--requisitos-jail` (ele só checa presença no `PATH` e a versão do ai-jail);
+detectar a versão do bubblewrap; verificar se o `claude` existe dentro da jail antes do
+lançamento; um executável wrapper (`bin/nick-jail`) enquanto não houver segunda ferramenta;
+acesso ao GitHub dentro da jail (se um dia precisar, vira uma chave opt-in separada, com
+padrão fechado, em outro ticket — inclui `ai-jail forge setup`); o contrato de wrapper do
+ai-jail (`--harness`, `--request-file`, `status --json`); mudar `GIT_TERMINAL_PROMPT` ou o
+credential helper do git. A detecção da versão do ai-jail saiu desta lista no ticket 27 (ver
+"ai-jail 3.x" acima).
 
 ## Regras de deny/ask do Claude Code (`lib/claude/`)
 

@@ -2429,17 +2429,25 @@ assert_eq "$pcf_dir/projects/alpha.conf" "$(pcf_value "$pcf_dir/cwd_without" alp
 assert_eq "$pcf_dir/projects/alpha.conf" "$(pcf_value "$pcf_dir/cwd_without" "" 1)" "menu (alpha): PROJECT_CONFIG_FILE é projects/alpha.conf"
 assert_eq "" "$(pcf_value "$pcf_dir/cwd_without" "" 2)" "menu ('Nenhum'): PROJECT_CONFIG_FILE fica vazia"
 
-# Stubs desta seção (diretórios próprios, no TEST_TMP desta suíte). O ai-jail grava o argv
-# de cada chamada (um argumento por linha) em $FAKE_JAIL_LOG_DIR/call_<n>.argv e o cwd em
-# call_<n>.cwd, pula as opções antes do "--" e, sem --no-save-config entre elas, cria um
-# .ai-jail no cwd (auto-save). Com "true" depois do "--", é a
-# verificação e sai com $FAKE_JAIL_RC (padrão 0); senão, faz exec do comando depois do
-# "--". O claude grava o argv em $FAKE_CLAUDE_LOG_DIR/argv e o cwd em .../cwd.
+# Stubs desta seção (diretórios próprios, no TEST_TMP desta suíte). O ai-jail, com
+# "--version" como 1º argumento, só grava uma linha em $FAKE_JAIL_LOG_DIR/version.calls,
+# imprime "ai-jail ${FAKE_JAIL_VERSION-3.2.0}" (definida e vazia, só "ai-jail ") e sai com
+# ${FAKE_JAIL_VERSION_RC:-0}, sem gravar call_<n>.argv (os jail_calls dos casos não mudam).
+# Fora isso, grava o argv de cada chamada (um argumento por linha) em
+# $FAKE_JAIL_LOG_DIR/call_<n>.argv e o cwd em call_<n>.cwd, pula as opções antes do "--" e,
+# sem --no-save-config entre elas, cria um .ai-jail no cwd (auto-save). Com "true" depois do
+# "--", é a verificação e sai com $FAKE_JAIL_RC (padrão 0); senão, faz exec do comando depois
+# do "--". O claude grava o argv em $FAKE_CLAUDE_LOG_DIR/argv e o cwd em .../cwd.
 jail_stub_dir="$TEST_TMP/jail_stub_ai_jail"
 jail_claude_dir="$TEST_TMP/jail_stub_claude"
 mkdir -p "$jail_stub_dir" "$jail_claude_dir"
 cat > "$jail_stub_dir/ai-jail" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo version >> "$FAKE_JAIL_LOG_DIR/version.calls"
+  printf 'ai-jail %s\n' "${FAKE_JAIL_VERSION-3.2.0}"
+  exit "${FAKE_JAIL_VERSION_RC:-0}"
+fi
 n=1
 while [ -e "$FAKE_JAIL_LOG_DIR/call_$n.argv" ]; do n=$((n + 1)); done
 printf '%s\n' "$@" > "$FAKE_JAIL_LOG_DIR/call_$n.argv"
@@ -2510,6 +2518,10 @@ while IFS= read -r jail_docs_host; do
   jail_docs_opts+=(--allow-host "$jail_docs_host")
 done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$SCRIPT_DIR/../../lib/jail/allow_hosts.txt" 2>/dev/null | grep .)
 
+# jail_base_opts: as opções que jail_options põe em todo nível, antes das do JAIL_CLIPBOARD —
+# a fonte única desta suíte pra elas (os argv esperados e as contagens de linha saem daqui).
+jail_base_opts=(--no-save-config --no-status-bar --clean --agent-state --toolchains --no-github --no-ssh --no-aws --no-kube --no-gcloud --no-docker-config --no-docker --no-inherit-env)
+
 # jail_input <type> [flags]: a entrada de main() até a confirmação (s) da etapa <type>. Sem
 # [flags], o menu é o de JIRA_ENABLED e SENTRY_ENABLED desligadas (só po_discussion e
 # development); com "flags", o das duas ligadas, com todas as etapas — nele, po e tech_leader
@@ -2549,23 +2561,25 @@ for jail_variant in vazio false ausente TRUE; do
     assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
     assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv de antes da jail"
     assert_eq "0" "$(jail_calls "$jail_dir")" "$jail_label: o ai-jail não é chamado nenhuma vez"
+    assert_not_exists "$jail_dir/jail/version.calls" "$jail_label: o ai-jail não é chamado nem com --version"
     assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Jail (ai-jail): desligada" "$jail_label: a saída mostra 'Jail (ai-jail): desligada'"
     assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "modo de clipboard" "$jail_label: nada sobre o modo de clipboard"
   done
 done
 
 echo
-echo "== main(): JAIL_ENABLED=\"true\", jail funcionando — verifica fora do projeto e lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...' =="
+echo "== main(): JAIL_ENABLED=\"true\", jail funcionando — verifica fora do projeto e lança 'ai-jail <opções base> --terminal-passthrough -- claude ...' =="
 for jail_type in po_discussion development; do
   jail_dir="$TEST_TMP/jail_on_$jail_type"
   jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input "$jail_type")" "$(jail_case_setup "$jail_dir")")"
   jail_label="JAIL_ENABLED \"true\", $jail_type"
   assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
   assert_eq "2" "$(jail_calls "$jail_dir")" "$jail_label: duas chamadas ao ai-jail (verificação e lançamento)"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a 1ª chamada é a verificação 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- true'"
+  assert_eq "version" "$(cat "$jail_dir/jail/version.calls" 2>/dev/null || echo 'sem arquivo')" "$jail_label: 'ai-jail --version' roda uma vez (no jail_check)"
+  assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_docs_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a 1ª chamada é a verificação 'ai-jail <opções base> --terminal-passthrough -- true'"
   jail_check_cwd="$(cat "$jail_dir/jail/call_1.cwd" 2>/dev/null || true)"
   assert_eq "true" "$([ -n "$jail_check_cwd" ] && [ "$jail_check_cwd" != "$jail_dir/cwd" ] && [ ! -e "$jail_check_cwd" ] && echo true || echo false)" "$jail_label: a verificação roda fora do projeto, num diretório já removido"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((5 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail --no-save-config --no-status-bar --terminal-passthrough -- claude ...'"
+  assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + 3 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail <opções base> --terminal-passthrough -- claude ...'"
   assert_eq "false" "$([ -e "$jail_dir/cwd/.ai-jail" ] && echo true || echo false)" "$jail_label: nenhum .ai-jail gravado no projeto (o prompt não fica salvo)"
   assert_eq "$jail_dir/cwd" "$(cat "$jail_dir/jail/call_2.cwd" 2>/dev/null || true)" "$jail_label: o lançamento roda no cwd do projeto"
   assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, mais o aviso da jail (--append-system-prompt) antes do prompt"
@@ -2605,9 +2619,9 @@ echo
 echo "== main(): JAIL_CLIPBOARD escolhe as opções do ai-jail e a linha do nível =="
 for jail_clip in medio restrito brando; do
   case "$jail_clip" in
-    restrito) jail_clip_options=(--no-save-config --no-status-bar); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard restrito" ;;
-    brando) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough --display); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard brando" ;;
-    *) jail_clip_options=(--no-save-config --no-status-bar --terminal-passthrough); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio" ;;
+    restrito) jail_clip_options=("${jail_base_opts[@]}"); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard restrito" ;;
+    brando) jail_clip_options=("${jail_base_opts[@]}" --terminal-passthrough --display); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard brando" ;;
+    *) jail_clip_options=("${jail_base_opts[@]}" --terminal-passthrough); jail_clip_line="⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio" ;;
   esac
   jail_clip_options+=("${jail_docs_opts[@]}")
   for jail_type in po_discussion development; do
@@ -2640,8 +2654,8 @@ for jail_mcp in jira sentry ambos; do
   jail_rc="$(run_main "$jail_dir" "$jail_mcp_base"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
   jail_label="MCP $jail_mcp com a jail"
   assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" "${jail_docs_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_mcp_hosts[*]}"
-  assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_mcp_hosts[@]}" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_mcp_hosts[@]} + 5 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_mcp_hosts[*]}"
+  assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_mcp_hosts[@]}" "${jail_docs_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_mcp_hosts[*]}"
+  assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_mcp_hosts[@]}" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + ${#jail_mcp_hosts[@]} + 3 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_mcp_hosts[*]}"
   assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "$jail_mcp_names")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv de sempre, mais o aviso da jail com os hosts do MCP"
   # Sem a jail, o host não muda nada: o claude roda direto.
   jail_dir="$TEST_TMP/jail_mcp_${jail_mcp}_off"
@@ -2664,7 +2678,7 @@ jail_dir="$TEST_TMP/jail_toolchain"
 mkdir -p "$jail_dir/home/.pyenv/versions"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "jail com ~/.pyenv no home: main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.pyenv" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((7 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com ~/.pyenv no home: o lançamento monta o ~/.pyenv (--map, somente leitura)"
+assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough --map "$jail_dir/home/.pyenv" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + 5 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com ~/.pyenv no home: o lançamento monta o ~/.pyenv (--map, somente leitura)"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "(~/.pyenv)" "jail com ~/.pyenv no home: o aviso ao agente cita o ~/.pyenv"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "jail com ~/.pyenv no home: o claude recebe o argv de sempre, mais o aviso"
 
@@ -2673,7 +2687,7 @@ jail_dir="$TEST_TMP/jail_playwright"
 mkdir -p "$jail_dir/home/.cache/ms-playwright"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "jail com o Playwright no home: main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough --map "$jail_dir/home/.cache/ms-playwright:$jail_dir/home/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$jail_dir/home/.ms-playwright" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((9 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com o Playwright no home: o lançamento monta os navegadores e define PLAYWRIGHT_BROWSERS_PATH"
+assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough --map "$jail_dir/home/.cache/ms-playwright:$jail_dir/home/.ms-playwright" --env "PLAYWRIGHT_BROWSERS_PATH=$jail_dir/home/.ms-playwright" "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + 7 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "jail com o Playwright no home: o lançamento monta os navegadores e define PLAYWRIGHT_BROWSERS_PATH"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "jail com o Playwright no home: o claude recebe o argv de sempre, mais o aviso"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "navegadores do Playwright" "jail com o Playwright no home: o aviso ao agente cita os navegadores"
 
@@ -2688,8 +2702,8 @@ echo "== main(): JAIL_FORWARD_PORTS libera portas de localhost na jail (--forwar
 jail_dir="$TEST_TMP/jail_ports"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_FORWARD_PORTS=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_FORWARD_PORTS="54320 6379"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "JAIL_FORWARD_PORTS \"54320 6379\": main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" --forward-port 54320 --forward-port 6379 -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": a verificação usa --forward-port 54320 --forward-port 6379"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_docs_opts[@]}" --forward-port 54320 --forward-port 6379 -- claude)" "$(head -n "$((9 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": o lançamento usa as mesmas portas"
+assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_docs_opts[@]}" --forward-port 54320 --forward-port 6379 -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": a verificação usa --forward-port 54320 --forward-port 6379"
+assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_docs_opts[@]}" --forward-port 54320 --forward-port 6379 -- claude)" "$(head -n "$((${#jail_base_opts[@]} + 7 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_FORWARD_PORTS \"54320 6379\": o lançamento usa as mesmas portas"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "" "54320 6379")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"54320 6379\": o claude recebe o argv de sempre, mais o aviso com as portas"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "(54320, 6379)" "JAIL_FORWARD_PORTS \"54320 6379\": o aviso ao agente cita as portas"
 jail_dir="$TEST_TMP/jail_ports_invalid"
@@ -2711,8 +2725,8 @@ jail_dir="$TEST_TMP/jail_allow_hosts"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -vE '^(JIRA_ENABLED|JAIL_ALLOW_HOSTS)=')"$'\n''JAIL_ENABLED="true"'$'\n''JIRA_ENABLED="true"'$'\n''JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 jail_allow_opts=(--allow-host mcp.atlassian.com --allow-host docs.djangoproject.com --allow-host tailwindcss.com "${jail_docs_opts[@]}")
 assert_eq "0" "$jail_rc" "JAIL_ALLOW_HOSTS com Jira: main() termina com código 0"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_allow_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: a verificação libera o MCP, os hosts da chave e a documentação do Claude, nessa ordem"
-assert_eq "$(printf '%s\n' --no-save-config --no-status-bar --terminal-passthrough "${jail_allow_opts[@]}" -- claude)" "$(head -n "$((${#jail_allow_opts[@]} + 5))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: o lançamento usa os mesmos hosts"
+assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_allow_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: a verificação libera o MCP, os hosts da chave e a documentação do Claude, nessa ordem"
+assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_allow_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + ${#jail_allow_opts[@]} + 3))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: o lançamento usa os mesmos hosts"
 assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "mcp.atlassian.com docs.djangoproject.com tailwindcss.com")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS com Jira: o aviso ao agente lista o MCP e os hosts da chave"
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "e também: mcp.atlassian.com, docs.djangoproject.com, tailwindcss.com" "JAIL_ALLOW_HOSTS com Jira: o aviso cita os hosts liberados"
 jail_dir="$TEST_TMP/jail_allow_hosts_bad"
@@ -2877,6 +2891,20 @@ assert_not_exists "$jail_dir/claude/argv" "projects/alpha.conf com ai-jail ausen
 assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "projects/alpha.conf com ai-jail ausente: parou antes do menu principal"
 
 echo
+echo "== main(): JAIL_ENABLED=\"true\" com ai-jail fora da versão suportada — para antes do menu, sem log e sem claude =="
+jail_dir="$TEST_TMP/jail_old_version"
+jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "export FAKE_JAIL_VERSION=2.14.0; exec 2>'$jail_dir/err'")")"
+jail_err="$(cat "$jail_dir/err" 2>/dev/null || true)"
+assert_eq "1" "$jail_rc" "ai-jail 2.14.0: main() termina com código 1"
+assert_eq "0" "$(jail_calls "$jail_dir")" "ai-jail 2.14.0: nem a verificação nem o lançamento rodam"
+assert_not_exists "$jail_dir/logs" "ai-jail 2.14.0: nenhum log é criado"
+assert_not_exists "$jail_dir/claude/argv" "ai-jail 2.14.0: o claude não é chamado"
+assert_contains "$jail_err" "versão do ai-jail não suportada: encontrada 2.14.0; suportada: 3.2.0 ou mais nova da série 3.x." "ai-jail 2.14.0: o stderr diz a versão encontrada e a suportada"
+assert_contains "$jail_err" "  1. atualize o ai-jail" "ai-jail 2.14.0: a saída 1 manda atualizar"
+assert_contains "$jail_err" "[atualizar] ai-jail 2.14.0" "ai-jail 2.14.0: os requisitos mostram [atualizar]"
+assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "ai-jail 2.14.0: parou antes do menu principal"
+
+echo
 echo "== main --requisitos-jail: mostra os requisitos e sai com 0, sem carregar configuração =="
 for jail_variant in sem_config com_jail_true; do
   jail_dir="$TEST_TMP/jail_requirements_$jail_variant"
@@ -2891,6 +2919,8 @@ for jail_variant in sem_config com_jail_true; do
   assert_eq "0" "$jail_rc" "--requisitos-jail ($jail_variant): termina com código 0"
   assert_contains "$jail_output" "Requisitos da jail" "--requisitos-jail ($jail_variant): a lista sai no stdout"
   assert_contains "$jail_output" "ai-jail" "--requisitos-jail ($jail_variant): a lista cita o ai-jail"
+  assert_contains "$jail_output" "[ok]    ai-jail 3.2.0" "--requisitos-jail ($jail_variant): mostra a versão instalada do ai-jail"
+  assert_contains "$jail_output" "Versão suportada do ai-jail: 3.2.0 ou mais nova da série 3.x." "--requisitos-jail ($jail_variant): mostra a versão suportada"
   assert_not_contains "$jail_output" "carregada de" "--requisitos-jail ($jail_variant): não carrega configuração"
   assert_eq "" "$(cat "$jail_dir/err" 2>/dev/null || true)" "--requisitos-jail ($jail_variant): nada no stderr (nenhum aviso de configuração)"
   assert_not_exists "$jail_dir/logs" "--requisitos-jail ($jail_variant): nenhum log é criado"

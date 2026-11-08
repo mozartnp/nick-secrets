@@ -23,8 +23,8 @@
 # lives there, under ai-jail's own trust rules.
 #
 # Rules (see ABOUT.md, "Código compartilhado entre ferramentas (lib/)"):
-#   - loading it only assigns JAIL_BIN, JAIL_OS_RELEASE_FILE, JAIL_HOSTS_FILE and JAIL_LANDLOCK
-#     and defines functions: it prints nothing and runs no command but the builtins (cd, pwd)
+#   - loading it only assigns JAIL_BIN, JAIL_VERSION_MIN, JAIL_OS_RELEASE_FILE, JAIL_HOSTS_FILE
+#     and JAIL_LANDLOCK and defines functions: it prints nothing and runs no command but the builtins (cd, pwd)
 #     that make JAIL_HOSTS_FILE absolute, as lib/claude/claude.sh does for its rules file;
 #   - no shebang and no executable bit; no set -euo pipefail of its own, but it works with
 #     or without it in the caller;
@@ -41,6 +41,12 @@
 # The ai-jail command, looked up in the PATH. A variable only so the tests can point it at a
 # name that doesn't exist (the "ai-jail missing" case), whatever the machine running them has.
 JAIL_BIN="ai-jail"
+# The oldest ai-jail the nick supports; the newest is any later one of the same major series
+# (3.x: >= 3.2.0 and < 4.0.0). The options of jail_options were checked against 3.2.0 only, and
+# the approval screen that made the nick adopt them came with a major release, so a new major
+# needs a new check (ABOUT.md). The single source of the number: jail_check, the messages and
+# the README test all read it from here.
+JAIL_VERSION_MIN="3.2.0"
 # Where jail_print_requirements reads the Linux distribution from (overridden by the tests).
 JAIL_OS_RELEASE_FILE="/etc/os-release"
 # The nick's own list of hosts always released in the jail's network (jail_nick_hosts): a text
@@ -122,6 +128,68 @@ jail_landlock_state() {
   fi
 }
 
+# jail_version_of <output>: prints (one line) the X.Y.Z version in <output>, the stdout of
+# 'ai-jail --version' ("ai-jail 3.2.0", one trailing line break allowed), or an empty line when
+# it isn't exactly that: another text, more lines, control characters, a part that isn't a
+# number, a leading zero ("03"), more than 9 digits or a suffix ("-rc1"). Pure: never runs
+# ai-jail.
+jail_version_of() {
+  local text="${1%$'\n'}" version major minor patch rest part
+  case "$text" in
+    "ai-jail "*) version="${text#ai-jail }" ;;
+    *) echo; return 0 ;;
+  esac
+  case "$version" in
+    *[!0-9.]* | *.*.*.*) echo; return 0 ;;
+    *.*.*) ;;
+    *) echo; return 0 ;;
+  esac
+  major="${version%%.*}"
+  rest="${version#*.}"
+  minor="${rest%%.*}"
+  patch="${rest#*.}"
+  for part in "$major" "$minor" "$patch"; do
+    case "$part" in
+      "" | 0?* | ??????????*) echo; return 0 ;;
+    esac
+  done
+  echo "$version"
+}
+
+# jail_version_supported <output>: returns 0 when the version in <output> (jail_version_of) is
+# in the supported range — JAIL_VERSION_MIN or later, in the same major series (numeric
+# comparison: 3.10.0 is newer than 3.2.0) — and 1 otherwise, an unreadable version included.
+jail_version_supported() {
+  local version major minor patch rest min_major min_minor min_patch
+  version="$(jail_version_of "$1")"
+  [ -n "$version" ] || return 1
+  major="${version%%.*}"
+  rest="${version#*.}"
+  minor="${rest%%.*}"
+  patch="${rest#*.}"
+  min_major="${JAIL_VERSION_MIN%%.*}"
+  rest="${JAIL_VERSION_MIN#*.}"
+  min_minor="${rest%%.*}"
+  min_patch="${rest#*.}"
+  if [ "$major" -ne "$min_major" ]; then
+    return 1
+  fi
+  if [ "$minor" -gt "$min_minor" ]; then
+    return 0
+  fi
+  if [ "$minor" -eq "$min_minor" ] && [ "$patch" -ge "$min_patch" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# jail_version_output: runs '$JAIL_BIN --version' and prints its stdout (stderr dropped),
+# returning its exit code. The one place both jail_check and jail_print_requirements ask
+# ai-jail for its version; cheap, outside any sandbox, writes nothing.
+jail_version_output() {
+  "$JAIL_BIN" --version 2>/dev/null
+}
+
 # jail_toolchain_dirs: prints (stdout, one per line, absolute) the version-manager directories
 # of the home that exist on this machine, in the order of the list below. The jail's home is
 # private, so without them a project's virtualenv or node_modules/.bin, whose interpreter
@@ -200,7 +268,25 @@ jail_host_valid() {
 #     cwd holding the whole argv — the agent's prompt included — and a bare 'ai-jail' there
 #     would replay it; it only stops that write, the project's .ai-jail is still read;
 #   - --no-status-bar: ai-jail's status bar shows the command line (the prompt again) and
-#     draws over the bottom rows of claude's interface, garbling the terminal.
+#     draws over the bottom rows of claude's interface, garbling the terminal;
+#   - --clean: ignores the project profile saved by ai-jail's approval screen
+#     (~/.config/ai-jail/projects/), and so the screen itself, which ai-jail 3.x opens on the
+#     first run of a known harness ("claude") in a terminal and whose suggested preset opens
+#     the GitHub token; the command line alone decides. The global config.toml still applies;
+#   - --agent-state: claude's login and state (~/.claude, ~/.claude.json), released by the nick
+#     instead of by the screen;
+#   - --toolchains: ai-jail's dependency tools (the screen's "Dependency tools"): its own
+#     writable caches (~/.local/share/ai-jail/cache on the host, seen as ~/.cache, ~/.npm,
+#     ~/.cargo/registry...) — persistent and shared by every project and session, so one
+#     project's agent can leave a tampered package there for another (risk accepted, in the
+#     README and ABOUT.md) — and, read-only, toolchains such as ~/.cargo/bin and ~/.rustup; the
+#     home's version managers still come in as --map, below;
+#   - --no-github --no-ssh --no-aws --no-kube --no-gcloud --no-docker-config --no-docker
+#     --no-inherit-env: close, explicitly, the host credentials and authorities that a global
+#     config.toml could open — the GitHub token, SSH and its agent, AWS, kube, gcloud, the
+#     Docker config, the Docker socket (root on the host) and the whole environment (which
+#     would carry a GH_TOKEN from the shell in). Not --no-network: with --allow-host it drops
+#     ai-jail's default host list, the Claude API included.
 # Then, by level:
 #   - "restrito": nothing else — ai-jail filters what the agent writes to the terminal, and
 #     the filter blocks claude's copy (OSC 52);
@@ -226,6 +312,8 @@ jail_host_valid() {
 jail_options() {
   local host_list host dir port_list port browsers
   printf '%s\n' --no-save-config --no-status-bar
+  printf '%s\n' --clean --agent-state --toolchains --no-github --no-ssh --no-aws --no-kube \
+    --no-gcloud --no-docker-config --no-docker --no-inherit-env
   case "$1" in
     restrito) ;;
     brando) printf '%s\n' --terminal-passthrough --display ;;
@@ -253,8 +341,10 @@ jail_options() {
 # only with the jail on. Without it, an agent that hits something the jail hides (a toolchain,
 # a home dir, a localhost service, a host) spends tokens diagnosing the machine and reaches
 # wrong conclusions ("~/.pyenv was removed"). It lists what is visible (the mounted
-# toolchains, with ~ for the home), the extra hosts and the localhost ports, and says what to
-# do instead: stop and tell the user. In PT-BR, like the prompts.
+# toolchains, with ~ for the home), the extra hosts and the localhost ports, says that the
+# GitHub token and SSH are not there (jail_options closes them: local git works, gh and push
+# are the user's, outside the jail) and says what to do instead: stop and tell the user. In
+# PT-BR, like the prompts.
 jail_agent_notice() {
   local home="${HOME:-}" dir toolchains="" host_list hosts="" port_list ports="" localhost
   local playwright="" docs
@@ -288,9 +378,9 @@ jail_agent_notice() {
   echo "Ambiente: você está rodando dentro do sandbox ai-jail, ligado pelo nick (JAIL_ENABLED=\"true\" na configuração do projeto). O que muda:"
   echo "- só o diretório do projeto aceita escrita; o resto do sistema é somente leitura;"
   if [ -n "$toolchains" ]; then
-    echo "- o home é privado: fora do projeto, por padrão só aparece o que a jail monta (o estado do claude, a configuração do git e os gerenciadores de versão desta máquina ($toolchains), somente leitura); outros diretórios do home (~/.ssh, ~/.config, ~/.local etc.) não existem aqui, mesmo existindo na máquina;"
+    echo "- o home é privado: fora do projeto, por padrão só aparece o que a jail monta (o estado do claude, a configuração do git e os gerenciadores de versão desta máquina ($toolchains), somente leitura, além do que o próprio ai-jail monta pras ferramentas de dependência: caches de dependência graváveis (~/.cache, ~/.npm, ~/.cargo/registry e afins) e, somente leitura, toolchains como ~/.cargo/bin e ~/.rustup, quando existem na máquina); os outros diretórios do home (~/.ssh, ~/.config etc.) não existem aqui, mesmo existindo na máquina;"
   else
-    echo "- o home é privado: fora do projeto, por padrão só aparece o que a jail monta (o estado do claude e a configuração do git); outros diretórios do home (~/.ssh, ~/.config, ~/.local etc.) não existem aqui, mesmo existindo na máquina;"
+    echo "- o home é privado: fora do projeto, por padrão só aparece o que a jail monta (o estado do claude, a configuração do git e o que o próprio ai-jail monta pras ferramentas de dependência: caches de dependência graváveis (~/.cache, ~/.npm, ~/.cargo/registry e afins) e, somente leitura, toolchains como ~/.cargo/bin e ~/.rustup, quando existem na máquina); os outros diretórios do home (~/.ssh, ~/.config etc.) não existem aqui, mesmo existindo na máquina;"
   fi
   if [ -n "$hosts" ]; then
     echo "- por padrão, a rede só alcança a API do Claude, os registries de pacotes e o GitHub$docs, e também: $hosts; $localhost;"
@@ -301,6 +391,7 @@ jail_agent_notice() {
   if [ -n "$playwright" ]; then
     echo "$playwright"
   fi
+  echo "- o token do GitHub e o SSH (chaves e agente) desta máquina não estão disponíveis aqui: o git local (status, diff, log, commit) funciona, e o fetch de repositório público também, mas o que exige a conta do GitHub (gh, git push, PR, fetch de repositório privado) falha por falta de credencial (o git pede usuário e senha, que não existem aqui, e pode ficar esperando a resposta) e fica com o usuário, fora da jail — não tente configurar credencial nem responder ao pedido; peça a ele;"
   echo "- você não consegue ver nem conferir nada fora da jail."
   echo "Se algo falhar por arquivo, diretório, interpretador, ferramenta, serviço ou host ausente ou bloqueado, a primeira hipótese é a jail, não a máquina: não conclua que algo foi removido ou está quebrado e não gaste tempo investigando o sistema. Pare e avise o usuário com o caminho, serviço ou host exato, dizendo que pode ser uma limitação da jail do nick."
 }
@@ -331,13 +422,17 @@ jail_exec() {
 # the same way, first) and <ports> that aren't space-separated numbers from 1 to 65535
 # without leading zeros nor repeats (a typo must never open another host or port nor reach
 # ai-jail as an option), then checks that the jail works on this
-# machine by running '$JAIL_BIN <jail_options of clipboard, hosts and ports> -- true' — the
+# machine: after command -v, it asks for the version ('$JAIL_BIN --version', stdout only) and
+# stops when it is outside the supported range (jail_version_supported) or unreadable, before
+# running anything in a sandbox; then it runs
+# '$JAIL_BIN <jail_options of clipboard, hosts and ports> -- true' — the
 # launch's own options, so an ai-jail that doesn't accept them fails here, before the launch —
 # with the cwd in a fresh temporary directory (a second guard: no .ai-jail ever lands in the
 # target project), and removes the directory afterwards, on success and on failure. Returns 0
 # quietly when the check passes; otherwise prints the error on stderr and returns 1:
 # jail_print_clipboard_error, jail_print_hosts_error or jail_print_ports_error for the value,
-# jail_print_check_error for a missing ai-jail, a failing mktemp or a non-zero check (missing
+# jail_print_check_error for a missing ai-jail, an unsupported version (way out: update it), a
+# failing mktemp or a non-zero check (missing
 # bwrap, blocked user namespaces and unsupported systems all end up there, with ai-jail's
 # output in the message).
 # There is no fallback: "true" never runs without the jail. Callers run it before || (it stops
@@ -345,7 +440,8 @@ jail_exec() {
 # before ||, set -e is off in here: every command that can fail is checked explicitly.
 jail_check() {
   local enabled="$1" clipboard="$2" hosts="$3" ports="$4" conf_path="$5" shared="$6" options
-  local tmp_dir output failed=0 port_list port seen=" " bad host_list host
+  local tmp_dir output failed=0 port_list port seen=" " bad host_list host version_output version
+  local version_rc
   JAIL_LANDLOCK=""
   [ "$enabled" = "true" ] || return 0
   case "$clipboard" in
@@ -387,6 +483,22 @@ jail_check() {
   mapfile -t options < <(jail_options "$clipboard" "$hosts" "$ports")
   if ! command -v "$JAIL_BIN" >/dev/null 2>&1; then
     jail_print_check_error "$conf_path" "$shared" "ai-jail não encontrado no PATH."
+    return 1
+  fi
+  version_rc=0
+  version_output="$(jail_version_output)" || version_rc=$?
+  if [ "$version_rc" -ne 0 ] || ! jail_version_supported "$version_output"; then
+    version="$(jail_version_of "$version_output")"
+    if [ "$version_rc" -ne 0 ]; then
+      version="não identificada (\"ai-jail --version\" falhou com código $version_rc)"
+    elif [ -n "$version" ]; then
+      version="encontrada $version"
+    elif [ -n "$version_output" ]; then
+      version="não identificada (saída de \"ai-jail --version\": \"${version_output//[[:cntrl:]]/?}\")"
+    else
+      version="não identificada (\"ai-jail --version\" não respondeu)"
+    fi
+    jail_print_check_error "$conf_path" "$shared" "versão do ai-jail não suportada: $version; suportada: $JAIL_VERSION_MIN ou mais nova da série ${JAIL_VERSION_MIN%%.*}.x." "" "atualize o ai-jail para uma versão suportada (comando na lista abaixo);"
     return 1
   fi
   if ! tmp_dir="$(mktemp -d 2>/dev/null)"; then
@@ -442,9 +554,11 @@ jail_print_hosts_error() {
   } >&2
 }
 
-# jail_print_check_error <conf_path> <shared> <reason> [output]: the single error text of
-# jail_check, on stderr: the config file that turned the jail on, the reason (or, when <reason>
-# is empty, ai-jail's captured output), the two ways out, a warning when <shared> is "true"
+# jail_print_check_error <conf_path> <shared> <reason> [output] [way_out]: the single error
+# text of jail_check, on stderr: the config file that turned the jail on, the reason (or, when
+# <reason> is empty, ai-jail's captured output), the two ways out — the first replaced by
+# [way_out] when it is given (an unsupported version: update ai-jail; without it, the text is
+# the same as before [way_out] existed) — a warning when <shared> is "true"
 # (the file is shared with the target team, so turning the jail off there affects everyone once
 # committed) and, last, the requirements list. With ai-jail's output, the first way out is
 # fixing the problem shown: ai-jail and bwrap may both be installed (blocked user namespaces, a
@@ -453,7 +567,7 @@ jail_print_hosts_error() {
 # line breaks ([:cntrl:], not [:print:], which under the C locale would also mangle the bytes
 # of "não").
 jail_print_check_error() {
-  local conf_path="${1//[[:cntrl:]]/?}" shared="$2" reason="$3" output="${4:-}" line
+  local conf_path="${1//[[:cntrl:]]/?}" shared="$2" reason="$3" output="${4:-}" way_out="${5:-}" line
   {
     echo "Erro: JAIL_ENABLED=\"true\" em $conf_path, mas a jail (ai-jail) não funciona nesta máquina."
     if [ -n "$reason" ]; then
@@ -467,7 +581,9 @@ jail_print_check_error() {
       echo "  A verificação com o ai-jail falhou, sem nenhuma saída."
     fi
     echo "Para continuar, escolha uma das saídas:"
-    if [ -n "$reason" ]; then
+    if [ -n "$way_out" ]; then
+      echo "  1. $way_out"
+    elif [ -n "$reason" ]; then
       echo "  1. instale o que falta (lista abaixo);"
     else
       echo "  1. corrija o problema acima (veja \"Problemas comuns\" na seção \"Sandbox (ai-jail)\""
@@ -504,14 +620,18 @@ jail_os_release_ids() {
 }
 
 # jail_print_requirements: prints (stdout) what the jail needs on this machine — ai-jail and,
-# on Linux, bwrap (bubblewrap) — each as [ok] or [falta] (command -v only), and the install
-# command of the detected platform for each missing one. The platform comes from uname -s
+# on Linux, bwrap (bubblewrap) — each as [ok] or [falta] (command -v), and the install
+# command of the detected platform for each missing one. An ai-jail in the PATH is also asked
+# its version (jail_version_output, cheap and outside any sandbox): "[ok]    ai-jail <X.Y.Z>"
+# in the supported range, "[atualizar] ai-jail <X.Y.Z or versão não identificada>  →  <update
+# command>" otherwise (the install command, but brew upgrade on macOS). A line with the
+# supported range (JAIL_VERSION_MIN) always follows. The platform comes from uname -s
 # and, on Linux, from the ID/ID_LIKE of JAIL_OS_RELEASE_FILE. This is the single source of
 # "what to install and how": jail_check's error ends with it, each tool exposes it through a
 # flag, and the README repeats the commands (a test checks they match). It only shows the
 # commands — it never runs an installer, never downloads anything.
 jail_print_requirements() {
-  local system ids label jail_cmd bwrap_cmd="" linux=0
+  local system ids label jail_cmd upgrade_cmd="" bwrap_cmd="" linux=0 version_output version
   system="$(uname -s 2>/dev/null || true)"
   case "$system" in
     Linux)
@@ -541,6 +661,7 @@ jail_print_requirements() {
     Darwin)
       label="macOS"
       jail_cmd="brew tap akitaonrails/tap && brew install ai-jail"
+      upgrade_cmd="brew upgrade ai-jail"
       ;;
     *)
       label="outro sistema (${system:-desconhecido})"
@@ -549,7 +670,15 @@ jail_print_requirements() {
   esac
   echo "Requisitos da jail (JAIL_ENABLED=\"true\") — sistema detectado: $label"
   if command -v "$JAIL_BIN" >/dev/null 2>&1; then
-    echo "  [ok]    ai-jail"
+    if ! version_output="$(jail_version_output)"; then
+      version_output=""
+    fi
+    version="$(jail_version_of "$version_output")"
+    if jail_version_supported "$version_output"; then
+      echo "  [ok]    ai-jail $version"
+    else
+      echo "  [atualizar] ai-jail ${version:-(versão não identificada)}  →  ${upgrade_cmd:-$jail_cmd}"
+    fi
   else
     echo "  [falta] ai-jail  →  $jail_cmd"
   fi
@@ -560,6 +689,7 @@ jail_print_requirements() {
       echo "  [falta] bwrap (bubblewrap)  →  $bwrap_cmd"
     fi
   fi
+  echo "Versão suportada do ai-jail: $JAIL_VERSION_MIN ou mais nova da série ${JAIL_VERSION_MIN%%.*}.x."
   echo "O nick não instala nada: rode os comandos acima você mesmo."
   if [ "$linux" -eq 1 ]; then
     echo "Ubuntu 24.04+ e Debian 13+ podem bloquear user namespaces sem privilégio (AppArmor): veja os problemas comuns na seção \"Sandbox (ai-jail)\" do README."

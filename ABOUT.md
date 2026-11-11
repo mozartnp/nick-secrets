@@ -49,12 +49,14 @@ O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
   suprimir com `# shellcheck disable=SCxxxx` acompanhado do porquê, como já feito no
   `SC2016` da linha do `envsubst` em `main()`.
 - Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
-  morde) só numa cópia descartável **fora do repositório**, com só `auto_scrum.sh`,
-  `templates/`, `tests/`, o `lib/` irmão e o `README.md` da raiz (lido pelo teste README ×
-  helper de `lib/tests/test_jail.sh`), na mesma estrutura relativa (sem copiar
-  `projects/` nem `logs/`, que têm dados reais), e
-  com o cwd dentro dessa cópia ao rodar a suíte. No fim, apagar a cópia e conferir com
-  `git status --short --ignored` que nada mudou no repositório.
+  morde) só numa cópia descartável **fora do repositório**, com só (caminhos a partir da
+  raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/templates/`,
+  `auto_scrum/tests/`, `lib/`, `README.md` (lido pelo teste README × helper de
+  `lib/tests/test_jail.sh`) e `.gitignore` (lido pelos testes de `.gitignore` de
+  `auto_scrum/tests/test_auto_scrum.sh`), na mesma estrutura (sem copiar
+  `auto_scrum/projects/` nem `auto_scrum/logs/`, que têm dados reais), com um `git init` na
+  cópia e o cwd dentro dela ao rodar a suíte (ou o `make test`). No fim, apagar a cópia e
+  conferir com `git status --short --ignored` que nada mudou no repositório.
 
 **Por quê:** essas regras evitam as três classes de bug mais comuns em bash —
 variável não citada que quebra com espaço/glob, variável de função vazando pro
@@ -64,7 +66,61 @@ escopo global, e falha de comando ignorada silenciosamente por causa do
 temporários), e a configuração da raiz (`.nick/nick.conf`, ou o `.nick.conf` de antes do
 ticket 24 num clone ainda não migrado) e a `.nick/` inteira são gitignoradas, sem cópia: uma
 sabotagem que escreve arquivo, rodada da raiz do repositório, zera ou cria arquivos reais —
-já aconteceu na validação do ticket 5, com o `.nick.conf` do usuário.
+já aconteceu na validação do ticket 5, com o `.nick.conf` do usuário. O `.gitignore` e o
+`git init` entram na cópia porque os testes de `.gitignore` da `test_auto_scrum.sh` (ticket 24)
+usam `git check-ignore` contra o `.gitignore` da raiz: sem os dois, eles dão FAIL falso, e a
+suíte acusaria falha sem relação com a sabotagem (aconteceu na validação do ticket 25).
+
+## Testes: `make test` e `tests/run_all.sh`
+
+`make test` na raiz roda todas as suítes do repositório. A lógica fica em `tests/run_all.sh`,
+e o `Makefile` só o chama. As regras:
+
+- **Descoberta por padrão de nome:** é suíte todo `test_*.sh` **direto** num diretório chamado
+  `tests` (sem descer em subdiretórios dele), fora de diretórios ocultos (`.git/`, `.nick/`,
+  `.claude/`, inclusive um `tests/` lá dentro). Não há lista de suítes nem de exclusões: uma
+  suíte nova entra só por ter esse nome nesse lugar, sem mexer no `Makefile` nem no runner, e
+  um helper como `lib/tests/assert.sh` fica de fora por não casar com o padrão. O runner usa
+  `find -prune` pros ocultos e, dentro de cada `tests/`, um glob `test_*.sh` com `[ -f ]`. Não
+  usa `find -path '*/tests/test_*.sh'`: o `*` do `-path` casa `/`, e `tests/test_dir/x.sh`
+  entraria. A ordem é a do `LC_ALL=C sort -z`, a mesma em qualquer máquina, e os caminhos
+  aparecem relativos à raiz (`./lib/tests/test_config.sh`).
+- **Uma de cada vez, com o cwd na raiz:** as suítes usam o `LOGS_DIR`, o `PROJECTS_DIR` e o cwd
+  reais (ver a regra da sabotagem em "Qualidade de código bash"), então não podem rodar em
+  paralelo nem de outro diretório. O runner dá `cd` na raiz (achada pelo `BASH_SOURCE`), então
+  `bash <raiz>/tests/run_all.sh` funciona de qualquer cwd. Cada suíte roda com `bash <suíte>`
+  (não `./`, que exigiria bit de execução) e herda o stdin, como rodada à mão.
+- **Nenhuma parada na primeira falha:** todas rodam, e o resumo no fim lista o caminho (e o
+  código) de cada uma que falhou, pra mostrar tudo de uma vez. Qualquer código ≠ 0 é falha,
+  inclusive o de uma suíte que morreu no meio. Com falha, o runner sai com 1, e o `make` sai
+  com 2 (`make: *** [Makefile:N: test] Error 1`).
+- **Nenhuma suíte achada é falha**, com a mensagem no stderr, e o mesmo vale pra uma busca
+  incompleta (o `find` saiu com erro, ex: diretório ilegível): aí nenhuma suíte roda. Sem isso,
+  uma descoberta quebrada (diretório renomeado, permissão) diria que passou sem rodar tudo. O
+  código de saída do `find` sai de `wait "$!"` depois do `mapfile ... < <(find_suites)`, já
+  que o `set -e` não enxerga falha dentro de uma process substitution.
+- **Script bash e `Makefile` fino:** numa receita de `make` (que roda em `/bin/sh`, com `$$` e
+  `\`), o `shellcheck` não enxerga o código e as regras de "Qualidade de código bash" não
+  valem. No script elas valem sem exceção, ele tem a própria suíte e roda sem `make`. Fica em
+  `tests/` da raiz, o lugar dos testes do repositório como um todo; `lib/` é só pra
+  bibliotecas carregadas com `source`.
+- **`make` sem alvo roda o `test`** (`.DEFAULT_GOAL := test`): é o único alvo, rodar os testes
+  não grava nada no repositório (as suítes usam `mktemp`), e um alvo de ajuda seria uma lista
+  a manter à mão (o problema da seção "README genérico"). Quando entrar um segundo alvo (ex:
+  `shellcheck`), a escolha deve ser revista. `test` é `.PHONY`, pra um arquivo chamado `test`
+  na raiz não fazer o `make` achar o alvo em dia. O `.NOTPARALLEL:` é garantia explícita:
+  hoje a receita é uma só, e o `make -j4 test` já roda tudo em série, mas o alvo pode um dia
+  ser dividido em um por suíte.
+- **A suíte do runner (`tests/test_run_all.sh`) nunca roda o `make test` real:** seria
+  recursão, já que ela mesma é achada por ele. Cada caso monta, no `TEST_TMP`, um repositório
+  de mentira com cópias do `Makefile` e do `tests/run_all.sh` reais e suítes falsas de poucas
+  linhas, sem bit de execução, que gravam o próprio caminho num log. Todo `make` dos casos roda
+  com `env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL`: rodando dentro de um `make -j4 test`, a suíte
+  herdaria o `-j` e o jobserver, e o caso não mediria só o que ele mesmo passou (mesmo
+  racional do `env -u PLAYWRIGHT_BROWSERS_PATH` de `jail_expected_argv`). A serialidade do
+  `-j4` é provada com uma trava (`mkdir`) nas suítes falsas, e cada caso que prova uma exclusão
+  ou uma proteção tem controle positivo (rodados à mão, os arquivos excluídos gravam no log;
+  sem o `.PHONY`, o arquivo `test` impede o `make test`; em paralelo, a trava acusa).
 
 ## Menus: opção "Sair (q)"
 
@@ -1027,7 +1083,15 @@ nenhuma suíte define os seus.
 `lib/tests/test_config.sh`, `lib/tests/test_jail.sh` e `lib/tests/test_claude.sh`):
 - **só define ao ser carregada:** atribui as constantes, cria as globais vazias e define
   funções; não imprime nada e não roda comando. Sem shebang e sem bit de execução; a 1ª linha
-  é `# shellcheck shell=bash`, seguida do cabeçalho em inglês;
+  é `# shellcheck shell=bash`, seguida do cabeçalho em inglês. O teste de "carga limpa" de
+  cada suíte compara o `compgen -v` antes e depois do `source` e ignora as variáveis que o
+  próprio bash cria ou mexe entre os retratos (`clean_bash_vars`: `_`, `BASH_*`, `COLUMNS`,
+  `LINES`, `FUNCNAME`, `LINENO`, `PIPESTATUS`). `COLUMNS` e `LINES` entraram no ticket 25: num
+  terminal com tamanho, o bash as preenche (`checkwinsize`, ligado por padrão no bash 5)
+  depois de cada comando externo, como o `sort` do 1º retrato, e as três suítes de `lib/tests/`
+  falhavam quando rodadas com a saída num terminal (com a saída num arquivo, passavam). Um caso
+  em cada suíte repete o retrato num pseudo-terminal 80x24 (`script`, pulado se não houver),
+  pra o `make test` sem terminal também pegar uma volta do problema;
 - não ativa `set -euo pipefail` (é de quem a carrega), mas funciona com ou sem ele no chamador;
 - **prefixo por biblioteca:** toda função `config_` e toda global `CONFIG_` em
   `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail/jail.sh`; toda função
@@ -1096,10 +1160,13 @@ segunda ferramenta existir". O ticket 23 reviu isso: o 13 introduz `JAIL_ENABLED
 pro nick inteiro, e extrair antes dele custava só revisar aquele plano; depois, custaria
 refazer código e testes do 13.
 
-**Como rodar as suítes** (cada uma sai com código 1 se houver `FAIL`; não há runner único):
-`bash auto_scrum/tests/test_auto_scrum.sh`, `bash lib/tests/test_config.sh`,
-`bash lib/tests/test_jail.sh` e `bash lib/tests/test_claude.sh` (esta precisa de `jq` ou
-`python3` pra validar o JSON; sem nenhum dos dois, dá FAIL).
+**Como rodar as suítes:** `make test` na raiz (ou `bash tests/run_all.sh`, sem `make`) roda
+todas, uma de cada vez, e sai com código 0 só se todas passarem (ver seção "Testes: `make
+test` e `tests/run_all.sh`"). Cada suíte continua podendo rodar direto, da raiz, e sai com
+código 1 se houver `FAIL`: `bash auto_scrum/tests/test_auto_scrum.sh`,
+`bash lib/tests/test_config.sh`, `bash lib/tests/test_jail.sh`, `bash lib/tests/test_claude.sh`
+(esta precisa de `jq` ou `python3` pra validar o JSON; sem nenhum dos dois, dá FAIL) e
+`bash tests/test_run_all.sh`.
 
 ## Registro de chaves da configuração
 

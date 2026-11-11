@@ -463,3 +463,17 @@ outro ticket.
   risco descrito acima, ou leve o trecho por um arquivo do projeto ou pelo `/export` do
   `claude`.
 - **Windows:** só via WSL 2.
+
+## Testes
+
+Na raiz do repositório:
+
+```bash
+make test
+```
+
+Roda todas as suítes de teste, uma de cada vez, e sai com código 0 só se todas passarem; com
+falha, o resumo no fim lista as suítes que falharam. Uma suíte é qualquer `test_*.sh` direto
+num diretório `tests/` (fora de diretórios ocultos), então uma suíte nova entra sem mexer no
+`Makefile`. Sem `make`, o mesmo runner roda com `bash tests/run_all.sh`, e cada suíte também
+pode rodar sozinha, da raiz, com `bash <caminho da suíte>`.

@@ -118,8 +118,21 @@ clean_rc=0
 timeout 2 bash --norc --noprofile -c "compgen -v | sort > '$clean_dir/vars_before'; declare -F | sort > '$clean_dir/funcs_before'; source '$CONFIG_SH' > '$clean_dir/out' 2>&1; compgen -v | sort > '$clean_dir/vars_after'; declare -F | sort > '$clean_dir/funcs_after'" < /dev/null || clean_rc=$?
 assert_eq "0" "$clean_rc" "source lib/config.sh num bash limpo termina com código 0"
 assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/config.sh não imprime nada (stdout nem stderr)"
-clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE '_|BASH_.*|FUNCNAME|LINENO|PIPESTATUS' || true)"
+# Variáveis que o próprio bash cria ou mexe entre os retratos (não são da biblioteca).
+clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
+clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
 clean_new_funcs="$(comm -13 "$clean_dir/funcs_before" "$clean_dir/funcs_after" 2>/dev/null | sed 's/^declare -f //' || true)"
+# Num terminal com tamanho, o bash atualiza COLUMNS e LINES (checkwinsize) depois de cada comando
+# externo, como o sort do 1º retrato: elas apareceriam como novas sem a biblioteca criar nada.
+# O mesmo retrato, num pseudo-terminal 80x24 (script, do util-linux), dá as mesmas variáveis novas.
+if script -qec true /dev/null > /dev/null 2>&1; then
+  mkdir -p "$clean_dir/tty"
+  script -qec "stty cols 80 rows 24; timeout 2 bash --norc --noprofile -c \"compgen -v | sort > '$clean_dir/tty/vars_before'; source '$CONFIG_SH' > /dev/null 2>&1; compgen -v | sort > '$clean_dir/tty/vars_after'\"" /dev/null < /dev/null > /dev/null 2>&1 || true
+  clean_tty_new_vars="$(comm -13 "$clean_dir/tty/vars_before" "$clean_dir/tty/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
+  assert_eq "$clean_new_vars" "$clean_tty_new_vars" "num terminal 80x24: as mesmas variáveis novas (COLUMNS e LINES são do bash)"
+else
+  echo "  PULADO: sem o script do util-linux pra simular um terminal"
+fi
 assert_contains "$clean_new_vars" "CONFIG_KEYS" "source lib/config.sh cria CONFIG_KEYS"
 assert_eq "" "$(grep -vE '^CONFIG_' <<< "$clean_new_vars" || true)" "toda variável nova começa com CONFIG_"
 assert_eq "" "$(grep -vE '^config_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com config_"

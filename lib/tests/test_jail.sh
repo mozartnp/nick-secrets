@@ -202,8 +202,21 @@ clean_rc=0
 timeout 2 bash --norc --noprofile -c "compgen -v | sort > '$clean_dir/vars_before'; declare -F | sort > '$clean_dir/funcs_before'; source '$JAIL_SH' > '$clean_dir/out' 2>&1; compgen -v | sort > '$clean_dir/vars_after'; declare -F | sort > '$clean_dir/funcs_after'" < /dev/null || clean_rc=$?
 assert_eq "0" "$clean_rc" "source lib/jail/jail.sh num bash limpo termina com código 0"
 assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/jail/jail.sh não imprime nada (stdout nem stderr)"
-clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE '_|BASH_.*|FUNCNAME|LINENO|PIPESTATUS' || true)"
+# Variáveis que o próprio bash cria ou mexe entre os retratos (não são da biblioteca).
+clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
+clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
 clean_new_funcs="$(comm -13 "$clean_dir/funcs_before" "$clean_dir/funcs_after" 2>/dev/null | sed 's/^declare -f //' || true)"
+# Num terminal com tamanho, o bash atualiza COLUMNS e LINES (checkwinsize) depois de cada comando
+# externo, como o sort do 1º retrato: elas apareceriam como novas sem a biblioteca criar nada.
+# O mesmo retrato, num pseudo-terminal 80x24 (script, do util-linux), dá as mesmas variáveis novas.
+if script -qec true /dev/null > /dev/null 2>&1; then
+  mkdir -p "$clean_dir/tty"
+  script -qec "stty cols 80 rows 24; timeout 2 bash --norc --noprofile -c \"compgen -v | sort > '$clean_dir/tty/vars_before'; source '$JAIL_SH' > /dev/null 2>&1; compgen -v | sort > '$clean_dir/tty/vars_after'\"" /dev/null < /dev/null > /dev/null 2>&1 || true
+  clean_tty_new_vars="$(comm -13 "$clean_dir/tty/vars_before" "$clean_dir/tty/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
+  assert_eq "$clean_new_vars" "$clean_tty_new_vars" "num terminal 80x24: as mesmas variáveis novas (COLUMNS e LINES são do bash)"
+else
+  echo "  PULADO: sem o script do util-linux pra simular um terminal"
+fi
 assert_eq "JAIL_BIN"$'\n'"JAIL_HOSTS_FILE"$'\n'"JAIL_LANDLOCK"$'\n'"JAIL_OS_RELEASE_FILE"$'\n'"JAIL_VERSION_MIN" "$clean_new_vars" "as únicas variáveis novas são JAIL_BIN, JAIL_HOSTS_FILE, JAIL_LANDLOCK, JAIL_OS_RELEASE_FILE e JAIL_VERSION_MIN"
 assert_eq "" "$(grep -vE '^jail_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com jail_"
 for clean_func in jail_agent_notice jail_check jail_landlock_state jail_exec jail_options jail_playwright_browsers jail_print_requirements jail_print_status jail_toolchain_dirs jail_version_of jail_version_output jail_version_supported; do

@@ -3053,11 +3053,11 @@ assert_contains "$git_status" "?? .nick/docs/SC-1/plan.md" "git real: com !docs/
 assert_not_contains "$git_status" "troca" "git real: com !docs/ e !docs/**, troca/ continua ignorada"
 
 echo
-echo "== .gitignore do nick_secrets: .nick/ inteira ignorada, .nick.conf e docs/plans/* mantidos como proteção de legado =="
+echo "== .gitignore do nick_secrets: .nick/ inteira ignorada, .nick.conf mantido como proteção de legado =="
 # Só lê o .gitignore da raiz deste repositório (check-ignore não escreve nada). --no-index:
 # confere a regra mesmo pra caminho que não existe ou já é versionado.
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-for ignored_path in .nick/nick.conf .nick/.gitignore .nick/docs/1/plan.md .nick.conf docs/plans/x.md; do
+for ignored_path in .nick/nick.conf .nick/.gitignore .nick/docs/1/plan.md .nick.conf; do
   assert_eq "ignorado" "$(git_isolated -C "$REPO_ROOT" check-ignore -q --no-index "$ignored_path" 2>/dev/null && echo ignorado || echo 'não ignorado')" "nick_secrets/.gitignore ignora $ignored_path"
   # A regra tem de vir do .gitignore da raiz, e não de .git/info/exclude.
   ignored_source="$(git_isolated -C "$REPO_ROOT" check-ignore -v --no-index "$ignored_path" 2>/dev/null || true)"

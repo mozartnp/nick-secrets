@@ -2,9 +2,11 @@ auto_scrum/logs/*.md
 auto_scrum/projects/*
 !auto_scrum/projects/.gitkeep
 .nick/
-# Legado (antes do ticket 24): a configuração era .nick.conf e os planos ficavam em
-# docs/plans/. Mantidos para que esses arquivos locais, que podem ter dado de cliente, não
-# apareçam como "untracked" num clone já usado. Podem sair num ticket futuro.
+# Legado (antes do ticket 24): a configuração era .nick.conf. Mantido para que esse arquivo
+# local, que pode ter dado de cliente, não apareça como "untracked" num clone já usado. Pode
+# sair num ticket futuro.
 .nick.conf
-docs/plans/*
 .claude/settings.local.json
+.env
+# Saída de build do Cargo do protótipo do painel (NS-29).
+prototype/panel/target/

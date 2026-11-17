@@ -31,7 +31,10 @@ conteúdo voltado a ele, e trocar isso pra inglês só atrapalharia sem ganho re
 
 ## Qualidade de código bash
 
-O projeto é 100% bash. Regras a seguir em todo script novo ou alterado:
+As ferramentas e as bibliotecas do nick continuam em bash. A única exceção é o protótipo
+descartável do painel em Rust, em `prototype/panel/` (ver "Rust no projeto: protótipo do
+painel (NS-29)"). O launcher dele, `launch_session.sh`, também é bash e segue estas regras.
+Regras a seguir em todo script novo ou alterado:
 
 - `set -euo pipefail` no topo do **script**. Uma biblioteca em `lib/` (carregada com
   `source`) não tem: quem decide isso é o script que a carrega, e ela funciona com ou sem
@@ -884,13 +887,16 @@ específicos). `.nick/` também é listada, sem `/` inicial (vale em qualquer pr
 `--init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo versionável no
 repositório público). Como o git não entra numa pasta ignorada, o `.nick/.gitignore` interno
 (com `!nick.conf`) não tem efeito aqui: `.nick/nick.conf` continua ignorado neste repositório
-(um teste com `git check-ignore --no-index` cobra isso). **As linhas `.nick.conf` e
-`docs/plans/*` continuam, como proteção de legado** (o ticket 24 pedia removê-las; o plano
-ajustou o critério): este repositório, e qualquer clone já usado, ainda tem um `.nick.conf`
-real e planos antigos em `docs/plans/`, ignorados e nunca commitados. Tirar as duas linhas
-faria esses arquivos — com dado de cliente, num repositório público — aparecerem como
-"untracked" e virarem candidatos a um `git add .`. O custo de manter é zero; elas podem sair
-num ticket futuro. `.claude/settings.local.json` também é listado: são as
+(um teste com `git check-ignore --no-index` cobra isso). **A linha `.nick.conf` continua,
+como proteção de legado** (o ticket 24 pedia removê-la; o plano ajustou o critério): este
+repositório, e qualquer clone já usado, ainda tem um `.nick.conf` real, ignorado e nunca
+commitado. Tirar a linha faria esse arquivo — com dado de cliente, num repositório público —
+aparecer como "untracked" e virar candidato a um `git add .`. O custo de manter é zero; ela
+pode sair num ticket futuro. A linha `docs/plans/*` tinha o mesmo motivo e saiu no commit
+`3db87b5` (decisão do usuário: a pasta não é mais usada, e não existe mais na máquina dele);
+o teste do `.gitignore` foi ajustado no NS-29, com autorização do usuário, porque o
+`make test` tinha ficado vermelho. Quem ainda tiver planos antigos em `docs/plans/` num clone
+já usado precisa apagá-los ou movê-los antes de um `git add .`. `.claude/settings.local.json` também é listado: são as
 permissões que cada pessoa aprova no Claude Code ao trabalhar neste repositório, com caminhos
 absolutos da máquina dela; versionado, exporia esses caminhos e daria a quem clona regras de
 `allow` que ela não aprovou. Só esse arquivo: um `.claude/settings.json` de projeto, se um dia
@@ -1165,8 +1171,9 @@ todas, uma de cada vez, e sai com código 0 só se todas passarem (ver seção "
 test` e `tests/run_all.sh`"). Cada suíte continua podendo rodar direto, da raiz, e sai com
 código 1 se houver `FAIL`: `bash auto_scrum/tests/test_auto_scrum.sh`,
 `bash lib/tests/test_config.sh`, `bash lib/tests/test_jail.sh`, `bash lib/tests/test_claude.sh`
-(esta precisa de `jq` ou `python3` pra validar o JSON; sem nenhum dos dois, dá FAIL) e
-`bash tests/test_run_all.sh`.
+(esta precisa de `jq` ou `python3` pra validar o JSON; sem nenhum dos dois, dá FAIL),
+`bash tests/test_run_all.sh` e `bash prototype/panel/tests/test_launch_session.sh` (o launcher
+do protótipo do painel; ver "Rust no projeto: protótipo do painel (NS-29)").
 
 ## Registro de chaves da configuração
 
@@ -1986,3 +1993,120 @@ lógica de `STACK_DESCRIPTION`/`SENTRY_ENABLED` ficarem no arquivo de configura�
 projeto, só que aqui o "arquivo do projeto" nem é do `nick_secrets`, é o `.mcp.json` que já
 mora no repositório do projeto alvo. O MCP fica restrito ao PO porque é ali que a análise
 do pedido acontece; o Tech Leader trabalha em cima do texto já produzido.
+
+## Rust no projeto: protótipo do painel (NS-29)
+
+`prototype/panel/` é um **protótipo descartável** do épico NS-28 ("nick como programa"). O
+binário Rust `nick-panel` (ratatui + crossterm, portable-pty, vt100 + tui-term) mostra uma
+lista fixa de sessões fictícias e o terminal da sessão selecionada, com o `claude` real de cada
+sessão rodando ao mesmo tempo. Ele existe pra responder se um painel assim é usável com o
+`claude` dentro da ai-jail e com as regras do nick. **O código dele não é a base da casca
+futura.** A decisão de usar Rust na casca de verdade sai do relatório
+(`prototype/panel/README.md`, seção "Relatório").
+
+**A regra de linguagem:** as ferramentas e as bibliotecas do nick continuam em bash (seção
+"Qualidade de código bash"). O Rust entra só em `prototype/panel/`, isolado: nada de
+`auto_scrum/`, `lib/`, `tests/` da raiz nem do `Makefile` muda por causa dele. Se a casca em
+Rust for adiante, a regra é revista no ticket dela.
+
+**Lançamento só pelo `lib/`.** Cada sessão é um PTY com `bash prototype/panel/launch_session.sh`
+(o único comando que o painel lança; um teste estrutural em Rust olha os fontes de `src/`). O
+launcher é um script bash que carrega `lib/jail/jail.sh` e `lib/claude/claude.sh` e repete o
+caminho do `auto_scrum`: `jail_check` → `claude_settings_load` → `jail_print_status` →
+`jail_exec ... claude --settings <permissions.json> --append-system-prompt
+<jail_agent_notice>`, no modo de permissão padrão e sem prompt inicial. Os motivos:
+- **um launcher bash, e não Rust:** as opções do ai-jail, a leitura do `permissions.json` e o
+  aviso ao agente têm fonte única em `lib/`. Uma cópia em Rust divergiria na primeira mudança, e
+  o critério do ticket era "o mesmo caminho de lançamento do nick". Nada em `lib/` precisou
+  mudar: tudo entra por parâmetro;
+- **a jail é sempre ligada:** `jail_check "true"`, `jail_exec "true"` e `jail_print_status
+  "true"` são literais, e não há flag nem variável que a desligue (teste estrutural);
+- **sem `.nick/nick.conf`:** o launcher não carrega `lib/config.sh`. As sessões são dados
+  fictícios, e a configuração do projeto ficou fora do escopo. As opções da jail vêm do ambiente
+  do painel: `NICK_PANEL_CLIPBOARD` (nível do `JAIL_CLIPBOARD`), `NICK_PANEL_ALLOW_HOSTS` e
+  `NICK_PANEL_FORWARD_PORTS`. O prefixo é `NICK_` e não `CLAUDE_`, pelo motivo de
+  `lib/claude/` (o Claude Code lê `CLAUDE_*` do ambiente). No lugar do caminho da configuração,
+  as mensagens de erro do `jail_check` mostram o rótulo `prototype/panel (protótipo NS-29)`;
+- o cwd de todas as sessões é o cwd de onde o painel foi aberto (o projeto de trabalho), como no
+  `auto_scrum`. O launcher é achado por `CARGO_MANIFEST_DIR`, fixado na compilação: o protótipo
+  roda do checkout com `cargo run`.
+
+**Testes: o launcher no `make test`, o Rust fora.** A suíte bash
+`prototype/panel/tests/test_launch_session.sh` é achada sozinha pelo `tests/run_all.sh`. Ela
+confere o argv exato que o ai-jail falso recebe, calculado pela própria lib (`jail_options`,
+`jail_agent_notice`, `permissions.json`, com `env -u PLAYWRIGHT_BROWSERS_PATH` e `HOME` do caso,
+mesmo racional de `jail_expected_argv`), com controles de ai-jail ausente (`PATH` mínimo, com
+controle positivo), versão fora da faixa e nível inválido, além da estrutura e do
+`shellcheck -x`. O `cargo test` (unitários de `keys.rs`, `app.rs` e `ui.rs`, e o de integração
+`tests/pty_launch.rs`, que abre sessões em PTY pelo construtor real com os mesmos falsos de
+`prototype/panel/tests/fixtures/bin/`, e o `tests/panic_hook.rs`, que roda o binário num PTY e
+força um panic) **não** entra no `make test`. Assim o `make test` não
+passa a exigir o Rust instalado, e o protótipo é descartável. Ele roda à mão, junto com
+`cargo clippy -- -D warnings` e `cargo fmt --check` (README do protótipo).
+
+**`.gitignore`:** `prototype/panel/target/` (saída de build do Cargo). O `Cargo.lock` é
+versionado (binário).
+
+**Resultado (2026-11-12, revisto no review de 2026-11-17):** com o `claude` e o ai-jail reais
+(parte conferida pelo agente por PTY, parte pelo usuário), os itens 1–6 do roteiro
+funcionaram e o 8 funcionou com a ressalva do `kill -9` (terminal sujo). O item 7
+(copiar/colar) está pra refazer: a versão testada descartava o OSC 52 do `claude`, e o "ok"
+não separou os casos nem disse o terminal. O item 9 (uso real) está sem a duração e as
+impressões. A recomendação do relatório é **seguir com Rust e ratatui na casca**, desde que o
+item 7 confirme o copiar, começando do zero e levando os achados abaixo; a regra de linguagem
+é revista no ticket da casca.
+
+**Achados que valem para a casca futura** (detalhe no relatório):
+- o `tui-term` 0.3.4 só funciona com o `vt100` 0.16 (ele o reexporta). Uma casca que use os dois
+  segue a versão do `tui-term`, ou desenha o `vt100::Screen` à mão;
+- em raw mode, o `Ctrl+\` (0x1c) chega como tecla (o crossterm o entrega como `Ctrl+4`), sem
+  SIGQUIT. O Claude Code não usa esse atalho (documentação de keybindings), e por isso ele é o
+  atalho reservado pra sair do terminal da sessão; o `Ctrl+]` foi evitado;
+- com o `claude` e o ai-jail reais (2026-11-12, conferido pelo agente fora da jail, por PTY): o
+  `claude` sobe e responde dentro do painel; acento, `Esc`/`Ctrl+C` interrompendo uma resposta,
+  histórico, menu do `/`, `Shift+Tab`, troca de sessão e resize funcionam. `TERM`/`COLORTERM`
+  chegam dentro da jail apesar do `--no-inherit-env`. CPU do painel: 0% ocioso, abaixo de 1%
+  com resposta em andamento e durante resizes; o gasto é do próprio `claude`, igual dentro e
+  fora do painel;
+- achado da `lib/jail`, fora do escopo do NS-29: o `jail_agent_notice` diz que o `~/.config` não
+  existe dentro da jail, mas o próprio `claude` cria nele, ao subir, os manifests de native
+  messaging da extensão do Chrome (e há um `mimeapps.list`). Não é perfil real de navegador,
+  mas o agente estranhou. Vale um ticket pra ajustar o texto;
+- o terminal integrado do VS Code não repassa o `Ctrl+\`: o VS Code fica com a tecla, que é
+  atalho dele ("dividir editor"). Num terminal standalone, ela funciona (conferido pelo usuário).
+  Decisão do usuário: manter o `Ctrl+\` no protótipo, com a regra do `keybindings.json` que
+  manda o 0x1c (`workbench.action.terminal.sendSequence`, README do protótipo). A casca de
+  verdade precisa de um atalho reservado que funcione no VS Code sem configuração, porque é lá
+  que o usuário trabalha;
+- sem leitura contínua, o PTY de uma sessão escondida enche e trava o filho: toda sessão precisa
+  da sua thread leitora. Com um laço bloqueado num canal (entrada, sinais, saída e fim de cada
+  sessão), o painel ocioso não gasta CPU (0 tick em 5 s, com os falsos);
+- o encerramento é por grupo de processos (o filho do PTY é líder de sessão): SIGTERM, SIGKILL
+  depois de 2 s, e `wait`. Com o ai-jail real, o `bwrap` fica numa sessão e num grupo próprios,
+  então o sinal só chega ao `ai-jail`, e é ele que encerra o resto. Na conferência manual não
+  sobrou órfão em nenhum caso: `q`+`s`, `kill -TERM`, `kill -9` e fechar a janela. O `kill -9`
+  deixa o terminal sujo (tela alternativa e mouse ligados; `reset` resolve), como em qualquer
+  TUI. O `portable-pty` 0.9 não expõe `pre_exec`, então um `PR_SET_PDEATHSIG` exigiria abrir o
+  PTY por conta própria; não fez falta. Só os grupos de sessões ainda não colhidas recebem
+  sinal: depois do `wait`, o pid pode ir pra outro líder de grupo (um job do shell do
+  usuário);
+- um emulador embutido (`vt100`) não repassa sozinho o que não é tela. O OSC 52 (o copiar do
+  `claude`) chega a um callback e, com o padrão, é descartado: o painel o reescreve no
+  terminal de fora, só o copiar (a leitura do clipboard, `ESC]52;c;?`, é descartada). Que
+  pedidos chegam é decisão da jail (o `restrito` barra o OSC 52 antes do painel);
+- colar com bracketed paste: tirar só o `ESC[201~` do texto colado não basta (`ESC ESC[201~`
+  o forma de novo, e o resto chega como digitado). O painel descarta todo caractere de
+  controle menos tab e CR dentro dos colchetes, como o xterm;
+- o `vt100` 0.16 entra em panic com um caractere largo (emoji, CJK) numa tela de 1 coluna ou 1
+  linha. A tela de cada sessão (parser e PTY) tem de ter pelo menos 2x2, por menor que seja a
+  janela;
+- o panic hook vale pra qualquer thread e tem de terminar o processo (saída 101): senão, um
+  panic numa thread secundária restaura o terminal e mata as sessões, mas o laço principal
+  continua desenhando sobre o terminal restaurado.
+- **requisito da casca, pedido do usuário no uso do protótipo (2026-11-12):** o `nick` roda de
+  qualquer diretório e mostra todos os projetos (navegação Projeto > Ticket > Agente), e cada
+  sessão abre no diretório do próprio projeto. O cwd passa a ser por sessão, e não um só pro
+  painel: é ele que o ai-jail deixa gravável e que faz o `claude` carregar o `.mcp.json` e o
+  `CLAUDE.md` do projeto (mesmo racional de "auto_scrum roda com o cwd dentro do projeto
+  alvo"). O protótipo não faz isso, porque a navegação com dados reais estava fora do escopo do
+  NS-29. Fica em aberto de onde vêm a lista de projetos e os caminhos.

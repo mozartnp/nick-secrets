@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# claude falso dos testes do protótipo do painel (NS-29), usado pela suíte bash
+# (test_launch_session.sh) e pelo teste de integração Rust (pty_launch.rs). Sempre grava o
+# próprio argv (um argumento por linha) em $FAKE_CLAUDE_LOG, o env em $FAKE_CLAUDE_ENV e
+# acrescenta "claude" em $FAKE_ORDER_LOG (cada um só se definido). Depois, conforme
+# $FAKE_CLAUDE_MODE:
+#   (vazio)  imprime o marcador OK em vermelho (\e[31mOK\e[0m) e sai com 0;
+#   echo     põe o terminal em raw (como o claude real), imprime READY, lê
+#            $FAKE_CLAUDE_READ_BYTES bytes e imprime cada um em hexadecimal (GOT <hex>);
+#   winsize  imprime SIZE <linhas> <colunas> ao abrir e a cada SIGWINCH, até ser encerrado;
+#   flood    escreve ~1 MB e, no fim, o marcador FIM-DO-FLOOD, e sai com 0;
+#   sleep    deixa um sleep em segundo plano (mesmo grupo de processos, ignorando SIGHUP, pra
+#            sobreviver ao fim do líder), acrescenta "<pid> <pid do sleep>" em
+#            $FAKE_CLAUDE_PIDS, imprime READY e espera até ser encerrado;
+#   osc52    pede ao terminal pra copiar "olá" (OSC 52, como o claude ao copiar), imprime
+#            COPIADO e sai com 0.
+set -euo pipefail
+
+if [ -n "${FAKE_CLAUDE_LOG:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLAUDE_ENV:-}" ]; then
+  env > "$FAKE_CLAUDE_ENV"
+fi
+if [ -n "${FAKE_ORDER_LOG:-}" ]; then
+  echo "claude" >> "$FAKE_ORDER_LOG"
+fi
+
+case "${FAKE_CLAUDE_MODE:-}" in
+  echo)
+    stty raw -echo
+    printf 'READY\r\n'
+    got="$(dd bs=1 count="${FAKE_CLAUDE_READ_BYTES:-1}" 2> /dev/null | od -An -tx1 | tr -s ' \n' ' ')"
+    printf 'GOT%s\r\n' "$got"
+    sleep 0.5
+    ;;
+  winsize)
+    trap 'echo "SIZE $(stty size)"' WINCH
+    echo "SIZE $(stty size)"
+    while :; do
+      sleep 0.05
+    done
+    ;;
+  flood)
+    head -c 1048576 /dev/zero | tr '\0' 'x'
+    printf '\r\nFIM-DO-FLOOD\r\n'
+    ;;
+  sleep)
+    (trap "" HUP && exec sleep 300) &
+    printf '%s %s\n' "$$" "$!" >> "$FAKE_CLAUDE_PIDS"
+    echo READY
+    wait
+    ;;
+  osc52)
+    printf '\033]52;c;b2zDoQ==\a'
+    printf 'COPIADO\r\n'
+    ;;
+  *)
+    printf '\033[31mOK\033[0m\r\n'
+    ;;
+esac

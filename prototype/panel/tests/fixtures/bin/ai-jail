@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# ai-jail falso dos testes do protótipo do painel (NS-29), usado pela suíte bash
+# (test_launch_session.sh) e pelo teste de integração Rust (pty_launch.rs). Nunca abre sandbox.
+#   --version  → imprime "ai-jail ${FAKE_JAIL_VERSION:-3.2.0}" e sai com 0;
+#   ... -- true → a verificação do jail_check: sai com 0, sem gravar nada;
+#   ... -- <comando> → o lançamento: grava o argv inteiro (um argumento por linha) em
+#                      $FAKE_JAIL_LOG, acrescenta "ai-jail" em $FAKE_ORDER_LOG (os dois só se
+#                      definidos) e faz exec do que vem depois do "--".
+set -euo pipefail
+
+if [ "${1:-}" = "--version" ]; then
+  printf 'ai-jail %s\n' "${FAKE_JAIL_VERSION:-3.2.0}"
+  exit 0
+fi
+
+all=("$@")
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+  shift
+done
+if [ "$#" -eq 0 ]; then
+  echo "ai-jail falso: sem -- <comando>" >&2
+  exit 2
+fi
+shift
+if [ "$#" -eq 1 ] && [ "$1" = "true" ]; then
+  exit 0
+fi
+if [ -n "${FAKE_JAIL_LOG:-}" ]; then
+  printf '%s\n' "${all[@]}" > "$FAKE_JAIL_LOG"
+fi
+if [ -n "${FAKE_ORDER_LOG:-}" ]; then
+  echo "ai-jail" >> "$FAKE_ORDER_LOG"
+fi
+exec "$@"

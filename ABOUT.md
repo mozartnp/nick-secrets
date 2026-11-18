@@ -31,10 +31,12 @@ conteúdo voltado a ele, e trocar isso pra inglês só atrapalharia sem ganho re
 
 ## Qualidade de código bash
 
-As ferramentas e as bibliotecas do nick continuam em bash. A única exceção é o protótipo
-descartável do painel em Rust, em `prototype/panel/` (ver "Rust no projeto: protótipo do
-painel (NS-29)"). O launcher dele, `launch_session.sh`, também é bash e segue estas regras.
-Regras a seguir em todo script novo ou alterado:
+As ferramentas e as bibliotecas do nick (`lib/`, `bin/nick-init`, `auto_scrum`) são em bash. O
+Rust entra em dois lugares, com regras próprias: a casca `nick`, em `nick/` (ver a regra de
+linguagem em "Rust no projeto: a casca `nick` (NS-31)"), e o protótipo descartável do painel,
+em `prototype/panel/` (ver "Rust no projeto: protótipo do painel (NS-29)"). Os scripts bash de
+lá (o `nick/tests/test_cargo.sh`, o init falso dos testes da casca e o `launch_session.sh` do
+protótipo) seguem estas regras. Regras a seguir em todo script novo ou alterado:
 
 - `set -euo pipefail` no topo do **script**. Uma biblioteca em `lib/` (carregada com
   `source`) não tem: quem decide isso é o script que a carrega, e ela funciona com ou sem
@@ -55,8 +57,9 @@ Regras a seguir em todo script novo ou alterado:
   morde) só numa cópia descartável **fora do repositório**, com só (caminhos a partir da
   raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/templates/`,
   `auto_scrum/tests/`, `bin/`, `lib/`, `README.md` (lido pelo teste README × helper de
-  `lib/tests/test_jail.sh`) e `.gitignore` (lido pelos testes de `.gitignore` de
-  `auto_scrum/tests/test_auto_scrum.sh`), na mesma estrutura (sem copiar `auto_scrum/logs/`,
+  `lib/tests/test_jail.sh`), `.gitignore` (lido pelos testes de `.gitignore` de
+  `auto_scrum/tests/test_auto_scrum.sh`) e `nick/` sem `nick/target/` (a casca Rust, desde o
+  NS-31), na mesma estrutura (sem copiar `auto_scrum/logs/`,
   que tem dados reais), com um `git init` na cópia e o cwd dentro dela ao rodar a suíte (ou o
   `make test`). No fim, apagar a cópia e conferir com `git status --short --ignored` que nada
   mudou no repositório.
@@ -74,7 +77,12 @@ já aconteceu na validação do ticket 5, com o `.nick.conf` do usuário. O `.gi
 usam `git check-ignore` contra o `.gitignore` da raiz: sem os dois, eles dão FAIL falso, e a
 suíte acusaria falha sem relação com a sabotagem (aconteceu na validação do ticket 25). O
 `bin/` entra na cópia desde o NS-30: a suíte `bin/tests/test_nick_init.sh` roda o
-`bin/nick-init`, e as mensagens do `auto_scrum.sh` apontam o caminho dele.
+`bin/nick-init`, e as mensagens do `auto_scrum.sh` apontam o caminho dele. O `nick/` entra desde
+o NS-31, sem o `nick/target/` (build grande, que o cargo refaz). Rode o cargo da cópia com
+`CARGO_TARGET_DIR` fora do repositório. Ao restaurar um arquivo sabotado, dê `touch` nele: o
+`.orig` guardado com `cp` tem mtime mais antigo que o build sabotado, e o cargo não recompila
+(o controle "sem sabotagem" passaria a falhar por engano, como aconteceu na validação do
+NS-31).
 
 ## Testes: `make test` e `tests/run_all.sh`
 
@@ -116,6 +124,11 @@ e o `Makefile` só o chama. As regras:
   na raiz não fazer o `make` achar o alvo em dia. O `.NOTPARALLEL:` é garantia explícita:
   hoje a receita é uma só, e o `make -j4 test` já roda tudo em série, mas o alvo pode um dia
   ser dividido em um por suíte.
+- **O `make test` exige o `cargo` desde o NS-31** (impacto aceito no ticket): a suíte
+  `nick/tests/test_cargo.sh` roda `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings` e `cargo test` da casca, com o cwd no crate. Sem `cargo` no PATH, ela falha com
+  uma mensagem que diz o que instalar, em vez de passar sem testar a casca. Ver "Rust no
+  projeto: a casca `nick` (NS-31)".
 - **A suíte do runner (`tests/test_run_all.sh`) nunca roda o `make test` real:** seria
   recursão, já que ela mesma é achada por ele. Cada caso monta, no `TEST_TMP`, um repositório
   de mentira com cópias do `Makefile` e do `tests/run_all.sh` reais e suítes falsas de poucas
@@ -1214,8 +1227,8 @@ garantia de que a configuração nunca é executada fica nos testes estruturais 
 
 **Riscos aceitos:**
 - a API de `lib/config/config.sh` nasceu com um cliente só; desde o NS-30 tem o segundo (o
-  `bin/nick-init`, com `config_dir_prepare`/`config_init`), e a casca Rust (F2a) vai chamar o
-  `bin/nick-init`, não a biblioteca;
+  `bin/nick-init`, com `config_dir_prepare`/`config_init`), e a casca Rust (`nick/`, NS-31)
+  chama o `bin/nick-init`, não a biblioteca;
 - o `auto_scrum/` e o `bin/` dependem do `lib/` irmão por caminho relativo (`SCRIPT_DIR` pelo
   `BASH_SOURCE`): mover um deles sozinho quebra o script, e um symlink do `bin/nick-init` em
   outro diretório (ex: `~/.local/bin`) não acharia o `lib/` — resolver isso é da instalação
@@ -1233,8 +1246,10 @@ código 1 se houver `FAIL`: `bash auto_scrum/tests/test_auto_scrum.sh`,
 `bash bin/tests/test_nick_init.sh`, `bash lib/tests/test_config.sh`,
 `bash lib/tests/test_keys.sh`, `bash lib/tests/test_jail.sh`, `bash lib/tests/test_claude.sh`
 (esta precisa de `jq` ou `python3` pra validar o JSON; sem nenhum dos dois, dá FAIL),
-`bash tests/test_run_all.sh` e `bash prototype/panel/tests/test_launch_session.sh` (o launcher
-do protótipo do painel; ver "Rust no projeto: protótipo do painel (NS-29)").
+`bash tests/test_run_all.sh`, `bash tests/test_cargo_suite.sh` (a guarda da suíte Rust, sem o
+`cargo` real), `bash nick/tests/test_cargo.sh` (a casca Rust: exige o `cargo`; ver "Rust no
+projeto: a casca `nick` (NS-31)") e `bash prototype/panel/tests/test_launch_session.sh` (o
+launcher do protótipo do painel; ver "Rust no projeto: protótipo do painel (NS-29)").
 
 ## Registro de chaves da configuração
 
@@ -2088,8 +2103,8 @@ futura.** A decisão de usar Rust na casca de verdade sai do relatório
 
 **A regra de linguagem:** as ferramentas e as bibliotecas do nick continuam em bash (seção
 "Qualidade de código bash"). O Rust entra só em `prototype/panel/`, isolado: nada de
-`auto_scrum/`, `lib/`, `tests/` da raiz nem do `Makefile` muda por causa dele. Se a casca em
-Rust for adiante, a regra é revista no ticket dela.
+`auto_scrum/`, `lib/`, `tests/` da raiz nem do `Makefile` muda por causa dele. A regra foi
+revista no ticket da casca: ver "Rust no projeto: a casca `nick` (NS-31)".
 
 **Lançamento só pelo `lib/`.** Cada sessão é um PTY com `bash prototype/panel/launch_session.sh`
 (o único comando que o painel lança; um teste estrutural em Rust olha os fontes de `src/`). O
@@ -2131,12 +2146,25 @@ versionado (binário).
 
 **Resultado (2026-11-12, revisto no review de 2026-11-17):** com o `claude` e o ai-jail reais
 (parte conferida pelo agente por PTY, parte pelo usuário), os itens 1–6 do roteiro
-funcionaram e o 8 funcionou com a ressalva do `kill -9` (terminal sujo). O item 7
-(copiar/colar) está pra refazer: a versão testada descartava o OSC 52 do `claude`, e o "ok"
-não separou os casos nem disse o terminal. O item 9 (uso real) está sem a duração e as
-impressões. A recomendação do relatório é **seguir com Rust e ratatui na casca**, desde que o
-item 7 confirme o copiar, começando do zero e levando os achados abaixo; a regra de linguagem
-é revista no ticket da casca.
+funcionaram e o 8 funcionou com a ressalva do `kill -9` (terminal sujo). O item 9 (uso real)
+está sem a duração e as impressões. A recomendação do relatório é **seguir com Rust e ratatui
+na casca**, começando do zero e levando os achados abaixo; a regra de linguagem foi revista no
+ticket da casca (NS-31).
+
+**Item 7 (copiar/colar), resultado final (2026-11-17, fechado no NS-31):** refeito depois do
+repasse do OSC 52. A parte automática foi feita pelo Tech Leader fora da jail, com o ai-jail
+3.4.1 e o `claude` 2.1.325 reais (`.nick/docs/NS-29/item7_auto.py` e `item7_auto.txt`): o OSC
+52 não chega ao painel no `restrito` e é repassado com o texto selecionado no `medio` e no
+`brando`; o `Ctrl+V` cola no `brando` e não no `restrito` nem no `medio`; a colagem de várias
+linhas chega inteira nos três níveis; o clique não copia nada; a saída fica limpa nos três. A
+parte que depende do programa de terminal foi feita pelo usuário (`.nick/docs/NS-29/item7_manual.md`):
+(i) copiar pelo `claude` e colar fora, (iii) `Ctrl+V` e (iv) botão direito → Colar funcionaram;
+(ii) a seleção nativa com `Shift` copia, mas pega junto o que está na mesma linha fora do
+`claude` (a lista de sessões, as bordas). Isso é um **achado para a F3**, não uma falha: a
+seleção é do terminal, que só enxerga a tela inteira, e o caminho de copiar é o (i). Se a
+seleção com `Shift` precisar sair limpa, a sessão precisa de um modo de tela cheia, sem a
+lista ao lado. Conferido no Konsole; VS Code não testado (o terminal do VS Code fica coberto
+pela verificação manual do `nick` no NS-31).
 
 **Achados que valem para a casca futura** (detalhe no relatório):
 - o `tui-term` 0.3.4 só funciona com o `vt100` 0.16 (ele o reexporta). Uma casca que use os dois
@@ -2192,3 +2220,211 @@ item 7 confirme o copiar, começando do zero e levando os achados abaixo; a regr
   `CLAUDE.md` do projeto (mesmo racional de "auto_scrum roda com o cwd dentro do projeto
   alvo"). O protótipo não faz isso, porque a navegação com dados reais estava fora do escopo do
   NS-29. Fica em aberto de onde vêm a lista de projetos e os caminhos.
+
+## Rust no projeto: a casca `nick` (NS-31)
+
+`nick/` é o crate da casca de verdade do épico NS-28 (fatia F2a): o programa `nick`, uma TUI em
+Rust com ratatui e crossterm que o operador abre de qualquer terminal (como o `htop`). Ela mostra
+**Módulos > Projetos**, lidos de um banco SQLite. Nesta fatia o único módulo é o auto_scrum, e a
+TUI só cadastra, mostra e remove projetos. Tickets, agentes, histórico e o lançamento do
+`claude` ficam para as fatias seguintes. O código do protótipo (`prototype/panel/`) não foi
+copiado: o crate foi escrito do zero, levando os achados do NS-29.
+
+**A regra de linguagem (bash + Rust), revista no NS-31:**
+- o **Rust é a casca**: o programa `nick`, a TUI, o banco e a navegação;
+- o **bash continua sendo as ferramentas e as bibliotecas** (`lib/`, `bin/nick-init`,
+  `auto_scrum`), a fonte única do init, da configuração, da jail e das regras do `claude`. A
+  casca chama o bash e não o reimplementa: o botão "Criar configuração" roda o `bin/nick-init`
+  como ele está, e nenhuma linha do init foi para o Rust;
+- regras do Rust: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, edition 2024, código
+  (identificadores, comentários, nomes de arquivo, SQL) em inglês e o que aparece na tela em
+  PT-BR (seção "Idioma do código"). Versões: `ratatui` 0.30.2 e `crossterm` 0.29.0 (as que o
+  NS-29 validou) e `rusqlite` com a feature `bundled`, que compila o SQLite no binário (não
+  depende da versão do sistema e já prepara o binário único da F6). Dev-dependencies:
+  `portable-pty` (o binário num PTY), `tempfile` e o `vt100` 0.16.2, o mesmo do protótipo, que
+  lê a saída do PTY como tela nos testes de integração. O `signal-hook` 0.3.18 (o `nick` imune ao
+  `Ctrl+C` enquanto o init roda, abaixo) é declarado na versão que o crossterm já usa, sem
+  duplicar nada no `Cargo.lock`. Sem crate de migração e sem
+  `dirs`/`directories`: a versão do esquema é o `PRAGMA user_version`, e o diretório de estado
+  sai de duas variáveis de ambiente, tudo em poucas linhas e testável.
+
+**Crate, instalação e o `bin/nick-init`:**
+- o crate fica em `nick/` (pacote e binário `nick`), com `Cargo.lock` versionado (é binário) e
+  `nick/target/` no `.gitignore`. O operador instala com `cargo install --path nick` (o
+  binário vai para `~/.cargo/bin/nick`). Empacotamento e atualização pelo sistema são da F6;
+- o caminho do `bin/nick-init` é fixado na compilação:
+  `concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-init")`, normalizado sem tocar no disco
+  (`init::init_path`). O binário instalado continua apontando para o checkout de onde foi
+  compilado: um `cargo install` feito de outro clone aponta para aquele clone, e um checkout
+  movido depois da instalação quebra o botão. A mensagem do init ausente mostra o caminho
+  procurado. Resolver isso é da F6. Um teste de unidade confere que o caminho padrão é
+  `<raiz>/bin/nick-init` e que o arquivo existe, para pegar um crate movido sem ajustar o
+  caminho;
+- a variável **`NICK_INIT_BIN`**, quando definida e não vazia, troca o caminho do init (um
+  caminho relativo vira absoluto contra o cwd do `nick`, já que o init roda com o cwd no
+  projeto). É ela que os testes de integração usam para apontar para o init falso
+  (`nick/tests/fixtures/bin/nick-init`). O prefixo é `NICK_` e não `CLAUDE_`, pelo mesmo motivo
+  do `lib/claude/` e das `NICK_PANEL_*`. Ela só escolhe qual programa o operador roda pelo botão,
+  no terminal dele, então não abre nada que ele já não pudesse rodar.
+
+**Local do banco:** `$XDG_STATE_HOME/nick/nick.db`, ou `$HOME/.local/state/nick/nick.db` quando
+`XDG_STATE_HOME` não está definida, está vazia ou é relativa (pela especificação XDG, um valor
+relativo é inválido e deve ser ignorado). É o diretório de **estado** do XDG, e não o de
+configuração nem o de dados, porque o cadastro é estado da máquina do operador: não é
+configuração versionável nem dado que valha copiar entre máquinas. Sem `HOME` (ou com `HOME`
+vazio) e sem um `XDG_STATE_HOME` válido, o `nick` não abre a TUI: imprime `Erro: não sei onde
+guardar o banco do nick (HOME e XDG_STATE_HOME não definidos).` no stderr e sai com 1. O
+diretório é criado com `0700` quando nasce, porque o banco pode ter caminhos de projetos de
+cliente. Uma falha ao criar o diretório ou abrir o banco também não abre a TUI: mensagem em
+PT-BR com o caminho no stderr e saída 1. Só o `main.rs` lê o ambiente
+(`paths::state_dir(xdg, home)` recebe as variáveis por parâmetro), então nenhum teste toca no
+`~/.local/state` real: os de integração rodam o binário com `env_clear` e um `HOME` e um
+`XDG_STATE_HOME` temporários.
+
+**Política de migrações** (`nick/src/db/`):
+- a versão do esquema é o `PRAGMA user_version`. A migração N (item N-1 da lista estática e
+  ordenada de `migrations.rs`) leva o banco da versão N-1 para a N. Ao abrir o banco, cada
+  migração pendente roda **numa transação, junto com o novo `user_version`**: se ela falhar,
+  nada dela fica, e o `nick` sai com a mensagem e o código 1;
+- **uma migração publicada nunca é editada.** Um erro se corrige com uma migração nova no fim
+  da lista. O teste `migration_1_is_pinned` fixa o texto literal da migração 1 (e o tamanho da
+  lista). Se ele falhar, desfaça a edição e escreva a migração 2 (que fixa o próprio texto no
+  mesmo teste);
+- um banco de versão **maior** que a última conhecida (migrado por um `nick` mais novo) é
+  recusado sem ser gravado: `Erro: o banco <caminho> está na versão <N>, mais nova que a deste
+  nick (<M>). Atualize o nick.` e saída 1;
+- toda conexão liga `PRAGMA foreign_keys = ON` e `busy_timeout` de 5 s. O SQLite tenta de novo
+  sozinho enquanto outro `nick` estiver gravando no mesmo banco, que é o único erro passageiro
+  dele. Decisão do usuário no NS-31: **sem reabrir o banco nem repetir com espera crescente**.
+  O laço é síncrono, então a TUI ficaria parada sem responder nem ao `q`. Os outros erros
+  (arquivo corrompido, disco cheio, permissão) não passam sozinhos, e reabrir um `nick.db`
+  apagado o recriaria vazio sem avisar. Com a TUI aberta, um erro inesperado do banco vira
+  `Erro no banco do nick: <erro>.` na barra de status, e a TUI continua;
+- a migração 1 tem só `modules` (com o `auto_scrum`) e `projects`. Ticket, agente e histórico
+  entram nas fatias que os usam. O `created_at` é gravado pelo próprio SQL
+  (`strftime('%Y-%m-%dT%H:%M:%SZ','now')`, RFC 3339 em UTC), sem crate de data. O caminho é
+  `TEXT`: um caminho que não é UTF-8 é recusado no cadastro (`Erro: o caminho tem caracteres
+  que o nick não consegue guardar.`), um caso raro que mantém o esquema simples.
+
+**Cadastro só explícito de projetos:** o operador cadastra cada projeto na TUI, informando o
+caminho, e o diretório de onde o `nick` é aberto não influencia nada (um teste de integração
+abre de três cwds e vê a mesma lista). A Q1 do plano do épico
+(`.nick/docs/plans/migracao_tui.md`) propunha cadastrar automaticamente o projeto do cwd. O
+ticket decidiu pelo cadastro explícito, e o cadastro automático saiu (o plano do épico ficou
+desatualizado nesse ponto). O único ponto em que o cwd entra é o caminho relativo digitado pelo
+operador, resolvido contra o cwd do processo `nick`. A ordem da validação (`projects::check`):
+aparar os espaços (vazio → `Informe o caminho da pasta do projeto.`), expandir `~` e `~/...`
+com o `HOME` (`~usuario` é um nome relativo comum), resolver o relativo, `canonicalize` (sem
+`.`/`..`, com os symlinks resolvidos; inexistente → `A pasta <digitado> não existe.`), conferir
+que é pasta, que o caminho é UTF-8 e que ainda não está cadastrado no módulo (dois caminhos para
+a mesma pasta contam como o mesmo, e o `UNIQUE` garante isso e dá a mesma mensagem), e só então
+olhar o `.nick/nick.conf`. Remover faz só `DELETE FROM projects WHERE id = ?`: nenhum arquivo do
+projeto é tocado (um teste compara um retrato recursivo da pasta antes e depois).
+
+**O projeto pertence a um módulo, e a disponibilidade é calculada:** a navegação é "projetos
+**do módulo**", então `projects.module_id` aponta para `modules`. Um módulo futuro que use o
+mesmo diretório cadastra o projeto de novo no módulo dele. Se um dia os projetos passarem a ser
+compartilhados entre módulos, uma migração nova faz a mudança. A disponibilidade (pasta ausente
+ou que virou arquivo → `[indisponível: pasta não encontrada]`; sem `.nick/nick.conf` → `[indisponível:
+sem .nick/nick.conf]`) é calculada do disco ao entrar na tela e depois de cada ação na lista,
+nunca guardada no banco. Enquanto um diálogo fica aberto ela não é recalculada: digitar um
+caminho não é uma ação, e cada recálculo lê o disco (uma montagem de rede travada congelaria o
+laço síncrono a cada letra; review do NS-31, P3). Ela volta a ser calculada quando o diálogo
+fecha, seja qual for o jeito. Um projeto indisponível aparece com o estilo apagado e não derruba nada.
+
+**Chamada ao `bin/nick-init` suspendendo a tela** (fluxo "Criar configuração"):
+- uma pasta sem `.nick/nick.conf` abre um alerta com o caminho exato onde a configuração seria
+  criada e dois botões, "Criar configuração" e "Cancelar". **O foco inicial fica em
+  "Cancelar"**, porque o init grava na pasta do projeto, que pode estar fora da jail. Abrir o
+  alerta não grava nada, nem no banco nem na pasta;
+- o init só roda pelo botão: o `app.rs` (estado e teclas, sem I/O de terminal) só devolve
+  `Action::RunInit` quando o botão é acionado, e o laço só chama o `InitRunner` a partir dessa
+  ação. Um teste de unidade (com um runner falso) e um de integração (o binário real no PTY, com
+  um init falso que grava um marcador) provam que tentar cadastrar uma pasta sem configuração
+  não roda o init e não cria nenhum arquivo nela;
+- o botão confere antes se o init existe e é arquivo. Se não for, o alerta mostra `Não encontrei
+  o bin/nick-init em <caminho>. Nada foi feito.`, e a TUI continua;
+- senão, a TUI é suspensa (sai do raw mode e da tela alternativa e mostra o cursor), imprime
+  `Rodando <init> em <pasta>...` e roda `bash <init>` com o cwd no projeto, sem argumentos e com
+  o terminal herdado. **Depois, seja qual for o resultado, espera um `Enter`** (`Pressione Enter
+  para voltar ao nick.`). Sem isso, um erro do init sumiria no instante em que a tela alternativa
+  volta, e é o mesmo cuidado do `git` com o pager. Depois a TUI volta, com um redesenho completo
+  (`terminal.clear()`), também quando o init falha;
+- **o `nick` ignora o `Ctrl+C` (SIGINT) e o `Ctrl+\` (SIGQUIT) enquanto o init roda e na espera
+  do `Enter`** (review do NS-31, P1). Fora do raw mode, o terminal manda esses sinais para todo o
+  grupo de processos em primeiro plano, e com a ação padrão o `nick` morreria junto com o init,
+  sem restaurar a TUI e sem dizer nada. Ele faz como o `system(3)` do POSIX: só o filho recebe o
+  sinal. É um handler que só liga uma flag que ninguém lê (`signal_hook::flag::register`), e não
+  um `SIG_IGN`, porque o handler volta ao padrão no `exec`, e o `bash`/`nick-init` continua
+  recebendo o `Ctrl+C`. Na espera do `Enter`, o `read_line` repete sozinho no `EINTR`, então o
+  `Ctrl+C` ali é ignorado. Os handlers saem antes de a TUI voltar, e no raw mode o `Ctrl+C` é de
+  novo a tecla que sai do `nick`. O teste `ctrl_c_during_the_init_only_interrupts_the_init`
+  manda um `0x03` real pelo PTY. O teste do init "morto por sinal" com `kill -TERM "$$"` não
+  pegava esse caso, porque o sinal não passava pelo `nick`;
+- **na volta, o `.nick/nick.conf` é conferido de novo.** O projeto só é cadastrado se o arquivo
+  existir. Senão, o alerta diz por quê, conforme o fim do init: saiu com 0 (sobrescrita
+  recusada), saiu com ≠ 0 (com o código), morto por sinal, ou não deu para rodar (`spawn`). O
+  arquivo é o que vale: um init que falhou depois de criar a configuração cadastra o projeto.
+
+**Terminal, laço e panic:**
+- um guarda RAII (`TerminalGuard`) entra no raw mode e na tela alternativa e, no `Drop`, sai dos
+  dois e mostra o cursor, também quando o `run()` devolve erro (aí a mensagem vai para o stderr
+  como `nick: <erro>`, e a saída é 1). Nesta fatia não há captura de mouse nem bracketed paste:
+  nada usa esses modos, e cada modo a mais é mais um a restaurar. Colar um caminho no campo de
+  texto funciona como digitação;
+- **laço síncrono nesta fatia:** `crossterm::event::read()` na thread principal, sem thread
+  leitora e sem canal. Ainda não há PTY, e uma thread leitora disputaria o stdin com o
+  `bin/nick-init` enquanto ele roda no terminal suspenso. **A F3 troca isso por um laço guiado
+  por um canal** (achado do NS-29) e, então, a leitura da entrada tem de ser pausada enquanto o
+  init roda;
+- o **panic hook** é instalado antes de entrar na TUI. Ele restaura o terminal, chama o hook
+  padrão (a mensagem sai depois da restauração, legível) e termina com
+  `std::process::exit(101)`, em qualquer thread. Sem o `exit`, um panic numa thread secundária
+  deixaria o laço principal vivo sobre o terminal restaurado;
+- **`NICK_TEST_PANIC` é um gancho só de teste** (`nick/tests/tui.rs`), no estilo do
+  `NICK_PANEL_TEST_PANIC` do protótipo, depois de entrar na TUI: `main` faz panic na thread
+  principal, `thread` faz panic numa thread criada para isso (com a principal bloqueada no
+  `event::read()`), e `error` faz o `run()` devolver um erro. O `error` foi acrescentado no
+  NS-31 (decisão do usuário): como o banco abre antes da TUI, o teste do banco ilegível não
+  chega a entrar nela e não prova a restauração por erro;
+- **SIGTERM/SIGHUP ficam sem tratamento nesta fatia:** não há filhos para encerrar, e o padrão do
+  sistema mata o processo. O terminal pode ficar sujo, como no `kill -9` (achado do NS-29), e o
+  `reset` resolve. A F3 trata isso junto com o encerramento dos agentes;
+- teclas: `q`/`Q` saem só nas listas (regra de "Menus: opção Sair (q)"). No campo de texto o `q`
+  é digitado, e nos diálogos ele não sai. `Ctrl+C` sai de qualquer tela, porque o raw mode o
+  entrega como tecla e o operador não pode ficar preso. Na remoção, só `s`/`S` confirmam (o "sim"
+  do `auto_scrum`). As teclas de cada tela ficam no rodapé da TUI, e não no README;
+- barra de status: a recusa do campo de texto continua na barra enquanto o campo está aberto (o
+  operador corrige o texto), e sai quando ele cancela o campo (`Esc`) ou quando o alerta abre ou
+  fecha por `Esc`/"Cancelar": é mensagem de uma ação que ele abandonou (review do NS-31, P2);
+- campo de texto: tem uma linha só, sem quebra. Um caminho maior que a caixa mostra `…` e o fim
+  do texto, com o cursor logo depois, porque o ponto de digitação é o que importa. Com quebra,
+  um caminho de mais de 88 caracteres fazia o cursor sumir (review do NS-31, P5).
+
+**Como acrescentar um módulo:** uma variante em `ModuleKind` (e em `ModuleKind::ALL`), uma
+migração nova que o insere em `modules` e um arquivo em `nick/src/modules/`. É um `enum` com
+`match`, e não um trait com objetos dinâmicos: com um módulo só, um trait seria abstração sem
+reuso real (seção "Reaproveitar o que já existe antes de criar"). Cada módulo define a própria
+hierarquia quando for desenhado (decisão do épico). Um teste confere que o `enum` e a tabela
+`modules` (depois das migrações) têm os mesmos módulos.
+
+**Testes: o `make test` passa a exigir o `cargo`** (impacto aceito no ticket). A suíte bash
+`nick/tests/test_cargo.sh` é achada pelo `tests/run_all.sh` só pelo nome e pelo lugar, sem mexer
+no runner nem no `Makefile`. Ela dá `cd` no crate (achado pelo `BASH_SOURCE`) e roda, em ordem,
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` e `cargo test`, parando no
+primeiro que falhar. Sem `cargo` no PATH, ela imprime no stderr `Erro: o cargo não foi encontrado
+no PATH. A suíte Rust do nick (nick/) precisa dele: instale o Rust (rustup) e rode de novo.` e sai
+com 1. A guarda dela é `tests/test_cargo_suite.sh`, na raiz, ao lado de `test_run_all.sh`,
+porque testa uma peça do `make test`. Ela **nunca roda o `cargo` real**, pelo mesmo racional da
+suíte do runner. Cobre o PATH mínimo sem `cargo` (com controle positivo), as três chamadas em
+ordem com o cwd no crate (com um `cargo` falso que grava argv e cwd), a falha de cada uma, a
+estrutura e o `shellcheck -x` das duas suítes e do init falso. A suíte Rust tem testes de unidade
+por módulo (`paths`, `db`, `modules`, `projects`, `init`, `app` com um `InitRunner` falso, `ui`
+com o `TestBackend`) e testes de integração com o binário real: `tests/cli.rs` (argumentos) e
+`tests/tui.rs` (PTY 30x100, com `tests/common/`). O retrato recursivo de uma pasta (tipo,
+tamanho, conteúdo e mtime de cada entrada), que prova que nenhum arquivo do projeto foi tocado,
+é um só: `nick/tests/common/snapshot.rs`, usado pelos testes de integração e incluído nos de
+unidade de `projects.rs` com `#[path]` (review do NS-31, P4). Assim o teste no PTY também pega
+um `touch`. O harness do PTY responde ao pedido de posição
+do cursor (`ESC[6n`), como faria um terminal: o `Terminal::clear` do ratatui o faz quando a TUI
+volta do init, e sem resposta ele dá erro depois de 2 s.

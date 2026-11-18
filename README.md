@@ -2,6 +2,31 @@
 
 Ferramentas pessoais de automação do dia a dia.
 
+## O programa `nick`
+
+`nick` é a casca das ferramentas: uma TUI (como o `htop`) que mostra os módulos do nick e os
+projetos de cada módulo. Por enquanto o único módulo é o auto_scrum, e a TUI só cadastra, mostra
+e remove projetos. O resto do fluxo continua no `auto_scrum.sh` (abaixo).
+
+Requisito: Rust ([rustup](https://rustup.rs)). Para instalar, rode na raiz do repositório:
+
+```bash
+cargo install --path nick
+```
+
+O binário vai para `~/.cargo/bin/nick`. Depois, é só rodar `nick` em qualquer terminal. O
+diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem no rodapé da TUI.
+
+- **Projetos:** são cadastrados na TUI, informando o caminho da pasta. Todo projeto cadastrado
+  precisa ter `.nick/nick.conf`. Quando a pasta não tem o arquivo, a TUI oferece criá-lo pelo
+  botão "Criar configuração", que roda o `bin/nick-init` na pasta do projeto. Também dá para rodar
+  o `bin/nick-init` à mão antes de cadastrar. Remover um projeto só tira o cadastro do nick: nenhum
+  arquivo do projeto é apagado.
+- **Banco:** o cadastro fica num SQLite em `$XDG_STATE_HOME/nick/nick.db`, ou em
+  `~/.local/state/nick/nick.db` quando `XDG_STATE_HOME` não está definida.
+- **Checkout:** o `nick` instalado usa o `bin/nick-init` do checkout de onde foi compilado. Se
+  você mover o checkout, rode o `cargo install --path nick` de novo.
+
 ## Módulos
 
 ### auto_scrum
@@ -482,3 +507,7 @@ falha, o resumo no fim lista as suítes que falharam. Uma suíte é qualquer `te
 num diretório `tests/` (fora de diretórios ocultos), então uma suíte nova entra sem mexer no
 `Makefile`. Sem `make`, o mesmo runner roda com `bash tests/run_all.sh`, e cada suíte também
 pode rodar sozinha, da raiz, com `bash <caminho da suíte>`.
+
+O `make test` também roda a suíte Rust do programa `nick` (`nick/tests/test_cargo.sh`:
+`cargo fmt --check`, `cargo clippy` e `cargo test`), então ele exige o `cargo` no PATH. Sem o
+`cargo`, essa suíte falha com uma mensagem que diz o que instalar.

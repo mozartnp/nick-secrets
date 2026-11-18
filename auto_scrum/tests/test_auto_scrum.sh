@@ -31,30 +31,15 @@ run_loader() {
   timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $setup; load_project_config '$config_file' >'$out_prefix.out' 2>'$out_prefix.err'; printf '%s|%s|%s|%s|%s' \"\$STACK_DESCRIPTION\" \"\$SENTRY_ENABLED\" \"\$PERMISSION_ENABLED\" \"\$JIRA_ENABLED\" \"\$PRODUCTION_ENABLED\"" 2>/dev/null || true
 }
 
-# run_resolve_stack <cwd> <projects_dir> <project_arg> <stdin> <out_prefix>: num bash
-# separado, faz cd pra <cwd> ANTES do source (resolve_stack procura config no cwd), aponta
-# PROJECTS_DIR pra <projects_dir> e roda resolve_stack <project_arg>, com stdout em
-# <out_prefix>.out, stderr em <out_prefix>.err e o código de saída em <out_prefix>.rc.
-# <stdin> vazio vira < /dev/null. Imprime as 5 chaves conhecidas separadas por '|'.
+# run_resolve_stack <cwd> <out_prefix>: num bash separado, faz cd pra <cwd> ANTES do source
+# (resolve_stack procura a configuração no cwd) e roda resolve_stack, com stdout em
+# <out_prefix>.out, stderr em <out_prefix>.err e o código de saída em <out_prefix>.rc. Imprime
+# as 5 chaves conhecidas separadas por '|'.
 run_resolve_stack() {
-  local cwd="$1" projects_dir="$2" project_arg="$3" input="$4" out_prefix="$5" rc=0 vars=""
-  local cmd="cd '$cwd' || exit 99; source '$AUTO_SCRUM_SH'; PROJECTS_DIR='$projects_dir'; resolve_stack '$project_arg' >'$out_prefix.out' 2>'$out_prefix.err'; printf '%s|%s|%s|%s|%s' \"\$STACK_DESCRIPTION\" \"\$SENTRY_ENABLED\" \"\$PERMISSION_ENABLED\" \"\$JIRA_ENABLED\" \"\$PRODUCTION_ENABLED\""
-  if [ -z "$input" ]; then
-    vars="$(timeout 2 bash -c "$cmd" < /dev/null 2>/dev/null)" || rc=$?
-  else
-    vars="$(timeout 2 bash -c "$cmd" <<< "$input" 2>/dev/null)" || rc=$?
-  fi
+  local cwd="$1" out_prefix="$2" rc=0 vars=""
+  vars="$(timeout 2 bash -c "cd '$cwd' || exit 99; source '$AUTO_SCRUM_SH'; resolve_stack >'$out_prefix.out' 2>'$out_prefix.err'; printf '%s|%s|%s|%s|%s' \"\$STACK_DESCRIPTION\" \"\$SENTRY_ENABLED\" \"\$PERMISSION_ENABLED\" \"\$JIRA_ENABLED\" \"\$PRODUCTION_ENABLED\"" < /dev/null 2>/dev/null)" || rc=$?
   echo "$rc" > "$out_prefix.rc"
   printf '%s' "$vars"
-}
-
-# run_init_project <cwd> <projects_dir> <stdin> <log_file>: num bash separado, faz cd pra
-# <cwd> antes do source, aponta PROJECTS_DIR pra <projects_dir> e roda init_project com
-# <stdin>; stdout+stderr vão pra <log_file>. Imprime o código de saída.
-run_init_project() {
-  local cwd="$1" projects_dir="$2" input="$3" log_file="$4" rc=0
-  timeout 2 bash -c "cd '$cwd' || exit 99; source '$AUTO_SCRUM_SH'; PROJECTS_DIR='$projects_dir'; init_project" <<< "$input" > "$log_file" 2>&1 || rc=$?
-  printf '%s' "$rc"
 }
 
 # config_keys_blank [except_key]: imprime uma linha CHAVE="" pra cada chave de
@@ -99,22 +84,10 @@ nick_tree() {
   (cd "$1" && [ -e .nick ] && find .nick | LC_ALL=C sort) || true
 }
 
-# init_tree_expected: a árvore de .nick/ que o --init com destino no projeto deixa.
+# init_tree_expected: a árvore de .nick/ completa (a que o bin/nick-init cria, e a que main()
+# completa ao confirmar o envio).
 init_tree_expected() {
   printf '%s\n' .nick .nick/.gitignore .nick/docs .nick/nick.conf .nick/troca
-}
-
-# init_cwd_expected_output <cwd>: a saída do --init com destino no projeto, depois do menu.
-init_cwd_expected_output() {
-  cat <<EOF
-Projeto criado em $1/.nick/nick.conf — edite antes de usar.
-Estrutura do nick em .nick/:
-  .gitignore   versionado: ignora tudo em .nick/ menos ele e o nick.conf
-  nick.conf    versionado: configuração do projeto
-  troca/       não versionada: troca de arquivos com os agentes
-  docs/        não versionada: plano, review e prints de cada ticket (docs/<ID>/)
-Versione .nick/nick.conf e .nick/.gitignore junto com o projeto.
-EOF
 }
 
 # Nota de PRODUCTION_ENABLED: é a única chave com texto próprio nos avisos, porque o padrão
@@ -179,11 +152,10 @@ count_missing_warnings() {
 }
 
 # count_warnings <file>: imprime quantos avisos há em <file> (linhas que começam com
-# "Aviso:"; nada, se o arquivo não existir). No menu de projetos, o select deixa o prompt
-# "#? " sem \n logo antes do aviso, na mesma linha — por isso o prefixo opcional.
+# "Aviso:"; nada, se o arquivo não existir).
 count_warnings() {
   local file="$1"
-  grep -cE '^(#\? )?Aviso:' "$file" 2>/dev/null || true
+  grep -c '^Aviso:' "$file" 2>/dev/null || true
 }
 
 # Fim padrão do aviso de valor inválido, pra chave sem nota própria.
@@ -222,250 +194,6 @@ assert_eq "tech_leader" "$type_result" "sem JIRA_ENABLED (padrão false), po_jir
 
 type_result="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED=false; choose_type <<< '3' >/dev/null 2>&1; printf '%s' \"\$TYPE\"")"
 assert_eq "tech_leader" "$type_result" "com JIRA_ENABLED=false explícito, po_jira também some do menu"
-
-echo
-echo "== init_project: pergunta o destino (.nick/nick.conf no cwd ou projects/<nome>.conf) e gera o mesmo esqueleto =="
-init_dir="$TEST_TMP/init_project"
-init_cwd_dest="$init_dir/cwd_dest"
-init_projects_dest="$init_dir/projects_dest"
-init_projects="$init_dir/projects"
-init_projects_unused="$init_dir/projects_nao_criado"
-mkdir -p "$init_cwd_dest" "$init_projects_dest"
-
-init_rc="$(run_init_project "$init_cwd_dest" "$init_projects_unused" "1" "$init_dir/cwd_dest.log")"
-init_cwd_file="$init_cwd_dest/.nick/nick.conf"
-assert_eq "0" "$init_rc" "destino cwd: init_project termina com código 0"
-assert_exists "$init_cwd_file" "destino cwd (opção 1): cria .nick/nick.conf no diretório atual"
-assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'JIRA_ENABLED="false"' "destino cwd: esqueleto declara JIRA_ENABLED=\"false\" por padrão"
-assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'PRODUCTION_ENABLED="false"' "destino cwd: esqueleto declara PRODUCTION_ENABLED=\"false\" por padrão"
-assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'Ligue ("true") quando o projeto entrar em produção.' "destino cwd: comentário do esqueleto manda ligar PRODUCTION_ENABLED quando o projeto entrar em produção"
-assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'TDD_ENABLED="true"' "destino cwd: esqueleto declara TDD_ENABLED=\"true\" por padrão (a única flag ligada por padrão)"
-assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" 'só "false" desliga.' "destino cwd: comentário do esqueleto diz que só \"false\" desliga a TDD"
-assert_contains "$(cat "$init_cwd_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino cwd: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
-assert_not_exists "$init_projects_unused" "destino cwd: PROJECTS_DIR não é criado"
-assert_eq "$(init_tree_expected)" "$(nick_tree "$init_cwd_dest")" "destino cwd: cria exatamente .nick/.gitignore, .nick/nick.conf, .nick/troca/ e .nick/docs/ (sem .gitignore em troca/ nem em docs/)"
-assert_eq "$(nick_gitignore_expected)" "$(cat "$init_cwd_dest/.nick/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "destino cwd: .nick/.gitignore tem exatamente *, !.gitignore e !nick.conf"
-assert_eq "true" "$([ -d "$init_cwd_dest/.nick/troca" ] && [ -d "$init_cwd_dest/.nick/docs" ] && echo true || echo false)" "destino cwd: .nick/troca/ e .nick/docs/ são diretórios"
-assert_contains "$(cat "$init_dir/cwd_dest.log" 2>/dev/null || true)" "$(init_cwd_expected_output "$(cd "$init_cwd_dest" && pwd)")" "destino cwd: a saída mostra o caminho do nick.conf e a árvore de .nick/ (texto exato)"
-assert_not_contains "$(cat "$init_dir/cwd_dest.log" 2>/dev/null || true)" "Pasta de troca de arquivos com os agentes" "destino cwd: a linha antiga da pasta de troca sumiu"
-
-init_rc="$(run_init_project "$init_projects_dest" "$init_projects" $'2\nprojeto-teste' "$init_dir/projects_dest.log")"
-init_projects_file="$init_projects/projeto-teste.conf"
-assert_eq "0" "$init_rc" "destino projects/: init_project termina com código 0"
-assert_exists "$init_projects_file" "destino projects/ (opção 2): cria \$PROJECTS_DIR/projeto-teste.conf"
-assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'JIRA_ENABLED="false"' "destino projects/: esqueleto declara JIRA_ENABLED=\"false\" por padrão"
-assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'PRODUCTION_ENABLED="false"' "destino projects/: esqueleto declara PRODUCTION_ENABLED=\"false\" por padrão"
-assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'Ligue ("true") quando o projeto entrar em produção.' "destino projects/: comentário do esqueleto manda ligar PRODUCTION_ENABLED quando o projeto entrar em produção"
-assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'TDD_ENABLED="true"' "destino projects/: esqueleto declara TDD_ENABLED=\"true\" por padrão (a única flag ligada por padrão)"
-assert_contains "$(cat "$init_projects_file" 2>/dev/null)" 'só "false" desliga.' "destino projects/: comentário do esqueleto diz que só \"false\" desliga a TDD"
-assert_contains "$(cat "$init_projects_file" 2>/dev/null)" '# Mantenha todas as chaves abaixo, mesmo as que não usar (o auto_scrum avisa quando falta alguma). Nas chaves *_ENABLED, use só "true", "false" ou "".' "destino projects/: comentário do esqueleto traz as regras de chave ausente e de valor das chaves *_ENABLED"
-assert_not_exists "$init_projects/projeto-teste.sh" "destino projects/: não cria projeto-teste.sh"
-assert_not_exists "$init_projects_dest/.nick/nick.conf" "destino projects/: não cria .nick/nick.conf no diretório atual"
-assert_not_exists "$init_projects_dest/.nick" "destino projects/: não cria .nick/ no diretório atual (que pode não ser o projeto; a troca nasce no primeiro envio)"
-
-assert_eq "$(cat "$init_cwd_file" 2>/dev/null || echo 'sem cwd')" "$(cat "$init_projects_file" 2>/dev/null || echo 'sem projects')" "os dois destinos geram o mesmo conteúdo"
-assert_eq "igual" "$(cmp -s "$init_cwd_file" "$init_projects_file" && echo igual || echo diferente)" "os dois destinos geram arquivos idênticos byte a byte (cmp, inclusive \\n final)"
-
-init_overwrite="$init_dir/overwrite"
-mkdir -p "$init_overwrite"
-mkdir -p "$init_overwrite/.nick"
-printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_overwrite/.nick/nick.conf"
-run_init_project "$init_overwrite" "$init_projects_unused" $'1\nN' "$init_dir/overwrite_no.log" >/dev/null
-assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_overwrite/.nick/nick.conf")" "destino cwd com .nick/nick.conf existente e resposta N: arquivo inalterado"
-assert_contains "$(cat "$init_dir/overwrite_no.log")" "Cancelado." "destino cwd com .nick/nick.conf existente e resposta N: cancela"
-assert_eq "$(printf '%s\n' .nick .nick/nick.conf)" "$(nick_tree "$init_overwrite")" "destino cwd com .nick/nick.conf existente e resposta N: nada é criado nem completado (sem .gitignore, troca/ ou docs/)"
-run_init_project "$init_overwrite" "$init_projects_unused" $'1\ns' "$init_dir/overwrite_yes.log" >/dev/null
-assert_eq "igual" "$(cmp -s "$init_overwrite/.nick/nick.conf" "$init_cwd_file" && echo igual || echo diferente)" "destino cwd com .nick/nick.conf existente e resposta s: arquivo substituído pelo esqueleto"
-assert_eq "$(init_tree_expected)" "$(nick_tree "$init_overwrite")" "destino cwd com .nick/nick.conf existente e resposta s: a árvore de .nick/ é completada"
-assert_eq "$(nick_gitignore_expected)" "$(cat "$init_overwrite/.nick/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "destino cwd com .nick/nick.conf existente e resposta s: .nick/.gitignore com o conteúdo exato"
-
-init_edited="$init_dir/edited_gitignore"
-mkdir -p "$init_edited/.nick"
-printf '%s\n' '*' '!.gitignore' '!nick.conf' '!docs/' '!docs/**' > "$init_edited/.nick/.gitignore"
-cp "$init_edited/.nick/.gitignore" "$init_dir/edited_gitignore.before"
-init_rc="$(run_init_project "$init_edited" "$init_projects_unused" "1" "$init_dir/edited_gitignore.log")"
-assert_eq "0" "$init_rc" "destino cwd com .nick/.gitignore editado: init_project termina com código 0"
-assert_eq "igual" "$(cmp -s "$init_dir/edited_gitignore.before" "$init_edited/.nick/.gitignore" && echo igual || echo diferente)" "destino cwd com .nick/.gitignore editado: o arquivo fica idêntico byte a byte"
-assert_exists "$init_edited/.nick/nick.conf" "destino cwd com .nick/.gitignore editado: o nick.conf é criado"
-
-# --init com o .nick.conf antigo no cwd: não para (a execução normal é que para). Cria a árvore
-# com o esqueleto padrão e avisa que o antigo não foi lido nem alterado.
-init_legacy_warning() {
-  printf '%s' "Aviso: o arquivo antigo $1/.nick.conf não foi lido nem alterado — copie os valores dele para $1/.nick/nick.conf e apague o antigo."
-}
-init_legacy="$init_dir/legacy"
-mkdir -p "$init_legacy"
-printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_legacy/.nick.conf"
-init_legacy_projects="$init_dir/legacy_projects"
-init_rc="$(run_init_project "$init_legacy" "$init_legacy_projects" $'2\nprojeto-legado' "$init_dir/legacy_projects.log")"
-assert_eq "0" "$init_rc" "destino projects/ com o .nick.conf antigo no cwd: termina com código 0"
-assert_exists "$init_legacy_projects/projeto-legado.conf" "destino projects/ com o .nick.conf antigo no cwd: cria o arquivo em projects/"
-assert_not_exists "$init_legacy/.nick" "destino projects/ com o .nick.conf antigo no cwd: não cria .nick/ no cwd"
-assert_not_contains "$(cat "$init_dir/legacy_projects.log" 2>/dev/null || true)" "Aviso:" "destino projects/ com o .nick.conf antigo no cwd: nenhum aviso"
-init_rc="$(run_init_project "$init_legacy" "$init_projects_unused" "1" "$init_dir/legacy.log")"
-assert_eq "0" "$init_rc" "destino cwd com só o .nick.conf antigo: init_project termina com código 0"
-assert_eq "$(init_tree_expected)" "$(nick_tree "$init_legacy")" "destino cwd com só o .nick.conf antigo: cria a árvore inteira de .nick/"
-assert_eq "igual" "$(cmp -s "$init_legacy/.nick/nick.conf" "$init_cwd_file" && echo igual || echo diferente)" "destino cwd com só o .nick.conf antigo: .nick/nick.conf é o esqueleto padrão"
-assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_legacy/.nick.conf")" "destino cwd com só o .nick.conf antigo: o arquivo antigo fica intacto"
-assert_contains "$(cat "$init_dir/legacy.log" 2>/dev/null || true)" "$(init_legacy_warning "$(cd "$init_legacy" && pwd)")" "destino cwd com só o .nick.conf antigo: avisa que o antigo não foi lido e que os valores têm de ser copiados"
-assert_contains "$(cat "$init_dir/legacy.log" 2>/dev/null || true)" "$(init_cwd_expected_output "$(cd "$init_legacy" && pwd)")" "destino cwd com só o .nick.conf antigo: a saída mostra a árvore, como sem o legado"
-assert_not_contains "$(cat "$init_dir/legacy.log" 2>/dev/null || true)" "Erro:" "destino cwd com só o .nick.conf antigo: nenhum erro"
-# Os dois arquivos: pergunta antes de sobrescrever o novo. N não avisa nem muda nada; s
-# sobrescreve e avisa de novo.
-printf '%s\n' 'STACK_DESCRIPTION="novo"' > "$init_legacy/.nick/nick.conf"
-run_init_project "$init_legacy" "$init_projects_unused" $'1\nN' "$init_dir/legacy_both_no.log" >/dev/null
-assert_eq 'STACK_DESCRIPTION="novo"' "$(cat "$init_legacy/.nick/nick.conf")" "destino cwd com os dois arquivos e resposta N: .nick/nick.conf inalterado"
-assert_not_contains "$(cat "$init_dir/legacy_both_no.log" 2>/dev/null || true)" "Aviso:" "destino cwd com os dois arquivos e resposta N: nenhum aviso"
-run_init_project "$init_legacy" "$init_projects_unused" $'1\ns' "$init_dir/legacy_both_yes.log" >/dev/null
-assert_eq "igual" "$(cmp -s "$init_legacy/.nick/nick.conf" "$init_cwd_file" && echo igual || echo diferente)" "destino cwd com os dois arquivos e resposta s: .nick/nick.conf vira o esqueleto padrão"
-assert_contains "$(cat "$init_dir/legacy_both_yes.log" 2>/dev/null || true)" "$(init_legacy_warning "$(cd "$init_legacy" && pwd)")" "destino cwd com os dois arquivos e resposta s: avisa do arquivo antigo"
-assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_legacy/.nick.conf")" "destino cwd com os dois arquivos: o arquivo antigo fica intacto"
-init_main_legacy="$init_dir/main_legacy"
-mkdir -p "$init_main_legacy"
-printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_main_legacy/.nick.conf"
-init_main_legacy_rc=0
-timeout 5 bash -c "cd '$init_main_legacy' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$init_dir/legacy_logs'; PROJECTS_DIR='$init_projects_unused'; main --init" <<< "1" > "$init_dir/legacy_main.log" 2>&1 || init_main_legacy_rc=$?
-assert_eq "0" "$init_main_legacy_rc" "main --init com só o .nick.conf antigo: termina com código 0"
-assert_eq "$(init_tree_expected)" "$(nick_tree "$init_main_legacy")" "main --init com só o .nick.conf antigo: cria a árvore inteira de .nick/"
-assert_not_exists "$init_dir/legacy_logs" "main --init com só o .nick.conf antigo: nenhum log é criado"
-
-init_blocked="$init_dir/blocked"
-mkdir -p "$init_blocked/.nick"
-printf 'arquivo no lugar da pasta' > "$init_blocked/.nick/troca"
-init_rc="$(run_init_project "$init_blocked" "$init_projects_unused" "1" "$init_dir/blocked.log")"
-assert_eq "1" "$init_rc" "destino cwd com .nick/troca sendo um arquivo: init_project retorna 1"
-assert_contains "$(cat "$init_dir/blocked.log" 2>/dev/null || true)" "Erro: não foi possível criar a estrutura .nick/ (.gitignore, troca/ e docs/) em $(cd "$init_blocked" && pwd)." "destino cwd com .nick/troca sendo um arquivo: mensagem de erro"
-assert_not_exists "$init_blocked/.nick/nick.conf" "destino cwd com .nick/troca sendo um arquivo: o nick.conf não é gravado"
-assert_eq "arquivo no lugar da pasta" "$(cat "$init_blocked/.nick/troca" 2>/dev/null || true)" "destino cwd com .nick/troca sendo um arquivo: o arquivo fica intacto"
-
-printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_projects/projeto-teste.conf"
-run_init_project "$init_projects_dest" "$init_projects" $'2\nprojeto-teste\nN' "$init_dir/overwrite_projects_no.log" >/dev/null
-assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_projects/projeto-teste.conf")" "destino projects/ com <nome>.conf existente e resposta N: arquivo inalterado"
-assert_contains "$(cat "$init_dir/overwrite_projects_no.log")" "Cancelado." "destino projects/ com <nome>.conf existente e resposta N: cancela"
-
-# init_project não chama o leitor, então não avisa — nem nos casos de sobrescrita, em que o
-# arquivo que já existia é incompleto e um aviso seria um erro real.
-for init_log in cwd_dest projects_dest overwrite_no overwrite_yes overwrite_projects_no; do
-  assert_not_contains "$(cat "$init_dir/$init_log.log" 2>/dev/null || true)" "Aviso:" "init_project ($init_log.log): nenhum aviso"
-done
-
-init_main="$init_dir/main_init"
-mkdir -p "$init_main/cwd"
-mkdir -p "$init_main/cwd/.nick"
-printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$init_main/cwd/.nick/nick.conf"
-init_main_rc=0
-# stdin: destino 1 (cwd) e N pra não sobrescrever. LOGS_DIR e PROJECTS_DIR temporários pra
-# não gravar em auto_scrum/logs/ nem ler auto_scrum/projects/.
-init_main_output="$(timeout 5 bash -c "cd '$init_main/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$init_main/logs'; PROJECTS_DIR='$init_main/projects'; main --init" <<< $'1\nN' 2>&1)" || init_main_rc=$?
-assert_eq "0" "$init_main_rc" "main --init sobre .nick/nick.conf incompleto, resposta N: termina com código 0"
-assert_contains "$init_main_output" "Cancelado." "main --init sobre .nick/nick.conf incompleto, resposta N: cancela"
-assert_not_contains "$init_main_output" "Aviso:" "main --init sobre .nick/nick.conf incompleto: nenhum aviso"
-assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$init_main/cwd/.nick/nick.conf")" "main --init sobre .nick/nick.conf incompleto, resposta N: arquivo inalterado"
-
-init_eof="$init_dir/eof"
-mkdir -p "$init_eof"
-for init_eof_input in "" "9"; do
-  init_rc="$(run_init_project "$init_eof" "$init_projects_unused" "$init_eof_input" "$init_dir/eof.log")"
-  assert_eq "1" "$init_rc" "stdin fecha no select de destino (entrada: '$init_eof_input' + EOF): init_project sai com código 1"
-  assert_contains "$(cat "$init_dir/eof.log")" "Cancelado. Nada foi alterado." "stdin fecha no select de destino (entrada: '$init_eof_input' + EOF): mensagem de cancelado"
-  assert_not_exists "$init_eof/.nick/nick.conf" "stdin fecha no select de destino (entrada: '$init_eof_input' + EOF): nenhum .nick/nick.conf é criado"
-  assert_not_exists "$init_projects_unused" "stdin fecha no select de destino (entrada: '$init_eof_input' + EOF): PROJECTS_DIR não é criado"
-done
-
-echo
-echo "== init_project: esqueleto amigável a lint/pre-commit e consistente com load_project_config =="
-init_first_line="$(head -n1 "$init_cwd_file" 2>/dev/null || true)"
-assert_eq "sem shebang" "$(case "$init_first_line" in '#!'*) echo 'com shebang' ;; *) echo 'sem shebang' ;; esac)" "esqueleto não começa com shebang"
-assert_eq "0" "$(grep -c '[[:space:]]$' "$init_cwd_file" 2>/dev/null || true)" "esqueleto não tem espaço (nem \\r) no fim de nenhuma linha"
-assert_eq '\n' "$(tail -c1 "$init_cwd_file" 2>/dev/null | od -An -c | tr -d ' ')" "esqueleto termina com \\n"
-
-skeleton_result="$(run_loader "$init_cwd_file" "$init_dir/skeleton_loader" "STACK_DESCRIPTION=antes")"
-assert_eq "|false|false|false|false" "$skeleton_result" "esqueleto carregado pelo leitor: flags false e STACK_DESCRIPTION vazio"
-assert_eq "" "$(cat "$init_dir/skeleton_loader.err" 2>/dev/null || echo 'sem stderr')" "esqueleto carregado pelo leitor não gera aviso (nem pelos comentários que citam CHAVE=\"valor\")"
-assert_eq "true" "$(loaded_value "$init_cwd_file" TDD_ENABLED)" "esqueleto carregado pelo leitor: TDD_ENABLED vem \"true\""
-
-skeleton_keys="$(grep -oE '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null | tr -d '=' | sort || true)"
-config_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\" | sort")"
-assert_eq "$config_keys" "$skeleton_keys" "chaves atribuídas no esqueleto são exatamente as de CONFIG_KEYS"
-
-# Testes-guarda da regra liga/desliga (config_is_toggle_key, em lib/config.sh): o esqueleto é o modelo, então
-# toda chave com "false" ou "true" nele precisa passar pela checagem de valor, e toda chave
-# com "" não. skeleton_toggle_lines guarda a linha inteira, com o padrão da chave.
-skeleton_guard_dir="$init_dir/skeleton_guard"
-mkdir -p "$skeleton_guard_dir"
-skeleton_toggle_lines=()
-skeleton_text_keys=()
-skeleton_other_lines=""
-while IFS= read -r skeleton_line; do
-  skeleton_key="${skeleton_line%%=*}"
-  if [ "$skeleton_line" = "$skeleton_key=\"false\"" ] || [ "$skeleton_line" = "$skeleton_key=\"true\"" ]; then
-    skeleton_toggle_lines+=("$skeleton_line")
-  elif [ "$skeleton_line" = "$skeleton_key=\"\"" ]; then
-    skeleton_text_keys+=("$skeleton_key")
-  else
-    skeleton_other_lines+="$skeleton_line"$'\n'
-  fi
-done < <(grep -E '^[A-Z_]+=' "$init_cwd_file" 2>/dev/null || true)
-assert_eq "" "$skeleton_other_lines" "toda chave do esqueleto é liga/desliga (=\"false\"/=\"true\") ou texto (=\"\")"
-assert_eq "true" "$([ "${#skeleton_toggle_lines[@]}" -gt 0 ] && [ "${#skeleton_text_keys[@]}" -gt 0 ] && echo true || echo false)" "o esqueleto tem pelo menos uma chave liga/desliga e uma de texto"
-
-for skeleton_line in "${skeleton_toggle_lines[@]}"; do
-  skeleton_key="${skeleton_line%%=*}"
-  skeleton_copy="$skeleton_guard_dir/toggle_$skeleton_key.conf"
-  sed "s/^$skeleton_line\$/$skeleton_key=\"sim\"/" "$init_cwd_file" > "$skeleton_copy"
-  run_loader "$skeleton_copy" "$skeleton_guard_dir/toggle_$skeleton_key" >/dev/null
-  assert_eq "true" "$(grep -qxF "$skeleton_key=\"sim\"" "$skeleton_copy" && echo true || echo false)" "esqueleto com $skeleton_line trocado por $skeleton_key=\"sim\": a cópia tem a linha trocada"
-  assert_eq "1" "$(count_warnings "$skeleton_guard_dir/toggle_$skeleton_key.err")" "esqueleto com $skeleton_key=\"sim\": exatamente um aviso (toda liga/desliga do modelo é checada)"
-  assert_contains "$(cat "$skeleton_guard_dir/toggle_$skeleton_key.err" 2>/dev/null || true)" "valor \"sim\" inválido para $skeleton_key" "esqueleto com $skeleton_key=\"sim\": o aviso é o de valor inválido"
-done
-
-for skeleton_key in "${skeleton_text_keys[@]}"; do
-  skeleton_copy="$skeleton_guard_dir/text_$skeleton_key.conf"
-  sed "s/^$skeleton_key=\"\"\$/$skeleton_key=\"sim\"/" "$init_cwd_file" > "$skeleton_copy"
-  run_loader "$skeleton_copy" "$skeleton_guard_dir/text_$skeleton_key" >/dev/null
-  assert_eq "true" "$(grep -qxF "$skeleton_key=\"sim\"" "$skeleton_copy" && echo true || echo false)" "esqueleto com $skeleton_key=\"sim\": a cópia tem a linha trocada"
-  assert_eq "0" "$(count_warnings "$skeleton_guard_dir/text_$skeleton_key.err")" "esqueleto com $skeleton_key=\"sim\": nenhum aviso (chave de texto não é checada)"
-done
-
-# Linhas sugeridas pelo aviso de chave ausente, sem os dois espaços do começo.
-: > "$skeleton_guard_dir/empty.conf"
-run_loader "$skeleton_guard_dir/empty.conf" "$skeleton_guard_dir/empty" >/dev/null
-skeleton_suggested_keys=""
-skeleton_unmatched_lines=""
-while IFS= read -r skeleton_line; do
-  skeleton_line="${skeleton_line#  }"
-  skeleton_suggested_keys+="${skeleton_line%%=*}"$'\n'
-  if ! grep -qxF "$skeleton_line" "$init_cwd_file"; then
-    skeleton_unmatched_lines+="$skeleton_line"$'\n'
-  fi
-done <<< "$(grep -E '^  [A-Z_]+=' "$skeleton_guard_dir/empty.err" 2>/dev/null || true)"
-assert_eq "" "$skeleton_unmatched_lines" "cada linha sugerida pelo aviso de chave ausente é idêntica à linha do esqueleto"
-config_keys_ordered="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"")"
-assert_eq "$config_keys_ordered" "$(printf '%s' "$skeleton_suggested_keys")" "as chaves sugeridas pelo aviso de chave ausente são exatamente as de CONFIG_KEYS, na mesma ordem"
-
-# Ida e volta: o bloco sugerido (o aviso menos a 1ª linha, inclusive as linhas de nota),
-# colado como está num arquivo novo, carrega sem nenhum aviso.
-tail -n +2 "$skeleton_guard_dir/empty.err" > "$skeleton_guard_dir/pasted.conf" 2>/dev/null || true
-skeleton_pasted_result="$(run_loader "$skeleton_guard_dir/pasted.conf" "$skeleton_guard_dir/pasted" "STACK_DESCRIPTION=antes")"
-assert_eq "|false|false|false|false" "$skeleton_pasted_result" "bloco do aviso de chave ausente colado num arquivo: as chaves carregam com o padrão do esqueleto"
-assert_eq "" "$(cat "$skeleton_guard_dir/pasted.err" 2>/dev/null || echo 'sem stderr')" "bloco do aviso de chave ausente colado num arquivo: carrega sem nenhum aviso"
-
-# Chave nova só no registro (config_register_key): entra nas duas checagens sem mudar a lógica.
-skeleton_new_setup="config_register_key NEW_FLAG_ENABLED 'false' '' 'NEW_FLAG_ENABLED: flag nova.'; config_register_key NEW_TEXT '' '' 'NEW_TEXT: texto novo.'"
-skeleton_new_file="$skeleton_guard_dir/new_keys.conf"
-{ cat "$init_cwd_file"; printf '%s\n' 'NEW_FLAG_ENABLED="sim"' 'NEW_TEXT="sim"'; } > "$skeleton_new_file"
-skeleton_new_line="$(grep -nxF 'NEW_FLAG_ENABLED="sim"' "$skeleton_new_file" | cut -d: -f1)"
-run_loader "$skeleton_new_file" "$skeleton_guard_dir/new_keys" "$skeleton_new_setup" >/dev/null
-assert_eq "1" "$(count_warnings "$skeleton_guard_dir/new_keys.err")" "chaves novas NEW_FLAG_ENABLED/NEW_TEXT com \"sim\": exatamente um aviso"
-assert_eq "$(value_warning "$skeleton_new_file:$skeleton_new_line" NEW_FLAG_ENABLED sim "$default_off_note")" "$(cat "$skeleton_guard_dir/new_keys.err" 2>/dev/null || true)" "chaves novas com \"sim\": só NEW_FLAG_ENABLED recebe o aviso de valor"
-
-run_loader "$init_cwd_file" "$skeleton_guard_dir/new_keys_missing" "$skeleton_new_setup" >/dev/null
-assert_eq "1" "$(count_warnings "$skeleton_guard_dir/new_keys_missing.err")" "chaves novas ausentes do esqueleto: exatamente um aviso"
-assert_eq "$(missing_warning "$init_cwd_file" 'NEW_FLAG_ENABLED="false"' 'NEW_TEXT=""')" "$(cat "$skeleton_guard_dir/new_keys_missing.err" 2>/dev/null || true)" "chaves novas ausentes do esqueleto: o aviso de chave ausente lista as duas, com o padrão de cada tipo"
-
-config_keys_blank > "$skeleton_guard_dir/blank.conf"
-run_loader "$skeleton_guard_dir/blank.conf" "$skeleton_guard_dir/blank" >/dev/null
-assert_eq "" "$(cat "$skeleton_guard_dir/blank.err" 2>/dev/null || echo 'sem stderr')" "config_keys_blank monta uma fixture completa: carrega sem nenhum aviso"
 
 echo
 echo "== ask_questions_po_jira: pede link (obrigatório) e descrição extra (opcional) =="
@@ -907,172 +635,185 @@ assert_eq "$(value_warning "$val_file:$(wc -l < "$val_file")" JIRA_ENABLED "não
 assert_not_contains "$(cat "$val_dir"/*.err 2>/dev/null || true)" "--init" "nenhum aviso desta seção sugere --init"
 
 echo
-echo "== resolve_stack: projects/ usa extensão .conf e é lido por load_project_config (sem source) =="
-rs_dir="$TEST_TMP/resolve_stack_conf"
-rs_cwd="$rs_dir/cwd"
-rs_projects="$rs_dir/projects"
-mkdir -p "$rs_cwd" "$rs_projects"
-printf '%s\n' '# alpha' 'STACK_DESCRIPTION="stack-alpha"' 'SENTRY_ENABLED="true"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="true"' > "$rs_projects/alpha.conf"
-printf '%s\n' '# beta' 'STACK_DESCRIPTION="stack-beta"' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="true"' 'JIRA_ENABLED="false"' > "$rs_projects/beta.conf"
-
-rs_result="$(run_resolve_stack "$rs_cwd" "$rs_projects" "alpha" "" "$rs_dir/by_arg")"
-assert_eq "stack-alpha|true|false|true|" "$rs_result" "--projeto=alpha carrega os valores de alpha.conf"
-
-rs_result="$(run_resolve_stack "$rs_cwd" "$rs_projects" "" "1" "$rs_dir/menu")"
-assert_eq "stack-alpha|true|false|true|" "$rs_result" "menu: opção 1 carrega alpha.conf (glob em ordem alfabética)"
-assert_contains "$(cat "$rs_dir/menu.err")" "1) alpha" "menu lista alpha (nome vindo de basename .conf)"
-assert_contains "$(cat "$rs_dir/menu.err")" "2) beta" "menu lista beta (nome vindo de basename .conf)"
-
-rs_result="$(run_resolve_stack "$rs_cwd" "$rs_projects" "" "3" "$rs_dir/none")"
-assert_eq "||||" "$rs_result" "menu: opção Nenhum (3, antes do Sair) deixa STACK_DESCRIPTION vazio"
-
-rs_result="$(run_resolve_stack "$rs_cwd" "$rs_projects" "inexistente" "" "$rs_dir/missing")"
-assert_eq "1" "$(cat "$rs_dir/missing.rc")" "--projeto=inexistente sai com código 1"
-assert_contains "$(cat "$rs_dir/missing.err")" "projeto 'inexistente' não encontrado" "--projeto=inexistente mostra erro de projeto não encontrado"
-
-for rs_case in by_arg menu none missing; do
-  assert_not_contains "$(cat "$rs_dir/$rs_case.out" "$rs_dir/$rs_case.err")" "não é mais lido" "caso '$rs_case' sem .sh legado não imprime aviso de legado"
-done
-
-rs_touch_projects="$rs_dir/projects_touch"
-mkdir -p "$rs_touch_projects"
-printf '%s\n' 'STACK_DESCRIPTION="stack-alpha"' "touch \"$rs_dir/marker_conf\"" > "$rs_touch_projects/alpha.conf"
-run_resolve_stack "$rs_cwd" "$rs_touch_projects" "alpha" "" "$rs_dir/touch" >/dev/null
-assert_not_exists "$rs_dir/marker_conf" "linha 'touch <marker>' em alpha.conf não é executada"
-
-echo
-echo "== resolve_stack: projects/*.sh legado não é lido, só gera aviso com o mv sugerido =="
-legacy_dir="$TEST_TMP/resolve_stack_legacy"
-legacy_cwd="$legacy_dir/cwd"
-legacy_projects="$legacy_dir/projects"
-mkdir -p "$legacy_cwd" "$legacy_projects"
-printf '%s\n' 'STACK_DESCRIPTION="stack-alpha"' > "$legacy_projects/alpha.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-gamma"' "touch \"$legacy_dir/marker_sh\"" > "$legacy_projects/gamma.sh"
-
-legacy_result="$(run_resolve_stack "$legacy_cwd" "$legacy_projects" "" "1" "$legacy_dir/menu")"
-assert_eq "stack-alpha||||" "$legacy_result" "menu com gamma.sh legado: opção 1 continua sendo alpha"
-assert_not_contains "$(cat "$legacy_dir/menu.out" "$legacy_dir/menu.err")" ") gamma" "menu não lista gamma (arquivo .sh)"
-assert_contains "$(cat "$legacy_dir/menu.err")" "gamma.sh não é mais lido" "menu: stderr avisa que gamma.sh não é mais lido"
-assert_contains "$(cat "$legacy_dir/menu.err")" "mv '$legacy_projects/gamma.sh' '$legacy_projects/gamma.conf'" "menu: aviso sugere o mv para .conf"
-
-legacy_result="$(run_resolve_stack "$legacy_cwd" "$legacy_projects" "gamma" "" "$legacy_dir/by_arg")"
-legacy_err="$(cat "$legacy_dir/by_arg.err")"
-assert_eq "1" "$(cat "$legacy_dir/by_arg.rc")" "--projeto=gamma (só existe gamma.sh) sai com código 1"
-assert_contains "$legacy_err" "gamma.sh não é mais lido" "--projeto=gamma: stderr avisa que gamma.sh não é mais lido"
-assert_contains "$legacy_err" "projeto 'gamma' não encontrado" "--projeto=gamma: stderr mostra erro de projeto não encontrado"
-legacy_before_warning="${legacy_err%%não é mais lido*}"
-legacy_before_error="${legacy_err%%não encontrado*}"
-assert_eq "true" "$([ "${#legacy_before_warning}" -lt "${#legacy_before_error}" ] && echo true || echo false)" "--projeto=gamma: aviso de legado aparece antes do erro de projeto não encontrado"
-assert_not_contains "$legacy_err" "- gamma" "--projeto=gamma: lista de projetos disponíveis não inclui gamma"
-assert_not_exists "$legacy_dir/marker_sh" "linha 'touch <marker>' em gamma.sh não é executada"
-
-echo
-echo "== resolve_stack: .nick/nick.conf no cwd tem precedência sobre --projeto= e projects/ =="
+echo "== resolve_stack: com .nick/nick.conf no cwd, carrega dele e imprime 'carregada de' =="
 cwd_dir="$TEST_TMP/resolve_stack_cwd"
 cwd_with="$cwd_dir/with_config"
-cwd_without="$cwd_dir/without_config"
-cwd_projects="$cwd_dir/projects"
-mkdir -p "$cwd_with" "$cwd_without" "$cwd_projects"
 mkdir -p "$cwd_with/.nick"
 printf '%s\n' '# cwd' 'STACK_DESCRIPTION="stack-do-cwd"' 'JIRA_ENABLED="true"' > "$cwd_with/.nick/nick.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-alpha"' 'SENTRY_ENABLED="true"' > "$cwd_projects/alpha.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-gamma"' > "$cwd_projects/gamma.sh"
-
-cwd_result="$(run_resolve_stack "$cwd_with" "$cwd_projects" "" "" "$cwd_dir/load")"
+cwd_result="$(run_resolve_stack "$cwd_with" "$cwd_dir/load")"
 cwd_output="$(cat "$cwd_dir/load.out" "$cwd_dir/load.err")"
+assert_eq "0" "$(cat "$cwd_dir/load.rc")" "com .nick/nick.conf no cwd, resolve_stack retorna (código 0)"
 assert_eq "stack-do-cwd|||true|" "$cwd_result" "com .nick/nick.conf no cwd, as variáveis vêm dele"
-assert_contains "$(cat "$cwd_dir/load.out")" "Configuração do projeto carregada de: $cwd_with/.nick/nick.conf" "com .nick/nick.conf no cwd, stdout mostra de onde a configuração foi carregada"
-assert_not_contains "$cwd_output" "Qual projeto" "com .nick/nick.conf no cwd, o menu de projetos não aparece"
-assert_not_contains "$cwd_output" "alpha" "com .nick/nick.conf no cwd, os projetos de projects/ não são listados"
-assert_not_contains "$cwd_output" "não é mais lido" "com .nick/nick.conf no cwd, não aparece aviso de .sh legado"
-
-cwd_result="$(run_resolve_stack "$cwd_with" "$cwd_projects" "alpha" "" "$cwd_dir/arg_existing")"
-assert_eq "stack-do-cwd|||true|" "$cwd_result" "com .nick/nick.conf no cwd, --projeto=alpha é ignorado e valem os valores do cwd"
-assert_contains "$(cat "$cwd_dir/arg_existing.err")" "Aviso: --projeto=alpha ignorado — a configuração do diretório atual ($cwd_with/.nick/nick.conf) tem precedência." "com .nick/nick.conf no cwd, stderr avisa que --projeto=alpha foi ignorado"
-
-cwd_result="$(run_resolve_stack "$cwd_with" "$cwd_projects" "inexistente" "" "$cwd_dir/arg_missing")"
-assert_eq "0" "$(cat "$cwd_dir/arg_missing.rc")" "com .nick/nick.conf no cwd, --projeto=inexistente não dá exit 1"
-assert_eq "stack-do-cwd|||true|" "$cwd_result" "com .nick/nick.conf no cwd, --projeto=inexistente usa os valores do cwd"
-assert_not_contains "$(cat "$cwd_dir/arg_missing.out" "$cwd_dir/arg_missing.err")" "não encontrado" "com .nick/nick.conf no cwd, --projeto=inexistente não mostra erro de projeto não encontrado"
-assert_contains "$(cat "$cwd_dir/arg_missing.err")" "Aviso: --projeto=inexistente ignorado" "com .nick/nick.conf no cwd, stderr avisa que --projeto=inexistente foi ignorado"
-
-cwd_result="$(run_resolve_stack "$cwd_without" "$cwd_projects" "" "1" "$cwd_dir/fallback_menu")"
-cwd_output="$(cat "$cwd_dir/fallback_menu.out" "$cwd_dir/fallback_menu.err")"
-assert_eq "stack-alpha|true|||" "$cwd_result" "sem .nick/nick.conf no cwd, menu opção 1 carrega alpha.conf"
-assert_contains "$cwd_output" "Qual projeto" "sem .nick/nick.conf no cwd, o menu de projetos aparece"
-assert_not_contains "$cwd_output" "Configuração do projeto carregada de" "sem .nick/nick.conf no cwd, não aparece a linha 'carregada de'"
-
-cwd_result="$(run_resolve_stack "$cwd_without" "$cwd_projects" "alpha" "" "$cwd_dir/fallback_arg")"
-cwd_output="$(cat "$cwd_dir/fallback_arg.out" "$cwd_dir/fallback_arg.err")"
-assert_eq "stack-alpha|true|||" "$cwd_result" "sem .nick/nick.conf no cwd, --projeto=alpha carrega alpha.conf"
-assert_not_contains "$cwd_output" "ignorado" "sem .nick/nick.conf no cwd, --projeto=alpha não gera aviso de flag ignorada"
-assert_not_contains "$cwd_output" "Configuração do projeto carregada de" "sem .nick/nick.conf no cwd, --projeto=alpha não imprime a linha 'carregada de'"
+assert_eq "Configuração do projeto carregada de: $cwd_with/.nick/nick.conf" "$(cat "$cwd_dir/load.out")" "com .nick/nick.conf no cwd, stdout é só a linha de onde a configuração foi carregada"
+assert_not_contains "$cwd_output" "Qual projeto" "com .nick/nick.conf no cwd, nenhum menu de projetos"
+assert_not_contains "$cwd_output" "não é mais lido" "com .nick/nick.conf no cwd, nenhum aviso de legado"
+mkdir -p "$cwd_with/sub"
+run_resolve_stack "$cwd_with/sub" "$cwd_dir/sub" >/dev/null
+assert_eq "1" "$(cat "$cwd_dir/sub.rc")" "num subdiretório do projeto (sem .nick/nick.conf próprio): para com código 1, sem subir para o pai"
+assert_eq "Erro: não há configuração do projeto em $cwd_with/sub/.nick/nick.conf. Rode na raiz do projeto: $(cd "$SCRIPT_DIR/../.." && pwd)/bin/nick-init" "$(cat "$cwd_dir/sub.err" 2>/dev/null || true)" "num subdiretório do projeto: o stderr é só o erro de configuração ausente, com o caminho do subdiretório (não o do pai)"
 
 cwd_both="$cwd_dir/both_configs"
 mkdir -p "$cwd_both/.nick"
 printf '%s\n' 'STACK_DESCRIPTION="stack-nova"' 'JIRA_ENABLED="true"' > "$cwd_both/.nick/nick.conf"
 printf '%s\n' 'STACK_DESCRIPTION="stack-antiga"' 'SENTRY_ENABLED="true"' > "$cwd_both/.nick.conf"
-cwd_result="$(run_resolve_stack "$cwd_both" "$cwd_projects" "" "" "$cwd_dir/both")"
+cwd_result="$(run_resolve_stack "$cwd_both" "$cwd_dir/both")"
 assert_eq "stack-nova|||true|" "$cwd_result" "com .nick.conf antigo junto do .nick/nick.conf, os valores vêm do novo"
 assert_contains "$(cat "$cwd_dir/both.err")" "Aviso: $cwd_both/.nick.conf não é mais lido — a configuração vem de $cwd_both/.nick/nick.conf. Apague o arquivo antigo." "com os dois arquivos, stderr avisa que o antigo é ignorado"
 assert_contains "$(cat "$cwd_dir/both.out")" "Configuração do projeto carregada de: $cwd_both/.nick/nick.conf" "com os dois arquivos, a linha 'carregada de' cita o novo"
 
 echo
+echo "== main(): --init e --projeto= saíram — erro antes de qualquer coisa (menu, log, claude), apontando o bin/nick-init =="
+# O caminho absoluto do bin/nick-init, calculado aqui a partir da raiz do repositório.
+NICK_INIT_EXPECTED="$(cd "$SCRIPT_DIR/../.." && pwd)/bin/nick-init"
+removed_init_error="Erro: o --init saiu do auto_scrum. Para criar a configuração do projeto, rode na raiz dele: $NICK_INIT_EXPECTED"
+removed_project_error="Erro: o --projeto= saiu do auto_scrum: a configuração vem só do .nick/nick.conf do diretório atual. Para criá-la, rode na raiz do projeto: $NICK_INIT_EXPECTED"
+missing_config_error() {
+  printf '%s' "Erro: não há configuração do projeto em $1/.nick/nick.conf. Rode na raiz do projeto: $NICK_INIT_EXPECTED"
+}
+removed_dir="$TEST_TMP/main_removed_flags"
+# removed_main <case> <config> <stdin> [arg...]: roda main [arg...] com o cwd em <case>/cwd —
+# vazio (<config> "sem"), com um .nick/nick.conf completo ("com") ou só com .nick/troca/
+# ("so_pasta") —, um claude falso no PATH (grava o argv em <case>/claude/argv) e
+# check_requirements trocada por um marcador (<case>/requirements). <stdin> vazio vira
+# < /dev/null: nos casos que têm de parar antes de tudo, nenhuma pergunta pode ser respondida
+# (nem por engano, criando algo fora do diretório temporário). Grava o retrato do cwd antes e
+# depois (<case>/before, <case>/after) e imprime o código de saída.
+removed_main() {
+  local case_dir="$removed_dir/$1" config="$2" input="$3" rc=0 args=""
+  shift 3
+  if [ "$#" -gt 0 ]; then
+    printf -v args '%q ' "$@"
+  fi
+  mkdir -p "$case_dir/cwd" "$case_dir/bin"
+  case "$config" in
+    com) mkdir -p "$case_dir/cwd/.nick"; config_keys_blank > "$case_dir/cwd/.nick/nick.conf" ;;
+    so_pasta) mkdir -p "$case_dir/cwd/.nick/troca" ;;
+  esac
+  printf '%s\n' '#!/usr/bin/env bash' "mkdir -p '$case_dir/claude'; printf '%s\n' \"\$@\" > '$case_dir/claude/argv'" > "$case_dir/bin/claude"
+  chmod +x "$case_dir/bin/claude"
+  (cd "$case_dir/cwd" && find . | LC_ALL=C sort) > "$case_dir/before"
+  local cmd="cd '$case_dir/cwd' || exit 99; PATH='$case_dir/bin':\"\$PATH\"; source '$AUTO_SCRUM_SH'; check_requirements() { touch '$case_dir/requirements'; }; LOGS_DIR='$case_dir/logs'; main $args"
+  if [ -z "$input" ]; then
+    timeout 5 bash -c "$cmd" < /dev/null > "$case_dir/out" 2> "$case_dir/err" || rc=$?
+  else
+    timeout 5 bash -c "$cmd" <<< "$input" > "$case_dir/out" 2> "$case_dir/err" || rc=$?
+  fi
+  (cd "$case_dir/cwd" && find . | LC_ALL=C sort) > "$case_dir/after"
+  printf '%s' "$rc"
+}
+# removed_flag_checks <case> <label>: as asserções de "parou antes de tudo, sem efeito".
+removed_flag_checks() {
+  local case_dir="$removed_dir/$1" label="$2"
+  assert_eq "" "$(cat "$case_dir/out" 2>/dev/null || echo 'sem stdout gravado')" "$label: nada no stdout (sem menu de tipo nem de projetos)"
+  assert_not_exists "$case_dir/logs" "$label: nenhum log é criado"
+  assert_not_exists "$case_dir/claude/argv" "$label: o claude não é chamado"
+  assert_not_exists "$case_dir/requirements" "$label: para antes até da checagem de requisitos"
+  assert_eq "igual" "$(cmp -s "$case_dir/before" "$case_dir/after" && echo igual || echo diferente)" "$label: nada é criado nem mudado no cwd"
+}
+for removed_config in sem com; do
+  removed_rc="$(removed_main "init_$removed_config" "$removed_config" "" --init)"
+  assert_eq "1" "$removed_rc" "--init ($removed_config .nick/nick.conf): termina com código 1"
+  assert_eq "$removed_init_error" "$(cat "$removed_dir/init_$removed_config/err" 2>/dev/null || true)" "--init ($removed_config .nick/nick.conf): stderr exato, com o caminho absoluto do bin/nick-init"
+  removed_flag_checks "init_$removed_config" "--init ($removed_config .nick/nick.conf)"
+  removed_case=0
+  for removed_arg in --projeto=alpha --projeto=; do
+    removed_case=$((removed_case + 1))
+    removed_rc="$(removed_main "projeto_${removed_config}_$removed_case" "$removed_config" "" "$removed_arg")"
+    assert_eq "1" "$removed_rc" "$removed_arg ($removed_config .nick/nick.conf): termina com código 1"
+    assert_eq "$removed_project_error" "$(cat "$removed_dir/projeto_${removed_config}_$removed_case/err" 2>/dev/null || true)" "$removed_arg ($removed_config .nick/nick.conf): stderr exato, com o caminho absoluto do bin/nick-init"
+    removed_flag_checks "projeto_${removed_config}_$removed_case" "$removed_arg ($removed_config .nick/nick.conf)"
+  done
+done
+# Junto de uma flag que existe, a recusa vem do mesmo jeito (e antes dos requisitos da jail).
+removed_rc="$(removed_main combinado com "" --requisitos-jail --init)"
+assert_eq "1" "$removed_rc" "--requisitos-jail --init: termina com código 1"
+assert_eq "$removed_init_error" "$(cat "$removed_dir/combinado/err" 2>/dev/null || true)" "--requisitos-jail --init: o erro do --init, exato"
+removed_flag_checks combinado "--requisitos-jail --init"
+assert_eq "true" "$([ -x "$NICK_INIT_EXPECTED" ] && echo true || echo false)" "o caminho citado nas mensagens é o bin/nick-init, que existe e é executável"
+
+echo
+echo "== main(): sem .nick/nick.conf no cwd — para com erro apontando o bin/nick-init, sem menu, log nem claude =="
+for removed_config in sem so_pasta; do
+  removed_rc="$(removed_main "missing_$removed_config" "$removed_config" "")"
+  removed_case_dir="$removed_dir/missing_$removed_config"
+  removed_label="sem .nick/nick.conf ($removed_config)"
+  removed_output="$(cat "$removed_case_dir/out" "$removed_case_dir/err" 2>/dev/null || true)"
+  assert_eq "1" "$removed_rc" "$removed_label: main() termina com código 1"
+  assert_eq "$(missing_config_error "$(cd "$removed_case_dir/cwd" && pwd)")" "$(cat "$removed_case_dir/err" 2>/dev/null || true)" "$removed_label: stderr exato, com o caminho esperado do nick.conf e o do bin/nick-init"
+  assert_not_contains "$removed_output" "Qual projeto" "$removed_label: o menu de projetos não aparece"
+  assert_not_contains "$removed_output" "Qual tipo de conversa" "$removed_label: o menu de tipo não aparece"
+  assert_not_exists "$removed_case_dir/logs" "$removed_label: nenhum log é criado"
+  assert_not_exists "$removed_case_dir/claude/argv" "$removed_label: o claude não é chamado"
+  assert_eq "igual" "$(cmp -s "$removed_case_dir/before" "$removed_case_dir/after" && echo igual || echo diferente)" "$removed_label: nada é criado no cwd (nem .nick/)"
+done
+# Controle positivo: o mesmo stub do claude, com a configuração no lugar, é chamado.
+removed_rc="$(removed_main controle com $'2\nassunto de teste\ns')"
+assert_eq "0" "$removed_rc" "controle positivo: com .nick/nick.conf, main() termina com código 0"
+assert_exists "$removed_dir/controle/claude/argv" "controle positivo: com .nick/nick.conf, o stub do claude é chamado"
+assert_contains "$(cat "$removed_dir/controle/out" 2>/dev/null || true)" "Configuração do projeto carregada de: $(cd "$removed_dir/controle/cwd" && pwd)/.nick/nick.conf" "controle positivo: a linha 'carregada de' cita o .nick/nick.conf do cwd"
+
+echo
+echo "== auto_scrum.sh: sem init nem projects/ (PROJECTS_DIR, menu de projetos, Nenhum e o aviso de .sh saíram) =="
+auto_scrum_code_now="$(grep -vE '^[[:space:]]*#' "$AUTO_SCRUM_SH" || true)"
+for removed_name in PROJECTS_DIR projects/ init_project list_projects warn_legacy_project_files print_project_skeleton nick_dir_prepare '"Nenhum"' 'Qual projeto'; do
+  assert_eq "" "$(grep -nF -- "$removed_name" <<< "$auto_scrum_code_now" || true)" "auto_scrum.sh não cita $removed_name fora de comentário"
+done
+# --projeto e --init só sobram no case de argumentos de main(), pra recusar a flag com a
+# mensagem que aponta o bin/nick-init: o padrão do case e a mensagem de erro, cada um.
+removed_main_body="$(awk '/^main\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
+for removed_flag in --projeto --init; do
+  assert_eq "2" "$(grep -cF -- "$removed_flag" <<< "$auto_scrum_code_now" || true)" "$removed_flag aparece só duas vezes fora de comentário (o padrão do case e a mensagem de recusa)"
+  assert_eq "2" "$(grep -vE '^[[:space:]]*#' <<< "$removed_main_body" | grep -cF -- "$removed_flag" || true)" "as duas ocorrências de $removed_flag ficam dentro de main()"
+done
+# shellcheck disable=SC2016
+# Aspas simples intencionais: '$1' é o texto literal buscado no código-fonte.
+assert_eq "" "$(grep -nE '^resolve_stack\(\) \{' -A3 "$AUTO_SCRUM_SH" | grep -E '\$1|project_arg' || true)" "resolve_stack não recebe mais parâmetro"
+assert_contains "$removed_main_body" '  resolve_stack'$'\n' "main() chama resolve_stack sem argumento"
+
+echo
 echo "== main(): só o .nick.conf antigo no cwd — para antes do menu de tipo, do log e do claude =="
 legacy_main_dir="$TEST_TMP/main_legacy"
-mkdir -p "$legacy_main_dir/projects"
-printf '%s\n' 'STACK_DESCRIPTION="stack-alpha"' > "$legacy_main_dir/projects/alpha.conf"
-# legacy_main <case> <args> <stdin>: cwd só com o .nick.conf antigo, um claude falso no PATH
-# (grava o argv em <case>/claude/argv) e PROJECTS_DIR com alpha.conf. Imprime o código de saída.
+# legacy_main <case> <stdin>: cwd só com o .nick.conf antigo e um claude falso no PATH (grava o
+# argv em <case>/claude/argv); roda main sem argumento. Imprime o código de saída.
 legacy_main() {
-  local case_dir="$legacy_main_dir/$1" args="$2" input="$3" rc=0
+  local case_dir="$legacy_main_dir/$1" input="$2" rc=0
   mkdir -p "$case_dir/cwd" "$case_dir/bin"
   printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$case_dir/cwd/.nick.conf"
   printf '%s\n' '#!/usr/bin/env bash' "mkdir -p '$case_dir/claude'; printf '%s\n' \"\$@\" > '$case_dir/claude/argv'" > "$case_dir/bin/claude"
   chmod +x "$case_dir/bin/claude"
-  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; PATH='$case_dir/bin':\"\$PATH\"; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$case_dir/logs'; PROJECTS_DIR='$legacy_main_dir/projects'; main $args" <<< "$input" > "$case_dir/out" 2> "$case_dir/err" || rc=$?
+  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; PATH='$case_dir/bin':\"\$PATH\"; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$case_dir/logs'; main" <<< "$input" > "$case_dir/out" 2> "$case_dir/err" || rc=$?
   printf '%s' "$rc"
 }
-for legacy_case in projeto menu; do
-  case "$legacy_case" in
-    projeto) legacy_rc="$(legacy_main projeto "--projeto=alpha" $'2\nassunto\ns')" ;;
-    menu) legacy_rc="$(legacy_main menu "" $'1\n2\nassunto\ns')" ;;
-  esac
-  legacy_case_dir="$legacy_main_dir/$legacy_case"
-  legacy_pwd="$(cd "$legacy_case_dir/cwd" && pwd)"
-  assert_eq "true" "$([ "$legacy_rc" -ne 0 ] && echo true || echo false)" "$legacy_case: main() termina com código ≠ 0"
-  assert_contains "$(cat "$legacy_case_dir/err" 2>/dev/null || true)" "Erro: a configuração do projeto agora fica em .nick/nick.conf, e $legacy_pwd/.nick.conf não é mais lido." "$legacy_case: stderr com o erro de legado"
-  assert_contains "$(cat "$legacy_case_dir/err" 2>/dev/null || true)" "  mkdir -p .nick && mv .nick.conf .nick/nick.conf" "$legacy_case: stderr com o mv"
-  assert_not_exists "$legacy_case_dir/logs" "$legacy_case: nenhum log é criado"
-  assert_not_exists "$legacy_case_dir/claude/argv" "$legacy_case: o claude não é chamado"
-  assert_not_contains "$(cat "$legacy_case_dir/out" "$legacy_case_dir/err" 2>/dev/null || true)" "Qual tipo de conversa" "$legacy_case: o menu de tipo não aparece"
-  assert_not_contains "$(cat "$legacy_case_dir/out" "$legacy_case_dir/err" 2>/dev/null || true)" "Qual projeto" "$legacy_case: o menu de projetos não aparece"
-  assert_not_exists "$legacy_case_dir/cwd/.nick" "$legacy_case: .nick/ não é criada"
-  assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$legacy_case_dir/cwd/.nick.conf")" "$legacy_case: o .nick.conf antigo fica intacto"
-done
+legacy_case="sem_argumento"
+legacy_rc="$(legacy_main "$legacy_case" $'2\nassunto\ns')"
+legacy_case_dir="$legacy_main_dir/$legacy_case"
+legacy_pwd="$(cd "$legacy_case_dir/cwd" && pwd)"
+assert_eq "true" "$([ "$legacy_rc" -ne 0 ] && echo true || echo false)" "$legacy_case: main() termina com código ≠ 0"
+assert_contains "$(cat "$legacy_case_dir/err" 2>/dev/null || true)" "Erro: a configuração do projeto agora fica em .nick/nick.conf, e $legacy_pwd/.nick.conf não é mais lido." "$legacy_case: stderr com o erro de legado"
+assert_contains "$(cat "$legacy_case_dir/err" 2>/dev/null || true)" "  mkdir -p .nick && mv .nick.conf .nick/nick.conf" "$legacy_case: stderr com o mv"
+assert_not_exists "$legacy_case_dir/logs" "$legacy_case: nenhum log é criado"
+assert_not_exists "$legacy_case_dir/claude/argv" "$legacy_case: o claude não é chamado"
+assert_not_contains "$(cat "$legacy_case_dir/out" "$legacy_case_dir/err" 2>/dev/null || true)" "Qual tipo de conversa" "$legacy_case: o menu de tipo não aparece"
+assert_not_contains "$(cat "$legacy_case_dir/out" "$legacy_case_dir/err" 2>/dev/null || true)" "Qual projeto" "$legacy_case: o menu de projetos não aparece"
+assert_not_exists "$legacy_case_dir/cwd/.nick" "$legacy_case: .nick/ não é criada"
+assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$legacy_case_dir/cwd/.nick.conf")" "$legacy_case: o .nick.conf antigo fica intacto"
 # Controle positivo: o mesmo stub do claude é usado quando a configuração está no lugar novo.
 legacy_ctrl="$legacy_main_dir/controle"
 mkdir -p "$legacy_ctrl/cwd/.nick" "$legacy_ctrl/bin"
 config_keys_blank > "$legacy_ctrl/cwd/.nick/nick.conf"
 printf '%s\n' '#!/usr/bin/env bash' "mkdir -p '$legacy_ctrl/claude'; printf '%s\n' \"\$@\" > '$legacy_ctrl/claude/argv'" > "$legacy_ctrl/bin/claude"
 chmod +x "$legacy_ctrl/bin/claude"
-timeout 5 bash -c "cd '$legacy_ctrl/cwd' || exit 99; PATH='$legacy_ctrl/bin':\"\$PATH\"; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$legacy_ctrl/logs'; PROJECTS_DIR='$legacy_main_dir/projects'; main" <<< $'2\nassunto\ns' > "$legacy_ctrl/out" 2>&1 || true
+timeout 5 bash -c "cd '$legacy_ctrl/cwd' || exit 99; PATH='$legacy_ctrl/bin':\"\$PATH\"; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$legacy_ctrl/logs'; main" <<< $'2\nassunto\ns' > "$legacy_ctrl/out" 2>&1 || true
 assert_exists "$legacy_ctrl/claude/argv" "controle positivo: com .nick/nick.conf, o stub do claude é chamado"
 
 echo
-echo "== resolve_stack: aviso de chave ausente só pro arquivo carregado (cwd, --projeto=, menu; nunca em 'Nenhum') =="
+echo "== resolve_stack: aviso de chave ausente pro .nick/nick.conf do cwd =="
 rs_miss_dir="$TEST_TMP/resolve_stack_missing_keys"
 rs_miss_cwd_incomplete="$rs_miss_dir/cwd_incompleto"
 rs_miss_cwd_complete="$rs_miss_dir/cwd_completo"
-rs_miss_cwd_none="$rs_miss_dir/cwd_sem_config"
-rs_miss_projects="$rs_miss_dir/projects"
-mkdir -p "$rs_miss_cwd_incomplete" "$rs_miss_cwd_complete" "$rs_miss_cwd_none" "$rs_miss_projects"
-mkdir -p "$rs_miss_cwd_incomplete/.nick"
+mkdir -p "$rs_miss_cwd_incomplete/.nick" "$rs_miss_cwd_complete/.nick"
 printf '%s\n' 'STACK_DESCRIPTION="stack-do-cwd"' > "$rs_miss_cwd_incomplete/.nick/nick.conf"
-mkdir -p "$rs_miss_cwd_complete/.nick"
 printf '%s\n' "$(config_keys_blank PRODUCTION_ENABLED)" 'STACK_DESCRIPTION="stack-do-cwd"' 'PRODUCTION_ENABLED="false"' > "$rs_miss_cwd_complete/.nick/nick.conf"
-printf '%s\n' "$(config_keys_blank PRODUCTION_ENABLED)" 'STACK_DESCRIPTION="stack-com-linha"' 'PRODUCTION_ENABLED="true"' > "$rs_miss_projects/comlinha.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-sem-linha"' > "$rs_miss_projects/semlinha.conf"
 
 # rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
 rs_miss_expected() {
@@ -1080,83 +821,39 @@ rs_miss_expected() {
   missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""'
 }
 
-rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_incomplete")"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_dir/cwd_incomplete")"
 rs_miss_err="$(cat "$rs_miss_dir/cwd_incomplete.err" 2>/dev/null || true)"
 assert_eq "stack-do-cwd||||" "$rs_miss_result" "cwd incompleto: a configuração do cwd é carregada"
 assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/cwd_incomplete.err")" "cwd incompleto: exatamente um aviso de chave ausente"
 assert_contains "$rs_miss_err" "Aviso: $rs_miss_cwd_incomplete/.nick/nick.conf não tem todas as chaves" "cwd incompleto: o aviso mostra o caminho do .nick/nick.conf do cwd"
 assert_contains "$rs_miss_err" "$(rs_miss_expected "$rs_miss_cwd_incomplete/.nick/nick.conf")" "cwd incompleto: o aviso tem o texto exato, com as linhas a adicionar"
 
-rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_complete" "$rs_miss_projects" "" "" "$rs_miss_dir/cwd_complete")"
+rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_complete" "$rs_miss_dir/cwd_complete")"
 assert_eq "stack-do-cwd||||false" "$rs_miss_result" "cwd completo: a configuração do cwd é carregada"
 assert_eq "0" "$(count_warnings "$rs_miss_dir/cwd_complete.err")" "cwd completo: nenhum aviso"
 
-rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "semlinha" "" "$rs_miss_dir/arg_incomplete")"
-assert_eq "stack-sem-linha||||" "$rs_miss_result" "--projeto=semlinha: semlinha.conf é carregado"
-assert_eq "1" "$(count_warnings "$rs_miss_dir/arg_incomplete.err")" "--projeto=semlinha: exatamente um aviso"
-assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/arg_incomplete.err")" "--projeto=semlinha: o aviso é o de chave ausente"
-assert_contains "$(cat "$rs_miss_dir/arg_incomplete.err" 2>/dev/null || true)" "$(rs_miss_expected "$rs_miss_projects/semlinha.conf")" "--projeto=semlinha: o aviso mostra o caminho de projects/semlinha.conf"
-
-# Menu: 1) comlinha, 2) semlinha, 3) Nenhum, 4) Sair (q) (glob em ordem alfabética).
-rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "2" "$rs_miss_dir/menu_incomplete")"
-assert_eq "stack-sem-linha||||" "$rs_miss_result" "menu escolhendo semlinha: semlinha.conf é carregado"
-assert_eq "1" "$(count_warnings "$rs_miss_dir/menu_incomplete.err")" "menu escolhendo semlinha: exatamente um aviso"
-assert_eq "1" "$(count_missing_warnings "$rs_miss_dir/menu_incomplete.err")" "menu escolhendo semlinha: o aviso é o de chave ausente"
-assert_contains "$(cat "$rs_miss_dir/menu_incomplete.err" 2>/dev/null || true)" "$(rs_miss_expected "$rs_miss_projects/semlinha.conf")" "menu escolhendo semlinha: o aviso mostra o caminho de projects/semlinha.conf"
-
-rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "1" "$rs_miss_dir/menu_complete")"
-assert_eq "stack-com-linha||||true" "$rs_miss_result" "menu escolhendo comlinha: comlinha.conf é carregado"
-assert_eq "0" "$(count_warnings "$rs_miss_dir/menu_complete.err")" "menu escolhendo comlinha (completo): nenhum aviso"
-
-rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_none" "$rs_miss_projects" "" "3" "$rs_miss_dir/menu_none")"
-assert_eq "||||" "$rs_miss_result" "menu escolhendo Nenhum: nenhuma configuração é carregada"
-assert_eq "0" "$(count_warnings "$rs_miss_dir/menu_none.err")" "menu escolhendo Nenhum (com semlinha.conf em projects/): nenhum aviso"
-
 echo
-echo "== resolve_stack: aviso de valor inválido nos três caminhos (cwd, --projeto=, menu; nunca em 'Nenhum') =="
-# PROJECTS_DIR próprio, pra não mudar a numeração do menu da seção acima.
+echo "== resolve_stack: aviso de valor inválido no .nick/nick.conf do cwd =="
 rs_val_dir="$TEST_TMP/resolve_stack_invalid_value"
 rs_val_cwd="$rs_val_dir/cwd_invalido"
-rs_val_cwd_none="$rs_val_dir/cwd_sem_config"
-rs_val_projects="$rs_val_dir/projects"
-mkdir -p "$rs_val_cwd" "$rs_val_cwd_none" "$rs_val_projects"
-rs_val_conf="$(config_keys_blank SENTRY_ENABLED)"$'\n''SENTRY_ENABLED="sim"'
 mkdir -p "$rs_val_cwd/.nick"
-printf '%s\n' "$rs_val_conf" > "$rs_val_cwd/.nick/nick.conf"
-printf '%s\n' "$rs_val_conf" > "$rs_val_projects/invalido.conf"
-rs_val_line="$(wc -l < "$rs_val_projects/invalido.conf")"
-
-rs_val_result="$(run_resolve_stack "$rs_val_cwd" "$rs_val_projects" "" "" "$rs_val_dir/cwd")"
+printf '%s\n' "$(config_keys_blank SENTRY_ENABLED)" 'SENTRY_ENABLED="sim"' > "$rs_val_cwd/.nick/nick.conf"
+rs_val_line="$(wc -l < "$rs_val_cwd/.nick/nick.conf")"
+rs_val_result="$(run_resolve_stack "$rs_val_cwd" "$rs_val_dir/cwd")"
 assert_eq "|sim|||" "$rs_val_result" "cwd com SENTRY_ENABLED=\"sim\": o valor literal é carregado"
 assert_eq "1" "$(count_warnings "$rs_val_dir/cwd.err")" "cwd com SENTRY_ENABLED=\"sim\": exatamente um aviso"
 assert_contains "$(cat "$rs_val_dir/cwd.err" 2>/dev/null || true)" "$(value_warning "$rs_val_cwd/.nick/nick.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "cwd com SENTRY_ENABLED=\"sim\": o aviso de valor aponta o .nick/nick.conf do cwd, última linha"
-
-rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "invalido" "" "$rs_val_dir/arg")"
-assert_eq "|sim|||" "$rs_val_result" "--projeto=invalido: o valor literal é carregado"
-assert_eq "1" "$(count_warnings "$rs_val_dir/arg.err")" "--projeto=invalido: exatamente um aviso"
-assert_contains "$(cat "$rs_val_dir/arg.err" 2>/dev/null || true)" "$(value_warning "$rs_val_projects/invalido.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "--projeto=invalido: o aviso de valor aponta projects/invalido.conf, última linha"
-
-# Menu: 1) invalido, 2) Nenhum, 3) Sair (q).
-rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "" "1" "$rs_val_dir/menu")"
-assert_eq "|sim|||" "$rs_val_result" "menu escolhendo invalido: o valor literal é carregado"
-assert_eq "1" "$(count_warnings "$rs_val_dir/menu.err")" "menu escolhendo invalido: exatamente um aviso"
-assert_contains "$(cat "$rs_val_dir/menu.err" 2>/dev/null || true)" "$(value_warning "$rs_val_projects/invalido.conf:$rs_val_line" SENTRY_ENABLED sim "$default_off_note")" "menu escolhendo invalido: o aviso de valor aponta projects/invalido.conf, última linha"
-
-rs_val_result="$(run_resolve_stack "$rs_val_cwd_none" "$rs_val_projects" "" "2" "$rs_val_dir/menu_none")"
-assert_eq "||||" "$rs_val_result" "menu escolhendo Nenhum: nenhuma configuração é carregada"
-assert_eq "0" "$(count_warnings "$rs_val_dir/menu_none.err")" "menu escolhendo Nenhum (com invalido.conf em projects/): nenhum aviso"
 
 echo
 echo "== main(): com .nick/nick.conf no cwd, 'carregada de' vem antes do menu de tipo e o JIRA_ENABLED do cwd chega a choose_type =="
 e2e_dir="$TEST_TMP/main_e2e"
 e2e_cwd="$e2e_dir/cwd"
-mkdir -p "$e2e_cwd" "$e2e_dir/projects"
 mkdir -p "$e2e_cwd/.nick"
 printf '%s\n' 'JIRA_ENABLED="true"' > "$e2e_cwd/.nick/nick.conf"
 e2e_rc=0
-# stdin: opção 2 (po_discussion), o assunto e N pra recusar o envio pro claude. LOGS_DIR e
-# PROJECTS_DIR temporários pra não gravar em auto_scrum/logs/ nem ler auto_scrum/projects/.
-e2e_output="$(timeout 5 bash -c "cd '$e2e_cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$e2e_dir/logs'; PROJECTS_DIR='$e2e_dir/projects'; main --projeto=inexistente" <<< $'2\nassunto de teste\nN' 2>&1)" || e2e_rc=$?
+# stdin: opção 2 (po_discussion), o assunto e N pra recusar o envio pro claude. LOGS_DIR
+# temporário pra não gravar em auto_scrum/logs/.
+e2e_output="$(timeout 5 bash -c "cd '$e2e_cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$e2e_dir/logs'; main" <<< $'2\nassunto de teste\nN' 2>&1)" || e2e_rc=$?
 assert_eq "0" "$e2e_rc" "main() termina com código 0 ao recusar o envio"
 assert_contains "$e2e_output" "Cancelado." "main() cancela ao receber N na confirmação"
 assert_contains "$e2e_output" "Configuração do projeto carregada de: $e2e_cwd/.nick/nick.conf" "main() imprime de onde a configuração foi carregada"
@@ -1166,7 +863,6 @@ e2e_before_type_menu="${e2e_output%%Qual tipo de conversa você quer iniciar?*}"
 assert_eq "true" "$([ "${#e2e_before_loaded}" -lt "${#e2e_before_type_menu}" ] && echo true || echo false)" "linha 'carregada de' aparece antes do menu de tipo de conversa"
 assert_contains "$e2e_output" "PO - Criar ticket a partir do Jira" "JIRA_ENABLED=\"true\" do .nick/nick.conf chega a choose_type()"
 assert_not_contains "$e2e_output" "Qual projeto" "main() não mostra o menu de projetos"
-assert_contains "$e2e_output" "Aviso: --projeto=inexistente ignorado" "main() avisa que --projeto=inexistente foi ignorado"
 
 echo
 echo "== choose_type: po_sentry só aparece com SENTRY_ENABLED=true, depois dos outros pontos de entrada do PO =="
@@ -1346,15 +1042,14 @@ fi
 
 # run_main <case_dir> <nick_conf_line> <stdin> [setup]: roda main() de ponta a ponta num
 # bash separado, com cwd em <case_dir>/cwd contendo um .nick/nick.conf de uma linha,
-# check_requirements stubado e LOGS_DIR/PROJECTS_DIR temporários (nada é gravado em
-# auto_scrum/logs/ nem lido de auto_scrum/projects/). [setup] roda antes de main (ex:
-# apontar EDITOR). stdout+stderr vão pra <case_dir>/output; imprime o código de saída.
+# check_requirements stubado e LOGS_DIR temporário (nada é gravado em auto_scrum/logs/).
+# [setup] roda antes de main (ex: apontar EDITOR). stdout+stderr vão pra <case_dir>/output;
+# imprime o código de saída.
 run_main() {
   local case_dir="$1" conf_line="$2" input="$3" setup="${4:-:}" rc=0
-  mkdir -p "$case_dir/cwd" "$case_dir/projects"
   mkdir -p "$case_dir/cwd/.nick"
   printf '%s\n' "$conf_line" > "$case_dir/cwd/.nick/nick.conf"
-  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$case_dir/logs'; PROJECTS_DIR='$case_dir/projects'; $setup; main" <<< "$input" > "$case_dir/output" 2>&1 || rc=$?
+  timeout 5 bash -c "cd '$case_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$case_dir/logs'; $setup; main" <<< "$input" > "$case_dir/output" 2>&1 || rc=$?
   printf '%s' "$rc"
 }
 
@@ -1589,23 +1284,21 @@ for production_variant in true false TRUE sem_linha; do
 done
 
 echo
-echo "== main(): projeto 'Nenhum' no menu não tem a pergunta de impacto em produção =="
-none_dir="$TEST_TMP/main_e2e_production_none"
-mkdir -p "$none_dir/cwd" "$none_dir/projects"
-printf '%s\n' 'STACK_DESCRIPTION="x"' > "$none_dir/projects/alpha.conf"
-none_rc=0
-# cwd sem .nick/nick.conf, pra cair no menu de projetos. stdin: projeto 2 (Nenhum), tipo 2
-# (po_discussion), o assunto e N pra recusar o envio.
-timeout 5 bash -c "cd '$none_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$none_dir/logs'; PROJECTS_DIR='$none_dir/projects'; main" <<< $'2\n2\nassunto de teste\nN' > "$none_dir/output" 2>&1 || none_rc=$?
+echo "== main(): .nick/nick.conf com todas as chaves vazias não tem a pergunta de impacto em produção =="
+# O que o antigo projeto "Nenhum" provava: sem nenhum valor preenchido (todas as chaves "", e
+# nenhum aviso), a pergunta de produção não entra. stdin: tipo 2 (po_discussion), o assunto e N
+# pra recusar o envio.
+none_dir="$TEST_TMP/main_e2e_production_blank"
+none_rc="$(run_main "$none_dir" "$(config_keys_blank)" $'2\nassunto de teste\nN')"
 none_logs="$(logs_for_type "$none_dir/logs" po_discussion)"
 none_log_text="$(cat "$(head -n1 <<< "$none_logs")" 2>/dev/null || true)"
 none_output="$(cat "$none_dir/output" 2>/dev/null || true)"
-assert_eq "0" "$none_rc" "Nenhum: main() termina com código 0"
-assert_eq "1" "$(grep -c . <<< "$none_logs" || true)" "Nenhum: gera exatamente um log po_discussion_<timestamp>.md"
-assert_contains "$none_log_text" "- Quais são os impactos negativos possíveis?" "Nenhum: o prompt tem a pergunta de impactos negativos"
-assert_not_contains "$none_log_text" "Existe impacto em produção?" "Nenhum: o prompt não tem a pergunta de impacto em produção"
-assert_not_contains "$none_output" "Existe impacto em produção?" "Nenhum: a saída (stdout+stderr) não tem a pergunta de impacto em produção"
-assert_eq "0" "$(count_warnings "$none_dir/output")" "Nenhum (com alpha.conf incompleto em projects/): nenhum aviso na saída"
+assert_eq "0" "$none_rc" "chaves vazias: main() termina com código 0"
+assert_eq "1" "$(grep -c . <<< "$none_logs" || true)" "chaves vazias: gera exatamente um log po_discussion_<timestamp>.md"
+assert_contains "$none_log_text" "- Quais são os impactos negativos possíveis?" "chaves vazias: o prompt tem a pergunta de impactos negativos"
+assert_not_contains "$none_log_text" "Existe impacto em produção?" "chaves vazias: o prompt não tem a pergunta de impacto em produção"
+assert_not_contains "$none_output" "Existe impacto em produção?" "chaves vazias: a saída (stdout+stderr) não tem a pergunta de impacto em produção"
+assert_eq "0" "$(count_warnings "$none_dir/output")" "chaves vazias: nenhum aviso na saída"
 
 echo
 echo "== main(): TDD_ENABLED de ponta a ponta nos prompts de Tech Leader, Desenvolvimento e Review =="
@@ -1887,29 +1580,27 @@ for tdd_variant in true vazio TRUE sem_linha false; do
 done
 
 echo
-echo "== main(): projeto 'Nenhum' mantém a TDD ligada nos prompts de Tech Leader, Desenvolvimento e Review =="
-# cwd sem .nick/nick.conf e PROJECTS_DIR vazio: o menu de projetos é 1) Nenhum 2) Sair (q). stdin:
-# Nenhum (1) e depois o roteiro do TYPE.
+echo "== main(): .nick/nick.conf com todas as chaves vazias mantém a TDD ligada nos prompts de Tech Leader, Desenvolvimento e Review =="
+# O que o antigo projeto "Nenhum" provava: com TDD_ENABLED="" (e as outras chaves vazias), a TDD
+# continua ligada. stdin: o roteiro do TYPE.
 for tdd_none_type in tech_leader development review; do
-  tdd_none_dir="$TEST_TMP/main_e2e_tdd_none/$tdd_none_type"
-  mkdir -p "$tdd_none_dir/cwd" "$tdd_none_dir/projects"
+  tdd_none_dir="$TEST_TMP/main_e2e_tdd_blank/$tdd_none_type"
   tdd_none_input_var="tdd_input_$tdd_none_type"
-  tdd_none_rc=0
-  timeout 5 bash -c "cd '$tdd_none_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$tdd_none_dir/logs'; PROJECTS_DIR='$tdd_none_dir/projects'; EDITOR='$fake_editor'; main" <<< "1"$'\n'"${!tdd_none_input_var}" > "$tdd_none_dir/output" 2>&1 || tdd_none_rc=$?
+  tdd_none_rc="$(run_main "$tdd_none_dir" "$(config_keys_blank)" "${!tdd_none_input_var}" "EDITOR='$fake_editor'")"
   tdd_none_ref_var="tdd_ref_${tdd_none_type}_on"
-  assert_eq "0" "$tdd_none_rc" "Nenhum, $tdd_none_type: main() termina com código 0"
-  assert_eq "${!tdd_none_ref_var}" "$(tdd_log_text "$tdd_none_dir/logs" "$tdd_none_type")" "Nenhum, $tdd_none_type: o prompt é idêntico à referência fixa (TDD ligada)"
-  assert_eq "0" "$(count_warnings "$tdd_none_dir/output")" "Nenhum, $tdd_none_type: nenhum aviso na saída"
+  assert_eq "0" "$tdd_none_rc" "chaves vazias, $tdd_none_type: main() termina com código 0"
+  assert_eq "${!tdd_none_ref_var}" "$(tdd_log_text "$tdd_none_dir/logs" "$tdd_none_type")" "chaves vazias, $tdd_none_type: o prompt é idêntico à referência fixa (TDD ligada)"
+  assert_eq "0" "$(count_warnings "$tdd_none_dir/output")" "chaves vazias, $tdd_none_type: nenhum aviso na saída"
 done
 
-# Com "Nenhum", JIRA_ENABLED fica vazio e tech_leader_jira não aparece no menu. Por isso esse
+# Com as chaves vazias, JIRA_ENABLED fica vazio e tech_leader_jira não aparece no menu. Por isso esse
 # TYPE é renderizado sem passar pelo menu: dá source, não carrega configuração, chama os
 # build_*_blocks na ordem em que main() os chama, exporta e roda o envsubst com a lista lida
 # do próprio script — os mesmos passos de main() depois de resolve_stack.
 tdd_none_builds="$(grep -E '^  build_[a-z_]+_blocks$' "$AUTO_SCRUM_SH" | tr -d ' ' | paste -sd ';' -)"
 tdd_none_envsubst_vars="$(grep -F "envsubst '" "$AUTO_SCRUM_SH" | sed -E "s/.*envsubst '([^']*)'.*/\1/")"
 tdd_none_jira_text="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $tdd_none_builds; JIRA_LINK='https://jira.example.com/browse/SC-20'; DESCRIPTION=''; export ${tdd_none_envsubst_vars//\$/}; envsubst '$tdd_none_envsubst_vars' < '$SCRIPT_DIR/../templates/tech_leader_jira.md'; printf '<FIM>'" 2>/dev/null || true)"
-assert_eq "$tdd_ref_tech_leader_jira_on" "$tdd_none_jira_text" "Nenhum, tech_leader_jira (renderizado sem o menu): o prompt é idêntico à referência fixa (TDD ligada)"
+assert_eq "$tdd_ref_tech_leader_jira_on" "$tdd_none_jira_text" "chaves vazias, tech_leader_jira (renderizado sem o menu): o prompt é idêntico à referência fixa (TDD ligada)"
 
 echo
 echo "== reaproveitamento: o parágrafo de cada papel é o mesmo com e sem STACK_DESCRIPTION, com a TDD ligada e desligada =="
@@ -1953,7 +1644,7 @@ tdd_block_exact() {
 }
 
 # Qualquer valor diferente de "false" exato (inclusive o valor global padrão, que é o caso
-# "Nenhum") mantém os três blocos idênticos ao texto de antes da flag.
+# o vazio) mantém os três blocos idênticos ao texto de antes da flag.
 for tdd_value_setup in "TDD_ENABLED='true'" "TDD_ENABLED=''" "TDD_ENABLED='TRUE'" "TDD_ENABLED='True'" "TDD_ENABLED='sim'" "TDD_ENABLED=' false'" "TDD_ENABLED='FALSE'" ":"; do
   tdd_value_label="$tdd_value_setup"
   if [ "$tdd_value_setup" = ":" ]; then
@@ -1992,22 +1683,30 @@ assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates s�
 assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
 
 echo
-echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config.sh, lib/jail/jail.sh e lib/claude/claude.sh (config nunca é executada) =="
-# A configuração nunca é executada: o leitor (config_load) não usa source/eval, e lib/config.sh
-# não tem source, . nem eval (teste estrutural em lib/tests/test_config.sh). Aqui, a lista
-# inteira de linhas source/. tem de ser só a das três bibliotecas, nesta ordem.
+echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config/config.sh, lib/config/keys.sh, lib/jail/jail.sh e lib/claude/claude.sh (config nunca é executada) =="
+# A configuração nunca é executada: o leitor (config_load) não usa source/eval, e
+# lib/config/config.sh e lib/config/keys.sh não têm source, . nem eval (testes estruturais em
+# lib/tests/test_config.sh e lib/tests/test_keys.sh). Aqui, a lista inteira de linhas source/.
+# tem de ser só a dos quatro arquivos das bibliotecas, nesta ordem.
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '$SCRIPT_DIR' é o texto literal buscado no código-fonte.
 source_lines="$(grep -E '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 # shellcheck disable=SC2016
-assert_eq 'source "$SCRIPT_DIR/../lib/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$source_lines" "auto_scrum.sh tem três linhas source/., a de lib/config.sh, a de lib/jail/jail.sh e depois a de lib/claude/claude.sh"
+assert_eq 'source "$SCRIPT_DIR/../lib/config/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/config/keys.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$source_lines" "auto_scrum.sh tem quatro linhas source/.: lib/config/config.sh, lib/config/keys.sh, lib/jail/jail.sh e depois lib/claude/claude.sh"
 
 echo
-echo "== auto_scrum.sh: carrega lib/config.sh com a diretiva do shellcheck logo acima =="
+echo "== auto_scrum.sh: carrega lib/config/config.sh com a diretiva do shellcheck logo acima =="
 # shellcheck disable=SC2016
-lib_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/config.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
-assert_eq "true" "$([ -n "$lib_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/config.sh\""
-assert_eq "# shellcheck source=SCRIPTDIR/../lib/config.sh" "$( [ -n "$lib_source_number" ] && sed -n "$((lib_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/config.sh'"
+lib_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/config/config.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$lib_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/config/config.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/../lib/config/config.sh" "$( [ -n "$lib_source_number" ] && sed -n "$((lib_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/config/config.sh'"
+
+echo
+echo "== auto_scrum.sh: carrega lib/config/keys.sh com a diretiva do shellcheck logo acima =="
+# shellcheck disable=SC2016
+keys_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/config/keys.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$keys_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/config/keys.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/../lib/config/keys.sh" "$( [ -n "$keys_source_number" ] && sed -n "$((keys_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/config/keys.sh'"
 
 echo
 echo "== auto_scrum.sh: carrega lib/jail/jail.sh com a diretiva do shellcheck logo acima =="
@@ -2024,16 +1723,17 @@ assert_eq "true" "$([ -n "$claude_source_number" ] && echo true || echo false)" 
 assert_eq "# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh" "$( [ -n "$claude_source_number" ] && sed -n "$((claude_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh'"
 
 echo
-echo "== lib/config.sh: nenhuma chave concreta do auto_scrum na biblioteca nem nos testes dela =="
-# As chaves vêm do próprio registro do auto_scrum, então este teste cobre sozinho as chaves
-# futuras. -w não casa um nome mais longo (o _ conta como caractere de palavra).
-LIB_CONFIG_SH="$SCRIPT_DIR/../../lib/config.sh"
+echo "== lib/config/config.sh: nenhuma chave concreta na parte genérica da biblioteca nem nos testes dela =="
+# As chaves concretas moram só em lib/config/keys.sh (e na suíte dele). Elas vêm do próprio
+# registro, então este teste cobre sozinho as chaves futuras. -w não casa um nome mais longo
+# (o _ conta como caractere de palavra).
+LIB_CONFIG_SH="$SCRIPT_DIR/../../lib/config/config.sh"
 LIB_TEST_CONFIG_SH="$SCRIPT_DIR/../../lib/tests/test_config.sh"
 registered_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"" 2>/dev/null || true)"
 # Só garante que o laço abaixo não roda vazio, sem fixar a quantidade de chaves.
 assert_eq "true" "$([ -n "$registered_keys" ] && echo true || echo false)" "o auto_scrum registra pelo menos uma chave"
 for registered_key in $registered_keys; do
-  assert_eq "" "$(grep -nw "$registered_key" "$LIB_CONFIG_SH" || true)" "lib/config.sh não cita $registered_key"
+  assert_eq "" "$(grep -nw "$registered_key" "$LIB_CONFIG_SH" || true)" "lib/config/config.sh não cita $registered_key"
   assert_eq "" "$(grep -nw "$registered_key" "$LIB_TEST_CONFIG_SH" || true)" "lib/tests/test_config.sh não cita $registered_key"
 done
 
@@ -2050,61 +1750,20 @@ for old_name in PROJECT_CONFIG_KEYS CWD_CONFIG_NAME; do
 done
 
 echo
-echo "== auto_scrum.sh: as chaves são registradas num lugar só, um bloco contíguo no topo =="
-# register_block_problems <arquivo> <chaves>: imprime um problema por linha (nada, se o
-# registro de <arquivo> está certo), comparando com <chaves> (uma por linha, na ordem de
-# CONFIG_KEYS). Não recorta o bloco por linha em branco: o comentário de uma chave pode ter
-# linha vazia (o esqueleto a escreve como "#"). Usa os números de linha das próprias chamadas
-# "config_register_key" (fora de função, na coluna 0):
-#   - toda chamada fora de comentário está na coluna 0 e há uma por chave;
-#   - os nomes saem na ordem de <chaves>;
-#   - entre a primeira e a última chamada não há definição de função nem atribuição CHAVE=;
-#   - a última chamada vem antes da primeira função (o bloco fica no topo).
-register_block_problems() {
-  local file="$1" expected_keys="$2" code calls first last first_function
-  code="$(grep -vE '^[[:space:]]*#' "$file" || true)"
-  calls="$(grep -nE '^config_register_key [A-Z0-9_]+' "$file" || true)"
-  if [ "$(grep -cw 'config_register_key' <<< "$code" || true)" != "$(grep -c . <<< "$expected_keys" || true)" ]; then
-    echo "número de chamadas config_register_key diferente do número de chaves"
-  fi
-  if [ "$(cut -d' ' -f2 <<< "$calls")" != "$expected_keys" ]; then
-    echo "nomes das chamadas fora da ordem de CONFIG_KEYS"
-  fi
-  first="$(head -n1 <<< "$calls" | cut -d: -f1)"
-  last="$(tail -n1 <<< "$calls" | cut -d: -f1)"
-  first_function="$(grep -nE '^[a-z_]+\(\) \{' "$file" | head -n1 | cut -d: -f1 || true)"
-  if [ -z "$first" ] || [ -z "$first_function" ]; then
-    echo "sem chamada de registro ou sem função no arquivo"
-    return 0
-  fi
-  if sed -n "${first},${last}p" "$file" | grep -qE '^([a-z_]+\(\)|[A-Z_]+=)'; then
-    echo "código entre a primeira e a última chamada de registro"
-  fi
-  if [ "$last" -ge "$first_function" ]; then
-    echo "chamada de registro depois da primeira função"
-  fi
-}
-assert_eq "" "$(register_block_problems "$AUTO_SCRUM_SH" "$registered_keys")" "o bloco de registro é contíguo, no topo, com uma chamada por chave na ordem de CONFIG_KEYS e nenhuma fora dele"
-# Regressão: linha vazia dentro do comentário da primeira chave (depois da 1ª linha do
-# comentário) não quebra a checagem.
-register_dir="$TEST_TMP/register_block"
-mkdir -p "$register_dir"
-awk '{print} /^config_register_key /{found++} found == 1 && !done && !/^config_register_key /{print ""; done=1}' "$AUTO_SCRUM_SH" > "$register_dir/blank_comment_line.sh"
-assert_eq "1" "$(diff "$AUTO_SCRUM_SH" "$register_dir/blank_comment_line.sh" | grep -c '^> $' || true)" "cópia de regressão: tem uma linha vazia a mais, dentro do bloco de registro"
-assert_eq "" "$(register_block_problems "$register_dir/blank_comment_line.sh" "$registered_keys")" "linha vazia no comentário de uma chave: o bloco de registro continua válido"
-# Controle negativo: uma chamada a mais no fim do arquivo é pega.
-{ cat "$AUTO_SCRUM_SH"; printf '%s\n' "config_register_key LATE_ENABLED \"false\" \"\" 'LATE_ENABLED: tarde.'"; } > "$register_dir/late_key.sh"
-assert_contains "$(register_block_problems "$register_dir/late_key.sh" "$registered_keys")" "chamada de registro depois da primeira função" "chave registrada no fim do arquivo: a checagem acusa"
-skeleton_body="$(awk '/^print_project_skeleton\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
-assert_contains "$skeleton_body" "print_project_skeleton" "print_project_skeleton() existe"
-assert_eq "" "$(grep -E '^[[:space:]]*[A-Z_]+=' <<< "$skeleton_body" || true)" "o corpo de print_project_skeleton não tem nenhuma linha CHAVE="
+echo "== auto_scrum.sh: não registra nenhuma chave; chama config_register_nick_keys uma vez, no topo, fora de função =="
+# O registro mora em lib/config/keys.sh (testes em lib/tests/test_keys.sh): aqui só a chamada.
+assert_eq "" "$(grep -nw 'config_register_key' <<< "$auto_scrum_code" || true)" "auto_scrum.sh não tem nenhuma linha config_register_key fora de comentário"
+assert_eq "1" "$(grep -cw 'config_register_nick_keys' <<< "$auto_scrum_code" || true)" "auto_scrum.sh cita config_register_nick_keys uma vez só fora de comentário"
+register_call_number="$(grep -nx 'config_register_nick_keys' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+register_first_function="$(grep -nE '^[a-z_]+\(\) \{' "$AUTO_SCRUM_SH" | head -n1 | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$register_call_number" ] && [ -n "$keys_source_number" ] && [ -n "$register_first_function" ] && [ "$keys_source_number" -lt "$register_call_number" ] && [ "$register_call_number" -lt "$register_first_function" ] && echo true || echo false)" "a chamada config_register_nick_keys está na coluna 0, depois do source de keys.sh e antes da primeira função (no topo, fora de função)"
 
 echo
 echo "== auto_scrum: chave nova só no registro aparece no esqueleto e nos dois avisos =="
 newkey_dir="$TEST_TMP/new_key"
 mkdir -p "$newkey_dir"
 newkey_setup="config_register_key NEW_X_ENABLED 'false' '' 'NEW_X_ENABLED: chave extra de teste.'"
-newkey_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $newkey_setup; print_project_skeleton" 2>/dev/null || true)"
+newkey_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $newkey_setup; config_print_skeleton nick" 2>/dev/null || true)"
 assert_contains "$newkey_skeleton" $'# NEW_X_ENABLED: chave extra de teste.\nNEW_X_ENABLED="false"' "a chave extra aparece no esqueleto, com o comentário e NEW_X_ENABLED=\"false\""
 config_keys_blank > "$newkey_dir/without.conf"
 run_loader "$newkey_dir/without.conf" "$newkey_dir/without" "$newkey_setup" >/dev/null
@@ -2192,79 +1851,8 @@ for ct_input in "" x; do
   assert_not_contains "$(cat "$ct_out" 2>/dev/null || true)" "$menu_quit_message" "menu principal, stdin fecha (entrada: '$ct_input' + EOF): sem mensagem de saída"
 done
 
-# Menu de projetos (resolve_stack): com alpha.conf e beta.conf o menu é
-# 1) alpha 2) beta 3) Nenhum 4) Sair (q). Sair não carrega projeto nenhum (sem aviso) e
-# encerra antes de resolve_stack retornar, então o helper imprime vazio.
-rs_quit_dir="$menu_dir/resolve_stack"
-rs_quit_cwd="$rs_quit_dir/cwd"
-rs_quit_projects="$rs_quit_dir/projects"
-mkdir -p "$rs_quit_cwd" "$rs_quit_projects"
-printf '%s\n' 'STACK_DESCRIPTION="stack-alpha"' > "$rs_quit_projects/alpha.conf"
-printf '%s\n' 'STACK_DESCRIPTION="stack-beta"' > "$rs_quit_projects/beta.conf"
-for rs_quit_input in 4 q Q; do
-  rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" "$rs_quit_input" "$rs_quit_dir/quit_$rs_quit_input")"
-  assert_eq "" "$rs_quit_result" "menu de projetos, entrada '$rs_quit_input': resolve_stack não retorna (o script encerra no menu)"
-  assert_eq "0" "$(cat "$rs_quit_dir/quit_$rs_quit_input.rc")" "menu de projetos, entrada '$rs_quit_input': código 0"
-  assert_contains "$(cat "$rs_quit_dir/quit_$rs_quit_input.out" 2>/dev/null || true)" "$menu_quit_message" "menu de projetos, entrada '$rs_quit_input': mostra a mensagem de saída no stdout"
-  assert_eq "0" "$(count_warnings "$rs_quit_dir/quit_$rs_quit_input.err")" "menu de projetos, entrada '$rs_quit_input': nenhum projeto é carregado (sem aviso)"
-done
-assert_contains "$(cat "$rs_quit_dir/quit_4.err" 2>/dev/null || true)" "4) $menu_quit_label" "menu de projetos: \"$menu_quit_label\" é o item 4, depois do Nenhum"
-assert_contains "$(cat "$rs_quit_dir/quit_4.err" 2>/dev/null || true)" "3) Nenhum" "menu de projetos: Nenhum continua sendo o item 3"
-
-rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" "3" "$rs_quit_dir/none")"
-assert_eq "||||" "$rs_quit_result" "menu de projetos: Nenhum (3) segue sem projeto, separado do Sair"
-assert_eq "0" "$(cat "$rs_quit_dir/none.rc")" "menu de projetos: Nenhum (3) retorna com código 0"
-assert_not_contains "$(cat "$rs_quit_dir/none.out" 2>/dev/null || true)" "$menu_quit_message" "menu de projetos: Nenhum (3) não mostra a mensagem de saída"
-
-# Sem projetos: o menu é 1) Nenhum 2) Sair (q).
-rs_quit_empty="$rs_quit_dir/projects_empty"
-mkdir -p "$rs_quit_empty"
-rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_empty" "" "2" "$rs_quit_dir/empty_quit")"
-assert_eq "" "$rs_quit_result" "menu de projetos sem projetos, entrada '2': resolve_stack não retorna"
-assert_eq "0" "$(cat "$rs_quit_dir/empty_quit.rc")" "menu de projetos sem projetos, entrada '2': código 0"
-assert_contains "$(cat "$rs_quit_dir/empty_quit.err" 2>/dev/null || true)" "2) $menu_quit_label" "menu de projetos sem projetos: \"$menu_quit_label\" é o item 2"
-rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_empty" "" "1" "$rs_quit_dir/empty_none")"
-assert_eq "||||" "$rs_quit_result" "menu de projetos sem projetos: Nenhum (1) segue sem projeto"
-
-# Inválidas: x, 5 (depois do Sair) e qq repetem a pergunta; o 3 seguinte é Nenhum.
-rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" $'x\n5\nqq\n3' "$rs_quit_dir/invalid")"
-assert_eq "||||" "$rs_quit_result" "menu de projetos: x, 5 e qq são inválidas; o 3 seguinte dá Nenhum"
-assert_eq "3" "$(count_in_file "$rs_quit_dir/invalid.out" "$menu_invalid_message")" "menu de projetos: cada entrada inválida mostra a mensagem de inválida (3 vezes)"
-
-# Ctrl+D (regressão): stdin fechado continua saindo com código 1 e sem mensagem de saída.
-rs_quit_result="$(run_resolve_stack "$rs_quit_cwd" "$rs_quit_projects" "" "" "$rs_quit_dir/eof")"
-assert_eq "" "$rs_quit_result" "menu de projetos, stdin fecha (EOF): resolve_stack não retorna valor"
-assert_eq "1" "$(cat "$rs_quit_dir/eof.rc")" "menu de projetos, stdin fecha (EOF): código 1"
-assert_not_contains "$(cat "$rs_quit_dir/eof.out" 2>/dev/null || true)" "$menu_quit_message" "menu de projetos, stdin fecha (EOF): sem mensagem de saída"
-
-# Menu do --init (init_project): 1) diretório atual 2) projects/ 3) Sair (q). Sair encerra
-# com código 0 sem criar o .nick/nick.conf nem o PROJECTS_DIR.
-init_quit_dir="$menu_dir/init_project"
-for init_quit_input in 3 q Q; do
-  init_quit_cwd="$init_quit_dir/cwd_$init_quit_input"
-  init_quit_projects="$init_quit_dir/projects_$init_quit_input"
-  mkdir -p "$init_quit_cwd"
-  init_quit_rc="$(run_init_project "$init_quit_cwd" "$init_quit_projects" "$init_quit_input" "$init_quit_dir/quit_$init_quit_input.log")"
-  assert_eq "0" "$init_quit_rc" "--init, entrada '$init_quit_input': init_project encerra com código 0"
-  assert_contains "$(cat "$init_quit_dir/quit_$init_quit_input.log" 2>/dev/null || true)" "$menu_quit_message" "--init, entrada '$init_quit_input': mostra a mensagem de saída"
-  assert_not_exists "$init_quit_cwd/.nick/nick.conf" "--init, entrada '$init_quit_input': nenhum .nick/nick.conf é criado no cwd"
-  assert_not_exists "$init_quit_projects" "--init, entrada '$init_quit_input': PROJECTS_DIR não é criado"
-done
-assert_contains "$(cat "$init_quit_dir/quit_3.log" 2>/dev/null || true)" "3) $menu_quit_label" "--init: \"$menu_quit_label\" é o item 3, depois dos dois destinos"
-
-# Inválidas seguidas de EOF: x, 4 (depois do Sair) e qq repetem a pergunta; o stdin fecha
-# e o comportamento de hoje continua (código 1, cancelado, nada criado).
-init_quit_cwd="$init_quit_dir/cwd_invalid"
-init_quit_projects="$init_quit_dir/projects_invalid"
-mkdir -p "$init_quit_cwd"
-init_quit_rc="$(run_init_project "$init_quit_cwd" "$init_quit_projects" $'x\n4\nqq' "$init_quit_dir/invalid.log")"
-assert_eq "1" "$init_quit_rc" "--init: x, 4 e qq são inválidas; o EOF seguinte sai com código 1"
-assert_eq "3" "$(count_in_file "$init_quit_dir/invalid.log" "$menu_invalid_message")" "--init: cada entrada inválida mostra a mensagem de inválida (3 vezes)"
-assert_not_contains "$(cat "$init_quit_dir/invalid.log" 2>/dev/null || true)" "$menu_quit_message" "--init: nenhuma entrada inválida encerra pelo menu"
-assert_not_exists "$init_quit_cwd/.nick/nick.conf" "--init: entradas inválidas + EOF não criam .nick/nick.conf"
-
 echo
-echo "== main(): sair por qualquer menu não cria log, não chama o claude e não cria configuração =="
+echo "== main(): sair pelo menu não cria log, não chama o claude e não cria a árvore .nick/ =="
 # claude falso: só toca um marcador. Prova que o exec claude não acontece ao sair pelo menu
 # — e o controle positivo abaixo prova que, quando o envio é confirmado, o stub é chamado.
 fake_claude_dir="$TEST_TMP/fake_claude"
@@ -2294,38 +1882,6 @@ for mq_input in 6 q Q; do
   assert_not_contains "$mq_output" "Confirma o envio" "menu principal, entrada '$mq_input': não chega à confirmação de envio"
 done
 
-# Menu de projetos: cwd sem .nick/nick.conf e projects/alpha.conf, então o menu é
-# 1) alpha 2) Nenhum 3) Sair (q).
-for mq_input in 3 q Q; do
-  mq_proj_dir="$menu_dir/projects_menu_$mq_input"
-  mkdir -p "$mq_proj_dir/cwd" "$mq_proj_dir/projects"
-  printf '%s\n' 'STACK_DESCRIPTION="x"' > "$mq_proj_dir/projects/alpha.conf"
-  rm -f "$fake_claude_marker"
-  mq_rc=0
-  timeout 5 bash -c "cd '$mq_proj_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$mq_proj_dir/logs'; PROJECTS_DIR='$mq_proj_dir/projects'; $fake_claude_setup; main" <<< "$mq_input" > "$mq_proj_dir/output" 2>&1 || mq_rc=$?
-  mq_output="$(cat "$mq_proj_dir/output" 2>/dev/null || true)"
-  assert_eq "0" "$mq_rc" "menu de projetos, entrada '$mq_input': main() termina com código 0"
-  assert_contains "$mq_output" "$menu_quit_message" "menu de projetos, entrada '$mq_input': mostra a mensagem de saída"
-  assert_not_contains "$mq_output" "Qual tipo de conversa" "menu de projetos, entrada '$mq_input': não chega ao menu principal"
-  assert_not_exists "$mq_proj_dir/logs" "menu de projetos, entrada '$mq_input': nenhum log é criado"
-  assert_not_exists "$fake_claude_marker" "menu de projetos, entrada '$mq_input': o claude não é chamado"
-done
-
-# --init: cwd vazio e PROJECTS_DIR inexistente; o menu é 1) cwd 2) projects/ 3) Sair (q).
-for mq_input in 3 q Q; do
-  mq_init_dir="$menu_dir/init_menu_$mq_input"
-  mkdir -p "$mq_init_dir/cwd"
-  rm -f "$fake_claude_marker"
-  mq_rc=0
-  timeout 5 bash -c "cd '$mq_init_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$mq_init_dir/logs'; PROJECTS_DIR='$mq_init_dir/projects'; $fake_claude_setup; main --init" <<< "$mq_input" > "$mq_init_dir/output" 2>&1 || mq_rc=$?
-  mq_output="$(cat "$mq_init_dir/output" 2>/dev/null || true)"
-  assert_eq "0" "$mq_rc" "--init, entrada '$mq_input': main --init termina com código 0"
-  assert_contains "$mq_output" "$menu_quit_message" "--init, entrada '$mq_input': mostra a mensagem de saída"
-  assert_not_exists "$mq_init_dir/cwd/.nick/nick.conf" "--init, entrada '$mq_input': nenhum .nick/nick.conf é criado"
-  assert_not_exists "$mq_init_dir/projects" "--init, entrada '$mq_input': PROJECTS_DIR não é criado"
-  assert_not_exists "$mq_init_dir/logs" "--init, entrada '$mq_input': nenhum log é criado"
-  assert_not_exists "$fake_claude_marker" "--init, entrada '$mq_input': o claude não é chamado"
-done
 rm -f "$fake_claude_marker"
 
 echo
@@ -2338,96 +1894,17 @@ assert_eq "1" "$(grep -c . <<< "$select_lines" || true)" "auto_scrum.sh tem exat
 select_menu_body="$(awk '/^select_menu\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
 assert_contains "$select_menu_body" "select " "a única linha select fica dentro de select_menu()"
 # A saída pelo menu é um exit: dentro de $(...) ele só encerraria o subshell, o script
-# seguiria e a mensagem de saída seria engolida pela captura. Nenhum menu (nem função que
-# mostra um) pode ser chamado assim.
-menu_in_subshell="$(grep -nE '\$\((select_menu|choose_type|resolve_stack|init_project)\b' "$AUTO_SCRUM_SH" || true)"
+# seguiria e a mensagem de saída seria engolida pela captura. Nenhuma das duas funções de menu
+# (select_menu e choose_type, que mostra o menu principal) pode ser chamada assim.
+menu_in_subshell="$(grep -nE '\$\((select_menu|choose_type)\b' "$AUTO_SCRUM_SH" || true)"
 assert_eq "" "$menu_in_subshell" "nenhum menu é chamado dentro de \$(...)"
 echo
-echo "== JAIL_ENABLED: registrada na quarta posição a partir do fim, padrão \"false\", com comentário no esqueleto =="
-jail_keys="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s\n' \"\${CONFIG_KEYS[@]}\"" 2>/dev/null || true)"
-assert_eq "JAIL_ENABLED"$'\n'"JAIL_CLIPBOARD"$'\n'"JAIL_FORWARD_PORTS"$'\n'"JAIL_ALLOW_HOSTS" "$(tail -n4 <<< "$jail_keys")" "JAIL_ENABLED, JAIL_CLIPBOARD, JAIL_FORWARD_PORTS e JAIL_ALLOW_HOSTS são as quatro últimas chaves de CONFIG_KEYS"
-jail_skeleton="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; print_project_skeleton" 2>/dev/null || true)"
-assert_contains "$jail_skeleton" 'JAIL_ENABLED="false"' "o esqueleto tem JAIL_ENABLED=\"false\""
-jail_skeleton_comment="$(awk '/^# JAIL_ENABLED:/{found=1} /^JAIL_ENABLED=/{found=0} found' <<< "$jail_skeleton")"
-for jail_word in ai-jail bubblewrap README --requisitos-jail JIRA_ENABLED SENTRY_ENABLED mcp.atlassian.com mcp.sentry.dev; do
-  assert_contains "$jail_skeleton_comment" "$jail_word" "o comentário de JAIL_ENABLED no esqueleto cita $jail_word"
-done
-assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_ENABLED" 2>/dev/null || true)" "JAIL_ENABLED não tem nota (o aviso de valor termina em \"a opção está desligada.\")"
-jail_reg_dir="$TEST_TMP/jail_register"
-mkdir -p "$jail_reg_dir"
-printf '%s\n' "$(config_keys_blank JAIL_ENABLED)" 'JAIL_ENABLED="sim"' > "$jail_reg_dir/invalid.conf"
-run_loader "$jail_reg_dir/invalid.conf" "$jail_reg_dir/invalid" >/dev/null
-assert_eq "$(value_warning "$jail_reg_dir/invalid.conf:$(wc -l < "$jail_reg_dir/invalid.conf")" JAIL_ENABLED sim "$default_off_note")" "$(cat "$jail_reg_dir/invalid.err" 2>/dev/null || true)" "JAIL_ENABLED=\"sim\": aviso de valor, terminando em \"a opção está desligada.\""
-config_keys_blank JAIL_ENABLED > "$jail_reg_dir/missing.conf"
-run_loader "$jail_reg_dir/missing.conf" "$jail_reg_dir/missing" >/dev/null
-assert_eq "$(missing_warning "$jail_reg_dir/missing.conf" 'JAIL_ENABLED="false"')" "$(cat "$jail_reg_dir/missing.err" 2>/dev/null || true)" "sem a linha JAIL_ENABLED: aviso de chave ausente sugerindo JAIL_ENABLED=\"false\""
-
-echo
-echo "== JAIL_CLIPBOARD: registrada na penúltima posição, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
-assert_contains "$jail_skeleton" 'JAIL_CLIPBOARD=""' "o esqueleto tem JAIL_CLIPBOARD=\"\""
-clip_skeleton_comment="$(awk '/^# JAIL_CLIPBOARD:/{found=1} /^JAIL_CLIPBOARD=/{found=0} found' <<< "$jail_skeleton")"
-for clip_word in 'JAIL_ENABLED="true"' '"restrito"' '"medio"' '"brando"' --terminal-passthrough --display clipboard 'botão direito → Colar' Ctrl+V README; do
-  assert_contains "$clip_skeleton_comment" "$clip_word" "o comentário de JAIL_CLIPBOARD no esqueleto cita $clip_word"
-done
-# Shift+Insert no terminal do VS Code (Linux) cola a seleção primária, não o clipboard.
-assert_not_contains "$clip_skeleton_comment" "Shift+Insert" "o comentário de JAIL_CLIPBOARD não manda colar com Shift+Insert"
-# jail_print_status mostra só o nível; o risco fica no comentário e no README.
-assert_not_contains "$clip_skeleton_comment" "e o risco" "o comentário de JAIL_CLIPBOARD não promete mostrar o risco a cada execução"
-assert_contains "$clip_skeleton_comment" "mostra o nível a cada execução" "o comentário de JAIL_CLIPBOARD diz que o auto_scrum mostra o nível a cada execução"
-assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_CLIPBOARD" 2>/dev/null || true)" "JAIL_CLIPBOARD não tem nota"
-# Chave de texto: a config.sh não valida o valor (quem valida é jail_check, com a jail ligada).
-printf '%s\n' "$(config_keys_blank JAIL_CLIPBOARD)" 'JAIL_CLIPBOARD="total"' > "$jail_reg_dir/clip_invalid.conf"
-run_loader "$jail_reg_dir/clip_invalid.conf" "$jail_reg_dir/clip_invalid" >/dev/null
-assert_eq "" "$(cat "$jail_reg_dir/clip_invalid.err" 2>/dev/null || true)" "JAIL_CLIPBOARD=\"total\": a carga da configuração não avisa (a validação é da jail)"
-config_keys_blank JAIL_CLIPBOARD > "$jail_reg_dir/clip_missing.conf"
-run_loader "$jail_reg_dir/clip_missing.conf" "$jail_reg_dir/clip_missing" >/dev/null
-assert_eq "$(missing_warning "$jail_reg_dir/clip_missing.conf" 'JAIL_CLIPBOARD=""')" "$(cat "$jail_reg_dir/clip_missing.err" 2>/dev/null || true)" "sem a linha JAIL_CLIPBOARD: aviso de chave ausente sugerindo JAIL_CLIPBOARD=\"\""
-
-echo
-echo "== JAIL_FORWARD_PORTS: chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
-assert_contains "$jail_skeleton" 'JAIL_FORWARD_PORTS=""' "o esqueleto tem JAIL_FORWARD_PORTS=\"\""
-ports_skeleton_comment="$(awk '/^# JAIL_FORWARD_PORTS:/{found=1} /^JAIL_FORWARD_PORTS=/{found=0} found' <<< "$jail_skeleton")"
-for ports_word in 'JAIL_ENABLED="true"' localhost --forward-port 'JAIL_FORWARD_PORTS="54320 6379"' "separadas por espaço" "commitado" README; do
-  assert_contains "$ports_skeleton_comment" "$ports_word" "o comentário de JAIL_FORWARD_PORTS no esqueleto cita $ports_word"
-done
-assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_FORWARD_PORTS" 2>/dev/null || true)" "JAIL_FORWARD_PORTS não tem nota"
-printf '%s\n' "$(config_keys_blank JAIL_FORWARD_PORTS)" 'JAIL_FORWARD_PORTS="abc"' > "$jail_reg_dir/ports_invalid.conf"
-run_loader "$jail_reg_dir/ports_invalid.conf" "$jail_reg_dir/ports_invalid" >/dev/null
-assert_eq "" "$(cat "$jail_reg_dir/ports_invalid.err" 2>/dev/null || true)" "JAIL_FORWARD_PORTS=\"abc\": a carga da configuração não avisa (a validação é da jail)"
-config_keys_blank JAIL_FORWARD_PORTS > "$jail_reg_dir/ports_missing.conf"
-run_loader "$jail_reg_dir/ports_missing.conf" "$jail_reg_dir/ports_missing" >/dev/null
-assert_eq "$(missing_warning "$jail_reg_dir/ports_missing.conf" 'JAIL_FORWARD_PORTS=""')" "$(cat "$jail_reg_dir/ports_missing.err" 2>/dev/null || true)" "sem a linha JAIL_FORWARD_PORTS: aviso de chave ausente sugerindo JAIL_FORWARD_PORTS=\"\""
-
-echo
-echo "== JAIL_ALLOW_HOSTS: registrada por último, chave de texto (padrão \"\"), sem nota, com comentário no esqueleto =="
-assert_eq 'JAIL_ALLOW_HOSTS=""' "$(tail -n1 <<< "$jail_skeleton")" "o esqueleto termina com JAIL_ALLOW_HOSTS=\"\""
-hosts_skeleton_comment="$(awk '/^# JAIL_ALLOW_HOSTS:/{found=1} /^JAIL_ALLOW_HOSTS=/{found=0} found' <<< "$jail_skeleton")"
-for hosts_word in 'JAIL_ENABLED="true"' --allow-host 'JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"' "separados por espaço" "subdomínios" "lista padrão do nick" "lib/jail/allow_hosts.txt" "commitado" README; do
-  assert_contains "$hosts_skeleton_comment" "$hosts_word" "o comentário de JAIL_ALLOW_HOSTS no esqueleto cita $hosts_word"
-done
-assert_eq "" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_key_note JAIL_ALLOW_HOSTS" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS não tem nota"
-printf '%s\n' "$(config_keys_blank JAIL_ALLOW_HOSTS)" 'JAIL_ALLOW_HOSTS="https://x"' > "$jail_reg_dir/hosts_invalid.conf"
-run_loader "$jail_reg_dir/hosts_invalid.conf" "$jail_reg_dir/hosts_invalid" >/dev/null
-assert_eq "" "$(cat "$jail_reg_dir/hosts_invalid.err" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS=\"https://x\": a carga da configuração não avisa (a validação é da jail)"
-config_keys_blank JAIL_ALLOW_HOSTS > "$jail_reg_dir/hosts_missing.conf"
-run_loader "$jail_reg_dir/hosts_missing.conf" "$jail_reg_dir/hosts_missing" >/dev/null
-assert_eq "$(missing_warning "$jail_reg_dir/hosts_missing.conf" 'JAIL_ALLOW_HOSTS=""')" "$(cat "$jail_reg_dir/hosts_missing.err" 2>/dev/null || true)" "sem a linha JAIL_ALLOW_HOSTS: aviso de chave ausente sugerindo JAIL_ALLOW_HOSTS=\"\""
-
-echo
-echo "== PROJECT_CONFIG_FILE: o arquivo carregado, pelos três caminhos (vazio com 'Nenhum') =="
+echo "== PROJECT_CONFIG_FILE: o caminho absoluto do .nick/nick.conf do cwd =="
 pcf_dir="$TEST_TMP/project_config_file"
-mkdir -p "$pcf_dir/cwd_with" "$pcf_dir/cwd_without" "$pcf_dir/projects"
 mkdir -p "$pcf_dir/cwd_with/.nick"
 config_keys_blank > "$pcf_dir/cwd_with/.nick/nick.conf"
-config_keys_blank > "$pcf_dir/projects/alpha.conf"
-# pcf_value <cwd> <project_arg> <stdin>: imprime PROJECT_CONFIG_FILE depois de resolve_stack.
-pcf_value() {
-  timeout 2 bash -c "cd '$1' || exit 99; source '$AUTO_SCRUM_SH'; PROJECTS_DIR='$pcf_dir/projects'; resolve_stack '$2' >/dev/null 2>&1; printf '%s' \"\$PROJECT_CONFIG_FILE\"" <<< "$3" 2>/dev/null || true
-}
-assert_eq "$pcf_dir/cwd_with/.nick/nick.conf" "$(pcf_value "$pcf_dir/cwd_with" "" "")" "cwd: PROJECT_CONFIG_FILE é o .nick/nick.conf do cwd"
-assert_eq "$pcf_dir/projects/alpha.conf" "$(pcf_value "$pcf_dir/cwd_without" alpha "")" "--projeto=alpha: PROJECT_CONFIG_FILE é projects/alpha.conf"
-assert_eq "$pcf_dir/projects/alpha.conf" "$(pcf_value "$pcf_dir/cwd_without" "" 1)" "menu (alpha): PROJECT_CONFIG_FILE é projects/alpha.conf"
-assert_eq "" "$(pcf_value "$pcf_dir/cwd_without" "" 2)" "menu ('Nenhum'): PROJECT_CONFIG_FILE fica vazia"
+pcf_value="$(timeout 2 bash -c "cd '$pcf_dir/cwd_with' || exit 99; source '$AUTO_SCRUM_SH'; resolve_stack >/dev/null 2>&1; printf '%s' \"\$PROJECT_CONFIG_FILE\"" < /dev/null 2>/dev/null || true)"
+assert_eq "$pcf_dir/cwd_with/.nick/nick.conf" "$pcf_value" "cwd: PROJECT_CONFIG_FILE é o caminho absoluto do .nick/nick.conf do cwd"
 
 # Stubs desta seção (diretórios próprios, no TEST_TMP desta suíte). O ai-jail, com
 # "--version" como 1º argumento, só grava uma linha em $FAKE_JAIL_LOG_DIR/version.calls,
@@ -2825,7 +2302,7 @@ for settings_variant in "${settings_variants[@]}"; do
 done
 
 echo
-echo "== main(): --init e --requisitos-jail não carregam as regras do claude (não abrem o claude) =="
+echo "== main(): --requisitos-jail e o --init recusado não carregam as regras do claude (não abrem o claude) =="
 settings_dir="$TEST_TMP/settings_requirements"
 mkdir -p "$settings_dir/cwd"
 settings_rc=0
@@ -2833,8 +2310,9 @@ timeout 5 bash -c "cd '$settings_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; N
 assert_eq "0" "$settings_rc" "--requisitos-jail sem as regras: termina com código 0"
 assert_not_contains "$(cat "$settings_dir/output" 2>/dev/null || true)" "regras de permissão" "--requisitos-jail sem as regras: nenhum erro de regras"
 settings_rc=0
-timeout 5 bash -c "cd '$settings_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; NICK_CLAUDE_PERMISSIONS_FILE='$settings_dir/nao-existe.json'; PROJECTS_DIR='$settings_dir/projects'; main --init" <<< $'q' > "$settings_dir/output_init" 2>&1 || settings_rc=$?
-assert_eq "0" "$settings_rc" "--init sem as regras (saindo pelo menu): termina com código 0"
+timeout 5 bash -c "cd '$settings_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; NICK_CLAUDE_PERMISSIONS_FILE='$settings_dir/nao-existe.json'; main --init" < /dev/null > "$settings_dir/output_init" 2>&1 || settings_rc=$?
+assert_eq "1" "$settings_rc" "--init sem as regras: recusado com código 1"
+assert_contains "$(cat "$settings_dir/output_init" 2>/dev/null || true)" "o --init saiu do auto_scrum" "--init sem as regras: o erro é o da flag recusada"
 assert_not_contains "$(cat "$settings_dir/output_init" 2>/dev/null || true)" "regras de permissão" "--init sem as regras: nenhum erro de regras"
 
 echo
@@ -2860,10 +2338,6 @@ assert_eq "" "$(grep -nE '(^|[^A-Za-z0-9_])CLAUDE_[A-Z0-9_]*=' <<< "$auto_scrum_
 assert_contains "$auto_scrum_code" 'claude_args=(--settings "$NICK_CLAUDE_SETTINGS")' "o argv do claude começa com --settings \"\$NICK_CLAUDE_SETTINGS\""
 
 echo
-echo "== nenhuma chave de configuração nova: CONFIG_KEYS igual à de antes do ticket 21 =="
-assert_eq "STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED JAIL_ENABLED JAIL_CLIPBOARD JAIL_FORWARD_PORTS JAIL_ALLOW_HOSTS" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s' \"\${CONFIG_KEYS[*]}\"" 2>/dev/null || true)" "CONFIG_KEYS não ganhou chave (as regras não têm flag para desligar)"
-
-echo
 echo "== main(): JAIL_ENABLED=\"true\" com ai-jail ausente — para antes do menu, sem log e sem claude =="
 jail_dir="$TEST_TMP/jail_missing_cwd"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED)"$'\n''JAIL_ENABLED="true"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "JAIL_BIN='ai-jail-inexistente-nick-13'; exec 2>'$jail_dir/err'")")"
@@ -2876,19 +2350,6 @@ assert_contains "$jail_err" "JAIL_ENABLED=\"true\" em $jail_dir/cwd/.nick/nick.c
 assert_contains "$jail_err" "é compartilhado com o time do projeto" ".nick/nick.conf com ai-jail ausente: aviso de arquivo compartilhado"
 assert_contains "$jail_err" "[falta] ai-jail" ".nick/nick.conf com ai-jail ausente: o stderr termina com os requisitos"
 assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" ".nick/nick.conf com ai-jail ausente: parou antes do menu principal"
-
-jail_dir="$TEST_TMP/jail_missing_projects"
-mkdir -p "$jail_dir/cwd" "$jail_dir/projects"
-printf '%s\n' "$(config_keys_blank JAIL_ENABLED)" 'JAIL_ENABLED="true"' > "$jail_dir/projects/alpha.conf"
-jail_rc=0
-timeout 5 bash -c "cd '$jail_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$jail_dir/logs'; PROJECTS_DIR='$jail_dir/projects'; $(jail_case_setup "$jail_dir" "JAIL_BIN='ai-jail-inexistente-nick-13'"); main --projeto=alpha" <<< "$(jail_input po_discussion)" > "$jail_dir/output" 2> "$jail_dir/err" || jail_rc=$?
-jail_err="$(cat "$jail_dir/err" 2>/dev/null || true)"
-assert_eq "1" "$jail_rc" "projects/alpha.conf com ai-jail ausente: main() termina com código 1"
-assert_contains "$jail_err" "JAIL_ENABLED=\"true\" em $jail_dir/projects/alpha.conf" "projects/alpha.conf com ai-jail ausente: o stderr cita o caminho de projects/alpha.conf"
-assert_not_contains "$jail_err" "compartilhado" "projects/alpha.conf com ai-jail ausente: sem aviso de arquivo compartilhado"
-assert_not_exists "$jail_dir/logs" "projects/alpha.conf com ai-jail ausente: nenhum log é criado"
-assert_not_exists "$jail_dir/claude/argv" "projects/alpha.conf com ai-jail ausente: o claude não é chamado"
-assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo de conversa" "projects/alpha.conf com ai-jail ausente: parou antes do menu principal"
 
 echo
 echo "== main(): JAIL_ENABLED=\"true\" com ai-jail fora da versão suportada — para antes do menu, sem log e sem claude =="
@@ -2914,7 +2375,7 @@ for jail_variant in sem_config com_jail_true; do
     printf '%s\n' "$(config_keys_blank JAIL_ENABLED)" 'JAIL_ENABLED="true"' > "$jail_dir/cwd/.nick/nick.conf"
   fi
   jail_rc=0
-  timeout 5 bash -c "cd '$jail_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; LOGS_DIR='$jail_dir/logs'; PROJECTS_DIR='$jail_dir/projects'; $(jail_case_setup "$jail_dir"); main --requisitos-jail" < /dev/null > "$jail_dir/output" 2> "$jail_dir/err" || jail_rc=$?
+  timeout 5 bash -c "cd '$jail_dir/cwd' || exit 99; source '$AUTO_SCRUM_SH'; LOGS_DIR='$jail_dir/logs'; $(jail_case_setup "$jail_dir"); main --requisitos-jail" < /dev/null > "$jail_dir/output" 2> "$jail_dir/err" || jail_rc=$?
   jail_output="$(cat "$jail_dir/output" 2>/dev/null || true)"
   assert_eq "0" "$jail_rc" "--requisitos-jail ($jail_variant): termina com código 0"
   assert_contains "$jail_output" "Requisitos da jail" "--requisitos-jail ($jail_variant): a lista sai no stdout"
@@ -2926,10 +2387,18 @@ for jail_variant in sem_config com_jail_true; do
   assert_not_exists "$jail_dir/logs" "--requisitos-jail ($jail_variant): nenhum log é criado"
   assert_not_exists "$jail_dir/claude/argv" "--requisitos-jail ($jail_variant): o claude não é chamado"
   assert_eq "0" "$(jail_calls "$jail_dir")" "--requisitos-jail ($jail_variant): o ai-jail não é chamado"
-  assert_not_exists "$jail_dir/projects" "--requisitos-jail ($jail_variant): PROJECTS_DIR não é criado"
+  case "$jail_variant" in
+    sem_config) jail_tree_expected="" ;;
+    *) jail_tree_expected="$(printf '%s\n' .nick .nick/nick.conf)" ;;
+  esac
+  assert_eq "$jail_tree_expected" "$(nick_tree "$jail_dir/cwd")" "--requisitos-jail ($jail_variant): nada é criado em .nick/"
 done
 jail_usage="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; main --nao-existe" 2>&1 < /dev/null || true)"
 assert_contains "$jail_usage" "[--requisitos-jail]" "a mensagem de uso de argumento desconhecido cita [--requisitos-jail]"
+assert_contains "$jail_usage" "Erro: argumento desconhecido: '--nao-existe'" "argumento desconhecido: o erro cita o argumento"
+assert_contains "$jail_usage" "Uso: bash [--requisitos-jail]" "a linha de uso é só '<script> [--requisitos-jail]'"
+assert_not_contains "$jail_usage" "--projeto" "a mensagem de uso não cita mais --projeto="
+assert_not_contains "$jail_usage" "--init" "a mensagem de uso não cita mais --init"
 
 echo
 echo "== auto_scrum.sh: a jail passa só pelas funções jail_* de lib/jail/jail.sh =="
@@ -2942,7 +2411,7 @@ assert_eq "" "$(grep -nE '(^|[^_])exec[[:space:]]+claude' "$AUTO_SCRUM_SH" || tr
 assert_eq "" "$(grep -nE '\$\((jail_check|jail_exec)\b' "$AUTO_SCRUM_SH" || true)" "jail_check e jail_exec nunca são chamadas dentro de \$(...)"
 main_body="$(awk '/^main\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
 jail_check_at="$(grep -n 'jail_check ' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
-jail_resolve_at="$(grep -n 'resolve_stack ' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
+jail_resolve_at="$(grep -nx '  resolve_stack' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
 jail_build_at="$(grep -n 'build_stack_blocks' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
 assert_eq "true" "$([ -n "$jail_check_at" ] && [ -n "$jail_resolve_at" ] && [ -n "$jail_build_at" ] && [ "$jail_resolve_at" -lt "$jail_check_at" ] && [ "$jail_check_at" -lt "$jail_build_at" ] && echo true || echo false)" "em main(), jail_check vem logo depois de resolve_stack e antes de build_stack_blocks"
 assert_eq "1" "$(grep -cE '^[[:space:]]*jail_check .*\|\| exit 1$' <<< "$main_body" || true)" "em main(), a falha de jail_check encerra com exit 1 (na própria linha da chamada)"
@@ -3009,22 +2478,8 @@ assert_contains "$(cat "$xchg_dir/output" 2>/dev/null || true)" "Erro: não foi 
 assert_not_exists "$xchg_dir/claude/argv" "árvore impossível de criar: o claude não é chamado"
 assert_eq "arquivo no lugar da pasta" "$(cat "$xchg_dir/cwd/.nick/troca" 2>/dev/null || true)" "árvore impossível de criar: o arquivo .nick/troca do projeto fica intacto"
 
-# .nick/ sem permissão de escrita, com troca/ e docs/ já existentes: o mkdir passa e só o
-# .gitignore falha. O stderr tem de ser só a mensagem do nick, sem o erro cru do bash. O root
-# ignora a permissão, então o caso é pulado.
-if [ "$(id -u)" -ne 0 ]; then
-  ro_dir="$TEST_TMP/nick_readonly"
-  mkdir -p "$ro_dir/.nick/troca" "$ro_dir/.nick/docs"
-  chmod a-w "$ro_dir/.nick"
-  ro_rc=0
-  (cd "$ro_dir" && timeout 2 bash -c "source '$AUTO_SCRUM_SH'; nick_dir_prepare" > /dev/null 2> "$TEST_TMP/nick_readonly.err") || ro_rc=$?
-  chmod u+w "$ro_dir/.nick"
-  assert_eq "1" "$ro_rc" ".nick/ somente leitura: nick_dir_prepare retorna 1"
-  assert_eq "Erro: não foi possível criar a estrutura .nick/ (.gitignore, troca/ e docs/) em $(cd "$ro_dir" && pwd)." "$(cat "$TEST_TMP/nick_readonly.err" 2>/dev/null || true)" ".nick/ somente leitura: o stderr é só a mensagem do nick (sem o erro cru do bash)"
-  assert_not_exists "$ro_dir/.nick/.gitignore" ".nick/ somente leitura: nenhum .gitignore é criado"
-else
-  echo "  (pulado: .nick/ somente leitura não vale como root)"
-fi
+# .nick/ somente leitura (só o .gitignore falha): coberto em lib/tests/test_config.sh, junto
+# com os outros casos de config_dir_prepare.
 
 echo
 echo "== consistência: NICK_DIR, CONFIG_CWD_FILE_NAME e a exceção !nick.conf do .gitignore =="
@@ -3032,7 +2487,7 @@ nick_consistency="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; printf '%s|%s|%s
 assert_eq "$(cut -d'|' -f2 <<< "$nick_consistency")" "$(cut -d'|' -f1 <<< "$nick_consistency")" "\$NICK_DIR/nick.conf = CONFIG_CWD_FILE_NAME"
 nick_consistency_dir="$TEST_TMP/nick_consistency"
 mkdir -p "$nick_consistency_dir"
-(cd "$nick_consistency_dir" && timeout 2 bash -c "source '$AUTO_SCRUM_SH'; nick_dir_prepare" >/dev/null 2>&1 || true)
+(cd "$nick_consistency_dir" && timeout 2 bash -c "source '$AUTO_SCRUM_SH'; config_dir_prepare" >/dev/null 2>&1 || true)
 assert_eq "!$(cut -d'|' -f3 <<< "$nick_consistency")" "$(sed -n 3p "$nick_consistency_dir/.nick/.gitignore" 2>/dev/null || true)" "a linha !nick.conf do .gitignore = basename de CONFIG_CWD_FILE_NAME"
 assert_eq "true" "$([ -n "$(cut -d'|' -f3 <<< "$nick_consistency")" ] && echo true || echo false)" "consistência: os valores foram lidos (amostra não vazia)"
 
@@ -3064,6 +2519,9 @@ for ignored_path in .nick/nick.conf .nick/.gitignore .nick/docs/1/plan.md .nick.
   assert_eq ".gitignore:" "${ignored_source%%[0-9]*}" "$ignored_path: a regra vem do .gitignore da raiz"
 done
 assert_eq "não ignorado" "$(git_isolated -C "$REPO_ROOT" check-ignore -q --no-index auto_scrum/auto_scrum.sh 2>/dev/null && echo ignorado || echo 'não ignorado')" "controle: auto_scrum/auto_scrum.sh não é ignorado"
+# auto_scrum/projects/ saiu do repositório (NS-30): nada mais o lê, e o .gitignore não o cita.
+assert_eq "" "$(grep -n 'auto_scrum/projects' "$REPO_ROOT/.gitignore" || true)" "o .gitignore da raiz não tem nenhuma linha com auto_scrum/projects"
+assert_eq "" "$(git_isolated -C "$REPO_ROOT" ls-files -- auto_scrum/projects 2>/dev/null || echo 'git falhou')" "auto_scrum/projects/ (inclusive o .gitkeep) não é versionado"
 
 echo
 if [ "$failures" -gt 0 ]; then

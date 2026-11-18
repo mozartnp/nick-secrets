@@ -3,16 +3,15 @@
 # jail.sh: runs the agent of a nick tool inside the ai-jail sandbox (akitaonrails/ai-jail:
 # bubblewrap + Landlock on Linux, sandbox-exec on macOS) — today only auto_scrum uses it. It is
 # opt-in per project through the JAIL_ENABLED key, a convention of the whole nick: each tool
-# registers that key in its own config (config_register_key, lib/config.sh) and passes the
-# value here; only "true" exactly turns the jail on. JAIL_CLIPBOARD, the same kind of
+# registers that key in its own config (config_register_key, lib/config/config.sh) and passes
+# the value here; only "true" exactly turns the jail on. JAIL_CLIPBOARD, the same kind of
 # convention, picks how much of the terminal and the clipboard the jail releases: "restrito",
 # "medio" (also the empty value, the default) or "brando" (jail_options). Each tool may also
 # pass extra hosts to release in the jail's network (the remote MCP servers it relies on, the
 # docs of the project's stack: JAIL_ALLOW_HOSTS), which become --allow-host next to the Claude
 # documentation and the other hosts of the nick's own list, lib/jail/allow_hosts.txt, always
-# released (jail_nick_hosts), and ports of the machine's localhost to
-# reach from inside (a database in Docker, for example: JAIL_FORWARD_PORTS), which become
-# --forward-port.
+# released (jail_nick_hosts), and ports of the machine's localhost to reach from inside (a
+# database in Docker, for example: JAIL_FORWARD_PORTS), which become --forward-port.
 # The version managers found in the home (pyenv, nvm, ...) and Playwright's browsers are
 # mounted read-only (jail_toolchain_dirs, jail_playwright_browsers), and the agent is told it
 # runs inside the jail (jail_agent_notice). This library holds the mechanism: checking that the
@@ -34,7 +33,7 @@
 #     JAIL_FORWARD_PORTS values, the extra hosts (MCPs and JAIL_ALLOW_HOSTS), the config path
 #     and whether that file is shared with the team all come in as parameters. $PWD, $HOME and
 #     the $TMPDIR that mktemp reads are shell state, not caller globals;
-#   - it doesn't depend on lib/config.sh (each library loads on its own).
+#   - it doesn't depend on lib/config/config.sh (each library loads on its own).
 # The one documented exception: jail_exec replaces the shell with exec, so it never returns.
 # That is not an exit, it is its job — the last step of the tool.
 

@@ -203,7 +203,7 @@ printf '%s\n' '# claude no comentário não conta' 'claude_settings_load setting
 # shellcheck disable=SC2016
 assert_eq 'exec claude --settings "$x"'$'\n''ai-jail -- claude' "$(claude_command_lines "$sample")" "controle positivo: o filtro acha claude/ai-jail chamados direto e ignora comentário, claude_* e o jail_exec \"true\""
 assert_not_contains "$launcher_code" "--permission-mode" "o launcher não passa --permission-mode (modo padrão)"
-assert_not_contains "$launcher_code" "config.sh" "o launcher não carrega lib/config.sh"
+assert_not_contains "$launcher_code" "config.sh" "o launcher não carrega lib/config/config.sh"
 assert_not_contains "$launcher_code" "nick.conf" "o launcher não lê .nick/nick.conf"
 # shellcheck disable=SC2016
 assert_eq 'source "$SCRIPT_DIR/../../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../../lib/claude/claude.sh"' \

@@ -1,6 +1,4 @@
 auto_scrum/logs/*.md
-auto_scrum/projects/*
-!auto_scrum/projects/.gitkeep
 .nick/
 # Legado (antes do ticket 24): a configuração era .nick.conf. Mantido para que esse arquivo
 # local, que pode ter dado de cliente, não apareça como "untracked" num clone já usado. Pode

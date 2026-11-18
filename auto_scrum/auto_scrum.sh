@@ -7,104 +7,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 LOGS_DIR="$SCRIPT_DIR/logs"
-PROJECTS_DIR="$SCRIPT_DIR/projects"
+# The command that creates the project config (.nick/nick.conf) in the cwd, absolute and
+# normalized so the user can paste it from the error messages: the nick isn't installed in the
+# PATH yet.
+NICK_INIT_BIN="$(cd "$SCRIPT_DIR/.." && pwd)/bin/nick-init"
 # Code shared with the other nick tools lives in lib/: the project config reader
-# (lib/config.sh), the ai-jail sandbox (lib/jail/jail.sh) and the Claude Code deny/ask rules
-# (lib/claude/claude.sh, which reads lib/claude/permissions.json). The paths are relative to
-# this script, so auto_scrum/ depends on its sibling lib/.
-# shellcheck source=SCRIPTDIR/../lib/config.sh
-source "$SCRIPT_DIR/../lib/config.sh"
+# (lib/config/config.sh) and the registry of its keys (lib/config/keys.sh), the ai-jail
+# sandbox (lib/jail/jail.sh) and the Claude Code deny/ask rules (lib/claude/claude.sh, which
+# reads lib/claude/permissions.json). The paths are relative to this script, so auto_scrum/
+# depends on its sibling lib/.
+# shellcheck source=SCRIPTDIR/../lib/config/config.sh
+source "$SCRIPT_DIR/../lib/config/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/config/keys.sh
+source "$SCRIPT_DIR/../lib/config/keys.sh"
 # shellcheck source=SCRIPTDIR/../lib/jail/jail.sh
 source "$SCRIPT_DIR/../lib/jail/jail.sh"
 # shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
 source "$SCRIPT_DIR/../lib/claude/claude.sh"
 
-# Project config keys, in skeleton order — the only place that lists them (see ABOUT.md).
-# config_register_key <name> <default> <note> <skeleton comment>
-# A toggle key ("true"/"false") must end in _ENABLED (config_is_toggle_key) and default to
-# "false" ("true" only for TDD_ENABLED, on by default); a text key defaults to "". The note is
-# the key-specific text both config warnings show, and only two keys have one, each because
-# the generic text would mislead:
-#   - PRODUCTION_ENABLED is the only flag whose off default removes something the PO prompt
-#     already had. The note shows both ways out, "true" and "false", so a project without
-#     production doesn't turn the question on just to silence the warning. It must not
-#     repeat the PO question itself: end-to-end checks read stdout and stderr together and
-#     look for that question to tell whether it reached the prompt;
-#   - TDD_ENABLED is the only flag that is on by default: an absent or invalid value keeps
-#     TDD on, so the note says that instead of "a opção está desligada.".
-# A bad registration stops the script on load (set -e): it is a programming error.
-config_register_key STACK_DESCRIPTION "" "" \
-'STACK_DESCRIPTION: stack técnica usada no prompt do Tech Leader/Desenvolvimento
-(texto livre, sem ponto final no fim — o template já adiciona).
-Exemplo: STACK_DESCRIPTION="Django avançado, django-tenants, Django ORM, PostgreSQL, pytest e TDD"'
-config_register_key SENTRY_ENABLED "false" "" \
-'SENTRY_ENABLED: "true" se esse projeto usa Sentry — a opção "PO - Criar ticket a partir
-do Sentry" aparece no menu principal (o PO busca o issue pelo MCP do Sentry do .mcp.json
-do projeto alvo), e os prompts de PO e Tech Leader passam a mencionar links de erro
-externo. Padrão é opt-in: vazio ou "false" esconde a opção e tira a menção dos prompts.'
-config_register_key PERMISSION_ENABLED "false" "" \
-'PERMISSION_ENABLED: "true" se esse projeto tem um sistema de permissões — o PO passa a
-avaliar, pra cada pedido, se será necessário adicionar uma nova permissão. Padrão é
-opt-in: vazio ou "false" tira essa pergunta do prompt do PO.'
-config_register_key JIRA_ENABLED "false" "" \
-'JIRA_ENABLED: "true" se esse projeto tem o MCP do Jira configurado (.mcp.json do
-projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
-principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.'
-config_register_key PRODUCTION_ENABLED "false" \
-'a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.' \
-'PRODUCTION_ENABLED: "true" se esse projeto já está em produção — o PO passa a avaliar,
-pra cada pedido, se existe impacto em produção. Padrão é opt-in: vazio ou "false" tira
-essa pergunta do prompt do PO. Ligue ("true") quando o projeto entrar em produção.'
-config_register_key TDD_ENABLED "true" \
-'a metodologia TDD continua ligada nos prompts de Tech Leader, Desenvolvimento e Review. Use "false" só em projeto sem testes automatizados.' \
-'TDD_ENABLED: "true" mantém a metodologia TDD nos prompts de Tech Leader, Desenvolvimento
-e Review. Use "false" só em projeto sem testes automatizados (ex: site em HTML estático):
-o plano passa a dizer como cada critério de aceite será verificado, e a suíte só roda se
-existir. Ao contrário das outras chaves *_ENABLED, vazio ou valor inválido mantêm a TDD
-ligada — só "false" desliga.'
-config_register_key JAIL_ENABLED "false" "" \
-'JAIL_ENABLED: "true" roda o claude de todas as etapas dentro do sandbox ai-jail: escrita
-só no diretório do projeto, o resto do sistema somente leitura e ~/.ssh, ~/.gnupg, ~/.aws
-e dados de navegador escondidos. Precisa do ai-jail e, no Linux, do bubblewrap (bwrap),
-instalados por você — veja a seção "Sandbox (ai-jail)" do README ou rode
-auto_scrum.sh --requisitos-jail. Se ligada e a jail não funcionar nesta máquina, o
-auto_scrum para antes de qualquer pergunta. A rede da jail é filtrada, e ela libera os
-MCPs remotos: mcp.atlassian.com quando JIRA_ENABLED="true" e mcp.sentry.dev
-quando SENTRY_ENABLED="true". Padrão é opt-in: vazio ou "false" roda o claude direto, como
-antes.'
-# JAIL_CLIPBOARD is a text key (three levels), so lib/config.sh doesn't check its value:
-# jail_check does, and only with JAIL_ENABLED="true", where it has an effect.
-config_register_key JAIL_CLIPBOARD "" "" \
-'JAIL_CLIPBOARD: só vale com JAIL_ENABLED="true". Quanto do terminal e do clipboard a jail
-libera; o auto_scrum mostra o nível a cada execução:
-  "restrito": não dá pra copiar de dentro do claude;
-  "medio" (ou vazio, o padrão): copia (--terminal-passthrough do ai-jail), mas o agente
-  pode escrever no seu clipboard e mandar sequências de controle ao terminal;
-  "brando": copia e o Ctrl+V do claude cola (--terminal-passthrough --display), mas o
-  agente pode LER o seu clipboard (senhas, tokens) e abrir janelas na sua tela.
-Nos três, cole com o botão direito → Colar. Outro valor faz o auto_scrum parar com erro.
-Veja a seção "Sandbox (ai-jail)" do README.'
-# JAIL_FORWARD_PORTS is a text key too (a list of ports), checked by jail_check.
-config_register_key JAIL_FORWARD_PORTS "" "" \
-'JAIL_FORWARD_PORTS: só vale com JAIL_ENABLED="true". Portas de localhost da sua máquina
-que o claude alcança de dentro da jail (--forward-port do ai-jail), separadas por espaço —
-ex: o PostgreSQL do Docker que os testes usam. Exemplo:
-  JAIL_FORWARD_PORTS="54320 6379"
-Cada porta liberada dá ao agente acesso total ao serviço dela. Este arquivo é commitado
-com o projeto, então o time inteiro herda a lista. Vazio: nenhuma porta (o localhost da
-máquina fica inalcançável). Outro formato faz o auto_scrum parar com erro. Veja a seção
-"Sandbox (ai-jail)" do README.'
-# JAIL_ALLOW_HOSTS is a text key too (a list of hosts), checked by jail_check.
-config_register_key JAIL_ALLOW_HOSTS "" "" \
-'JAIL_ALLOW_HOSTS: só vale com JAIL_ENABLED="true". Hosts que o claude alcança de dentro
-da jail (--allow-host do ai-jail), separados por espaço — ex: a documentação da stack do
-projeto. Exemplo:
-  JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"
-Cada host libera também os subdomínios dele. Já são liberados os hosts dos MCPs ligados
-acima e os da lista padrão do nick (lib/jail/allow_hosts.txt, com a documentação do
-Claude, de Python, Django etc.). Este arquivo é commitado com o projeto, então o time
-inteiro herda a lista. Vazio: nenhum host além desses. Outro formato (com https://, porta
-ou caminho) faz o auto_scrum parar com erro. Veja a seção "Sandbox (ai-jail)" do README.'
+# The project config keys are registered in lib/config/keys.sh, the only place that lists
+# them (see ABOUT.md). A bad registration stops the script on load (set -e): it is a
+# programming error.
+config_register_nick_keys
 
 TITLE=""
 DESCRIPTION=""
@@ -134,7 +58,8 @@ JAIL_ENABLED=""
 JAIL_CLIPBOARD=""
 JAIL_FORWARD_PORTS=""
 JAIL_ALLOW_HOSTS=""
-# The config file load_project_config loaded (empty with "Nenhum"): the jail error names it.
+# The config file load_project_config loaded (always the cwd .nick/nick.conf): the jail error
+# names it.
 PROJECT_CONFIG_FILE=""
 # The content of lib/claude/permissions.json (claude_settings_load), passed inline to every
 # claude launch as --settings. Never CLAUDE_*: Claude Code reads CLAUDE_* from the environment.
@@ -144,16 +69,16 @@ PO_TICKET_FORMAT_BLOCK=""
 TECH_LEADER_PLAN_RULES_BLOCK=""
 TYPE=""
 # The nick dir in the target project (the cwd): the project config (.nick/nick.conf, read by
-# lib/config.sh), the exchange dir and the per-ticket docs. Inside the project, so it stays
-# writable with the jail on. nick_dir_prepare creates its tree with a single .gitignore that
-# ignores everything but itself and nick.conf.
-NICK_DIR=".nick"
+# lib/config/config.sh), the exchange dir and the per-ticket docs. The names come from the
+# library (CONFIG_*_NAME, lib/config/config.sh), the single source; config_dir_prepare creates
+# the tree with a single .gitignore that ignores everything but itself and nick.conf.
+NICK_DIR="$CONFIG_NICK_DIR_NAME"
 # Exchange dir: where the user and the agents trade files (screenshots, attachments), announced
 # at the end of every prompt (exchange_block).
-EXCHANGE_DIR="$NICK_DIR/troca"
+EXCHANGE_DIR="$CONFIG_EXCHANGE_DIR_NAME"
 # Docs dir: plan, review and validation screenshots of each ticket, in $NICK_DOCS_DIR/<ID>/
 # (created by the agent when it writes there).
-NICK_DOCS_DIR="$NICK_DIR/docs"
+NICK_DOCS_DIR="$CONFIG_DOCS_DIR_NAME"
 
 check_requirements() {
   local missing=()
@@ -233,10 +158,9 @@ read_via_editor() {
   printf -v "$__resultvar" '%s' "$value"
 }
 
-# quit_from_menu: the only way out through a menu ("Sair (q)"). Ends the script right away
-# with code 0, before anything with a side effect: no log, no config file, no projects/
-# directory and no claude call. Menus run in the main shell, never inside $(...), so this
-# exit ends the script and not a subshell.
+# quit_from_menu: the only way out through a menu ("Sair (q)"). Ends the script right away with
+# code 0, before anything with a side effect: no log, no .nick/ tree and no claude call. Menus
+# run in the main shell, never inside $(...), so this exit ends the script and not a subshell.
 quit_from_menu() {
   echo "Saindo. Nada foi feito."
   exit 0
@@ -245,9 +169,9 @@ quit_from_menu() {
 # select_menu <variable_name> <option>...: the only select in the script — every menu goes
 # through here, so every menu gets the way out. Shows <option>... plus "Sair (q)" as the last
 # numbered item, and stores in <variable_name> the 0-based index of the chosen option. The
-# number of "Sair (q)" moves with the project flags and the number of projects, so q/Q also
-# quits; any other input is invalid. The index comes from comparing REPLY with [ -eq ], not
-# from $((REPLY - 1)): select accepts "08", which bash arithmetic reads as a bad octal.
+# number of "Sair (q)" moves with the project flags, so q/Q also quits; any other input is
+# invalid. The index comes from comparing REPLY with [ -eq ], not from $((REPLY - 1)):
+# select accepts "08", which bash arithmetic reads as a bad octal.
 # When stdin closes (Ctrl+D) it leaves <variable_name> empty and returns 1, the same status
 # a bare select gave — each caller keeps its own handling for that.
 # Locals are prefixed with __menu_ so they can't shadow the caller's <variable_name>; REPLY
@@ -315,110 +239,42 @@ choose_type() {
   TYPE="${keys[$choice]}"
 }
 
-list_projects() {
-  local f found=0
-  echo "Projetos disponíveis em $PROJECTS_DIR/:"
-  for f in "$PROJECTS_DIR"/*.conf; do
-    [ -e "$f" ] || continue
-    found=1
-    echo "  - $(basename "$f" .conf)"
-  done
-  [ "$found" -eq 0 ] && echo "  (nenhum)"
-}
-
-# warn_legacy_project_files: projects/ files used to be <name>.sh (sourced); they are now
-# <name>.conf, read by load_project_config. .sh files are deliberately not read as a
-# fallback (that would bring back a second loading mechanism) nor renamed automatically
-# (moving the user's files without asking is a surprise) — this only warns on stderr, with
-# the mv to run, so a machine still holding old files doesn't lose its config silently.
-warn_legacy_project_files() {
-  local f
-  for f in "$PROJECTS_DIR"/*.sh; do
-    [ -e "$f" ] || continue
-    echo "Aviso: $f não é mais lido — renomeie para .conf: mv '$f' '${f%.sh}.conf'" >&2
-  done
-}
-
-# load_project_config <file>: loads a project config file through config_load (lib/config.sh),
-# which holds the reader, its grammar and the three warnings (format, missing key, invalid
-# toggle value) — see the comment there. It stays here, as a thin call, because the tests
-# and the rest of the script call this name, and because this is the auto_scrum place to
-# record anything about the loaded file without putting a caller global inside the library:
-# PROJECT_CONFIG_FILE keeps its path (all three resolve_stack paths come through here), for
-# the jail error message.
+# load_project_config <file>: loads a project config file through config_load
+# (lib/config/config.sh), which holds the reader, its grammar and the three warnings
+# (format, missing key, invalid toggle value) — see the comment there. It stays here, as a
+# thin call, because the tests and the rest of the script call this name, and because this is
+# the auto_scrum place to record anything about the loaded file without putting a caller
+# global inside the library: PROJECT_CONFIG_FILE keeps its path, for the jail error message.
 load_project_config() {
   PROJECT_CONFIG_FILE="$1"
   config_load "$1"
 }
 
-# resolve_stack <project_name_via_argv_or_empty>
-# Sets the project config (STACK_DESCRIPTION and the *_ENABLED flags) via
-# load_project_config. First of all, an old $PWD/.nick.conf without the new file stops the
-# script (config_cwd_legacy_check, lib/config.sh), whatever the path below: it used to win
-# over --projeto=, so going on with projects/ or "Nenhum" would run the project without its
-# config (and without its jail). Then it searches in this order:
-#   1. $PWD/.nick/nick.conf (config_cwd_file, lib/config.sh) — only the cwd itself, no parent
-#      directories.
-#      When present it wins: no menu, no legacy warning, and a --projeto= name is ignored
-#      (with a warning on stderr, and not validated — the flag isn't used at all);
-#   2. auto_scrum/projects/<name>.conf, with the name passed as an argument (error if it
-#      doesn't exist);
-#   3. a menu (select_menu) with the projects found + a "Nenhum" option (leaves
-#      STACK_DESCRIPTION empty — build_stack_blocks(), in main, is what assembles the
-#      conditional text that makes the stack mention disappear when empty). The menu's
-#      "Sair (q)" ends the script (quit_from_menu), before anything is loaded.
-# Old projects/*.sh files are only warned about (warn_legacy_project_files), in steps 2/3.
+# resolve_stack: sets the project config (STACK_DESCRIPTION and the *_ENABLED flags) from
+# $PWD/.nick/nick.conf (config_cwd_file, lib/config/config.sh) — the only place the config
+# comes from: only the cwd itself, no parent directories, no other destination. In order:
+#   1. an old $PWD/.nick.conf without the new file stops the script with the migration error
+#      (config_cwd_legacy_check, lib/config/config.sh);
+#   2. without $PWD/.nick/nick.conf, the script stops with an error pointing to bin/nick-init
+#      (NICK_INIT_BIN), which creates it — before any menu, log or claude;
+#   3. otherwise load_project_config loads it and the path is shown.
 resolve_stack() {
-  local project_arg="$1"
-  local file
   local cwd_config
   config_cwd_legacy_check || exit 1
   cwd_config="$(config_cwd_file)"
-
-  if [ -f "$cwd_config" ]; then
-    if [ -n "$project_arg" ]; then
-      echo "Aviso: --projeto=$project_arg ignorado — a configuração do diretório atual ($cwd_config) tem precedência." >&2
-    fi
-    load_project_config "$cwd_config"
-    echo "Configuração do projeto carregada de: $cwd_config"
-    return
+  if [ ! -f "$cwd_config" ]; then
+    echo "Erro: não há configuração do projeto em $cwd_config. Rode na raiz do projeto: $NICK_INIT_BIN" >&2
+    exit 1
   fi
-
-  warn_legacy_project_files
-
-  if [ -n "$project_arg" ]; then
-    file="$PROJECTS_DIR/$project_arg.conf"
-    if [ ! -f "$file" ]; then
-      echo "Erro: projeto '$project_arg' não encontrado." >&2
-      list_projects >&2
-      exit 1
-    fi
-    load_project_config "$file"
-    return
-  fi
-
-  local names=() f choice
-  for f in "$PROJECTS_DIR"/*.conf; do
-    [ -e "$f" ] || continue
-    names+=("$(basename "$f" .conf)")
-  done
-  names+=("Nenhum")
-
-  echo "Qual projeto (define a stack usada no prompt)?"
-  # stdin closed (Ctrl+D): return 1, so main stops with code 1 (set -e), as before.
-  select_menu choice "${names[@]}" || return 1
-  if [ "${names[$choice]}" = "Nenhum" ]; then
-    STACK_DESCRIPTION=""
-  else
-    load_project_config "$PROJECTS_DIR/${names[$choice]}.conf"
-  fi
+  load_project_config "$cwd_config"
+  echo "Configuração do projeto carregada de: $cwd_config"
 }
 
 # build_stack_blocks: assembles STACK_BLOCK_DEV/STACK_BLOCK_TL/STACK_BLOCK_REVIEW from
-# STACK_DESCRIPTION. If STACK_DESCRIPTION is empty (no project chosen), the blocks become
-# just a period — the stack sentence disappears entirely from the prompt, instead of
-# showing generic text. Done here (bash), not in the template, because envsubst has no
-# conditionals.
+# STACK_DESCRIPTION. If STACK_DESCRIPTION is empty (the project didn't fill it in), the
+# blocks become just a period — the stack sentence disappears entirely from the prompt,
+# instead of showing generic text. Done here (bash), not in the template, because envsubst
+# has no conditionals.
 build_stack_blocks() {
   if [ -n "$STACK_DESCRIPTION" ]; then
     printf -v STACK_BLOCK_DEV ', com habilidades principais em:\n%s.' "$STACK_DESCRIPTION"
@@ -498,8 +354,8 @@ build_production_blocks() {
 # TDD_BLOCK_REVIEW from TDD_ENABLED (set in the project file), same mechanism as
 # build_production_blocks(). TDD_ENABLED is the only flag that is on by default: only "false"
 # (exact) turns TDD off, so a typo ("TRUE", "sim", " false") never removes TDD from a project
-# that has tests — any other value, empty and "Nenhum" included, keeps the text of before the
-# flag, byte for byte. A project without automated tests (e.g. a static HTML site) uses
+# that has tests — any other value, empty included, keeps the text of before the flag, byte
+# for byte. A project without automated tests (e.g. a static HTML site) uses
 # "false": the plan then says how each acceptance criterion will be verified, and Dev and
 # Review only run a test suite if the project has one.
 #   - TDD_BLOCK_TL and TDD_CRITERIA_BLOCK_TL are embedded in TECH_LEADER_PLAN_RULES_BLOCK
@@ -603,107 +459,6 @@ porquê; se faltar algo que o plano exige, adicione. Essa seção é obrigatóri
 de review usa ela para validar o trabalho feito.${TDD_CRITERIA_BLOCK_TL}
 ## Habilidades necessárias
 As habilidades que o(a) desenvolvedor(a) precisa para executar o serviço."
-}
-
-# print_project_skeleton: prints (stdout) the project config skeleton — the keys registered
-# at the top of this script, at their default value, with their comments — through
-# config_print_skeleton (lib/config.sh), which holds the format rules. Both init_project
-# destinations write this same output, so they can't drift apart.
-print_project_skeleton() {
-  config_print_skeleton "auto_scrum"
-}
-
-# init_project: asks where to create the project config (select_menu, which also offers
-# "Sair (q)") and writes the skeleton (print_project_skeleton) there. The user opens it and
-# fills it in afterwards.
-#   1. $PWD/.nick/nick.conf — listed first since it's the recommended place: versioned with
-#      the target project, shared with its team. No name is asked. After the overwrite
-#      confirmation, nick_dir_prepare creates the whole .nick/ tree (the team sees and versions
-#      it from the first commit), and the output shows it. An old $PWD/.nick.conf doesn't stop
-#      it (the user's choice: the old file is the source to copy the values from): the
-#      skeleton is written all the same, the old file is neither read nor touched, and a
-#      warning at the end says to copy its values into the new file and remove it — without
-#      it, the values would be lost silently. A normal run still stops on the old file alone
-#      (config_cwd_legacy_check, in resolve_stack);
-#   2. auto_scrum/projects/<name>.conf — local to this machine (gitignored). PROJECTS_DIR
-#      is only created in this branch, so neither option 1 nor "Sair (q)" creates a
-#      directory for nothing.
-# Either way, an existing file is only overwritten after confirmation.
-init_project() {
-  local choice name file="" confirm cwd_config
-  cwd_config="$(config_cwd_file)"
-  local options=(
-    "Diretório atual ($cwd_config) — versionado junto com o projeto"
-    "auto_scrum/projects/<nome>.conf — só nesta máquina"
-  )
-  echo "Onde criar a configuração do projeto?"
-  # stdin closed during the menu (Ctrl+D, or an invalid option followed by EOF): no
-  # destination was chosen, so stop here instead of failing on a redirect to "".
-  if ! select_menu choice "${options[@]}"; then
-    echo "Cancelado. Nada foi alterado." >&2
-    return 1
-  fi
-  if [ "$choice" -eq 0 ]; then
-    file="$cwd_config"
-  else
-    mkdir -p "$PROJECTS_DIR"
-    read_required "Nome do projeto: " name
-    file="$PROJECTS_DIR/$name.conf"
-  fi
-
-  if [ -f "$file" ]; then
-    read -r -p "Já existe $file. Sobrescrever? (s/N): " confirm
-    case "$confirm" in
-      s|S|sim|Sim|SIM) ;;
-      *)
-        echo "Cancelado. Nada foi alterado."
-        return
-        ;;
-    esac
-  fi
-
-  # Only with option 1: the cwd is then the target project. With projects/ it may be anywhere,
-  # and the .nick/ tree is created by main() on the first launch instead. Before the skeleton,
-  # since nick.conf lives inside .nick/.
-  if [ "$choice" -eq 0 ]; then
-    nick_dir_prepare || return 1
-  fi
-
-  print_project_skeleton > "$file"
-
-  echo "Projeto criado em $file — edite antes de usar."
-  if [ "$choice" -eq 0 ]; then
-    cat <<EOF
-Estrutura do nick em $NICK_DIR/:
-  .gitignore   versionado: ignora tudo em $NICK_DIR/ menos ele e o nick.conf
-  nick.conf    versionado: configuração do projeto
-  troca/       não versionada: troca de arquivos com os agentes
-  docs/        não versionada: plano, review e prints de cada ticket (docs/<ID>/)
-Versione $CONFIG_CWD_FILE_NAME e $NICK_DIR/.gitignore junto com o projeto.
-EOF
-    if [ -e "$PWD/$CONFIG_CWD_LEGACY_FILE_NAME" ]; then
-      echo "Aviso: o arquivo antigo $PWD/$CONFIG_CWD_LEGACY_FILE_NAME não foi lido nem alterado — copie os valores dele para $file e apague o antigo." >&2
-    fi
-  fi
-}
-
-# nick_dir_prepare: creates the $NICK_DIR tree in the cwd — $EXCHANGE_DIR, $NICK_DOCS_DIR and,
-# only if it doesn't exist yet, $NICK_DIR/.gitignore with exactly "*", "!.gitignore" and
-# "!nick.conf" (everything in .nick/ is ignored but the config and the .gitignore itself, so
-# the target project's own .gitignore is never touched). Not nick.conf (init_project's job)
-# nor docs/<ID>/ (the agent creates it when it writes there). An existing .gitignore, edited
-# or not, and whatever is already in troca/ and docs/ are kept; no .gitignore is created
-# inside troca/ or docs/. Prints an error and returns 1 when the tree can't be created.
-nick_dir_prepare() {
-  local ignore="$NICK_DIR/.gitignore"
-  if mkdir -p "$EXCHANGE_DIR" "$NICK_DOCS_DIR" 2>/dev/null; then
-    [ -e "$ignore" ] && return 0
-    # Grouped so the 2>/dev/null also covers the failing > "$ignore" (redirections apply left
-    # to right): the user sees only the message below, not bash's own error.
-    { printf '%s\n' '*' '!.gitignore' "!$(basename "$CONFIG_CWD_FILE_NAME")" > "$ignore"; } 2>/dev/null && return 0
-  fi
-  echo "Erro: não foi possível criar a estrutura $NICK_DIR/ (.gitignore, troca/ e docs/) em $PWD." >&2
-  return 1
 }
 
 # exchange_block: the section that closes every stage's prompt, telling the agent where to
@@ -811,24 +566,28 @@ ask_questions_review() {
 }
 
 main() {
-  local project_arg="" arg init_flag=0 jail_requirements_flag=0
+  local arg jail_requirements_flag=0
   for arg in "$@"; do
     case "$arg" in
-      --projeto=*) project_arg="${arg#--projeto=}" ;;
-      --init) init_flag=1 ;;
+      # The two flags that left auto_scrum (the config now lives only in the cwd
+      # .nick/nick.conf, created by bin/nick-init) are refused before anything else, pointing
+      # to the command that replaces them.
+      --init)
+        echo "Erro: o --init saiu do auto_scrum. Para criar a configuração do projeto, rode na raiz dele: $NICK_INIT_BIN" >&2
+        exit 1
+        ;;
+      --projeto=*)
+        echo "Erro: o --projeto= saiu do auto_scrum: a configuração vem só do .nick/nick.conf do diretório atual. Para criá-la, rode na raiz do projeto: $NICK_INIT_BIN" >&2
+        exit 1
+        ;;
       --requisitos-jail) jail_requirements_flag=1 ;;
       *)
         echo "Erro: argumento desconhecido: '$arg'" >&2
-        echo "Uso: $(basename "$0") [--projeto=<nome>] [--init] [--requisitos-jail]" >&2
+        echo "Uso: $(basename "$0") [--requisitos-jail]" >&2
         exit 1
         ;;
     esac
   done
-
-  if [ "$init_flag" -eq 1 ]; then
-    init_project
-    exit 0
-  fi
 
   # What the jail needs on this machine, before anyone turns JAIL_ENABLED on: no config is
   # loaded, nothing runs and nothing is written.
@@ -838,18 +597,19 @@ main() {
   fi
 
   check_requirements
-  resolve_stack "$project_arg"
+  resolve_stack
   # First point where JAIL_ENABLED is known, before any question: with "true", a jail that
   # doesn't work here stops the script (no log, no claude). The .nick/nick.conf in the cwd is
-  # shared with the target team, so the error warns about turning the jail off there.
+  # shared with the target team, so the error warns about turning the jail off there (always
+  # the case now, but the comparison stays: simplifying the jail call is out of scope).
   local config_shared="false" jail_hosts
   [ "$PROJECT_CONFIG_FILE" = "$(config_cwd_file)" ] && config_shared="true"
   # The MCP hosts first, then the project's own (JAIL_ALLOW_HOSTS); jail_check validates both.
   jail_hosts="$(mcp_jail_hosts) $JAIL_ALLOW_HOSTS"
   jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$jail_hosts" "$JAIL_FORWARD_PORTS" "$PROJECT_CONFIG_FILE" "$config_shared" || exit 1
   # The Claude Code deny/ask rules (lib/claude/) go to every session, always: without them
-  # the script stops here, before any question, log or claude. --init and --requisitos-jail
-  # never open claude, so they exit above without loading them.
+  # the script stops here, before any question, log or claude. --requisitos-jail never opens
+  # claude, so it exits above without loading them.
   claude_settings_load NICK_CLAUDE_SETTINGS || exit 1
   # The jail status (and the JAIL_CLIPBOARD warning) shows up front, before anything else
   # runs, and again right before the confirmation.
@@ -901,7 +661,7 @@ main() {
   read -r -p "Confirma o envio para o claude? (s/N): " confirm
   case "$confirm" in
     s|S|sim|Sim|SIM)
-      nick_dir_prepare || exit 1
+      config_dir_prepare || exit 1
       # The deny/ask rules come first, inline (the content, not a path: a path out of the
       # project may not exist inside the jail), in every stage and with or without the jail.
       local claude_args=(--settings "$NICK_CLAUDE_SETTINGS")

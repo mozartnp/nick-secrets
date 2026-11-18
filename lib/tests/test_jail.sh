@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # test_jail: testes em bash puro (sem framework) da biblioteca lib/jail/jail.sh. Cada caso roda
-# num bash -c separado, que dá source só em lib/jail/jail.sh — nunca em lib/config.sh, o que
-# prova que as duas bibliotecas são independentes. O ai-jail real nunca é usado: os casos põem
-# à frente do PATH stubs de ai-jail, claude, bwrap e uname, criados no TEST_TMP desta suíte, e
-# o caso "ai-jail ausente" sobrescreve JAIL_BIN com um nome que não existe. A integração com o
-# auto_scrum fica em auto_scrum/tests/test_auto_scrum.sh.
+# num bash -c separado, que dá source só em lib/jail/jail.sh — nunca em lib/config/config.sh, o
+# que prova que as duas bibliotecas são independentes. O ai-jail real nunca é usado: os casos
+# põem à frente do PATH stubs de ai-jail, claude, bwrap e uname, criados no TEST_TMP desta
+# suíte, e o caso "ai-jail ausente" sobrescreve JAIL_BIN com um nome que não existe. A
+# integração com o auto_scrum fica em auto_scrum/tests/test_auto_scrum.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -238,12 +238,12 @@ assert_eq "" "$(grep -nE '\[\[[[:space:]]' <<< "$jail_code" || true)" "nenhum te
 assert_eq "" "$(grep -nE '(^|[;&|])[[:space:]]*\.[[:space:]]+[^[:space:]]' <<< "$jail_code" || true)" "nenhum '. arquivo' fora de comentário"
 
 echo
-echo "== independência: lib/jail/jail.sh não depende de lib/config.sh =="
+echo "== independência: lib/jail/jail.sh não depende de lib/config/config.sh =="
 assert_eq "" "$(grep -nE 'config_|CONFIG_' <<< "$jail_code" || true)" "lib/jail/jail.sh não cita config_ nem CONFIG_ fora de comentário"
 assert_eq "" "$(grep -nF 'config.sh' <<< "$jail_code" || true)" "lib/jail/jail.sh não cita config.sh fora de comentário"
 # O padrão não casa com a própria linha: o [^;]* para no ';' do colchete, e a descrição não
 # usa a palavra.
-assert_eq "" "$(grep -nE 'source[^;]*config' <<< "$(code_lines "$0")" || true)" "esta suíte nunca carrega lib/config.sh"
+assert_eq "" "$(grep -nE 'source[^;]*config' <<< "$(code_lines "$0")" || true)" "esta suíte nunca carrega lib/config/config.sh"
 
 echo
 echo "== estrutural: as opções do ai-jail saem só de jail_options; o nick não mexe no .ai-jail =="

@@ -1,0 +1,184 @@
+//! Finding and running bin/nick-init (NS-30), the only source of the project config: the
+//! shell runs it as it is, never copies its logic. The path is fixed at compile time (the
+//! checkout the binary was built from, until the F6 slice packages the nick) and can be
+//! replaced by NICK_INIT_BIN. Running it goes through the `InitRunner` trait, so the TUI state
+//! (app.rs) is tested with a fake one that only records the calls.
+
+use std::ffi::OsStr;
+use std::io::{self, BufRead, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use signal_hook::consts::{SIGINT, SIGQUIT};
+
+use crate::paths::printable;
+use crate::terminal::TerminalGuard;
+
+/// bin/nick-init of the checkout this binary was built from, before normalization.
+const DEFAULT_INIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-init");
+
+/// How a run of the init ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitOutcome {
+    /// It ended with this exit code.
+    Exited(i32),
+    /// It was killed by a signal.
+    Signaled,
+    /// It could not be started (e.g. no bash); the system error.
+    SpawnFailed(String),
+}
+
+/// Runs the init of `init` with the cwd at `project`.
+pub trait InitRunner {
+    fn run(&mut self, init: &Path, project: &Path) -> InitOutcome;
+}
+
+/// The real runner: suspends the TUI (terminal.rs), runs `bash <init>` with the cwd at the
+/// project and the terminal inherited, and waits for an Enter before the TUI comes back,
+/// whatever the result, so the operator can read the output of the init. A failure to enter
+/// the TUI again is kept in `error`, for the loop to end with it.
+pub struct TerminalInitRunner<'a> {
+    guard: &'a mut TerminalGuard,
+    pub error: Option<io::Error>,
+}
+
+impl<'a> TerminalInitRunner<'a> {
+    pub fn new(guard: &'a mut TerminalGuard) -> TerminalInitRunner<'a> {
+        TerminalInitRunner { guard, error: None }
+    }
+}
+
+impl InitRunner for TerminalInitRunner<'_> {
+    fn run(&mut self, init: &Path, project: &Path) -> InitOutcome {
+        match self.guard.suspend(|| run_in_terminal(init, project)) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let message = err.to_string();
+                self.error = Some(err);
+                InitOutcome::SpawnFailed(message)
+            }
+        }
+    }
+}
+
+/// Runs the init on the normal terminal and waits for the Enter, with the nick immune to the
+/// Ctrl+C (and Ctrl+\\) of that time: out of raw mode, the terminal sends SIGINT/SIGQUIT to the
+/// whole foreground group, the nick included, and the default action would kill it without
+/// restoring the TUI (review NS-31, P1). Like system(3) does, the parent ignores them while
+/// the child runs; the child still gets them, since a handler (unlike SIG_IGN) goes back to
+/// the default on exec.
+fn run_in_terminal(init: &Path, project: &Path) -> InitOutcome {
+    let _immune = IgnoreTerminalSignals::new();
+    println!(
+        "Rodando {} em {}...",
+        printable(&init.to_string_lossy()),
+        printable(&project.to_string_lossy())
+    );
+    let outcome = match Command::new("bash").arg(init).current_dir(project).status() {
+        Ok(status) => match status.code() {
+            Some(code) => InitOutcome::Exited(code),
+            None => InitOutcome::Signaled,
+        },
+        Err(err) => InitOutcome::SpawnFailed(err.to_string()),
+    };
+    print!("Pressione Enter para voltar ao nick.");
+    let _ = io::stdout().flush();
+    // Any line, or the end of the input, goes back.
+    let _ = io::stdin().lock().read_line(&mut String::new());
+    outcome
+}
+
+/// While alive, SIGINT and SIGQUIT only set a flag that nobody reads (so they do nothing to
+/// the nick). Dropping it removes the handlers: back in raw mode, Ctrl+C is a key again.
+struct IgnoreTerminalSignals {
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl IgnoreTerminalSignals {
+    fn new() -> IgnoreTerminalSignals {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ids = [SIGINT, SIGQUIT]
+            .into_iter()
+            .filter_map(|signal| signal_hook::flag::register(signal, Arc::clone(&flag)).ok())
+            .collect();
+        IgnoreTerminalSignals { ids }
+    }
+}
+
+impl Drop for IgnoreTerminalSignals {
+    fn drop(&mut self) {
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+/// The init to run: NICK_INIT_BIN when it is set and not empty (made absolute against the cwd
+/// of the nick, since the init runs with the cwd at the project), or bin/nick-init of the
+/// checkout, normalized (without `..`).
+pub fn init_path(override_path: Option<&OsStr>) -> PathBuf {
+    match override_path.filter(|path| !path.is_empty()) {
+        Some(path) => std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path)),
+        None => normalize(Path::new(DEFAULT_INIT)),
+    }
+}
+
+/// Removes `.` and `..` from an absolute path without touching the disk (the init may be
+/// missing, and the message then shows this path).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Moving the crate without fixing the path breaks the button: this pins it to
+    /// <repository root>/bin/nick-init, and the file must exist.
+    #[test]
+    fn the_default_init_is_bin_nick_init_of_the_repository() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = init_path(None);
+        assert_eq!(path, root.join("bin/nick-init"));
+        assert!(path.is_file(), "{} exists", path.display());
+        assert!(
+            !path.components().any(|c| c == Component::ParentDir),
+            "normalized: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn an_empty_override_is_ignored() {
+        assert_eq!(init_path(Some(OsStr::new(""))), init_path(None));
+    }
+
+    #[test]
+    fn an_absolute_override_wins_as_it_is() {
+        assert_eq!(
+            init_path(Some(OsStr::new("/x/fake-init"))),
+            PathBuf::from("/x/fake-init")
+        );
+    }
+
+    #[test]
+    fn a_relative_override_is_made_absolute_against_the_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            init_path(Some(OsStr::new("tests/fake"))),
+            cwd.join("tests/fake")
+        );
+    }
+}

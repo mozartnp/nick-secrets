@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# Fake bin/nick-init of the nick integration tests (tests/tui.rs points NICK_INIT_BIN here).
+# It records its cwd in $FAKE_INIT_MARKER and then acts by FAKE_INIT_MODE:
+#   create: asks a line on the stdin, like the overwrite question of the real init (with the
+#           terminal still in raw mode the line never ends, and the test times out), and
+#           creates .nick/nick.conf when the answer is "s";
+#   zero:   exits with 0 without creating anything (an overwrite refused);
+#   fail:   exits with 1 (an error, or Ctrl+D);
+#   signal: kills itself with SIGTERM.
+set -euo pipefail
+
+pwd -P > "$FAKE_INIT_MARKER"
+
+case "${FAKE_INIT_MODE:-}" in
+  create)
+    printf 'Criar a configuração? (s/N) '
+    read -r answer
+    if [ "$answer" = "s" ]; then
+      mkdir -p .nick
+      printf 'STACK_DESCRIPTION=""\n' > .nick/nick.conf
+      echo "init falso: configuração criada"
+    fi
+    ;;
+  zero)
+    echo "init falso: nada foi criado"
+    ;;
+  fail)
+    echo "init falso: falhou" >&2
+    exit 1
+    ;;
+  signal)
+    kill -TERM "$$"
+    ;;
+  *)
+    echo "init falso: FAKE_INIT_MODE inválido: '${FAKE_INIT_MODE:-}'" >&2
+    exit 2
+    ;;
+esac

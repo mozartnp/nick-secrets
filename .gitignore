@@ -8,3 +8,5 @@ auto_scrum/logs/*.md
 .env
 # Saída de build do Cargo do protótipo do painel (NS-29).
 prototype/panel/target/
+# Saída de build do Cargo da casca nick (NS-31).
+nick/target/

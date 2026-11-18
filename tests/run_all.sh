@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # run_all.sh: runs every test suite of the repository, one at a time, with the cwd at the
-# repository root (the suites use the real LOGS_DIR, PROJECTS_DIR and cwd, so they can't run
-# in parallel nor from another directory). Called by `make test` (Makefile at the root), and
+# repository root (the suites use the real LOGS_DIR and cwd, so they can't run in parallel nor
+# from another directory). Called by `make test` (Makefile at the root), and
 # also runnable directly: bash tests/run_all.sh.
 # A suite is any test_*.sh directly inside a directory named tests, outside hidden
 # directories (.git/, .nick/, .claude/...): a new suite runs without touching this script or

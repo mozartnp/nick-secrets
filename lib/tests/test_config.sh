@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# test_config: testes em bash puro (sem framework) da biblioteca lib/config.sh. Cada caso roda
+# test_config: testes em bash puro (sem framework) da biblioteca lib/config/config.sh. Cada caso roda
 # num bash -c separado, que dá source na biblioteca e registra só chaves de mentira (FAKE_*):
 # nenhuma chave de ferramenta real aparece aqui. A integração com o auto_scrum fica em
 # auto_scrum/tests/test_auto_scrum.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_SH="$SCRIPT_DIR/../config.sh"
+CONFIG_SH="$SCRIPT_DIR/../config/config.sh"
 
 failures=0
 
@@ -116,8 +116,8 @@ mkdir -p "$clean_dir"
 clean_rc=0
 # Só redirecionamentos entre os retratos, pra o próprio teste não criar variável nenhuma.
 timeout 2 bash --norc --noprofile -c "compgen -v | sort > '$clean_dir/vars_before'; declare -F | sort > '$clean_dir/funcs_before'; source '$CONFIG_SH' > '$clean_dir/out' 2>&1; compgen -v | sort > '$clean_dir/vars_after'; declare -F | sort > '$clean_dir/funcs_after'" < /dev/null || clean_rc=$?
-assert_eq "0" "$clean_rc" "source lib/config.sh num bash limpo termina com código 0"
-assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/config.sh não imprime nada (stdout nem stderr)"
+assert_eq "0" "$clean_rc" "source lib/config/config.sh num bash limpo termina com código 0"
+assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/config/config.sh não imprime nada (stdout nem stderr)"
 # Variáveis que o próprio bash cria ou mexe entre os retratos (não são da biblioteca).
 clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
 clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
@@ -133,16 +133,18 @@ if script -qec true /dev/null > /dev/null 2>&1; then
 else
   echo "  PULADO: sem o script do util-linux pra simular um terminal"
 fi
-assert_contains "$clean_new_vars" "CONFIG_KEYS" "source lib/config.sh cria CONFIG_KEYS"
+assert_contains "$clean_new_vars" "CONFIG_KEYS" "source lib/config/config.sh cria CONFIG_KEYS"
 assert_eq "" "$(grep -vE '^CONFIG_' <<< "$clean_new_vars" || true)" "toda variável nova começa com CONFIG_"
 assert_eq "" "$(grep -vE '^config_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com config_"
-clean_arrays="$(timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; printf '%s|%s|%s|%s|%s|%s' \"\$CONFIG_CWD_FILE_NAME\" \"\$CONFIG_CWD_LEGACY_FILE_NAME\" \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\"" 2>/dev/null || true)"
-assert_eq ".nick/nick.conf|.nick.conf|0|0|0|0" "$clean_arrays" "CONFIG_CWD_FILE_NAME é .nick/nick.conf, CONFIG_CWD_LEGACY_FILE_NAME é .nick.conf e os quatro arrays do registro nascem vazios"
+clean_arrays="$(timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \"\$CONFIG_NICK_DIR_NAME\" \"\$CONFIG_EXCHANGE_DIR_NAME\" \"\$CONFIG_DOCS_DIR_NAME\" \"\$CONFIG_CWD_FILE_NAME\" \"\$CONFIG_CWD_LEGACY_FILE_NAME\" \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\"" 2>/dev/null || true)"
+assert_eq ".nick|.nick/troca|.nick/docs|.nick/nick.conf|.nick.conf|0|0|0|0" "$clean_arrays" "CONFIG_NICK_DIR_NAME é .nick, CONFIG_EXCHANGE_DIR_NAME é .nick/troca, CONFIG_DOCS_DIR_NAME é .nick/docs, CONFIG_CWD_FILE_NAME é .nick/nick.conf, CONFIG_CWD_LEGACY_FILE_NAME é .nick.conf e os quatro arrays do registro nascem vazios"
+assert_eq "$(cut -d'|' -f1 <<< "$clean_arrays")/nick.conf" "$(cut -d'|' -f4 <<< "$clean_arrays")" "consistência: CONFIG_CWD_FILE_NAME = \$CONFIG_NICK_DIR_NAME/nick.conf"
+assert_eq "$(cut -d'|' -f1 <<< "$clean_arrays")/troca|$(cut -d'|' -f1 <<< "$clean_arrays")/docs" "$(cut -d'|' -f2-3 <<< "$clean_arrays")" "consistência: CONFIG_EXCHANGE_DIR_NAME e CONFIG_DOCS_DIR_NAME ficam dentro de CONFIG_NICK_DIR_NAME"
 
 echo
 echo "== carga limpa: estrutura do arquivo (sem shebang, sem bit de execução, sem set/exit/source/eval) =="
 assert_eq "# shellcheck shell=bash" "$(head -n1 "$CONFIG_SH" 2>/dev/null || true)" "a 1ª linha é a diretiva '# shellcheck shell=bash' (sem shebang)"
-assert_eq "sem bit de execução" "$([ -e "$CONFIG_SH" ] && [ ! -x "$CONFIG_SH" ] && echo 'sem bit de execução' || echo 'executável ou inexistente')" "lib/config.sh existe e não tem bit de execução"
+assert_eq "sem bit de execução" "$([ -e "$CONFIG_SH" ] && [ ! -x "$CONFIG_SH" ] && echo 'sem bit de execução' || echo 'executável ou inexistente')" "lib/config/config.sh existe e não tem bit de execução"
 config_code="$(code_lines "$CONFIG_SH" 2>/dev/null || true)"
 assert_eq "" "$(grep -nE '(^|[;&|[:space:]])set[[:space:]]+[-+]' <<< "$config_code" || true)" "nenhum set -e/set -o (nem outro set) fora de comentário"
 assert_eq "" "$(grep -nwE 'exit|source|eval' <<< "$config_code" || true)" "nenhum exit, source ou eval fora de comentário"
@@ -444,8 +446,272 @@ assert_eq "|false|false|true" "$(run_load "$skel_dir/skeleton.conf" "$skel_dir/r
 assert_eq "" "$(cat "$skel_dir/round_trip.err" 2>/dev/null || echo 'sem stderr')" "ida e volta: o esqueleto carrega sem nenhum aviso"
 
 echo
-echo "== genérico: lib/config.sh não conhece nenhuma ferramenta =="
-assert_eq "" "$(grep -n 'auto_scrum' <<< "$(code_lines "$CONFIG_SH")" || true)" "lib/config.sh não cita auto_scrum fora de comentário"
+echo "== config_dir_prepare: cria a árvore .nick/ no cwd (.gitignore único, troca/ e docs/) =="
+# nick_tree <dir>: lista (find | sort, locale C) o que existe em <dir>/.nick, com caminhos
+# relativos a <dir>. Sem .nick, imprime vazio.
+nick_tree() {
+  (cd "$1" && [ -e .nick ] && find .nick | LC_ALL=C sort) || true
+}
+# nick_gitignore_expected: o .nick/.gitignore que a biblioteca cria, escrito à mão (três linhas).
+nick_gitignore_expected() {
+  printf '%s\n' '*' '!.gitignore' '!nick.conf'
+}
+# run_in_dir <dir> <stdin> <out_prefix> <commands> [shell_options]: com o cwd em <dir>, num
+# bash separado com [shell_options] (padrão: set -euo pipefail; ":" roda sem set -e), dá source
+# em FAKE_KEYS_SH e roda <commands>, com stdout em <out_prefix>.out e stderr em
+# <out_prefix>.err. <stdin> vazio vira < /dev/null (EOF já na primeira leitura). Imprime o
+# código de saída do bash.
+run_in_dir() {
+  local dir="$1" input="$2" out_prefix="$3" commands="$4" shell_options="${5:-set -euo pipefail}" rc=0
+  if [ -z "$input" ]; then
+    (cd "$dir" && timeout 2 bash -c "$shell_options; source '$FAKE_KEYS_SH'; $commands" < /dev/null > "$out_prefix.out" 2> "$out_prefix.err") || rc=$?
+  else
+    (cd "$dir" && timeout 2 bash -c "$shell_options; source '$FAKE_KEYS_SH'; $commands" <<< "$input" > "$out_prefix.out" 2> "$out_prefix.err") || rc=$?
+  fi
+  printf '%s' "$rc"
+}
+# prep_blocked_error <cwd>: a mensagem exata de quando a árvore não pode ser criada.
+prep_blocked_error() {
+  printf '%s' "Erro: não foi possível criar a estrutura .nick/ (.gitignore, troca/ e docs/) em $(cd "$1" && pwd)."
+}
+prep_dir="$TEST_TMP/dir_prepare"
+mkdir -p "$prep_dir/fresh"
+assert_eq "0" "$(run_in_dir "$prep_dir/fresh" "" "$prep_dir/fresh" "config_dir_prepare")" "cwd vazio: config_dir_prepare retorna 0"
+assert_eq "$(printf '%s\n' .nick .nick/.gitignore .nick/docs .nick/troca)" "$(nick_tree "$prep_dir/fresh")" "cwd vazio: cria exatamente .nick/.gitignore, .nick/troca/ e .nick/docs/ (sem nick.conf nem .gitignore em troca/ ou docs/)"
+assert_eq "$(nick_gitignore_expected)" "$(cat "$prep_dir/fresh/.nick/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "cwd vazio: .nick/.gitignore tem exatamente *, !.gitignore e !nick.conf"
+assert_eq "true" "$([ -d "$prep_dir/fresh/.nick/troca" ] && [ -d "$prep_dir/fresh/.nick/docs" ] && echo true || echo false)" "cwd vazio: .nick/troca/ e .nick/docs/ são diretórios"
+assert_eq "" "$(cat "$prep_dir/fresh.out" "$prep_dir/fresh.err" 2>/dev/null || echo 'sem saída gravada')" "cwd vazio: nada no stdout nem no stderr"
+
+mkdir -p "$prep_dir/existing/.nick/troca" "$prep_dir/existing/.nick/docs/SC-1"
+printf '%s\n' '*' '!.gitignore' '!nick.conf' '!docs/' '!docs/**' > "$prep_dir/existing/.nick/.gitignore"
+cp "$prep_dir/existing/.nick/.gitignore" "$prep_dir/existing_gitignore.before"
+printf '%s\n' '# do usuário' '*' > "$prep_dir/existing/.nick/troca/.gitignore"
+printf 'print antiga' > "$prep_dir/existing/.nick/troca/prova.png"
+printf 'plano antigo' > "$prep_dir/existing/.nick/docs/SC-1/plan.md"
+assert_eq "0" "$(run_in_dir "$prep_dir/existing" "" "$prep_dir/existing" "config_dir_prepare")" "árvore já existente: config_dir_prepare retorna 0"
+assert_eq "igual" "$(cmp -s "$prep_dir/existing_gitignore.before" "$prep_dir/existing/.nick/.gitignore" && echo igual || echo diferente)" "árvore já existente: .nick/.gitignore editado fica idêntico byte a byte"
+assert_eq "$(printf '%s\n' '# do usuário' '*')" "$(cat "$prep_dir/existing/.nick/troca/.gitignore" 2>/dev/null || true)" "árvore já existente: o .nick/troca/.gitignore do usuário não é tocado"
+assert_eq "print antiga" "$(cat "$prep_dir/existing/.nick/troca/prova.png" 2>/dev/null || true)" "árvore já existente: os arquivos de troca/ continuam lá"
+assert_eq "plano antigo" "$(cat "$prep_dir/existing/.nick/docs/SC-1/plan.md" 2>/dev/null || true)" "árvore já existente: os arquivos de docs/<ID>/ continuam lá"
+assert_not_exists "$prep_dir/existing/.nick/docs/.gitignore" "árvore já existente: nenhum .gitignore é criado em docs/"
+
+mkdir -p "$prep_dir/blocked/.nick"
+printf 'arquivo no lugar da pasta' > "$prep_dir/blocked/.nick/troca"
+assert_eq "1" "$(run_in_dir "$prep_dir/blocked" "" "$prep_dir/blocked" "t_rc=0; config_dir_prepare || t_rc=\$?; printf '%s|depois' \"\$t_rc\" > '$prep_dir/blocked.after'; exit \"\$t_rc\"")" ".nick/troca sendo um arquivo: config_dir_prepare retorna 1"
+assert_eq "1|depois" "$(cat "$prep_dir/blocked.after" 2>/dev/null || true)" ".nick/troca sendo um arquivo: retorna 1 sem exit (o shell segue)"
+assert_eq "$(prep_blocked_error "$prep_dir/blocked")" "$(cat "$prep_dir/blocked.err" 2>/dev/null || true)" ".nick/troca sendo um arquivo: o stderr é só a mensagem exata"
+assert_eq "arquivo no lugar da pasta" "$(cat "$prep_dir/blocked/.nick/troca" 2>/dev/null || true)" ".nick/troca sendo um arquivo: o arquivo fica intacto"
+# .nick/ sem permissão de escrita, com troca/ e docs/ já existentes: o mkdir passa e só o
+# .gitignore falha. O stderr tem de ser só a mensagem da biblioteca, sem o erro cru do bash. O
+# root ignora a permissão, então o caso é pulado.
+if [ "$(id -u)" -ne 0 ]; then
+  mkdir -p "$prep_dir/readonly/.nick/troca" "$prep_dir/readonly/.nick/docs"
+  chmod a-w "$prep_dir/readonly/.nick"
+  prep_ro_rc="$(run_in_dir "$prep_dir/readonly" "" "$prep_dir/readonly" "config_dir_prepare")"
+  chmod u+w "$prep_dir/readonly/.nick"
+  assert_eq "1" "$prep_ro_rc" ".nick/ somente leitura: config_dir_prepare retorna 1"
+  assert_eq "$(prep_blocked_error "$prep_dir/readonly")" "$(cat "$prep_dir/readonly.err" 2>/dev/null || true)" ".nick/ somente leitura: o stderr é só a mensagem da biblioteca (sem o erro cru do bash)"
+  assert_not_exists "$prep_dir/readonly/.nick/.gitignore" ".nick/ somente leitura: nenhum .gitignore é criado"
+else
+  echo "  PULADO: .nick/ somente leitura não vale como root"
+fi
+mkdir -p "$prep_dir/no_set_e"
+assert_eq "0" "$(run_in_dir "$prep_dir/no_set_e" "" "$prep_dir/no_set_e" "config_dir_prepare" ":")" "sem set -e no chamador: config_dir_prepare retorna 0"
+assert_eq "$(printf '%s\n' .nick .nick/.gitignore .nick/docs .nick/troca)" "$(nick_tree "$prep_dir/no_set_e")" "sem set -e no chamador: a mesma árvore"
+
+echo
+echo "== config_init <tool_name>: cria .nick/ e .nick/nick.conf no cwd, com confirmação de sobrescrita =="
+init_dir="$TEST_TMP/init"
+mkdir -p "$init_dir"
+run_fake "config_print_skeleton ferramenta-x > '$init_dir/skeleton.conf'" >/dev/null
+# init_tree_expected: a árvore de .nick/ que config_init deixa.
+init_tree_expected() {
+  printf '%s\n' .nick .nick/.gitignore .nick/docs .nick/nick.conf .nick/troca
+}
+# init_expected_output <cwd>: o stdout exato de config_init quando ele cria o arquivo.
+init_expected_output() {
+  cat <<EOF
+Projeto criado em $1/.nick/nick.conf — edite antes de usar.
+Estrutura do nick em .nick/:
+  .gitignore   versionado: ignora tudo em .nick/ menos ele e o nick.conf
+  nick.conf    versionado: configuração do projeto
+  troca/       não versionada: troca de arquivos com os agentes
+  docs/        não versionada: plano, review e prints de cada ticket (docs/<ID>/)
+Versione .nick/nick.conf e .nick/.gitignore junto com o projeto.
+EOF
+}
+# init_legacy_warning <cwd>: o aviso exato do .nick.conf antigo.
+init_legacy_warning() {
+  printf '%s' "Aviso: o arquivo antigo $1/.nick.conf não foi lido nem alterado — copie os valores dele para $1/.nick/nick.conf e apague o antigo."
+}
+# run_init <dir> <stdin> <out_prefix> [shell_options]: config_init ferramenta-x com o cwd em
+# <dir>; grava "<código>|depois" em <out_prefix>.after (o "depois" só sai se o shell seguiu
+# depois da chamada, provando que não houve exit). Imprime o código de saída do bash.
+run_init() {
+  local dir="$1" input="$2" out_prefix="$3" shell_options="${4:-set -euo pipefail}"
+  run_in_dir "$dir" "$input" "$out_prefix" "t_rc=0; config_init ferramenta-x || t_rc=\$?; printf '%s|depois' \"\$t_rc\" > '$out_prefix.after'; exit \"\$t_rc\"" "$shell_options"
+}
+
+mkdir -p "$init_dir/fresh"
+init_fresh_pwd="$(cd "$init_dir/fresh" && pwd)"
+assert_eq "0" "$(run_init "$init_dir/fresh" "" "$init_dir/fresh")" "cwd vazio: config_init retorna 0"
+assert_eq "$(init_tree_expected)" "$(nick_tree "$init_dir/fresh")" "cwd vazio: cria exatamente .nick/.gitignore, .nick/nick.conf, .nick/troca/ e .nick/docs/"
+assert_eq "$(nick_gitignore_expected)" "$(cat "$init_dir/fresh/.nick/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "cwd vazio: .nick/.gitignore tem exatamente *, !.gitignore e !nick.conf"
+assert_eq "igual" "$(cmp -s "$init_dir/skeleton.conf" "$init_dir/fresh/.nick/nick.conf" && echo igual || echo diferente)" "cwd vazio: .nick/nick.conf é config_print_skeleton ferramenta-x, byte a byte"
+assert_eq "$(init_expected_output "$init_fresh_pwd")" "$(cat "$init_dir/fresh.out" 2>/dev/null || true)" "cwd vazio: stdout exato (caminho do nick.conf e a árvore de .nick/)"
+assert_eq "" "$(cat "$init_dir/fresh.err" 2>/dev/null || echo 'sem stderr gravado')" "cwd vazio: nada no stderr (nenhum aviso: o init não chama o leitor)"
+
+mkdir -p "$init_dir/overwrite/.nick"
+printf '%s\n' 'FAKE_TEXT="antigo"' > "$init_dir/overwrite/.nick/nick.conf"
+assert_eq "0" "$(run_init "$init_dir/overwrite" "N" "$init_dir/overwrite_no")" "nick.conf existente, resposta N: retorna 0"
+assert_eq "Cancelado. Nada foi alterado." "$(cat "$init_dir/overwrite_no.out" 2>/dev/null || true)" "nick.conf existente, resposta N: stdout é só 'Cancelado. Nada foi alterado.'"
+assert_eq "" "$(cat "$init_dir/overwrite_no.err" 2>/dev/null || echo 'sem stderr gravado')" "nick.conf existente (incompleto), resposta N: nada no stderr (nenhum aviso)"
+assert_eq 'FAKE_TEXT="antigo"' "$(cat "$init_dir/overwrite/.nick/nick.conf")" "nick.conf existente, resposta N: arquivo inalterado"
+assert_eq "$(printf '%s\n' .nick .nick/nick.conf)" "$(nick_tree "$init_dir/overwrite")" "nick.conf existente, resposta N: nada é criado nem completado (sem .gitignore, troca/ ou docs/)"
+
+assert_eq "1" "$(run_init "$init_dir/overwrite" "" "$init_dir/overwrite_eof")" "nick.conf existente, stdin fecha na pergunta (Ctrl+D): retorna 1"
+assert_eq "1|depois" "$(cat "$init_dir/overwrite_eof.after" 2>/dev/null || true)" "nick.conf existente, Ctrl+D: retorna 1 sem exit (o shell segue)"
+assert_eq "Cancelado. Nada foi alterado." "$(cat "$init_dir/overwrite_eof.err" 2>/dev/null || true)" "nick.conf existente, Ctrl+D: 'Cancelado. Nada foi alterado.' no stderr"
+assert_eq "" "$(cat "$init_dir/overwrite_eof.out" 2>/dev/null || echo 'sem stdout gravado')" "nick.conf existente, Ctrl+D: nada no stdout"
+assert_eq 'FAKE_TEXT="antigo"' "$(cat "$init_dir/overwrite/.nick/nick.conf")" "nick.conf existente, Ctrl+D: arquivo inalterado"
+assert_eq "$(printf '%s\n' .nick .nick/nick.conf)" "$(nick_tree "$init_dir/overwrite")" "nick.conf existente, Ctrl+D: nada é criado nem completado"
+
+assert_eq "0" "$(run_init "$init_dir/overwrite" "s" "$init_dir/overwrite_yes")" "nick.conf existente, resposta s: retorna 0"
+assert_eq "igual" "$(cmp -s "$init_dir/skeleton.conf" "$init_dir/overwrite/.nick/nick.conf" && echo igual || echo diferente)" "nick.conf existente, resposta s: arquivo substituído pelo esqueleto"
+assert_eq "$(init_tree_expected)" "$(nick_tree "$init_dir/overwrite")" "nick.conf existente, resposta s: a árvore de .nick/ é completada"
+assert_eq "$(nick_gitignore_expected)" "$(cat "$init_dir/overwrite/.nick/.gitignore" 2>/dev/null || echo 'sem .gitignore')" "nick.conf existente, resposta s: .nick/.gitignore com o conteúdo exato"
+assert_eq "$(init_expected_output "$(cd "$init_dir/overwrite" && pwd)")" "$(cat "$init_dir/overwrite_yes.out" 2>/dev/null || true)" "nick.conf existente, resposta s: stdout exato, como sem o arquivo"
+assert_eq "" "$(cat "$init_dir/overwrite_yes.err" 2>/dev/null || echo 'sem stderr gravado')" "nick.conf existente, resposta s: nada no stderr"
+for init_answer in S sim Sim SIM; do
+  mkdir -p "$init_dir/answer_$init_answer/.nick"
+  printf '%s\n' 'FAKE_TEXT="antigo"' > "$init_dir/answer_$init_answer/.nick/nick.conf"
+  run_init "$init_dir/answer_$init_answer" "$init_answer" "$init_dir/answer_$init_answer" >/dev/null
+  assert_eq "igual" "$(cmp -s "$init_dir/skeleton.conf" "$init_dir/answer_$init_answer/.nick/nick.conf" && echo igual || echo diferente)" "nick.conf existente, resposta $init_answer: sobrescreve"
+done
+init_answer_case=0
+for init_answer in n x não; do
+  init_answer_case=$((init_answer_case + 1))
+  init_answer_dir="$init_dir/answer_no_$init_answer_case"
+  mkdir -p "$init_answer_dir/.nick"
+  printf '%s\n' 'FAKE_TEXT="antigo"' > "$init_answer_dir/.nick/nick.conf"
+  run_init "$init_answer_dir" "$init_answer" "$init_answer_dir" >/dev/null
+  assert_eq 'FAKE_TEXT="antigo"' "$(cat "$init_answer_dir/.nick/nick.conf")" "nick.conf existente, resposta '$init_answer': não sobrescreve"
+done
+
+mkdir -p "$init_dir/edited/.nick/troca" "$init_dir/edited/.nick/docs/SC-1"
+printf '%s\n' '*' '!.gitignore' '!nick.conf' '!docs/' '!docs/**' > "$init_dir/edited/.nick/.gitignore"
+cp "$init_dir/edited/.nick/.gitignore" "$init_dir/edited_gitignore.before"
+printf 'print antiga' > "$init_dir/edited/.nick/troca/prova.png"
+printf 'plano antigo' > "$init_dir/edited/.nick/docs/SC-1/plan.md"
+assert_eq "0" "$(run_init "$init_dir/edited" "" "$init_dir/edited")" ".nick/.gitignore editado: config_init retorna 0"
+assert_eq "igual" "$(cmp -s "$init_dir/edited_gitignore.before" "$init_dir/edited/.nick/.gitignore" && echo igual || echo diferente)" ".nick/.gitignore editado: o arquivo fica idêntico byte a byte"
+assert_eq "igual" "$(cmp -s "$init_dir/skeleton.conf" "$init_dir/edited/.nick/nick.conf" && echo igual || echo diferente)" ".nick/.gitignore editado: o nick.conf é criado com o esqueleto"
+assert_eq "print antiga|plano antigo" "$(cat "$init_dir/edited/.nick/troca/prova.png" 2>/dev/null || true)|$(cat "$init_dir/edited/.nick/docs/SC-1/plan.md" 2>/dev/null || true)" ".nick/.gitignore editado: o conteúdo de troca/ e docs/ fica intacto"
+
+mkdir -p "$init_dir/legacy"
+printf '%s\n' 'FAKE_TEXT="antigo"' > "$init_dir/legacy/.nick.conf"
+init_legacy_pwd="$(cd "$init_dir/legacy" && pwd)"
+assert_eq "0" "$(run_init "$init_dir/legacy" "" "$init_dir/legacy_only")" "só o .nick.conf antigo: config_init retorna 0 (não para no legado)"
+assert_eq "$(init_tree_expected)" "$(nick_tree "$init_dir/legacy")" "só o .nick.conf antigo: cria a árvore inteira de .nick/"
+assert_eq "igual" "$(cmp -s "$init_dir/skeleton.conf" "$init_dir/legacy/.nick/nick.conf" && echo igual || echo diferente)" "só o .nick.conf antigo: .nick/nick.conf é o esqueleto"
+assert_eq 'FAKE_TEXT="antigo"' "$(cat "$init_dir/legacy/.nick.conf")" "só o .nick.conf antigo: o arquivo antigo fica intacto"
+assert_eq "$(init_legacy_warning "$init_legacy_pwd")" "$(cat "$init_dir/legacy_only.err" 2>/dev/null || true)" "só o .nick.conf antigo: o stderr é só o aviso exato (copie os valores e apague o antigo)"
+assert_eq "$(init_expected_output "$init_legacy_pwd")" "$(cat "$init_dir/legacy_only.out" 2>/dev/null || true)" "só o .nick.conf antigo: stdout exato, como sem o legado"
+printf '%s\n' 'FAKE_TEXT="novo"' > "$init_dir/legacy/.nick/nick.conf"
+assert_eq "0" "$(run_init "$init_dir/legacy" "N" "$init_dir/legacy_both_no")" "os dois arquivos, resposta N: retorna 0"
+assert_eq 'FAKE_TEXT="novo"' "$(cat "$init_dir/legacy/.nick/nick.conf")" "os dois arquivos, resposta N: .nick/nick.conf inalterado"
+assert_eq "" "$(cat "$init_dir/legacy_both_no.err" 2>/dev/null || echo 'sem stderr gravado')" "os dois arquivos, resposta N: nenhum aviso"
+assert_eq "0" "$(run_init "$init_dir/legacy" "s" "$init_dir/legacy_both_yes")" "os dois arquivos, resposta s: retorna 0"
+assert_eq "igual" "$(cmp -s "$init_dir/skeleton.conf" "$init_dir/legacy/.nick/nick.conf" && echo igual || echo diferente)" "os dois arquivos, resposta s: .nick/nick.conf vira o esqueleto"
+assert_eq "$(init_legacy_warning "$init_legacy_pwd")" "$(cat "$init_dir/legacy_both_yes.err" 2>/dev/null || true)" "os dois arquivos, resposta s: avisa do arquivo antigo"
+assert_eq 'FAKE_TEXT="antigo"' "$(cat "$init_dir/legacy/.nick.conf")" "os dois arquivos: o arquivo antigo fica intacto"
+
+mkdir -p "$init_dir/blocked/.nick"
+printf 'arquivo no lugar da pasta' > "$init_dir/blocked/.nick/troca"
+assert_eq "1" "$(run_init "$init_dir/blocked" "" "$init_dir/blocked")" ".nick/troca sendo um arquivo: config_init retorna 1"
+assert_eq "1|depois" "$(cat "$init_dir/blocked.after" 2>/dev/null || true)" ".nick/troca sendo um arquivo: retorna 1 sem exit (o shell segue)"
+assert_eq "$(prep_blocked_error "$init_dir/blocked")" "$(cat "$init_dir/blocked.err" 2>/dev/null || true)" ".nick/troca sendo um arquivo: o stderr é só a mensagem exata"
+assert_eq "" "$(cat "$init_dir/blocked.out" 2>/dev/null || echo 'sem stdout gravado')" ".nick/troca sendo um arquivo: nada no stdout"
+assert_not_exists "$init_dir/blocked/.nick/nick.conf" ".nick/troca sendo um arquivo: o nick.conf não é gravado"
+assert_eq "arquivo no lugar da pasta" "$(cat "$init_dir/blocked/.nick/troca" 2>/dev/null || true)" ".nick/troca sendo um arquivo: o arquivo fica intacto"
+
+# Número de argumentos errado (API pública: a casca e outros módulos chamam): erro da
+# biblioteca no stderr, retorno 1 sem exit, nada criado — com e sem set -u/-e no chamador.
+init_args_case=0
+for init_args in "sem argumento|0|" "nome vazio|1|''" "dois argumentos|2|ferramenta-x extra"; do
+  init_args_case=$((init_args_case + 1))
+  init_args_label="${init_args%%|*}"
+  init_args_rest="${init_args#*|}"
+  init_args_count="${init_args_rest%%|*}"
+  init_args_call="config_init ${init_args_rest#*|}"
+  for init_args_opts in "set -euo pipefail" ":"; do
+    init_args_dir="$init_dir/args_${init_args_case}_${init_args_opts%% *}"
+    mkdir -p "$init_args_dir/cwd"
+    assert_eq "1" "$(run_in_dir "$init_args_dir/cwd" "" "$init_args_dir/run" "t_rc=0; $init_args_call || t_rc=\$?; printf '%s|depois' \"\$t_rc\" > '$init_args_dir/run.after'; exit \"\$t_rc\"" "$init_args_opts")" "config_init $init_args_label ($init_args_opts): retorna 1"
+    assert_eq "1|depois" "$(cat "$init_args_dir/run.after" 2>/dev/null || true)" "config_init $init_args_label ($init_args_opts): sem exit (o shell segue)"
+    assert_eq "Erro: config_init espera 1 argumento (o nome da ferramenta), recebeu $init_args_count." "$(cat "$init_args_dir/run.err" 2>/dev/null || true)" "config_init $init_args_label ($init_args_opts): o stderr é só a mensagem da biblioteca"
+    assert_eq "" "$(cat "$init_args_dir/run.out" 2>/dev/null || echo 'sem stdout gravado')" "config_init $init_args_label ($init_args_opts): nada no stdout"
+    assert_not_exists "$init_args_dir/cwd/.nick" "config_init $init_args_label ($init_args_opts): nada é criado"
+  done
+done
+
+# init_write_error <cwd>: a mensagem exata de quando o nick.conf não pode ser gravado.
+init_write_error() {
+  printf '%s' "Erro: não foi possível gravar $(cd "$1" && pwd)/.nick/nick.conf."
+}
+# .nick/nick.conf sendo um diretório (vale também como root): a árvore é completada, mas a
+# gravação falha com a mensagem da biblioteca, sem o erro cru do bash.
+mkdir -p "$init_dir/conf_dir/.nick/nick.conf"
+assert_eq "1" "$(run_init "$init_dir/conf_dir" "" "$init_dir/conf_dir")" ".nick/nick.conf sendo um diretório: config_init retorna 1"
+assert_eq "1|depois" "$(cat "$init_dir/conf_dir.after" 2>/dev/null || true)" ".nick/nick.conf sendo um diretório: retorna 1 sem exit (o shell segue)"
+assert_eq "$(init_write_error "$init_dir/conf_dir")" "$(cat "$init_dir/conf_dir.err" 2>/dev/null || true)" ".nick/nick.conf sendo um diretório: o stderr é só a mensagem da biblioteca (sem o erro cru do bash)"
+assert_eq "" "$(cat "$init_dir/conf_dir.out" 2>/dev/null || echo 'sem stdout gravado')" ".nick/nick.conf sendo um diretório: nada no stdout"
+assert_eq "true" "$([ -d "$init_dir/conf_dir/.nick/nick.conf" ] && echo true || echo false)" ".nick/nick.conf sendo um diretório: o diretório fica lá"
+# .nick/nick.conf somente leitura, resposta s: o mesmo erro e o arquivo intacto. O root ignora a
+# permissão, então o caso é pulado.
+if [ "$(id -u)" -ne 0 ]; then
+  mkdir -p "$init_dir/conf_ro/.nick"
+  printf '%s\n' 'FAKE_TEXT="antigo"' > "$init_dir/conf_ro/.nick/nick.conf"
+  chmod a-w "$init_dir/conf_ro/.nick/nick.conf"
+  init_ro_rc="$(run_init "$init_dir/conf_ro" "s" "$init_dir/conf_ro")"
+  chmod u+w "$init_dir/conf_ro/.nick/nick.conf"
+  assert_eq "1" "$init_ro_rc" ".nick/nick.conf somente leitura, resposta s: config_init retorna 1"
+  assert_eq "$(init_write_error "$init_dir/conf_ro")" "$(cat "$init_dir/conf_ro.err" 2>/dev/null || true)" ".nick/nick.conf somente leitura, resposta s: o stderr é só a mensagem da biblioteca"
+  assert_eq 'FAKE_TEXT="antigo"' "$(cat "$init_dir/conf_ro/.nick/nick.conf" 2>/dev/null || true)" ".nick/nick.conf somente leitura, resposta s: o arquivo fica intacto"
+else
+  echo "  PULADO: .nick/nick.conf somente leitura não vale como root"
+fi
+
+# Sem set -e no chamador: os mesmos códigos, saídas e arquivos.
+init_nose_case=0
+for init_nose in "fresh|" "overwrite|N" "overwrite|" "overwrite|s" "blocked|"; do
+  init_nose_case=$((init_nose_case + 1))
+  init_nose_kind="${init_nose%%|*}"
+  init_nose_input="${init_nose#*|}"
+  for init_nose_opts in with without; do
+    init_nose_dir="$init_dir/no_set_e_${init_nose_case}_$init_nose_opts"
+    mkdir -p "$init_nose_dir/cwd"
+    case "$init_nose_kind" in
+      overwrite) mkdir -p "$init_nose_dir/cwd/.nick"; printf '%s\n' 'FAKE_TEXT="antigo"' > "$init_nose_dir/cwd/.nick/nick.conf" ;;
+      blocked) mkdir -p "$init_nose_dir/cwd/.nick"; printf 'arquivo' > "$init_nose_dir/cwd/.nick/troca" ;;
+    esac
+    if [ "$init_nose_opts" = with ]; then
+      run_init "$init_nose_dir/cwd" "$init_nose_input" "$init_nose_dir/run" >/dev/null
+    else
+      run_init "$init_nose_dir/cwd" "$init_nose_input" "$init_nose_dir/run" ":" >/dev/null
+    fi
+    (cd "$init_nose_dir/cwd" && find . -type f -exec cksum {} + | LC_ALL=C sort) > "$init_nose_dir/files"
+    cat "$init_nose_dir/run.out" "$init_nose_dir/run.err" "$init_nose_dir/run.after" 2>/dev/null | sed "s#$init_nose_dir#<dir>#g" > "$init_nose_dir/all" || true
+  done
+  init_nose_label="$init_nose_kind (entrada '${init_nose_input:-EOF}')"
+  assert_eq "igual" "$(cmp -s "$init_dir/no_set_e_${init_nose_case}_with/all" "$init_dir/no_set_e_${init_nose_case}_without/all" && echo igual || echo diferente)" "$init_nose_label: mesmo código e mesmas saídas sem set -e no chamador"
+  assert_eq "igual" "$(cmp -s "$init_dir/no_set_e_${init_nose_case}_with/files" "$init_dir/no_set_e_${init_nose_case}_without/files" && echo igual || echo diferente)" "$init_nose_label: mesmos arquivos sem set -e no chamador"
+  assert_eq "true" "$([ -s "$init_dir/no_set_e_${init_nose_case}_without/all" ] && echo true || echo false)" "$init_nose_label: sem set -e, o caso tem saída (amostra não vazia)"
+done
+
+echo
+echo "== genérico: lib/config/config.sh não conhece nenhuma ferramenta =="
+assert_eq "" "$(grep -n 'auto_scrum' <<< "$(code_lines "$CONFIG_SH")" || true)" "lib/config/config.sh não cita auto_scrum fora de comentário"
 
 echo
 if [ "$failures" -gt 0 ]; then

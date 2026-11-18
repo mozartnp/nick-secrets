@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# nick-init: creates the nick project config in the cwd (run it at the root of the target
+# project): the .nick/ tree (.gitignore, troca/, docs/) and .nick/nick.conf with the skeleton
+# of every key of the nick, to be filled in afterwards. An existing .nick/nick.conf is only
+# overwritten after confirmation. No argument, no other destination, no project name: the
+# config always lives in the cwd, where every nick tool reads it.
+# It only loads the config library (lib/config/), never auto_scrum nor the jail and claude
+# libraries, and it never opens claude. The paths are relative to this script, so bin/
+# depends on its sibling lib/.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/config/config.sh
+source "$SCRIPT_DIR/../lib/config/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/config/keys.sh
+source "$SCRIPT_DIR/../lib/config/keys.sh"
+
+# The keys of the skeleton (lib/config/keys.sh). A bad registration stops the script on load
+# (set -e): it is a programming error.
+config_register_nick_keys
+
+main() {
+  if [ "$#" -gt 0 ]; then
+    echo "Erro: argumento desconhecido: '$1'" >&2
+    echo "Uso: nick-init (rode na raiz do projeto)" >&2
+    exit 1
+  fi
+  # config_init does the whole job (lib/config/config.sh); the script exits with its code.
+  config_init "nick" || exit "$?"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

@@ -18,10 +18,10 @@ do texto, que é o que importa pro modelo entender contexto de código.
 
 Por convenção, todo o código fica em inglês — o oposto do que vale pros templates (seção
 acima). Isso inclui não só nomes de variável/função e comentários do `auto_scrum.sh`, mas
-também nomes de diretório/arquivo internos (`auto_scrum/projects/`, `templates/*.md`) e os
+também nomes de diretório/arquivo internos (`lib/config/`, `templates/*.md`) e os
 valores de `$TYPE` (`po`, `tech_leader`, `development`, `review`). Fica em português só o
 que é visual pro usuário: os textos do menu (`select`), prompts de `read -p`, mensagens de
-erro/confirmação, a flag `--projeto=`, e o conteúdo em si dos templates (`.md`) — que o
+erro/confirmação, a flag `--requisitos-jail`, e o conteúdo em si dos templates (`.md`) — que o
 usuário lê/edita diretamente.
 
 **Por quê:** identificadores, comentários e nomes de arquivo/diretório são "estrutura do
@@ -54,25 +54,27 @@ Regras a seguir em todo script novo ou alterado:
 - Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
   morde) só numa cópia descartável **fora do repositório**, com só (caminhos a partir da
   raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/templates/`,
-  `auto_scrum/tests/`, `lib/`, `README.md` (lido pelo teste README × helper de
+  `auto_scrum/tests/`, `bin/`, `lib/`, `README.md` (lido pelo teste README × helper de
   `lib/tests/test_jail.sh`) e `.gitignore` (lido pelos testes de `.gitignore` de
-  `auto_scrum/tests/test_auto_scrum.sh`), na mesma estrutura (sem copiar
-  `auto_scrum/projects/` nem `auto_scrum/logs/`, que têm dados reais), com um `git init` na
-  cópia e o cwd dentro dela ao rodar a suíte (ou o `make test`). No fim, apagar a cópia e
-  conferir com `git status --short --ignored` que nada mudou no repositório.
+  `auto_scrum/tests/test_auto_scrum.sh`), na mesma estrutura (sem copiar `auto_scrum/logs/`,
+  que tem dados reais), com um `git init` na cópia e o cwd dentro dela ao rodar a suíte (ou o
+  `make test`). No fim, apagar a cópia e conferir com `git status --short --ignored` que nada
+  mudou no repositório.
 
 **Por quê:** essas regras evitam as três classes de bug mais comuns em bash —
 variável não citada que quebra com espaço/glob, variável de função vazando pro
 escopo global, e falha de comando ignorada silenciosamente por causa do
 `set -e` ausente. A regra da sabotagem existe porque os testes unitários usam o
-`LOGS_DIR`, o `PROJECTS_DIR` e o cwd reais (só os de `main()` apontam pra diretórios
-temporários), e a configuração da raiz (`.nick/nick.conf`, ou o `.nick.conf` de antes do
+`LOGS_DIR` e o cwd reais (só os de `main()` apontam pra diretórios temporários), e a
+configuração da raiz (`.nick/nick.conf`, ou o `.nick.conf` de antes do
 ticket 24 num clone ainda não migrado) e a `.nick/` inteira são gitignoradas, sem cópia: uma
 sabotagem que escreve arquivo, rodada da raiz do repositório, zera ou cria arquivos reais —
 já aconteceu na validação do ticket 5, com o `.nick.conf` do usuário. O `.gitignore` e o
 `git init` entram na cópia porque os testes de `.gitignore` da `test_auto_scrum.sh` (ticket 24)
 usam `git check-ignore` contra o `.gitignore` da raiz: sem os dois, eles dão FAIL falso, e a
-suíte acusaria falha sem relação com a sabotagem (aconteceu na validação do ticket 25).
+suíte acusaria falha sem relação com a sabotagem (aconteceu na validação do ticket 25). O
+`bin/` entra na cópia desde o NS-30: a suíte `bin/tests/test_nick_init.sh` roda o
+`bin/nick-init`, e as mensagens do `auto_scrum.sh` apontam o caminho dele.
 
 ## Testes: `make test` e `tests/run_all.sh`
 
@@ -88,8 +90,8 @@ e o `Makefile` só o chama. As regras:
   usa `find -path '*/tests/test_*.sh'`: o `*` do `-path` casa `/`, e `tests/test_dir/x.sh`
   entraria. A ordem é a do `LC_ALL=C sort -z`, a mesma em qualquer máquina, e os caminhos
   aparecem relativos à raiz (`./lib/tests/test_config.sh`).
-- **Uma de cada vez, com o cwd na raiz:** as suítes usam o `LOGS_DIR`, o `PROJECTS_DIR` e o cwd
-  reais (ver a regra da sabotagem em "Qualidade de código bash"), então não podem rodar em
+- **Uma de cada vez, com o cwd na raiz:** as suítes usam o `LOGS_DIR` e o cwd reais (ver a
+  regra da sabotagem em "Qualidade de código bash"), então não podem rodar em
   paralelo nem de outro diretório. O runner dá `cd` na raiz (achada pelo `BASH_SOURCE`), então
   `bash <raiz>/tests/run_all.sh` funciona de qualquer cwd. Cada suíte roda com `bash <suíte>`
   (não `./`, que exigiria bit de execução) e herda o stdin, como rodada à mão.
@@ -138,7 +140,7 @@ tem uma única linha `select`, dentro de `select_menu()`.
 - grava em `<variável>` o **índice base 0** da opção escolhida, via `printf -v` (mesmo
   padrão de `read_required`);
 - o "Sair" é decidido pela **posição** (o índice logo depois das opções do chamador), não
-  pelo texto — um projeto chamado `Sair (q).conf` continua sendo um projeto comum;
+  pelo texto — uma opção que se chame "Sair (q)" continua sendo uma opção comum;
 - só `q` e `Q` **exatos** encerram; ` q`, `qq`, `quit` e `sair` são inválidos, como
   qualquer outra entrada que o `select` não aceite (mostram `Opção inválida, tente
   novamente.` e repetem a pergunta);
@@ -151,26 +153,26 @@ tem uma única linha `select`, dentro de `select_menu()`.
   (o `select` continua preenchendo o `REPLY` local normalmente);
 - **nunca** chame um menu dentro de `$(...)`: a saída é por `exit`, que só encerraria o
   subshell — o script seguiria e a mensagem de saída seria engolida pela captura. É por
-  isso que o resultado volta por `printf -v`, e os três menus rodam no shell principal
-  (`main` chama `resolve_stack`, `choose_type` e `init_project` diretamente). Um teste
-  estrutural garante que nem `select_menu` nem as três funções de menu aparecem depois de
-  `$(`.
+  isso que o resultado volta por `printf -v`, e o menu roda no shell principal (`main` chama
+  `choose_type` diretamente). Um teste estrutural garante que nem `select_menu` nem
+  `choose_type` aparecem depois de `$(`. Desde o NS-30 o menu principal (de tipo de conversa)
+  é o único: o menu de projetos e o de destino do `--init` saíram junto com o `projects/` e o
+  `--init` (ver "Configuração do projeto: só `.nick/nick.conf` no cwd").
 
 **A saída:** `quit_from_menu` é o único caminho, com o texto `Saindo. Nada foi feito.` só nessa
 função, no **stdout**, e `exit 0`. Sair é uma ação normal, como responder `N` na confirmação de
-envio, que também usa stdout e código 0. É `exit`, e não `return`, porque o menu de projetos
-roda antes do principal, e voltar até `main()` exigiria um sinal a mais em cada chamador. Não
-há efeito colateral porque a ordem já garante isso: em `main()`, o `mkdir -p "$LOGS_DIR"`, o
-log e o lançamento do `claude` (`jail_exec`) só acontecem depois de `choose_type`; no `--init`,
-o arquivo e o `mkdir -p "$PROJECTS_DIR"` só acontecem depois da escolha do destino. Os testes
+envio, que também usa stdout e código 0. É `exit`, e não `return`, porque voltar até `main()`
+exigiria um sinal a mais em cada chamador (quando a regra nasceu, havia um menu de projetos
+antes do principal). Não há efeito colateral porque a ordem já garante isso: em `main()`, o
+`mkdir -p "$LOGS_DIR"`, o log, a árvore `.nick/` (`config_dir_prepare`) e o lançamento do
+`claude` (`jail_exec`) só acontecem depois de `choose_type`. Os testes
 de ponta a ponta (com um `claude` falso no `PATH` e um controle positivo que prova que o stub é
 usado) protegem essa ordem.
 
 **Ctrl+D continua igual** (fora do escopo do ticket, mas o caminho foi tocado e ganhou teste
 de regressão): no EOF, `select_menu` deixa a variável vazia e retorna 1, o mesmo status do
-`select` puro. `choose_type` e `resolve_stack` fazem `select_menu ... || return 1`, e o
-`set -e` de `main()` encerra com código 1, sem mensagem; `init_project` usa
-`if ! select_menu ...` e mantém o `Cancelado. Nada foi alterado.` no stderr. Atenção: chamar
+`select` puro. `choose_type` faz `select_menu ... || return 1`, e o `set -e` de `main()`
+encerra com código 1, sem mensagem. Atenção: chamar
 a função num `if !` ou antes de `||` desliga o `set -e` **dentro** dela. Isso é aceitável
 porque o corpo de `select_menu` só tem `select`, `printf -v`, `echo`, `[ ]` e
 `quit_from_menu`, e o `exit` funciona do mesmo jeito. Não acrescente ao helper comandos que
@@ -181,32 +183,27 @@ dependam do `set -e`.
   terminal já a conhece;
 - `s` (de "sair") não serve: no próprio script, `s` já significa "sim" nas confirmações
   `(s/N)`, e a mesma tecla teria sentidos opostos em telas vizinhas;
-- um número fixo também não serve: o número do Sair muda conforme as flags e a quantidade
-  de projetos, e o `select` não mostra um `0`.
-
-**"Nenhum" continua comparado pelo nome** no menu de projetos
-(`"${names[$choice]}" = "Nenhum"`), como antes. Trocar pra posição mudaria o comportamento
-de um projeto chamado `Nenhum.conf`, e esse caso não faz parte do ticket.
+- um número fixo também não serve: o número do Sair muda conforme as flags, e o `select` não
+  mostra um `0`.
 
 **Fora de escopo, de propósito:**
-- prompts de texto (`read -p`, inclusive o "Nome do projeto" do `--init` e a confirmação
-  `(s/N)`) e o loop do editor em `read_via_editor`;
+- prompts de texto (`read -p`, inclusive a confirmação `(s/N)`) e o loop do editor em
+  `read_via_editor`;
 - mudar o comportamento do Ctrl+D (só ganhou testes de regressão) e tratar Ctrl+C (`trap`);
-- aceitar `sair`, `quit`, `qq` ou `q` com espaços em volta;
-- um projeto chamado `Nenhum.conf`, que continua se confundindo com a opção "Nenhum".
+- aceitar `sair`, `quit`, `qq` ou `q` com espaços em volta.
 
 ## README genérico: sem repetir detalhe que muda com o código
 
 O `README.md` descreve uso e comportamento estável: como rodar, de onde vem a configuração e em
 que ordem, a regra de formato, o que é versionado onde, notas de migração. Listas que crescem a
 cada ticket — chaves de configuração, quais etapas usam cada flag, opções de menu — **não** vão
-pro README: ficam no código, neste `ABOUT.md` ou nos comentários do esqueleto gerado por
-`--init`. A fonte única da lista de chaves da configuração do projeto é o bloco de registro
-(`config_register_key`) no topo do `auto_scrum.sh`, de onde saem o esqueleto e os avisos (ver
-seção "Registro de chaves da configuração"). O README remete a essas fontes em vez de
+pro README: ficam no código, neste `ABOUT.md` ou nos comentários do esqueleto gerado pelo
+`bin/nick-init`. A fonte única da lista de chaves da configuração do projeto é o registro
+(`config_register_nick_keys`, em `lib/config/keys.sh`), de onde saem o esqueleto e os avisos
+(ver seção "Registro de chaves da configuração"). O README remete a essas fontes em vez de
 copiá-las. Pelo mesmo motivo, o README não traz um exemplo de arquivo de configuração completo:
-ele teria de listar todas as chaves. O exemplo completo é o arquivo gerado por `--init`, e o
-README só ilustra o formato com uma linha preenchida.
+ele teria de listar todas as chaves. O exemplo completo é o arquivo gerado pelo
+`bin/nick-init`, e o README só ilustra o formato com uma linha preenchida.
 
 **Por quê:** o README não tem teste que pegue desatualização, e cada flag nova exigiria
 lembrar de editá-lo. O ticket 8 já mostrou isso acontecendo: uma frase do passo 1 de "Uso"
@@ -401,8 +398,8 @@ estrutural que protege contra reintrodução do problema.
 
 Nem toda referência de prompt vale para todo projeto (ex: nem todo projeto usa Sentry).
 Esse tipo de coisa vira uma variável booleana no arquivo de configuração do projeto
-(`.nick/nick.conf` no cwd ou `auto_scrum/projects/<name>.conf` — ver seção "Configuração do
-projeto: cwd primeiro, projects/ como fallback" abaixo), no formato
+(`.nick/nick.conf` no cwd — ver seção "Configuração do projeto: só `.nick/nick.conf` no cwd"
+abaixo), no formato
 `SENTRY_ENABLED="true"/"false"` (opt-in — vazio conta como `"false"`; só `"true"`, `"false"` e
 `""` são aceitos, e qualquer outro valor desliga a opção com aviso; a única exceção é
 `TDD_ENABLED`, ligada por padrão — ver seção "Metodologia TDD por projeto"), lida por uma função
@@ -427,9 +424,9 @@ silenciosamente por vazio. Pra isso existe um teste de conjunto exato por templa
 `development.md` e `review.md` o têm.
 Template novo, ou que ganhe variável nova, deve ganhar o seu.
 
-Toda flag nova é uma chamada `config_register_key` no bloco de registro do topo do
-`auto_scrum.sh` (ver seção "Registro de chaves da configuração"): o leitor (`config_load`, em
-`lib/config.sh`) ignora qualquer chave fora do registro, então uma flag só escrita no arquivo
+Toda flag nova é uma chamada `config_register_key` no registro de `lib/config/keys.sh`
+(`config_register_nick_keys`, ver seção "Registro de chaves da configuração"): o leitor (`config_load`, em
+`lib/config/config.sh`) ignora qualquer chave fora do registro, então uma flag só escrita no arquivo
 nunca chegaria ao script. A mesma chamada já a põe no esqueleto e nos avisos, e um teste
 compara as chaves do esqueleto com `CONFIG_KEYS`. A flag nova também precisa terminar em
 `_ENABLED` e ser registrada com padrão `"false"` (chave de texto entra com `""`; a exceção é
@@ -441,7 +438,7 @@ inválido".
 
 **Por quê:** manter esse tipo de decisão condicional em bash, não no template, é o mesmo
 racional de `build_stack_blocks()` — e opt-in (padrão desligado) evita que um projeto novo
-criado via `--init` puxe menção a uma ferramenta que ele não usa sem querer. `TDD_ENABLED` é
+criado pelo `bin/nick-init` puxe menção a uma ferramenta que ele não usa sem querer. `TDD_ENABLED` é
 a exceção, porque ali o padrão é o comportamento que todo projeto já tinha (ver seção
 "Metodologia TDD por projeto"); uma flag nova só copia essa exceção por um motivo do mesmo
 tipo.
@@ -465,7 +462,7 @@ pergunta sai, sem deixar linha em branco.
 `warn_missing_production_line`, que não existe mais) virou parte do aviso geral de chaves
 ausentes — ver seção "Validação da configuração do projeto: chave ausente e valor inválido",
 que também guarda as regras gerais (roda só no leitor, `config_load`, linha mal formatada
-conta como presente, linha comentada e chave parecida não contam, "Nenhum" não avisa). Um
+conta como presente, linha comentada e chave parecida não contam). Um
 arquivo sem a linha `PRODUCTION_ENABLED` recebe esse aviso, que sugere
 `PRODUCTION_ENABLED="false"` precedida de uma nota da chave (registrada em
 `config_register_key` e lida por `config_key_note`). Regras
@@ -491,7 +488,7 @@ que continuam específicas desta chave, cada uma com o seu motivo:
   inválido (`"TRUE"`, `"sim"`) também tira a chave desse aviso, mas recebe o aviso de valor,
   que termina com a mesma nota e também diz que a pergunta está desligada. Um projeto sem
   produção usa `PRODUCTION_ENABLED="false"`.
-- **O `--init` já traz a linha** (`PRODUCTION_ENABLED="false"`, com comentário mandando ligar
+- **O esqueleto do `bin/nick-init` já traz a linha** (`PRODUCTION_ENABLED="false"`, com comentário mandando ligar
   quando o projeto entrar em produção), então um arquivo novo já nasce com a decisão
   explícita e não dispara o aviso.
 
@@ -505,8 +502,8 @@ versionados em projetos alvo, perderia a pergunta em silêncio.
 **Fora de escopo, de propósito:**
 - staging, homologação e outros ambientes: hoje nenhum prompt mudaria por causa deles, então
   viram ticket próprio quando houver um efeito concreto definido;
-- pergunta interativa no `--init`: ele continua só gerando o esqueleto comentado, como faz
-  pras outras chaves;
+- pergunta interativa no init (hoje o `bin/nick-init`): ele continua só gerando o esqueleto
+  comentado, como faz pras outras chaves;
 - prompts de Tech Leader, Desenvolvimento e Review: não falam de produção, então não há o
   que desligar neles.
 
@@ -540,11 +537,11 @@ técnica de `PERMISSION_BLOCK_PO`).
   com o código antigo). Depois, no ticket 26, essas referências fixas (`tdd_tl_rules_*`,
   `tdd_ref_*`) incorporaram o parágrafo de reaproveitamento de cada papel, montado a partir
   das constantes `reuse_*_text` — ver seção "Reaproveitar o que já existe antes de criar".
-- **Só `"false"` exato desliga.** `"true"`, vazio, chave ausente, "Nenhum" e qualquer valor
+- **Só `"false"` exato desliga.** `"true"`, vazio, chave ausente e qualquer valor
   inválido (`"TRUE"`, `"False"`, `" false"`, `"sim"`) mantêm a TDD ligada. Um erro de digitação
   nunca pode remover a TDD de um projeto que tem testes; o erro contrário (TDD ligada num
   projeto sem testes) é o problema de antes da flag, e o aviso de valor já o torna visível. O
-  leitor (`config_load`, em `lib/config.sh`) não muda: `"TRUE"` continua atribuído literal e
+  leitor (`config_load`, em `lib/config/config.sh`) não muda: `"TRUE"` continua atribuído literal e
   recebe o aviso; quem decide é só `build_tdd_blocks`, com `[ "$TDD_ENABLED" = "false" ]` —
   essa é a regra de desligamento, não o padrão da chave.
 - **As outras flags `_ENABLED` continuam opt-in** (padrão desligado). Uma flag nova não deve
@@ -552,7 +549,7 @@ técnica de `PERMISSION_BLOCK_PO`).
   comportamento que todo projeto já tinha e que continua sendo o esperado).
 - **Padrão por chave só no registro.** A chamada `config_register_key` de cada chave é o único
   lugar com o padrão dela (`"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga, `""`
-  pras de texto); `config_key_default` (em `lib/config.sh`) só o devolve. Ele é usado pela
+  pras de texto); `config_key_default` (em `lib/config/config.sh`) só o devolve. Ele é usado pela
   linha sugerida do aviso de ausente e pelo esqueleto (`TDD_ENABLED="true"`). Não
   há outro `case` por chave.
 - **Nota da chave no registro** (lida por `config_key_note`). Diz que a TDD continua ligada e
@@ -565,7 +562,7 @@ técnica de `PERMISSION_BLOCK_PO`).
 **Fora de escopo, de propósito:**
 - mudar o padrão das outras flags `_ENABLED` (continuam opt-in);
 - separar "usa a metodologia TDD" de "tem suíte de testes" em duas flags;
-- pergunta interativa no `--init`;
+- pergunta interativa no init (hoje o `bin/nick-init`);
 - mudanças nos prompts do PO;
 - filtrar "TDD" de uma `STACK_DESCRIPTION` escrita pelo usuário.
 
@@ -677,14 +674,10 @@ de PO" abaixo — sem o `auto_scrum` precisar saber nada sobre ele) e o `CLAUDE.
 código de verdade: ela roda `claude --permission-mode auto` no mesmo cwd, então as
 mudanças caem no repositório certo.
 
-O cwd também decide a configuração do projeto (`STACK_DESCRIPTION`/`*_ENABLED`) quando
-existe um `.nick/nick.conf` nele: nesse caso `--projeto=<nome>` é ignorado (com aviso) e o
-menu de projetos não aparece — ver seção "Configuração do projeto: cwd primeiro, projects/
-como fallback" abaixo. É também no cwd que ficam a troca de arquivos e os docs de cada ticket
-(seção "Pasta `.nick/` no projeto alvo"). Sem `.nick/nick.conf` no cwd, `--projeto=<nome>` (flag do
-`auto_scrum.sh`) escolhe a configuração em `auto_scrum/projects/<name>.conf`, e aí sim não
-tem relação com em qual diretório o comando roda — são coisas independentes que
-coincidentemente usam o mesmo nome de projeto.
+O cwd também decide a configuração do projeto (`STACK_DESCRIPTION`/`*_ENABLED`): ela vem só
+do `.nick/nick.conf` do cwd, e sem ele o script para — ver seção "Configuração do projeto: só
+`.nick/nick.conf` no cwd" abaixo. É também no cwd que ficam a troca de arquivos e os docs de
+cada ticket (seção "Pasta `.nick/` no projeto alvo").
 
 ## Pasta `.nick/` no projeto alvo (configuração, troca e docs)
 
@@ -699,14 +692,21 @@ Tudo o que o nick guarda no projeto alvo fica em `.nick/`, no cwd:
     └── <JIRA_ID>/    # plan.md, review.md, prints de validação (ignorada por padrão)
 ```
 
-Em `auto_scrum.sh`: `NICK_DIR=".nick"`, `EXCHANGE_DIR="$NICK_DIR/troca"` e
-`NICK_DOCS_DIR="$NICK_DIR/docs"`. O nome do `nick.conf` é de `lib/config.sh`
-(`CONFIG_CWD_FILE_NAME`), e um teste de consistência garante que `$NICK_DIR/nick.conf` é igual
-a ele e que a linha `!nick.conf` do `.gitignore` é o `basename` dele (a exceção não pode
-desalinhar do nome lido pela biblioteca — o código monta a linha a partir da constante).
+Os nomes são constantes de `lib/config/config.sh`, atribuídas na carga e relativas ao cwd:
+`CONFIG_NICK_DIR_NAME=".nick"`, `CONFIG_EXCHANGE_DIR_NAME=".nick/troca"`,
+`CONFIG_DOCS_DIR_NAME=".nick/docs"` e `CONFIG_CWD_FILE_NAME=".nick/nick.conf"`, escritas por
+extenso (um teste de `lib/tests/test_config.sh` garante que `CONFIG_CWD_FILE_NAME` é
+`$CONFIG_NICK_DIR_NAME/nick.conf` e que as duas pastas ficam dentro dela). O `auto_scrum.sh`
+continua com `NICK_DIR`, `EXCHANGE_DIR` e `NICK_DOCS_DIR` (usados nos prompts e nas perguntas),
+agora atribuídos a partir delas — fonte única, sem mudar o valor. Um teste de consistência
+garante que a linha `!nick.conf` do `.gitignore` é o `basename` de `CONFIG_CWD_FILE_NAME` (a
+exceção não pode desalinhar do nome lido pela biblioteca — o código monta a linha a partir da
+constante).
 
-**`nick_dir_prepare`** (substituiu `exchange_dir_prepare`, do ticket 21) monta a árvore
-inteira, menos o `nick.conf` (do `init_project`) e as pastas `docs/<ID>/` (dependem do ticket;
+**`config_dir_prepare`** (`lib/config/config.sh`; era o `nick_dir_prepare` do `auto_scrum.sh`,
+que substituiu o `exchange_dir_prepare` do ticket 21, movido no NS-30 sem mudar comportamento
+nem mensagem) monta a árvore inteira, menos o `nick.conf` (do `config_init`) e as pastas
+`docs/<ID>/` (dependem do ticket;
 o agente as cria ao gravar): `mkdir -p` de `troca/` e `docs/` e, **só se `.nick/.gitignore`
 não existir** (`[ -e ]`), grava exatamente `*`, `!.gitignore` e `!nick.conf`, sem comentário.
 Regras:
@@ -714,21 +714,38 @@ Regras:
   existentes ficam como estão, com o que tiverem dentro;
 - não cria `.gitignore` em `troca/` nem em `docs/` (o `*` de cima já as ignora, e o git não
   versiona pasta vazia). Um `.nick/troca/.gitignore` antigo (do ticket 21) não é tocado;
-- é chamada em dois pontos: no `init_project` com destino no cwd e em `main()` ao confirmar o
-  envio (`|| exit 1`), só pra completar o que faltar (projeto configurado por `projects/`,
-  pasta apagada à mão, projeto migrado com `mv`). Cancelar o envio não cria nada;
+- é chamada em dois pontos: no `config_init` (o `bin/nick-init`) e em `main()` do
+  `auto_scrum.sh` ao confirmar o envio (`|| exit 1`), só pra completar o que faltar (pasta
+  apagada à mão, projeto migrado com `mv`). Cancelar o envio não cria nada;
 - se não der pra criar (ex: `.nick/troca` é um arquivo, ou `.nick/` sem permissão de escrita),
   imprime só `Erro: não foi possível criar a estrutura .nick/ (.gitignore, troca/ e docs/) em
   <PWD>.` (a gravação do `.gitignore` fica num grupo `{ ...; } 2>/dev/null`, porque um
-  `> arquivo 2>/dev/null` que falha mostra o erro cru do bash antes de o `2>` valer): o `init_project` retorna 1 sem
-  gravar o `nick.conf`, e `main()` para antes do `claude`, porque o prompt promete a pasta.
+  `> arquivo 2>/dev/null` que falha mostra o erro cru do bash antes de o `2>` valer) e
+  retorna 1, sem `exit`: o `config_init` retorna 1 sem gravar o `nick.conf` (o `bin/nick-init`
+  sai com 1), e `main()` para antes do `claude`, porque o prompt promete a pasta.
 
-**A árvore nasce no `--init`** (pedido do usuário): com destino no projeto, o `--init`
+**A árvore nasce no `bin/nick-init`** (pedido do usuário, desde o `--init` do ticket 24): ele
 termina com `.gitignore`, `nick.conf`, `troca/` e `docs/` criados e mostra essa árvore na
 saída, explicando o que é versionado. Assim o time vê e versiona a estrutura desde o primeiro
-commit, sem depender de uma primeira execução. A ordem no `init_project` é: confirmação de
-sobrescrita → `nick_dir_prepare` (cria `.nick/`, que o `nick.conf` precisa) → esqueleto → aviso
-de legado, se houver. Respondendo N à sobrescrita, nada é criado nem completado.
+commit, sem depender de uma primeira execução. A ordem no `config_init <nome da ferramenta>`
+é: confirmação de sobrescrita → `config_dir_prepare` (cria `.nick/`, que o `nick.conf`
+precisa) → esqueleto (`config_print_skeleton`) → árvore na saída → aviso de legado, se houver.
+Respondendo N à sobrescrita, nada é criado nem completado: `Cancelado. Nada foi alterado.` no
+stdout e código 0. **Ctrl+D na sobrescrita** (o `read` falha no EOF) mostra a mesma mensagem no
+**stderr** e retorna 1, com o mesmo "nada criado" — é o canal e o código do EOF no antigo menu
+de destino do `--init`. Antes do NS-30, o EOF nessa pergunta derrubava o script pelo `set -e`,
+sem mensagem; o tratamento usa `if ! read ...` e não depende do `set -e` do chamador. É a única
+mudança de comportamento do init pedida no NS-30. Na review do NS-30 entraram dois cuidados de
+API (o `config_init` é público, e a casca Rust e outros módulos vão depender dele), no mesmo
+padrão de `config_register_key` e `config_dir_prepare` — o chamador nunca vê o erro cru do bash:
+- **número de argumentos:** sem exatamente 1 argumento não vazio, imprime `Erro: config_init
+  espera 1 argumento (o nome da ferramenta), recebeu <N>.` no stderr e retorna 1, sem criar
+  nada. A checagem vem antes de qualquer `$1`, então vale também sob `set -u` (antes, era o erro
+  cru `$1: variável não associada`; sem `set -u`, gravava um cabeçalho "pro ." com código 0);
+- **falha ao gravar o `nick.conf`** (somente leitura, ou um diretório com esse nome): `Erro:
+  não foi possível gravar <caminho>.` no stderr e código 1, com o mesmo grupo
+  `{ ...; } 2>/dev/null` do `.gitignore`. A árvore pode já ter sido completada nesse ponto, como
+  antes. `config_print_skeleton` continua sem validar o argumento (fora do escopo do NS-30).
 
 **Por que um `.gitignore` só, em `.nick/`:** o ticket 21 punha um `.gitignore` com `*` dentro
 de `.nick/troca/`. Com a configuração (versionada) e os docs (ignorados por padrão) na mesma
@@ -744,9 +761,11 @@ passa a aparecer, `troca/` não). Os testes de git rodam por `git_isolated`
 do review do ticket 24). Pelo mesmo motivo, o teste do `.gitignore` deste repositório confere
 com `check-ignore -v` que a regra vem do `.gitignore` da raiz, e não de `.git/info/exclude`.
 
-**Por que `nick_dir_prepare` fica em `auto_scrum.sh` e não em `lib/`:** hoje só o
-`auto_scrum` cria a pasta. Extrair pra biblioteca é assunto de quando existir uma segunda
-ferramenta (mesmo racional dos riscos aceitos de `lib/config.sh`).
+**Por que a árvore e o init foram pra `lib/config/config.sh` (NS-30):** até o NS-30, o
+`nick_dir_prepare` ficava no `auto_scrum.sh` "até existir uma segunda ferramenta". O
+`bin/nick-init` é essa segunda: ele e o `auto_scrum.sh` criam a mesma árvore, e a casca Rust
+(fatia F2a do épico NS-28) vai chamar o `bin/nick-init`. A biblioteca continua sem conhecer
+ferramenta: o nome que vai no cabeçalho do esqueleto (`nick`) chega por parâmetro.
 
 **Troca de arquivos (`.nick/troca/`):** onde o usuário põe arquivos pro agente ver (prints,
 anexos) e onde o agente salva o que entrega pra conferência (ex: relatórios).
@@ -769,27 +788,55 @@ o bloco vai no prompt sempre, e não no aviso da jail (`jail_agent_notice`).
 pasta de troca é criada e o agente lê e grava arquivos nela. A verificação do ticket 24 segue
 o roteiro `.nick/troca/24_teste_manual.md`.
 
-## Configuração do projeto: cwd primeiro, projects/ como fallback
+## Configuração do projeto: só `.nick/nick.conf` no cwd
 
-A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves registradas
-com `config_register_key`) pode morar em dois lugares, e `resolve_stack()` procura nesta ordem:
+A configuração de cada projeto alvo (a stack e as flags, ou seja, as chaves registradas em
+`lib/config/keys.sh`) mora **só** em `.nick/nick.conf`, no cwd. `resolve_stack()` (sem
+parâmetro), chamada em `main()` logo depois de `check_requirements` e antes de `jail_check`, do
+menu de tipo, do log e do `claude`:
 
-0. **Antes de tudo, o legado:** `config_cwd_legacy_check` (em `lib/config.sh`) na primeira
-   linha útil de `resolve_stack`, com `|| exit 1` (ver "Migração do `.nick.conf`" abaixo).
-1. **`.nick/nick.conf` no cwd** (`$PWD/.nick/nick.conf`, de `config_cwd_file` e da constante
-   `CONFIG_CWD_FILE_NAME`, em `lib/config.sh`). Se
-   existir, vence tudo: é carregado, o script imprime no stdout
-   `Configuração do projeto carregada de: <caminho absoluto>` e retorna — sem menu de
-   projetos e sem aviso de `.sh` legado. Se `--projeto=<nome>` também foi passado, sai no
-   stderr `Aviso: --projeto=<nome> ignorado — a configuração do diretório atual (<caminho>)
-   tem precedência.`, e o nome **não é validado** (`--projeto=inexistente` não dá `exit 1`,
-   já que a flag nem é usada).
-2. **`--projeto=<nome>`** → `auto_scrum/projects/<nome>.conf` (erro se não existir).
-3. **Menu** com `auto_scrum/projects/*.conf` + "Nenhum" + "Sair (q)" (ver seção "Menus:
-   opção Sair (q)" — o Sair encerra o script sem carregar nada).
+0. **Antes de tudo, o legado:** `config_cwd_legacy_check` (em `lib/config/config.sh`) com
+   `|| exit 1` (ver "Migração do `.nick.conf`" abaixo).
+1. **Sem `.nick/nick.conf` no cwd** (`$PWD/.nick/nick.conf`, de `config_cwd_file` e da
+   constante `CONFIG_CWD_FILE_NAME`): o script para com `Erro: não há configuração do projeto em
+   <PWD>/.nick/nick.conf. Rode na raiz do projeto: <caminho absoluto do bin/nick-init>` no
+   stderr e código 1, sem criar nada no cwd.
+2. **Com ele:** é carregado (`load_project_config`) e o script imprime no stdout
+   `Configuração do projeto carregada de: <caminho absoluto>`.
 
-A linha "carregada de" só existe no caminho do cwd; nos caminhos 2 e 3 a saída é a de
-sempre, exceto pelo aviso de `.sh` legado (abaixo).
+**Saíram no NS-30:** a flag `--projeto=<nome>`, o diretório `auto_scrum/projects/` (os
+`<nome>.conf` locais desta máquina), o menu de projetos com a opção "Nenhum", o aviso de
+`projects/*.sh` legado e o `--init` do `auto_scrum` (com os dois destinos). `--init` e
+`--projeto=<qualquer valor>` viram erro **antes de qualquer outra coisa** (requisitos, menu,
+log, `claude`), mesmo com um `.nick/nick.conf` válido no cwd, com uma mensagem que mostra o
+caminho absoluto do `bin/nick-init` (`NICK_INIT_BIN`, global do `auto_scrum.sh`, calculada a
+partir do `SCRIPT_DIR`: o nick ainda não é instalado no `PATH`, então é o caminho que o
+operador consegue colar). O `Uso:` do argumento desconhecido passou a ser
+`auto_scrum.sh [--requisitos-jail]`. A configuração nova é criada pelo **`bin/nick-init`**, na
+raiz do projeto alvo (`config_init "nick"`, ver "Pasta `.nick/` no projeto alvo"): destino
+único, sem menu nem nome de projeto, e qualquer argumento é recusado (`Erro: argumento
+desconhecido` + `Uso: nick-init (rode na raiz do projeto)`, código 1, nada criado). Ele só
+carrega `lib/config/` (um teste estrutural prova que as únicas linhas `source` são as de
+`config.sh` e `keys.sh` e que ele não cita `auto_scrum` em código, e um teste de comportamento
+o roda numa cópia sem `auto_scrum/`). O esqueleto é o de antes, só com o cabeçalho citando o
+`nick` em vez do `auto_scrum`.
+
+**Por que a mudança:** a configuração é **do nick**, e não só do `auto_scrum`: outros módulos
+vão lê-la, a começar pela casca Rust (épico NS-28). `auto_scrum/projects/` não guarda o
+caminho do projeto (o nome do arquivo é só um rótulo), então não serve à casca, que precisa
+achar a configuração a partir do projeto (Q1 do épico). E o cwd já identifica o projeto alvo
+(seção "auto_scrum roda com o cwd dentro do projeto alvo"). Manter dois lugares seria manter
+dois caminhos de carga, o menu e a opção "Nenhum" só pro `auto_scrum`.
+
+**Quem não quer versionar o `.nick/`** no projeto alvo (substitui o antigo "só nesta máquina"
+do `projects/`) põe `.nick/` no `.git/info/exclude` do repositório dele: é local, não é
+versionado e não mexe no `.gitignore` do time.
+
+**Sem migração automática dos `auto_scrum/projects/*.conf`** (fora do escopo do NS-30): o
+formato é o mesmo, então a migração é copiar o arquivo pra `.nick/nick.conf` na raiz do
+projeto e apagar o `auto_scrum/projects/` antes de atualizar o clone (nota no README). Rodar o
+`bin/nick-init` em vez de copiar perderia os valores. Nesta máquina a migração foi feita pelo
+usuário antes do NS-30 (commit `7e66ebe`).
 
 **Nome `nick.conf` dentro de `.nick/`, só no cwd.** O arquivo vai ser versionado dentro do
 repositório de outro time, então não pode ser apanhado pelo lint/pre-commit/CI desse time:
@@ -800,14 +847,13 @@ pre-commit detecta shell por shebang em arquivo sem extensão conhecida); sem `.
 carregado por `python-dotenv`/`django-environ`/`docker compose` nem tratado como segredo por
 scanners); sem `.yml`/`.json`/`.toml`/`.ini` (fora de `check-yaml`/`check-json`/prettier). Os
 hooks genéricos de texto (`trailing-whitespace`, `end-of-file-fixer`, `mixed-line-ending`)
-valem pra qualquer arquivo, então o esqueleto do `--init` sai sem espaço no fim de linha, com
+valem pra qualquer arquivo, então o esqueleto do `bin/nick-init` sai sem espaço no fim de linha, com
 LF e terminando em `\n` — coberto por teste. A busca é só no `$PWD`, sem subir pra diretórios
 pais ou pra raiz do git: a convenção já é rodar da raiz do projeto alvo, e subir criaria
 ambiguidade (qual arquivo vence num monorepo?) sem pedido concreto.
 
-**Leitura por `CHAVE="valor"` (`config_load`, em `lib/config.sh`; no `auto_scrum`, chamado
-pela casca fina `load_project_config`), sem `source` nem `eval`.** O mesmo
-leitor vale pro cwd e pra `projects/` — um mecanismo de carga só. Gramática: depois de tirar
+**Leitura por `CHAVE="valor"` (`config_load`, em `lib/config/config.sh`; no `auto_scrum`,
+chamado pela casca fina `load_project_config`), sem `source` nem `eval`.** Gramática: depois de tirar
 espaços/tabs do começo e do fim da linha (o que também remove o `\r` de CRLF), só é aplicada
 uma linha `CHAVE="valor"` com `CHAVE` em `CONFIG_KEYS` (comparação exata) e `valor`
 sem aspas duplas dentro. O valor é atribuído **literalmente** com `printf -v` — sem expansão
@@ -828,22 +874,8 @@ de testar. Variáveis locais do leitor ficam em minúsculo — uma local com o n
 faria o `printf -v` alterar a local em vez da global —, e isso agora é garantido pela
 estrutura: `config_register_key` só aceita nome de chave em maiúsculo (`^[A-Z][A-Z0-9_]*$`).
 
-**`projects/` passou de `.sh` pra `.conf`.** Os arquivos deixaram de ser executados, e manter
-`.sh` passaria a ideia errada de que são `source`ados (e editores/`shellcheck` os tratariam
-como script). O conteúdo não mudou: já era `CHAVE="valor"` com comentários. `.sh` **não** é
-lido como fallback (seriam dois mecanismos de novo) nem renomeado pelo script (mover arquivo
-do usuário sem pedir é surpresa): `warn_legacy_project_files` só avisa no stderr, pra cada
-`projects/*.sh`, com o `mv` sugerido — e só nos caminhos 2 e 3, nunca quando a configuração
-vem do cwd.
-
-**`--init` pergunta o destino** (`.nick/nick.conf` no cwd primeiro, por ser o local
-recomendado, ou `auto_scrum/projects/<nome>.conf`), gera o mesmo conteúdo nos dois casos
-(`print_project_skeleton`, que chama `config_print_skeleton "auto_scrum"`) e pergunta antes
-de sobrescrever em ambos. Com destino no cwd, cria também o resto da árvore `.nick/` e a
-mostra na saída (ver "Pasta `.nick/` no projeto alvo").
-
 **Migração do `.nick.conf` (ticket 24).** A configuração do cwd saiu de `$PWD/.nick.conf` pra
-`$PWD/.nick/nick.conf`. `lib/config.sh` tem as duas constantes (`CONFIG_CWD_FILE_NAME` e
+`$PWD/.nick/nick.conf`. `lib/config/config.sh` tem as duas constantes (`CONFIG_CWD_FILE_NAME` e
 `CONFIG_CWD_LEGACY_FILE_NAME`) e a função `config_cwd_legacy_check`, porque é ela que sabe onde
 mora o arquivo do cwd:
 - só o antigo existe → erro no stderr com o comando de migração (`mkdir -p .nick && mv
@@ -853,38 +885,38 @@ mora o arquivo do cwd:
   apagado, e retorno 0. *(Acréscimo do plano: sem isso, quem editasse o arquivo antigo por
   engano não entenderia por que nada muda.)*;
 - caso contrário → silêncio, retorno 0. O arquivo antigo nunca é lido, movido nem apagado
-  (mover arquivo do usuário sem pedir é surpresa — mesmo racional de `projects/*.sh`).
+  (mover arquivo do usuário sem pedir é surpresa).
 
-Onde o `auto_scrum` chama: **`resolve_stack`**, antes do passo 1, vale pros três caminhos
-(cwd, `--projeto=`, menu). Antes do ticket 24, um `.nick.conf` no cwd tinha precedência sobre
-`--projeto=`; seguir com `projects/` ou "Nenhum" rodaria o projeto sem a configuração dele —
-principalmente sem a jail. Como `resolve_stack` roda antes de qualquer menu de tipo, log ou
-`claude`, a saída ≠ 0 acontece antes de abrir o `claude`. `--requisitos-jail` não carrega
-configuração e não checa.
+Onde o `auto_scrum` chama: **`resolve_stack`**, antes de procurar o `.nick/nick.conf`. Só o
+antigo dá o erro de migração (que já diz o que fazer), e não o erro de configuração ausente.
+Como `resolve_stack` roda antes de qualquer menu de tipo, log ou `claude`, a saída ≠ 0
+acontece antes de abrir o `claude`. `--requisitos-jail` não carrega configuração e não checa.
 
-**O `--init` não para no legado (decisão do usuário, revendo o plano).** O plano do ticket 24
-fazia o `--init` com destino no cwd parar como a execução normal, pra não gerar um
-`.nick/nick.conf` ao lado do antigo e perder os valores em silêncio. Na validação, o usuário
-preferiu o contrário: o `--init` é o caminho de quem quer a pasta nova pronta, com o
-esqueleto padrão, e o antigo é a fonte de onde copiar os valores. Por isso `init_project` não
-chama `config_cwd_legacy_check`: segue o fluxo de sempre (sobrescrita, `nick_dir_prepare`,
-esqueleto, árvore na saída) e, se `$PWD/.nick.conf` existir, termina com um aviso no stderr
+**O init não para no legado (decisão do usuário, revendo o plano do ticket 24; desde o NS-30,
+vale pro `bin/nick-init`/`config_init`).** O plano do ticket 24 fazia o `--init` com destino no
+cwd parar como a execução normal, pra não gerar um `.nick/nick.conf` ao lado do antigo e perder
+os valores em silêncio. Na validação, o usuário preferiu o contrário: o init é o caminho de
+quem quer a pasta nova pronta, com o esqueleto padrão, e o antigo é a fonte de onde copiar os
+valores. Por isso `config_init` não chama `config_cwd_legacy_check` (nem o leitor): segue o
+fluxo de sempre (sobrescrita, `config_dir_prepare`, esqueleto, árvore na saída) e, se
+`$PWD/.nick.conf` existir, termina com um aviso no stderr
 (`Aviso: o arquivo antigo <PWD>/.nick.conf não foi lido nem alterado — copie os valores dele
 para <PWD>/.nick/nick.conf e apague o antigo.`). O aviso é o que impede a perda silenciosa. Com
 N na sobrescrita (os dois arquivos já existem), nada muda e nada é avisado; a execução normal
-já avisa dos dois arquivos. O destino `projects/` não olha o legado. A execução normal continua
-parando só com o antigo: é ela que rodaria o projeto sem configuração, e sem a jail.
+já avisa dos dois arquivos. A execução normal continua parando só com o antigo: é ela que
+rodaria o projeto sem configuração, e sem a jail.
 
-**`.gitignore` do `nick_secrets`:** lista `auto_scrum/projects/*` com a exceção
-`!auto_scrum/projects/.gitkeep` (o placeholder que mantém o diretório no git continua
-versionável — sem a exceção, se ele fosse removido e recriado, o `git add` passaria a exigir
-`-f`). A regra ampla cobre de uma vez os `*.conf` (formato local atual), os `*.sh` legados
-ainda não renomeados em alguma máquina e os backups/swaps de editor (`alpha.conf~`,
-`.alpha.conf.swp`, `alpha.conf.bak`), que um `*.conf` sozinho deixaria aparecer como
-"untracked" — e acabar commitados com dado de cliente num repositório público. Isso
-substitui a decisão original do plano do ticket 8 (`*.conf` + `*.sh`, dois padrões
-específicos). `.nick/` também é listada, sem `/` inicial (vale em qualquer profundidade: um
-`--init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo versionável no
+**`.gitignore` do `nick_secrets`:** as linhas `auto_scrum/projects/*` e
+`!auto_scrum/projects/.gitkeep` **saíram no NS-30** (decisão do usuário, revendo o ticket, que
+mandava mantê-las como proteção de legado): nada mais lê o diretório. A linha existia pra um
+`.conf` com dado de cliente não aparecer como "untracked" num repositório público; é seguro
+tirá-la porque o diretório foi apagado antes (o usuário migrou os `.conf` desta máquina e
+removeu o `.gitkeep` do git no commit `7e66ebe`), então não há o que aparecer. Quem tiver um
+clone com `auto_scrum/projects/` precisa migrar e apagar o diretório **antes** de atualizar
+(nota no README), porque ele deixou de ser ignorado. Um teste confere que o `.gitignore` não
+tem nenhuma linha de `auto_scrum/projects` e que nada nesse caminho é versionado.
+`.nick/` é listada, sem `/` inicial (vale em qualquer profundidade: um
+`bin/nick-init` rodado com o cwd dentro do próprio `nick_secrets` não cria arquivo versionável no
 repositório público). Como o git não entra numa pasta ignorada, o `.nick/.gitignore` interno
 (com `!nick.conf`) não tem efeito aqui: `.nick/nick.conf` continua ignorado neste repositório
 (um teste com `git check-ignore --no-index` cobra isso). **A linha `.nick.conf` continua,
@@ -911,11 +943,12 @@ que já se dá ao `CLAUDE.md` do projeto alvo, que o Claude Code carrega sozinho
 repositório. Por isso, alterações em `.nick/nick.conf` devem passar pelo mesmo review de PR que o
 `CLAUDE.md` — um `.nick/nick.conf` de terceiros não é "seguro" só por não ser executado.
 
-**Por quê:** com a configuração só em `auto_scrum/projects/`, gitignorada, ela se perdia ao
-trocar de máquina e o time do projeto alvo não conseguia reaproveitá-la — e versioná-la no
-`nick_secrets` não é opção, porque o repositório é público e exporia nome de cliente e pistas
-de infraestrutura. Como o cwd já identifica o projeto alvo (seção acima), a configuração pode
-morar lá, versionada junto com o código que ela descreve. Só que um arquivo num repositório
+**Por que no projeto alvo (desde o ticket 8):** com a configuração só em
+`auto_scrum/projects/`, gitignorada, ela se perdia ao trocar de máquina e o time do projeto alvo
+não conseguia reaproveitá-la — e versioná-la no `nick_secrets` não é opção, porque o repositório
+é público e exporia nome de cliente e pistas de infraestrutura. Como o cwd já identifica o
+projeto alvo (seção acima), a configuração pode morar lá, versionada junto com o código que ela
+descreve. Só que um arquivo num repositório
 compartilhado pode ser editado por qualquer pessoa desse time, e não deve conseguir executar
 código no shell de quem roda o `auto_scrum` — daí o `source` sair e entrar um leitor restrito
 a chaves conhecidas, com valor literal (inclusive na linha "híbrida" `CHAVE="x" && comando`,
@@ -945,7 +978,7 @@ segue até o prompt.
    ligada).
 
 **O que é liga/desliga: nome terminado em `_ENABLED`**, decidido só em `config_is_toggle_key`
-(em `lib/config.sh`). As duas checagens e a validação do registro usam essa função. Uma flag
+(em `lib/config/config.sh`). As duas checagens e a validação do registro usam essa função. Uma flag
 nova precisa seguir o sufixo e ser registrada com `"false"` (ou `"true"`, como `TDD_ENABLED`, a
 única ligada por padrão); uma chave de texto entra com `""`. O que cada flag faz, e qual valor
 a desliga, é do `auto_scrum`, não da biblioteca. O teste de consistência do esqueleto cobra
@@ -957,7 +990,8 @@ chamada de registro — e todas as flags já seguem o sufixo.
 **Valor padrão da linha sugerida.** Vem do registro (`config_key_default`), o único lugar com
 padrão por chave: `"true"` pra `TDD_ENABLED`, `"false"` pras outras liga/desliga e `""` pra
 texto. É exatamente a linha do esqueleto, e um teste confere que cada linha sugerida aparece
-idêntica no arquivo gerado por `--init` (o script não lê o esqueleto em tempo de execução).
+idêntica no esqueleto (o que o `bin/nick-init` grava; o script não lê o esqueleto em tempo de
+execução).
 Esse padrão mantém o comportamento de antes: nas flags opt-in, vazio e `"false"` desligam
 igual; em `TDD_ENABLED`, vazio e `"true"` mantêm a TDD ligada.
 
@@ -972,9 +1006,9 @@ aviso de ausentes.
 
 **Forma dos avisos.**
 - O de chave ausente é um bloco só, e só a primeira linha começa com `Aviso:` (os testes
-  contam avisos por ela, aceitando antes o prompt `#? ` que o `select` do menu de projetos
-  deixa sem quebra de linha — sem isso, um aviso logo depois do menu passaria sem ser
-  contado). Cada chave vem numa linha `  CHAVE="padrão"`. A nota da chave,
+  contam avisos por ela; até o NS-30 aceitavam antes o prompt `#? ` que o `select` do menu de
+  projetos deixava sem quebra de linha, e esse menu saiu). Cada chave vem numa linha
+  `  CHAVE="padrão"`. A nota da chave,
   quando existe, vai numa linha de comentário antes dela, e não no fim da linha: assim o
   bloco pode ser colado no arquivo como está, porque o leitor ignora comentários e tira os
   espaços do começo, enquanto um comentário no fim da linha geraria aviso de formato.
@@ -995,7 +1029,8 @@ termina com "a opção está desligada.". O nome era `config_key_off_note`; viro
 `config_key_note` porque a nota de `TDD_ENABLED` não fala de opção desligada.
 
 **O que os avisos não fazem, e por quê.**
-- Não sugerem `--init`: ele sobrescreve o arquivo e apagaria os valores já preenchidos.
+- Não sugerem o init (`bin/nick-init`, antes o `--init`): ele sobrescreve o arquivo e
+  apagaria os valores já preenchidos.
 - Não mostram o valor de `STACK_DESCRIPTION`. Ele é texto livre, pode ser longo e pode trazer
   nome de cliente ou pista de infraestrutura, que é o motivo de essas configurações não
   ficarem neste repositório público. Como nunca é validado, não há por que mostrá-lo.
@@ -1011,13 +1046,11 @@ termina com "a opção está desligada.". O nome era `config_key_off_note`; viro
 - Não interrompem a execução: a configuração continua utilizável, só com a chave no padrão
   dela (opção desligada, TDD ligada) ou vazia, que é o comportamento de antes das checagens.
 
-**Onde rodam.** Só em `config_load`, o único leitor, então valem nos três caminhos
-(cwd, `--projeto=` e menu) sem repetir código. Só o arquivo carregado é verificado: outros
-`projects/*.conf` incompletos ou inválidos não geram aviso, porque não são eles que definem
-essa execução. "Nenhum" no menu e o `--init` não chamam o leitor e por isso não avisam — o
-`--init` nem quando sobrescreve um arquivo incompleto que já existe. O esqueleto já nasce com
-todas as chaves e traz um comentário com as duas regras, então um arquivo novo carrega sem
-aviso.
+**Onde rodam.** Só em `config_load`, o único leitor, que roda no `.nick/nick.conf` do cwd (o
+único lugar da configuração desde o NS-30). O init (`config_init`, o `bin/nick-init`) não chama
+o leitor e por isso não avisa — nem quando sobrescreve um arquivo incompleto que já existe, nem
+quando o usuário responde N. O esqueleto já nasce com todas as chaves e traz um comentário com
+as duas regras, então um arquivo novo carrega sem aviso.
 
 **Por quê:** uma chave nova nunca chega sozinha às configurações que já existem, inclusive
 aos `.nick/nick.conf` versionados em repositórios de outros times, e um valor como `"TRUE"` ou um
@@ -1032,9 +1065,8 @@ checagens.
 - validar `STACK_DESCRIPTION`: é texto livre, sem valor inválido a definir;
 - avisar chave desconhecida ou sugerir o nome certo: o aviso de chave ausente já pega o nome
   digitado errado pelo lado da chave certa;
-- avisar quando não há arquivo ("Nenhum"): não há arquivo onde adicionar as linhas;
 - corrigir ou completar o arquivo automaticamente: mexer no arquivo do usuário sem pedir é
-  surpresa (mesmo racional de não renomear os `.sh` legados), e o aviso já traz as linhas
+  surpresa (mesmo racional de não mover o `.nick.conf` antigo), e o aviso já traz as linhas
   prontas pra colar.
 
 ## Código compartilhado entre ferramentas (`lib/`)
@@ -1042,16 +1074,29 @@ checagens.
 O `nick_secrets` vai ter outras ferramentas com IA além do `auto_scrum`, e elas leem o mesmo
 `.nick/nick.conf`. O que é genérico entre elas mora em `lib/`, com as suítes de teste em
 `lib/tests/` (todas lá, inclusive a de uma biblioteca em subdiretório). **Convenção de
-nome:** uma biblioteca que é só código fica num arquivo, `lib/<assunto>.sh`; uma que tem
-arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os dados (hoje só
-`lib/claude/`, com o `permissions.json`). Hoje existem três bibliotecas:
-- `lib/config.sh`: o leitor da configuração do projeto (`config_load`), os três avisos, a
-  regra liga/desliga (`config_is_toggle_key`), a troca de caracteres de controle, o padrão e
-  a nota por chave, o arquivo do cwd (`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd), a
-  checagem do `.nick.conf` antigo (`CONFIG_CWD_LEGACY_FILE_NAME`/`config_cwd_legacy_check`) e o
-  formato do esqueleto (`config_print_skeleton`). A biblioteca não conhece nenhuma chave
-  concreta: cada ferramenta registra as suas (ver "Registro de chaves da configuração"
-  abaixo);
+nome:** uma biblioteca de um arquivo só de código fica em `lib/<assunto>.sh`; uma com mais de um
+arquivo (dados ou código) ganha um diretório, `lib/<assunto>/<assunto>.sh` + os outros arquivos.
+Hoje as três bibliotecas têm diretório: `lib/config/` (dois arquivos de código, desde o NS-30),
+`lib/jail/` (com o `allow_hosts.txt`) e `lib/claude/` (com o `permissions.json`):
+- `lib/config/`, a biblioteca da configuração do projeto, em duas partes, carregadas nesta
+  ordem:
+  - `lib/config/config.sh`, a parte genérica: o leitor (`config_load`), os três avisos, a
+    regra liga/desliga (`config_is_toggle_key`), a troca de caracteres de controle, o padrão e
+    a nota por chave, os nomes da árvore `.nick/` no cwd (`CONFIG_NICK_DIR_NAME`,
+    `CONFIG_EXCHANGE_DIR_NAME`, `CONFIG_DOCS_DIR_NAME`), o arquivo do cwd
+    (`CONFIG_CWD_FILE_NAME`/`config_cwd_file`, só o cwd), a checagem do `.nick.conf` antigo
+    (`CONFIG_CWD_LEGACY_FILE_NAME`/`config_cwd_legacy_check`), o formato do esqueleto
+    (`config_print_skeleton`), a criação da árvore `.nick/` (`config_dir_prepare`) e o init
+    (`config_init <nome da ferramenta>`, ver "Pasta `.nick/` no projeto alvo"). Ela continua
+    genérica: não conhece nenhuma chave concreta nem ferramenta (o nome da ferramenta chega
+    por parâmetro), e `lib/tests/test_config.sh` só usa chaves de mentira;
+  - `lib/config/keys.sh`, o registro de **todas** as chaves do nick (`config_register_nick_keys`),
+    inclusive as de módulos futuros. Até o NS-30 a regra era "a biblioteca não conhece nenhuma
+    chave concreta: cada ferramenta registra as suas"; ela foi **revogada**, porque a
+    configuração é do nick e não do `auto_scrum` (o `bin/nick-init` grava o esqueleto de todas
+    as chaves sem carregar o `auto_scrum`). A regra que sobra: as chaves concretas moram só em
+    `keys.sh` (e na suíte dele, `lib/tests/test_keys.sh`). Ver "Registro de chaves da
+    configuração" abaixo;
 - `lib/jail/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
   (`jail_print_requirements`), status (`jail_print_status`), opções do ai-jail por nível
   (`jail_options`, a fonte única delas), toolchains montadas (`jail_toolchain_dirs`), aviso
@@ -1072,7 +1117,7 @@ arquivo de dados junto ganha um diretório, `lib/<assunto>/<assunto>.sh` + os da
   | a mensagem de erro (`claude_print_settings_error`) | o resto do argv (`--permission-mode`, `--append-system-prompt`, prompt) |
 
 **As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a suíte
-de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config.sh`, e um teste
+de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config/config.sh`, e um teste
 estrutural proíbe `config_`/`CONFIG_` fora de comentário em `lib/jail/jail.sh`;
 `lib/tests/test_claude.sh` só carrega `lib/claude/claude.sh`, que não cita `config_`, `CONFIG_`,
 `jail_` nem `JAIL_` em código). A jail recebe os
@@ -1086,7 +1131,8 @@ Os `assert_*` dos testes ficam em `lib/tests/assert.sh`, carregado por todas as 
 nenhuma suíte define os seus.
 
 **Regras de toda biblioteca em `lib/`** (cobertas por testes estruturais em
-`lib/tests/test_config.sh`, `lib/tests/test_jail.sh` e `lib/tests/test_claude.sh`):
+`lib/tests/test_config.sh`, `lib/tests/test_keys.sh`, `lib/tests/test_jail.sh` e
+`lib/tests/test_claude.sh`):
 - **só define ao ser carregada:** atribui as constantes, cria as globais vazias e define
   funções; não imprime nada e não roda comando. Sem shebang e sem bit de execução; a 1ª linha
   é `# shellcheck shell=bash`, seguida do cabeçalho em inglês. O teste de "carga limpa" de
@@ -1100,7 +1146,7 @@ nenhuma suíte define os seus.
   pra o `make test` sem terminal também pegar uma volta do problema;
 - não ativa `set -euo pipefail` (é de quem a carrega), mas funciona com ou sem ele no chamador;
 - **prefixo por biblioteca:** toda função `config_` e toda global `CONFIG_` em
-  `lib/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail/jail.sh`; toda função
+  `lib/config/config.sh`; toda função `jail_` e toda global `JAIL_` em `lib/jail/jail.sh`; toda função
   `claude_` e toda global `NICK_CLAUDE_` em `lib/claude/claude.sh` (as locais, `__claude_`).
   As globais de `lib/claude/` **não** usam `CLAUDE_`: o Claude Code lê variáveis `CLAUDE_*` do
   ambiente (ex: `CLAUDE_CODE_DISABLE_MOUSE`), e um nome nosso nesse espaço poderia colidir com
@@ -1110,14 +1156,16 @@ nenhuma suíte define os seus.
   global `CLAUDE_*` no `auto_scrum.sh`. O `auto_scrum.sh` não define nada nesses namespaces;
 - **nunca chama `exit`** e não usa `source`, `.` nem `eval`;
 - **não lê globais do chamador:** tudo entra por parâmetro ou pelo próprio registro (o `$PWD`
-  de `config_cwd_file` é estado do shell, não global do chamador);
+  de `config_cwd_file`, `config_dir_prepare` e `config_init` é estado do shell, não global do
+  chamador);
 - mesmas regras de estilo de "Qualidade de código bash".
 
 **Exceção de globais, documentada:** `config_load` escreve, com `printf -v`, as globais das
 chaves que o chamador registrou — esse é o papel do leitor — e nada mais: nem outra global do
 chamador, nem `CONFIG_*` (um teste compara o `declare -p` antes e depois). O registro só
 escreve nos próprios arrays `CONFIG_*` e não inicializa as globais das chaves; as linhas
-`STACK_DESCRIPTION=""` etc. continuam no topo do `auto_scrum.sh`, que é o dono delas. Por isso
+`STACK_DESCRIPTION=""` etc. continuam no topo do `auto_scrum.sh`, que é o dono delas (o
+`bin/nick-init` não precisa delas: não chama o leitor). Por isso
 `load_project_config` continua existindo no `auto_scrum` como chamada fina: é ali que a
 ferramenta guarda o que precisar sobre o arquivo carregado, sem pôr global de chamador dentro
 da biblioteca (hoje, `PROJECT_CONFIG_FILE`, o caminho usado na mensagem de erro da jail).
@@ -1125,8 +1173,11 @@ da biblioteca (hoje, `PROJECT_CONFIG_FILE`, o caminho usado na mensagem de erro 
 **Exceção de `exit`, documentada:** `jail_exec` termina com `exec` (dentro ou fora da jail) e
 por isso não retorna. Não é um `exit`: é o papel dela, o último passo da ferramenta.
 
-**Constantes atribuídas ao carregar:** `JAIL_BIN`, `JAIL_VERSION_MIN` e `JAIL_OS_RELEASE_FILE`
-(valores fixos) e
+**Constantes atribuídas ao carregar:** em `lib/config/config.sh`, `CONFIG_NICK_DIR_NAME`,
+`CONFIG_EXCHANGE_DIR_NAME`, `CONFIG_DOCS_DIR_NAME`, `CONFIG_CWD_FILE_NAME` e
+`CONFIG_CWD_LEGACY_FILE_NAME` (valores fixos, relativos ao cwd); `lib/config/keys.sh` não cria
+nenhuma (só define `config_register_nick_keys`); em `lib/jail/`, `JAIL_BIN`, `JAIL_VERSION_MIN`
+e `JAIL_OS_RELEASE_FILE` (valores fixos); e, em `lib/claude/`,
 `NICK_CLAUDE_PERMISSIONS_FILE`, calculada a partir de `${BASH_SOURCE[0]}`
 (`"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" > /dev/null && pwd)/permissions.json"`). O `cd`
 roda no subshell do `$(...)`: não muda o cwd de quem carrega, e a saída dele (que existe com
@@ -1138,28 +1189,37 @@ arquivo ausente, ilegível ou vazio — mesmo racional de `JAIL_BIN`.
 **Carga:** logo depois de `SCRIPT_DIR`, com
 
 ```bash
-# shellcheck source=SCRIPTDIR/../lib/config.sh
-source "$SCRIPT_DIR/../lib/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/config/config.sh
+source "$SCRIPT_DIR/../lib/config/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/config/keys.sh
+source "$SCRIPT_DIR/../lib/config/keys.sh"
 # shellcheck source=SCRIPTDIR/../lib/jail/jail.sh
 source "$SCRIPT_DIR/../lib/jail/jail.sh"
 # shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
 source "$SCRIPT_DIR/../lib/claude/claude.sh"
+
+config_register_nick_keys
 ```
 
-A diretiva usa `SCRIPTDIR/` e não `../lib/config.sh`: o caminho relativo puro só resolve se o
-`shellcheck` rodar de dentro de `auto_scrum/` (da raiz dá SC1091), e com `SCRIPTDIR` ele
+A diretiva usa `SCRIPTDIR/` e não `../lib/config/config.sh`: o caminho relativo puro só resolve
+se o `shellcheck` rodar de dentro de `auto_scrum/` (da raiz dá SC1091), e com `SCRIPTDIR` ele
 resolve de qualquer cwd. Rode `shellcheck -x`, pra ele seguir o `source`. O `SCRIPT_DIR` vem de
 `BASH_SOURCE[0]`, então o caminho também funciona quando os testes dão `source` no script de
-outro cwd. As três linhas `source` das bibliotecas, nessa ordem (config → jail → claude),
-são as únicas linhas `source`/`.` do `auto_scrum.sh` (um teste compara a lista inteira); a
-garantia de que a configuração nunca é executada fica no teste estrutural de `lib/config.sh`
-e nos testes de gramática.
+outro cwd. As quatro linhas `source`, nessa ordem (config/config → config/keys → jail →
+claude), são as únicas linhas `source`/`.` do `auto_scrum.sh` (um teste compara a lista
+inteira), e a chamada `config_register_nick_keys` vem logo depois, no topo, fora de função. O
+`bin/nick-init` carrega só as duas de `lib/config/`, na mesma ordem, com a mesma chamada. A
+garantia de que a configuração nunca é executada fica nos testes estruturais de
+`lib/config/config.sh` e `lib/config/keys.sh` e nos testes de gramática.
 
 **Riscos aceitos:**
-- a API de `lib/config.sh` nasce com um cliente só e pode mudar quando a segunda ferramenta
-  existir;
-- o `auto_scrum/` depende do `lib/` irmão por caminho relativo: mover o `auto_scrum/` sozinho
-  quebra o script.
+- a API de `lib/config/config.sh` nasceu com um cliente só; desde o NS-30 tem o segundo (o
+  `bin/nick-init`, com `config_dir_prepare`/`config_init`), e a casca Rust (F2a) vai chamar o
+  `bin/nick-init`, não a biblioteca;
+- o `auto_scrum/` e o `bin/` dependem do `lib/` irmão por caminho relativo (`SCRIPT_DIR` pelo
+  `BASH_SOURCE`): mover um deles sozinho quebra o script, e um symlink do `bin/nick-init` em
+  outro diretório (ex: `~/.local/bin`) não acharia o `lib/` — resolver isso é da instalação
+  (fatia F6 do épico NS-28).
 
 **Por que agora:** a decisão 1 do plano do ticket 13 (jail) era extrair o leitor "quando a
 segunda ferramenta existir". O ticket 23 reviu isso: o 13 introduz `JAIL_ENABLED`, que vale
@@ -1170,29 +1230,42 @@ refazer código e testes do 13.
 todas, uma de cada vez, e sai com código 0 só se todas passarem (ver seção "Testes: `make
 test` e `tests/run_all.sh`"). Cada suíte continua podendo rodar direto, da raiz, e sai com
 código 1 se houver `FAIL`: `bash auto_scrum/tests/test_auto_scrum.sh`,
-`bash lib/tests/test_config.sh`, `bash lib/tests/test_jail.sh`, `bash lib/tests/test_claude.sh`
+`bash bin/tests/test_nick_init.sh`, `bash lib/tests/test_config.sh`,
+`bash lib/tests/test_keys.sh`, `bash lib/tests/test_jail.sh`, `bash lib/tests/test_claude.sh`
 (esta precisa de `jq` ou `python3` pra validar o JSON; sem nenhum dos dois, dá FAIL),
 `bash tests/test_run_all.sh` e `bash prototype/panel/tests/test_launch_session.sh` (o launcher
 do protótipo do painel; ver "Rust no projeto: protótipo do painel (NS-29)").
 
 ## Registro de chaves da configuração
 
-As chaves da configuração do `auto_scrum` ficam num bloco único no topo do `auto_scrum.sh`,
-logo depois do `source` da biblioteca, uma chamada por chave, na ordem do esqueleto:
+As chaves da configuração do nick ficam num bloco único em `lib/config/keys.sh`, dentro da
+função `config_register_nick_keys`, uma chamada por chave, na ordem do esqueleto (até o NS-30
+o bloco ficava no topo do `auto_scrum.sh`):
 
 ```bash
-# config_register_key <name> <default> <note> <skeleton comment>
-config_register_key PRODUCTION_ENABLED "false" \
+config_register_nick_keys() {
+  # config_register_key <name> <default> <note> <skeleton comment>
+  config_register_key PRODUCTION_ENABLED "false" \
 'a pergunta de impacto em produção está desligada no prompt do PO. ...' \
-'PRODUCTION_ENABLED: "true" se esse projeto já está em produção — ...'
+'PRODUCTION_ENABLED: "true" se esse projeto já está em produção — ...' || return 1
+  ...
+}
 ```
 
 - o comentário vai **sem** o `# ` de cada linha; quem acrescenta o prefixo (e escreve `#`
-  numa linha vazia) é `config_print_skeleton`, porque é regra de formato do esqueleto;
+  numa linha vazia) é `config_print_skeleton`, porque é regra de formato do esqueleto. Os
+  textos entre aspas continuam na coluna 0 dentro da função: indentá-los mudaria o esqueleto;
 - a ordem do registro é a do esqueleto, do aviso de chave ausente e de `CONFIG_KEYS`;
-- as chamadas rodam ao carregar o script (inclusive no `source` dos testes), sob o
-  `set -euo pipefail` dele: um registro inválido derruba o script na carga, de propósito, por
-  ser erro de programação.
+- **por que uma função (decisão D1 do NS-30):** toda biblioteca de `lib/` só define ao ser
+  carregada (seção "Código compartilhado entre ferramentas"); chamadas no corpo de `keys.sh`
+  rodariam comando na carga. Quem decide quando registrar é a ferramenta: o `auto_scrum.sh` e o
+  `bin/nick-init` chamam `config_register_nick_keys` uma vez, logo depois dos `source`, no
+  topo, fora de função. Ela depende de `config.sh` já carregado (é a mesma biblioteca; a regra
+  "as bibliotecas não dependem umas das outras" fala de config × jail × claude);
+- cada chamada termina em `|| return 1`: a primeira que falha faz a função retornar 1 ali, sem
+  `exit` e sem registrar as chaves seguintes; o chamador, sob `set -euo pipefail`, para na
+  carga — um registro inválido é erro de programação. Chamar a função duas vezes também falha
+  (as chaves "já foram registradas"), como esperado.
 
 `config_register_key` valida antes de registrar e, se uma regra falhar, imprime uma mensagem
 no stderr e retorna 1, sem registrar e sem `exit`: nome em `^[A-Z][A-Z0-9_]*$` (garante a
@@ -1212,11 +1285,18 @@ sob `set -e` (o leitor nunca deve sair). Hoje nenhuma chave registrada é assim;
 porque a biblioteca nasce pra ser reaproveitada por outras ferramentas. Consultar o atributo
 readonly lê estado do shell, como o `$PWD` de `config_cwd_file`, e não uma global do chamador.
 
-Testes de integração no `test_auto_scrum.sh` cobram o formato: o bloco é contíguo, no topo,
-fora de função e com uma chamada por chave; `print_project_skeleton` não tem linha `CHAVE=`;
-nenhuma chave registrada aparece em `lib/config.sh` nem em `lib/tests/test_config.sh` (que só
-usa chaves de mentira); e uma chave extra registrada no teste aparece no esqueleto e nos
-avisos de chave ausente e de valor inválido.
+Os testes do registro ficam em `lib/tests/test_keys.sh` (movidos do `test_auto_scrum.sh` no
+NS-30): a carga de `keys.sh` não cria variável nem registra nada (só a função, inclusive no
+pseudo-terminal); `CONFIG_KEYS`, padrões e notas iguais aos de antes (valores fixados à mão);
+o corpo do esqueleto idêntico byte a byte ao de antes; o bloco contíguo, dentro da função, com
+uma chamada por chave; as posições e os comentários das chaves `JAIL_*`; e a consistência do
+esqueleto com o leitor (sem espaço no fim, LF, `\n` final, sem shebang, ida e volta sem aviso,
+toda liga/desliga checada e nenhuma de texto, cada linha sugerida no aviso de ausente idêntica à
+do esqueleto). No `test_auto_scrum.sh` ficam: o `auto_scrum.sh` não tem nenhuma linha
+`config_register_key` e chama `config_register_nick_keys` uma vez, no topo; nenhuma chave
+registrada aparece em `lib/config/config.sh` nem em `lib/tests/test_config.sh` (que só usa
+chaves de mentira); e uma chave extra registrada no teste aparece no esqueleto e nos avisos de
+chave ausente e de valor inválido.
 
 **Por quê:** cada chave fica numa chamada só, com as quatro informações (nome, padrão, nota e
 comentário) lado a lado, e acrescentar uma chave é acrescentar uma chamada. Some o trio que
@@ -1273,8 +1353,9 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   "corrija o problema acima", com remissão a "Problemas comuns" do README, porque a lista pode
   vir toda `[ok]` — user namespaces bloqueados, bwrap reprovado na validação de binário
   confiável; achado do review, em que a mensagem mandava instalar com tudo `[ok]`), o aviso de
-  arquivo compartilhado quando a configuração é o `.nick/nick.conf` do cwd (`config_cwd_file`) e a
-  lista de `jail_print_requirements`, e retorna 1. O `|| exit 1` vem antes de `mkdir -p
+  arquivo compartilhado quando a configuração é o `.nick/nick.conf` do cwd (`config_cwd_file`;
+  desde o NS-30 é sempre o caso, mas o `auto_scrum.sh` mantém a comparação, pra não mudar a
+  chamada da jail fora do escopo) e a lista de `jail_print_requirements`, e retorna 1. O `|| exit 1` vem antes de `mkdir -p
   "$LOGS_DIR"`: nenhum log é gravado.
 - `jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"` imprime uma linha: `Jail (ai-jail):
   desligada — ...` ou `Jail (ai-jail): ativa | Landlock: <estado> | modo de clipboard <nível>`,
@@ -1373,8 +1454,9 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   confere que os três níveis do `JAIL_CLIPBOARD` e cada opção de `jail_options` aparecem
   literal no README (que repete as flags de cada nível na tabela), e que existem as seções
   "Sandbox (ai-jail)" e "Problemas comuns", citadas na mensagem de erro.
-- **`PROJECT_CONFIG_FILE` fica no `auto_scrum`** (atribuída em `load_project_config`, pelos
-  três caminhos; vazia com "Nenhum"), porque `lib/config.sh` não guarda o caminho carregado.
+- **`PROJECT_CONFIG_FILE` fica no `auto_scrum`** (atribuída em `load_project_config`; desde o
+  NS-30, sempre o caminho absoluto do `.nick/nick.conf` do cwd), porque `lib/config/config.sh`
+  não guarda o caminho carregado.
   Quem decide se o arquivo é compartilhado com o time também é o `auto_scrum`
   (`config_cwd_file`), não a biblioteca da jail.
 - **Personalização só pela configuração global do ai-jail** (`~/.config/ai-jail/config.toml`,
@@ -1850,8 +1932,8 @@ antes do `--permission-mode`.
 espaços, tabs e quebras de linha contam como vazio) → `Erro: regras de permissão do Claude Code não
 encontradas ou ilegíveis: <caminho>` no stderr e código 1: nenhuma pergunta, nenhum log,
 `claude` não aberto, com e sem jail. Com a jail ligada, a verificação dela (`ai-jail ... --
-true`) já rodou nesse ponto; o lançamento, não. `--init` e `--requisitos-jail` saem antes e
-não carregam as regras, porque não abrem o `claude`. A biblioteca não valida o JSON: isso
+true`) já rodou nesse ponto; o lançamento, não. `--requisitos-jail` (e o `--init`/`--projeto=`
+recusados, desde o NS-30) saem antes e não carregam as regras, porque não abrem o `claude`. A biblioteca não valida o JSON: isso
 fica na suíte (`jq` e/ou `python3 -m json.tool`, mais a checagem das chaves e dos tipos), que
 dá FAIL, e não PULADO, sem nenhum dos dois.
 
@@ -1926,7 +2008,7 @@ erro do `sudo` ou do `git`; a contraprova é um `git push` comum, aprovado no as
 publicar no remote. Registrar aqui e no PR o resultado de cada um.
 
 **Fora de escopo, de propósito:** flag pra desligar; gravar em `.claude/settings*.json`;
-regras por projeto; hooks; regras de rede/MCP; `lib/ai/`; mudar `lib/config.sh` ou
+regras por projeto; hooks; regras de rede/MCP; `lib/ai/`; mudar `lib/config/config.sh` ou
 `lib/jail/jail.sh`; qualquer dependência nova em runtime.
 
 ## Sentry via MCP na etapa de PO
@@ -2021,7 +2103,7 @@ caminho do `auto_scrum`: `jail_check` → `claude_settings_load` → `jail_print
   mudar: tudo entra por parâmetro;
 - **a jail é sempre ligada:** `jail_check "true"`, `jail_exec "true"` e `jail_print_status
   "true"` são literais, e não há flag nem variável que a desligue (teste estrutural);
-- **sem `.nick/nick.conf`:** o launcher não carrega `lib/config.sh`. As sessões são dados
+- **sem `.nick/nick.conf`:** o launcher não carrega `lib/config/config.sh`. As sessões são dados
   fictícios, e a configuração do projeto ficou fora do escopo. As opções da jail vêm do ambiente
   do painel: `NICK_PANEL_CLIPBOARD` (nível do `JAIL_CLIPBOARD`), `NICK_PANEL_ALLOW_HOSTS` e
   `NICK_PANEL_FORWARD_PORTS`. O prefixo é `NICK_` e não `CLAUDE_`, pelo motivo de

@@ -1,31 +1,44 @@
 # shellcheck shell=bash
 #
-# config.sh: reads the project config file (.nick/nick.conf in the cwd, or any other file the
-# caller picks) shared by the nick tools that run an AI agent — today only auto_scrum. The
-# tool registers its own keys (config_register_key) and this library does the rest: the
-# KEY="value" reader with no source/eval (config_load), its three warnings, the toggle rule
-# (*_ENABLED), the per-key default and note, where the cwd file lives (config_cwd_file, plus
-# the check for the old .nick.conf, config_cwd_legacy_check) and the skeleton format
-# (config_print_skeleton). It knows no concrete key of any tool.
+# config.sh: the generic part of the nick project config library (lib/config/). It reads the
+# project config file (.nick/nick.conf in the cwd, or any other file the caller picks) shared
+# by the nick tools — today auto_scrum and bin/nick-init. The keys are registered through
+# config_register_key (every key of the nick lives in lib/config/keys.sh,
+# config_register_nick_keys) and this file does the rest: the KEY="value" reader with no
+# source/eval (config_load), its three warnings, the toggle rule (*_ENABLED), the per-key
+# default and note, where the cwd file lives (config_cwd_file, plus the check for the old
+# .nick.conf, config_cwd_legacy_check), the skeleton format (config_print_skeleton), the
+# .nick/ tree in the cwd (config_dir_prepare) and the init that creates it with the skeleton
+# (config_init). This file knows no concrete key and no tool: the tool name comes as a
+# parameter.
 #
 # Rules (see ABOUT.md, "Código compartilhado entre ferramentas (lib/)"):
-#   - loading it only assigns CONFIG_CWD_FILE_NAME and CONFIG_CWD_LEGACY_FILE_NAME, creates
-#     the four empty registry arrays and defines functions: it prints nothing and runs no
+#   - loading it only assigns CONFIG_NICK_DIR_NAME, CONFIG_EXCHANGE_DIR_NAME,
+#     CONFIG_DOCS_DIR_NAME, CONFIG_CWD_FILE_NAME and CONFIG_CWD_LEGACY_FILE_NAME, creates the
+#     four empty registry arrays and defines functions: it prints nothing and runs no
 #     command;
 #   - no shebang and no executable bit; no set -euo pipefail of its own, but it works with
 #     or without it in the caller;
 #   - every function is prefixed config_ and every global CONFIG_;
 #   - it never calls exit, and never uses source, . or eval;
 #   - it reads no global of the caller: everything comes in as a parameter or from the
-#     registry. $PWD (config_cwd_file, config_cwd_legacy_check) and the readonly attribute
+#     registry. $PWD (config_cwd_file, config_cwd_legacy_check, config_dir_prepare,
+#     config_init) and the readonly attribute
 #     checked when registering (config_register_key) are shell state, not caller globals.
 # The one documented exception: config_load writes, through printf -v, the globals of the
 # keys the caller registered — that is the reader's job. It writes nothing else, neither
 # another caller global nor a CONFIG_* one. Registering only writes to the CONFIG_* arrays
 # and never initializes the key globals: the caller owns them.
 
-# Both relative to the cwd. The legacy name is never read: config_cwd_legacy_check only
-# tells the user to move it.
+# All relative to the cwd (the target project). The nick dir holds the project config, the
+# exchange dir (where the user and the agents trade files) and the per-ticket docs
+# (docs/<ID>/, created by the agent when it writes there). Inside the project, so it stays
+# writable with the jail on. Spelled out, not built from each other: a test checks that
+# CONFIG_CWD_FILE_NAME is $CONFIG_NICK_DIR_NAME/nick.conf. The legacy name is never read:
+# config_cwd_legacy_check only tells the user to move it.
+CONFIG_NICK_DIR_NAME=".nick"
+CONFIG_EXCHANGE_DIR_NAME=".nick/troca"
+CONFIG_DOCS_DIR_NAME=".nick/docs"
 CONFIG_CWD_FILE_NAME=".nick/nick.conf"
 CONFIG_CWD_LEGACY_FILE_NAME=".nick.conf"
 
@@ -359,4 +372,87 @@ config_print_skeleton() {
     done <<< "${CONFIG_KEY_COMMENTS[$index]}"
     printf '%s\n' "${CONFIG_KEYS[$index]}=\"${CONFIG_KEY_DEFAULTS[$index]}\""
   done
+}
+
+# config_dir_prepare: creates the $CONFIG_NICK_DIR_NAME tree in the cwd —
+# $CONFIG_EXCHANGE_DIR_NAME, $CONFIG_DOCS_DIR_NAME and, only if it doesn't exist yet,
+# $CONFIG_NICK_DIR_NAME/.gitignore with exactly "*", "!.gitignore" and "!nick.conf"
+# (everything in .nick/ is ignored but the config and the .gitignore itself, so the target
+# project's own .gitignore is never touched). Not nick.conf (config_init's job) nor docs/<ID>/
+# (the agent creates it when it writes there). An existing .gitignore, edited or not, and
+# whatever is already in troca/ and docs/ are kept; no .gitignore is created inside troca/ or
+# docs/. Prints an error on stderr and returns 1 when the tree can't be created (without exit).
+config_dir_prepare() {
+  local ignore="$CONFIG_NICK_DIR_NAME/.gitignore"
+  if mkdir -p "$CONFIG_EXCHANGE_DIR_NAME" "$CONFIG_DOCS_DIR_NAME" 2>/dev/null; then
+    [ -e "$ignore" ] && return 0
+    # Grouped so the 2>/dev/null also covers the failing > "$ignore" (redirections apply left
+    # to right): the user sees only the message below, not bash's own error.
+    { printf '%s\n' '*' '!.gitignore' "!$(basename "$CONFIG_CWD_FILE_NAME")" > "$ignore"; } 2>/dev/null && return 0
+  fi
+  echo "Erro: não foi possível criar a estrutura $CONFIG_NICK_DIR_NAME/ (.gitignore, troca/ e docs/) em $PWD." >&2
+  return 1
+}
+
+# config_init <tool_name>: creates the project config in the cwd — the only destination,
+# $PWD/$CONFIG_CWD_FILE_NAME (config_cwd_file) — with the skeleton of the registered keys
+# (config_print_skeleton <tool_name>, so the header names the tool). The user opens it and
+# fills it in afterwards.
+#   - An existing file is only overwritten after confirmation (s/S/sim/Sim/SIM). Any other
+#     answer prints "Cancelado. Nada foi alterado." on stdout and returns 0; a closed stdin
+#     (Ctrl+D) prints the same on stderr and returns 1. Either way nothing is created or
+#     changed.
+#   - Then config_dir_prepare creates the whole .nick/ tree (the team sees and versions it
+#     from the first commit), the skeleton is written and the output shows the tree.
+#   - An old $PWD/$CONFIG_CWD_LEGACY_FILE_NAME doesn't stop it (the old file is the source
+#     to copy the values from): the skeleton is written all the same, the old file is neither
+#     read nor touched, and a warning on stderr says to copy its values into the new file and
+#     remove it — without it, the values would be lost silently.
+# It never reads the config (no config_load nor config_cwd_legacy_check), so it prints no
+# config warning. Returns 1, without exit, with the library's own message on stderr (never
+# bash's raw error), when <tool_name> is missing or empty, or when the tree or the file can't
+# be written.
+config_init() {
+  local tool_name file confirm
+  # Checked before touching "$1", so a caller under set -u gets this message, not bash's.
+  if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    echo "Erro: config_init espera 1 argumento (o nome da ferramenta), recebeu $#." >&2
+    return 1
+  fi
+  tool_name="$1"
+  file="$(config_cwd_file)"
+  if [ -f "$file" ]; then
+    # Not left to set -e: the caller may not have it, and EOF must still cancel.
+    if ! read -r -p "Já existe $file. Sobrescrever? (s/N): " confirm; then
+      echo "Cancelado. Nada foi alterado." >&2
+      return 1
+    fi
+    case "$confirm" in
+      s | S | sim | Sim | SIM) ;;
+      *)
+        echo "Cancelado. Nada foi alterado."
+        return 0
+        ;;
+    esac
+  fi
+  # Before the skeleton, since nick.conf lives inside .nick/.
+  config_dir_prepare || return 1
+  # Grouped so the 2>/dev/null also covers the failing > "$file" (same as config_dir_prepare).
+  if ! { config_print_skeleton "$tool_name" > "$file"; } 2>/dev/null; then
+    echo "Erro: não foi possível gravar $file." >&2
+    return 1
+  fi
+  echo "Projeto criado em $file — edite antes de usar."
+  cat <<EOF
+Estrutura do nick em $CONFIG_NICK_DIR_NAME/:
+  .gitignore   versionado: ignora tudo em $CONFIG_NICK_DIR_NAME/ menos ele e o nick.conf
+  nick.conf    versionado: configuração do projeto
+  troca/       não versionada: troca de arquivos com os agentes
+  docs/        não versionada: plano, review e prints de cada ticket (docs/<ID>/)
+Versione $CONFIG_CWD_FILE_NAME e $CONFIG_NICK_DIR_NAME/.gitignore junto com o projeto.
+EOF
+  if [ -e "$PWD/$CONFIG_CWD_LEGACY_FILE_NAME" ]; then
+    echo "Aviso: o arquivo antigo $PWD/$CONFIG_CWD_LEGACY_FILE_NAME não foi lido nem alterado — copie os valores dele para $file e apague o antigo." >&2
+  fi
+  return 0
 }

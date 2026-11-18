@@ -23,12 +23,14 @@ etapa, monta o prompt final e já abre o `claude` com ele.
 #### Uso
 
 ```bash
-./auto_scrum/auto_scrum.sh [--projeto=<nome>]
+./auto_scrum/auto_scrum.sh [--requisitos-jail]
 ```
 
-1. Configuração do projeto (stack e flags): vem do `.nick/nick.conf` do diretório atual, se
-   existir (o script mostra de onde carregou); senão o script pergunta qual projeto usar.
-   Veja "Stack por projeto" abaixo.
+Rode da raiz do projeto alvo (o diretório atual é o projeto).
+
+1. Configuração do projeto (stack e flags): vem do `.nick/nick.conf` do diretório atual (o
+   script mostra de onde carregou); sem ele o script para, dizendo como criá-lo. Veja "Stack
+   por projeto" abaixo.
 2. Escolha o tipo de conversa no menu (PO, Tech Leader, Desenvolvimento ou Review).
 3. Responda o roteiro de perguntas daquela etapa. Campos de descrição longa abrem
    `$EDITOR` num arquivo temporário (salve e feche para continuar) — colar texto grande
@@ -48,9 +50,8 @@ todas as etapas roda dentro do sandbox ai-jail, e o script para logo depois de c
 configuração (antes de qualquer pergunta) se a jail não funcionar nesta máquina. Veja a
 seção [Sandbox (ai-jail)](#sandbox-ai-jail).
 
-Todo menu (inclusive o de destino do `--init`) termina com a opção **Sair (q)**: o número
-dela, ou `q`/`Q`, encerra o script sem fazer nada — nenhum log gravado, nenhuma
-configuração criada e o `claude` não é aberto.
+O menu termina com a opção **Sair (q)**: o número dela, ou `q`/`Q`, encerra o script sem
+fazer nada — nenhum log gravado, nada criado no projeto e o `claude` não é aberto.
 
 Cada etapa roda de forma independente (normalmente em terminais separados); não há
 encadeamento automático entre elas — por exemplo, depois do Review, quem decide se volta
@@ -64,22 +65,15 @@ livremente sem tocar no script.
 
 Os prompts e o menu usam a configuração do projeto: a stack técnica (ex: "Django, DRF,
 PostgreSQL" ou "Rust, Actix") e flags opt-in que ligam ou desligam partes dos prompts e do
-menu. Essa configuração pode ficar em dois lugares, procurados nesta ordem:
+menu. Essa configuração fica num lugar só: **`.nick/nick.conf` no diretório atual** (o
+projeto alvo, de onde o script é rodado). O script imprime
+`Configuração do projeto carregada de: <caminho>`. Só o diretório atual é olhado, não os
+diretórios pais. Sem `.nick/nick.conf`, o script para antes de qualquer pergunta, mostrando o
+comando que o cria (abaixo). Um `.nick.conf` antigo na raiz (sem o `.nick/nick.conf`) faz o
+script parar com o comando de migração — veja "Migração (`.nick/`)" abaixo.
 
-1. **`.nick/nick.conf` no diretório atual** (o projeto alvo, de onde o script é
-   rodado). Se existir, é usado e o script imprime
-   `Configuração do projeto carregada de: <caminho>` — sem menu de projetos. Se
-   `--projeto=` também for passado, ele é ignorado com um aviso (mesmo que o nome não
-   exista em `auto_scrum/projects/`). Só o diretório atual é olhado, não os diretórios
-   pais. Um `.nick.conf` antigo na raiz (sem o `.nick/nick.conf`) faz o script parar com o
-   comando de migração — veja "Migração (`.nick/`)" abaixo.
-2. **`auto_scrum/projects/<nome>.conf`**, escolhido por `--projeto=<nome>` (erro claro se
-   o arquivo não existir) ou, sem argumento, pelo menu com os projetos encontrados + a
-   opção "Nenhum" (usa uma stack genérica).
-
-O formato de `.nick/nick.conf` e de `auto_scrum/projects/<nome>.conf` é o mesmo. O exemplo
-completo é o arquivo gerado por `--init`: ele traz todas as chaves aceitas, com um
-comentário explicando cada uma. Uma linha preenchida fica assim:
+O exemplo completo é o arquivo gerado pelo `bin/nick-init`: ele traz todas as chaves aceitas,
+com um comentário explicando cada uma. Uma linha preenchida fica assim:
 `STACK_DESCRIPTION="Django, DRF, PostgreSQL"`.
 
 Regra de formato: o arquivo **não é executado** — o script lê só linhas `CHAVE="valor"`
@@ -96,23 +90,29 @@ Duas regras valem além do formato:
   chave ausente vale como vazia. Uma linha comentada ou com outro nome não conta.
 - **As chaves `*_ENABLED` aceitam só `"true"`, `"false"` e `""`.** Qualquer outro valor (ex:
   `"TRUE"`, `"sim"`) mantém a chave no valor padrão dela (o comentário de cada chave no
-  arquivo gerado por `--init` diz qual é) e gera um aviso com o arquivo e o número da
+  arquivo gerado pelo `bin/nick-init` diz qual é) e gera um aviso com o arquivo e o número da
   linha.
 
 Os avisos não interrompem a execução. Quando uma chave nova é criada, as configurações que
 já existem passam a receber o aviso de chaves ausentes, com a linha a adicionar.
 
-- Pra criar a configuração: `./auto_scrum/auto_scrum.sh --init` — pergunta o destino
-  (`.nick/nick.conf` no diretório atual, ou `auto_scrum/projects/<nome>.conf`, que pede o
-  nome) e cria o arquivo com as chaves aceitas no valor padrão e comentários explicando cada
-  uma. O conteúdo é o mesmo nos dois destinos. Abre e preenche depois. Se o arquivo já
-  existir, pergunta antes de sobrescrever. No destino do diretório atual, cria também o resto
-  da pasta `.nick/` (abaixo) e mostra a estrutura na saída.
+- Pra criar a configuração, rode na raiz do projeto alvo:
+
+  ```bash
+  <caminho do nick_secrets>/bin/nick-init
+  ```
+
+  Ele cria a pasta `.nick/` inteira (abaixo) e o `.nick/nick.conf` com as chaves aceitas no
+  valor padrão e comentários explicando cada uma, e mostra a estrutura na saída. Abra e
+  preencha depois. Se o `.nick/nick.conf` já existir, pergunta antes de sobrescrever
+  (responder N, ou fechar a entrada com Ctrl+D, cancela sem alterar nada). O destino é sempre o
+  diretório atual, e o comando não aceita argumento.
 - `./auto_scrum/auto_scrum.sh --requisitos-jail` mostra o que a jail precisa nesta máquina
   (ver [Sandbox (ai-jail)](#sandbox-ai-jail)) e sai, sem carregar configuração.
-- Só `--projeto=` (singular), `--init` e `--requisitos-jail` são reconhecidos — qualquer
-  outra flag (ex: `--projetos=` com "s") dá erro claro em vez de ser ignorada
-  silenciosamente.
+- Só `--requisitos-jail` é reconhecido — qualquer outra flag dá erro claro em vez de ser
+  ignorada silenciosamente. As flags antigas de criar a configuração e de escolher o projeto
+  saíram do `auto_scrum` (veja "Migração (`auto_scrum/projects/`)" abaixo): usadas, dão erro
+  com o caminho do `bin/nick-init`.
 
 #### Pasta `.nick/` do projeto alvo
 
@@ -129,8 +129,8 @@ Tudo o que o nick guarda no projeto alvo fica numa pasta só, na raiz dele:
 
 - **O que é versionado:** só `.nick/nick.conf` e `.nick/.gitignore`. O `.gitignore` tem três
   linhas (`*`, `!.gitignore` e `!nick.conf`), então o `.gitignore` do projeto não precisa ser
-  alterado. O nick cria `.gitignore`, `troca/` e `docs/` no `--init` (destino no diretório
-  atual) e, se faltar algum, ao confirmar o envio do prompt; cancelar o envio não cria nada.
+  alterado. O nick cria `.gitignore`, `troca/` e `docs/` no `bin/nick-init` e, se faltar
+  algum, ao confirmar o envio do prompt; cancelar o envio não cria nada.
   Um `.nick/.gitignore` que já exista, editado ou não, nunca é sobrescrito.
 - **Troca de arquivos (`.nick/troca/`):** pra mostrar um arquivo ao agente (uma print, um
   anexo) ou receber o que ele gera pra você conferir (ex: um relatório). O prompt de toda
@@ -155,10 +155,10 @@ Tudo o que o nick guarda no projeto alvo fica numa pasta só, na raiz dele:
 `.nick/nick.conf` é feito pra ser versionado **no repositório do projeto alvo**, junto com o
 código que ele descreve, e compartilhado com o time. Como o conteúdo dele entra no prompt
 enviado ao `claude`, revise mudanças nesse arquivo no PR como qualquer outro arquivo que
-influencia o agente (ex: `CLAUDE.md`) — não ser executado não o torna inofensivo. Já
-`auto_scrum/projects/` é gitignorado — é configuração local, específica desta máquina, não
-faz parte deste repositório (`.nick/` inteira também é gitignorada aqui, pra nunca ser
-commitada neste repo por engano). O mesmo cuidado vale pras chaves da jail do `.nick/nick.conf`
+influencia o agente (ex: `CLAUDE.md`) — não ser executado não o torna inofensivo. Quem não
+quer versionar a pasta no projeto alvo põe `.nick/` no `.git/info/exclude` do repositório dele
+(fica só na sua máquina, sem mexer no `.gitignore` do time). Neste repositório, `.nick/` inteira
+é gitignorada, pra nunca ser commitada aqui por engano. O mesmo cuidado vale pras chaves da jail do `.nick/nick.conf`
 (`JAIL_ENABLED`, `JAIL_ALLOW_HOSTS`, `JAIL_FORWARD_PORTS`): desligar a jail num PR tira a jail de
 todo o time, e cada host ou porta liberado amplia o acesso do agente (ver
 [Sandbox (ai-jail)](#sandbox-ai-jail)).
@@ -176,9 +176,9 @@ dois caminhos, na raiz do projeto alvo:
   mkdir -p .nick && mv .nick.conf .nick/nick.conf
   ```
 
-- **rodar o `--init`** com destino no diretório atual: ele cria a pasta `.nick/` inteira com o
-  `nick.conf` no padrão (todas as chaves, com os comentários) e não lê nem altera o antigo. No
-  fim, avisa pra copiar os valores do antigo pro novo e apagar o antigo.
+- **rodar o `bin/nick-init`**: ele cria a pasta `.nick/` inteira com o `nick.conf` no padrão
+  (todas as chaves, com os comentários) e não lê nem altera o antigo. No fim, avisa pra copiar
+  os valores do antigo pro novo e apagar o antigo.
 
 Faça commit do `.nick/nick.conf`, do `.nick/.gitignore` e da remoção do `.nick.conf` antigo
 (se ele era versionado). Com os dois arquivos, vale o novo, e o script avisa que o antigo pode
@@ -187,20 +187,25 @@ quando `.nick/docs/<ID>/plan.md` não existe e há um `docs/plans/<ID>_*.md`, o 
 caminho antes da pergunta do plano — é só informá-lo ali. Um `.nick/troca/.gitignore` antigo
 pode continuar onde está.
 
-**Migração (`projects/*.sh`):** arquivos antigos `auto_scrum/projects/<nome>.sh` não são mais lidos. O
-conteúdo não precisa mudar, só a extensão — o script avisa e sugere o comando pra cada um
-(`mv 'auto_scrum/projects/<nome>.sh' 'auto_scrum/projects/<nome>.conf'`).
+**Migração (`auto_scrum/projects/`):** `auto_scrum/projects/<nome>.conf` não é mais lido, e o
+`auto_scrum` não escolhe mais projeto nem cria configuração: ela vem só do `.nick/nick.conf`
+do diretório atual, criado pelo `bin/nick-init`. Pra cada projeto, copie o arquivo pra `.nick/nick.conf`
+na raiz do projeto (o formato é o mesmo — não rode o `bin/nick-init` no lugar, que criaria um
+arquivo no padrão, sem os seus valores) e, na primeira execução confirmada, o nick cria o resto
+da pasta. Os `auto_scrum/projects/<nome>.sh` mais antigos também têm o mesmo formato: copie do
+mesmo jeito. Depois, apague o `auto_scrum/projects/` **antes** de atualizar o clone deste
+repositório, porque ele deixou de ser ignorado pelo `.gitignore` e os arquivos (com dado de
+cliente) apareceriam como candidatos a commit.
 
 **Migração (`PRODUCTION_ENABLED`):** a pergunta de impacto em produção no prompt do PO
 passou a depender da chave `PRODUCTION_ENABLED` e fica desligada por padrão. Configurações
-criadas antes dela — tanto `.nick/nick.conf` versionados nos projetos alvo quanto
-`auto_scrum/projects/<nome>.conf` — perdem a pergunta até ganharem
+criadas antes dela perdem a pergunta até ganharem
 `PRODUCTION_ENABLED="true"`. Enquanto o arquivo carregado não tiver essa linha, o aviso de
 chaves ausentes lista `PRODUCTION_ENABLED`, explicando que a pergunta está desligada; um
 projeto sem produção usa `PRODUCTION_ENABLED="false"`, que mantém a pergunta desligada e
 tira essa chave do aviso. Valores como `"TRUE"` ou `"sim"`, que antes desligavam a pergunta
-em silêncio, agora geram o aviso de valor. Arquivos novos gerados por `--init` já vêm com
-todas as chaves.
+em silêncio, agora geram o aviso de valor. Arquivos novos gerados pelo `bin/nick-init` já vêm
+com todas as chaves.
 
 ## Sandbox (ai-jail)
 
@@ -263,8 +268,8 @@ JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"
 Cada host libera também os subdomínios dele e é mais um canal de saída pro agente. Use só o
 nome do host: com `https://`, porta, caminho ou curinga (`*.`), a ferramenta para com erro.
 
-É opt-in por projeto, pela chave `JAIL_ENABLED` da configuração do projeto (`.nick/nick.conf` ou
-`auto_scrum/projects/<nome>.conf`). Vazio ou `"false"` roda o agente direto, como antes. Com
+É opt-in por projeto, pela chave `JAIL_ENABLED` da configuração do projeto (`.nick/nick.conf`).
+Vazio ou `"false"` roda o agente direto, como antes. Com
 `"true"`, a ferramenta confere logo no início se a jail funciona nesta máquina e, se não
 funcionar, para com uma mensagem dizendo o que falta. Não existe fallback: com `"true"` o
 agente nunca roda sem a jail.

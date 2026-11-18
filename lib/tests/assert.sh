@@ -8,7 +8,7 @@
 # the suite initializes (failures=0) before the first assert and checks at the end.
 # Like the libraries in lib/, it only defines functions when loaded: no shebang, no
 # executable bit and no set -e of its own. Being a test helper and not a tool library, it
-# doesn't follow the config_/CONFIG_ prefix rule of lib/config.sh.
+# doesn't follow the config_/CONFIG_ prefix rule of lib/config/config.sh.
 
 # assert_eq <expected> <actual> <description>
 assert_eq() {

@@ -1,8 +1,9 @@
 //! The state of the TUI and its transitions by key, with no terminal I/O: `handle_key` takes a
 //! key and returns an `Action`, which the loop (main.rs, through `on_key`) carries out. The
 //! only action that runs bin/nick-init is `Action::RunInit`, and only the "Criar configuração"
-//! button of the missing-config alert produces it (plan D7). The screen texts are in PT-BR,
-//! and drawing is ui.rs's job.
+//! button of the missing-config alert produces it (plan D7). The navigation is Modules >
+//! Projects > Tickets; the rules of the tickets are in tickets.rs, and none of them touches a
+//! file of the project. The screen texts are in PT-BR, and drawing is ui.rs's job.
 
 use std::path::{Path, PathBuf};
 
@@ -12,12 +13,15 @@ use crate::db::Db;
 use crate::init::{InitOutcome, InitRunner};
 use crate::modules::ModuleKind;
 use crate::projects::{self, Availability, Check, Project};
+use crate::tickets::{self, Ticket};
 
 /// The list on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Modules,
     Projects,
+    /// The tickets of the open project (`App::project`).
+    Tickets,
 }
 
 /// The buttons of the missing-config alert.
@@ -25,6 +29,13 @@ pub enum Screen {
 pub enum Button {
     CreateConfig,
     Cancel,
+}
+
+/// The fields of the new ticket dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketField {
+    Title,
+    JiraId,
 }
 
 /// A dialog over the list. While one is open, `q` does not quit.
@@ -39,8 +50,19 @@ pub enum Dialog {
         focus: Button,
         note: Option<String>,
     },
-    /// The `(s/N)` confirmation of a removal.
-    ConfirmRemove { project: Project },
+    /// The `(s/N)` confirmation of a removal, with how many tickets go with the project.
+    ConfirmRemove { project: Project, tickets: i64 },
+    /// A new ticket: the title (required) and the Jira ID (optional; empty generates a
+    /// provisional one).
+    NewTicket {
+        title: String,
+        jira_id: String,
+        focus: TicketField,
+    },
+    /// The title of a ticket (its ID is not editable).
+    EditTitle { ticket: Ticket, input: String },
+    /// The `(s/N)` confirmation of hiding a ticket.
+    ConfirmHide { ticket: Ticket },
 }
 
 /// What the loop must do after a key.
@@ -73,6 +95,12 @@ pub struct App {
     pub(crate) dialog: Option<Dialog>,
     pub(crate) status: Option<String>,
     pub(crate) rows: Vec<Row>,
+    /// The project whose tickets are on the Tickets screen.
+    pub(crate) project: Option<Project>,
+    pub(crate) ticket_index: usize,
+    pub(crate) ticket_rows: Vec<Ticket>,
+    /// The filter of the Tickets screen: the hidden ones are listed too.
+    pub(crate) show_hidden: bool,
 }
 
 impl App {
@@ -90,6 +118,10 @@ impl App {
             dialog: None,
             status: None,
             rows: Vec::new(),
+            project: None,
+            ticket_index: 0,
+            ticket_rows: Vec::new(),
+            show_hidden: false,
         }
     }
 
@@ -131,17 +163,30 @@ impl App {
             Some(Dialog::NeedsConfig { dir, focus, note }) => {
                 self.key_needs_config(key, dir, focus, note)
             }
-            Some(Dialog::ConfirmRemove { project }) => self.key_confirm_remove(key, project),
+            Some(Dialog::ConfirmRemove { project, .. }) => self.key_confirm_remove(key, project),
+            Some(Dialog::NewTicket {
+                title,
+                jira_id,
+                focus,
+            }) => self.key_new_ticket(key, title, jira_id, focus),
+            Some(Dialog::EditTitle { ticket, input }) => self.key_edit_title(key, ticket, input),
+            Some(Dialog::ConfirmHide { ticket }) => self.key_confirm_hide(key, ticket),
             None => match self.screen {
                 Screen::Modules => self.key_modules(key),
                 Screen::Projects => self.key_projects(key),
+                Screen::Tickets => self.key_tickets(key),
             },
         };
         // The availability is computed again after every action on the list (plan D9): not
         // while a dialog stays open (typing a path is not an action, and each refresh reads
-        // the disk), but when it closes, whatever closed it.
-        if self.screen == Screen::Projects && self.dialog.is_none() {
-            self.refresh();
+        // the disk), but when it closes, whatever closed it. The tickets are read again the
+        // same way.
+        if self.dialog.is_none() {
+            match self.screen {
+                Screen::Projects => self.refresh(),
+                Screen::Tickets => self.refresh_tickets(),
+                Screen::Modules => {}
+            }
         }
         action
     }
@@ -181,11 +226,18 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(row) = self.rows.get(self.project_index) {
-                    self.dialog = Some(Dialog::ConfirmRemove {
-                        project: row.project.clone(),
-                    });
+                    match self.db.count_tickets(row.project.id) {
+                        Ok(tickets) => {
+                            self.dialog = Some(Dialog::ConfirmRemove {
+                                project: row.project.clone(),
+                                tickets,
+                            });
+                        }
+                        Err(err) => self.status = Some(projects::db_error_message(&err)),
+                    }
                 }
             }
+            KeyCode::Enter | KeyCode::Right => self.open_tickets(),
             KeyCode::Esc | KeyCode::Left => {
                 self.screen = Screen::Modules;
                 self.status = None;
@@ -194,6 +246,182 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// Opens the Tickets screen of the selected project, only if it is available now.
+    fn open_tickets(&mut self) {
+        let Some(row) = self.rows.get(self.project_index) else {
+            return;
+        };
+        let availability = projects::availability(&row.project.path);
+        if let Some(mark) = projects::unavailable_text(availability) {
+            self.status = Some(format!(
+                "Projeto indisponível: {mark}. Os tickets só abrem com a pasta e o \
+                 .nick/nick.conf no lugar."
+            ));
+            return;
+        }
+        self.project = Some(row.project.clone());
+        self.screen = Screen::Tickets;
+        self.ticket_index = 0;
+        self.ticket_rows.clear();
+        self.show_hidden = false;
+        self.status = None;
+    }
+
+    fn key_tickets(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.ticket_index = self.ticket_index.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.ticket_index =
+                    (self.ticket_index + 1).min(self.ticket_rows.len().saturating_sub(1));
+            }
+            KeyCode::Char('a') => {
+                self.dialog = Some(Dialog::NewTicket {
+                    title: String::new(),
+                    jira_id: String::new(),
+                    focus: TicketField::Title,
+                });
+            }
+            KeyCode::Char('e') => {
+                if let Some(ticket) = self.ticket_rows.get(self.ticket_index) {
+                    self.dialog = Some(Dialog::EditTitle {
+                        input: ticket.title.clone(),
+                        ticket: ticket.clone(),
+                    });
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() {
+                    if ticket.hidden_at.is_some() {
+                        // Restoring hides nothing and is undone with `o`: no confirmation.
+                        self.status = Some(match tickets::restore(&self.db, &ticket) {
+                            Ok(message) | Err(message) => message,
+                        });
+                    } else {
+                        self.dialog = Some(Dialog::ConfirmHide { ticket });
+                    }
+                }
+            }
+            KeyCode::Char('f') => self.show_hidden = !self.show_hidden,
+            KeyCode::Esc | KeyCode::Left => {
+                self.screen = Screen::Projects;
+                self.project = None;
+                self.ticket_rows.clear();
+                self.show_hidden = false;
+                self.status = None;
+            }
+            _ if is_quit(key) => return Action::Quit,
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn key_new_ticket(
+        &mut self,
+        key: KeyEvent,
+        mut title: String,
+        mut jira_id: String,
+        mut focus: TicketField,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Enter => {
+                let Some(project_id) = self.project.as_ref().map(|p| p.id) else {
+                    return Action::None;
+                };
+                match tickets::create(&self.db, project_id, &title, &jira_id) {
+                    Ok(ticket) => {
+                        self.status = Some(tickets::created_message(&ticket));
+                        // Select the new ticket: the refresh after the dialog closes reads the
+                        // list again and keeps the selection by id.
+                        self.ticket_rows.push(ticket);
+                        self.ticket_index = self.ticket_rows.len() - 1;
+                        return Action::None;
+                    }
+                    Err(message) => self.status = Some(message),
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                focus = match focus {
+                    TicketField::Title => TicketField::JiraId,
+                    TicketField::JiraId => TicketField::Title,
+                };
+            }
+            _ => {
+                let field = match focus {
+                    TicketField::Title => &mut title,
+                    TicketField::JiraId => &mut jira_id,
+                };
+                edit_text(field, key);
+            }
+        }
+        self.dialog = Some(Dialog::NewTicket {
+            title,
+            jira_id,
+            focus,
+        });
+        Action::None
+    }
+
+    fn key_edit_title(&mut self, key: KeyEvent, ticket: Ticket, mut input: String) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Enter => match tickets::rename(&self.db, &ticket, &input) {
+                Ok(message) => {
+                    self.status = Some(message);
+                    return Action::None;
+                }
+                Err(message) => self.status = Some(message),
+            },
+            _ => {
+                edit_text(&mut input, key);
+            }
+        }
+        self.dialog = Some(Dialog::EditTitle { ticket, input });
+        Action::None
+    }
+
+    fn key_confirm_hide(&mut self, key: KeyEvent, ticket: Ticket) -> Action {
+        // Only s/S confirm, as in the removal; any other key cancels.
+        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            self.status = Some(match tickets::hide(&self.db, &ticket) {
+                Ok(message) | Err(message) => message,
+            });
+        }
+        Action::None
+    }
+
+    /// Reads the tickets of the open project again (with the hidden ones when the filter is
+    /// on), keeping the selected ticket selected when it is still listed.
+    fn refresh_tickets(&mut self) {
+        let Some(project_id) = self.project.as_ref().map(|p| p.id) else {
+            return;
+        };
+        let selected = self.ticket_rows.get(self.ticket_index).map(|t| t.id);
+        match self.db.list_tickets(project_id, self.show_hidden) {
+            Ok(list) => self.ticket_rows = list,
+            Err(err) => {
+                self.ticket_rows.clear();
+                self.status = Some(projects::db_error_message(&err));
+            }
+        }
+        if let Some(index) =
+            selected.and_then(|id| self.ticket_rows.iter().position(|t| t.id == id))
+        {
+            self.ticket_index = index;
+        }
+        self.ticket_index = self
+            .ticket_index
+            .min(self.ticket_rows.len().saturating_sub(1));
     }
 
     fn key_add_path(&mut self, key: KeyEvent, mut input: String) -> Action {
@@ -236,17 +464,9 @@ impl App {
                 }
                 return Action::None;
             }
-            KeyCode::Backspace => {
-                input.pop();
+            _ => {
+                edit_text(&mut input, key);
             }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                input.push(c);
-            }
-            _ => {}
         }
         self.dialog = Some(Dialog::AddPath { input });
         Action::None
@@ -367,6 +587,23 @@ impl App {
             focus,
             note: Some(note),
         });
+    }
+}
+
+/// The typing of a one-line text field: Backspace erases the last character, and a character
+/// without Ctrl/Alt is appended. Returns true when the key changed the text.
+fn edit_text(text: &mut String, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Backspace => text.pop().is_some(),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            text.push(c);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -924,7 +1161,7 @@ mod tests {
         let (mut f, p) = with_one_project();
         assert_eq!(f.ch('r'), Action::None);
         match &f.app.dialog {
-            Some(Dialog::ConfirmRemove { project }) => assert_eq!(project.path, p),
+            Some(Dialog::ConfirmRemove { project, .. }) => assert_eq!(project.path, p),
             other => panic!("{other:?}"),
         }
     }
@@ -1022,6 +1259,435 @@ mod tests {
         assert_eq!(f.app.rows[0].availability, Availability::ConfigMissing);
         f.ch('n');
         assert_eq!(f.app.rows[0].availability, Availability::DirMissing);
+    }
+
+    // ---- tickets (NS-32) ----
+
+    /// Registers `rel` (with config) and opens its tickets.
+    fn with_tickets(rel: &str) -> (Fixture, PathBuf) {
+        let mut f = fixture();
+        let p = f.dir(rel, true);
+        f.add(p.to_str().unwrap());
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.app.screen, Screen::Tickets, "{:?}", f.status());
+        (f, p)
+    }
+
+    impl Fixture {
+        fn keys(&self) -> Vec<String> {
+            self.app.ticket_rows.iter().map(|t| t.key.clone()).collect()
+        }
+
+        fn all_tickets(&self) -> Vec<crate::tickets::Ticket> {
+            let id = self.app.project.as_ref().expect("a project is open").id;
+            self.app.db.list_tickets(id, true).unwrap()
+        }
+
+        /// Creates a ticket through the dialog: `a`, the title, Tab, the ID, Enter.
+        fn new_ticket(&mut self, title: &str, jira: &str) -> Action {
+            self.ch('a');
+            self.type_text(title);
+            self.key(KeyCode::Tab);
+            self.type_text(jira);
+            self.key(KeyCode::Enter)
+        }
+    }
+
+    #[test]
+    fn enter_and_right_open_the_tickets_of_an_available_project() {
+        for open in [KeyCode::Enter, KeyCode::Right] {
+            let mut f = fixture();
+            let p = f.dir("proj", true);
+            f.add(p.to_str().unwrap());
+            f.app.status = Some("x".into());
+            assert_eq!(f.key(open), Action::None);
+            assert_eq!(f.app.screen, Screen::Tickets);
+            assert_eq!(f.app.project.as_ref().unwrap().path, p);
+            assert_eq!(f.app.ticket_rows, []);
+            assert!(!f.app.show_hidden);
+            assert_eq!(f.status(), None);
+        }
+    }
+
+    #[test]
+    fn an_unavailable_project_does_not_open_and_says_why() {
+        for dir_missing in [true, false] {
+            let (mut f, p) = with_one_project();
+            let mark = if dir_missing {
+                fs::remove_dir_all(&p).unwrap();
+                "[indisponível: pasta não encontrada]"
+            } else {
+                fs::remove_file(projects::config_file(&p)).unwrap();
+                "[indisponível: sem .nick/nick.conf]"
+            };
+            for open in [KeyCode::Enter, KeyCode::Right] {
+                assert_eq!(f.key(open), Action::None);
+                assert_eq!(f.app.screen, Screen::Projects, "{mark}");
+                assert_eq!(f.app.project, None);
+                assert_eq!(
+                    f.status(),
+                    Some(
+                        format!(
+                            "Projeto indisponível: {mark}. Os tickets só abrem com a pasta \
+                             e o .nick/nick.conf no lugar."
+                        )
+                        .as_str()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enter_on_an_empty_projects_list_does_nothing() {
+        let mut f = fixture();
+        f.key(KeyCode::Enter);
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.app.screen, Screen::Projects);
+    }
+
+    #[test]
+    fn esc_and_left_go_back_to_the_projects_with_it_selected() {
+        for back in [KeyCode::Esc, KeyCode::Left] {
+            let mut f = fixture();
+            let a = f.dir("a", true);
+            let b = f.dir("b", true);
+            f.add(a.to_str().unwrap());
+            f.add(b.to_str().unwrap());
+            assert_eq!(f.app.project_index, 1);
+            f.key(KeyCode::Enter);
+            f.ch('f');
+            assert!(f.app.show_hidden);
+            assert_eq!(f.key(back), Action::None);
+            assert_eq!(f.app.screen, Screen::Projects);
+            assert_eq!(f.app.project_index, 1, "b is still selected");
+            assert!(!f.app.show_hidden, "the filter is off again");
+            assert_eq!(f.app.project, None);
+        }
+    }
+
+    #[test]
+    fn a_opens_the_new_ticket_dialog_on_the_title() {
+        let (mut f, _) = with_tickets("proj");
+        assert_eq!(f.ch('a'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::NewTicket {
+                title: String::new(),
+                jira_id: String::new(),
+                focus: TicketField::Title,
+            })
+        );
+    }
+
+    #[test]
+    fn tab_shift_tab_up_down_switch_the_field_and_typing_goes_to_it() {
+        let (mut f, _) = with_tickets("proj");
+        f.ch('a');
+        f.type_text("Tq");
+        f.key(KeyCode::Tab);
+        f.type_text("NS-1");
+        f.key(KeyCode::BackTab);
+        f.type_text("x");
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Backspace);
+        f.key(KeyCode::Up);
+        let alt = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+        f.app.handle_key(alt);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::NewTicket {
+                title: "Tqx".into(),
+                jira_id: "NS-".into(),
+                focus: TicketField::Title,
+            })
+        );
+    }
+
+    #[test]
+    fn enter_creates_from_either_field_and_selects_the_new_ticket() {
+        let (mut f, _) = with_tickets("proj");
+        assert_eq!(f.new_ticket("Primeiro", "NS-1"), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some("Ticket criado: NS-1 — Primeiro."));
+        // Enter on the title field also confirms.
+        f.ch('a');
+        f.type_text("Segundo");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.keys().len(), 2);
+        assert_eq!(f.app.ticket_index, 1, "the new one is selected");
+        let second = &f.app.ticket_rows[1];
+        assert!(second.is_provisional);
+        assert_eq!(
+            f.status(),
+            Some(format!("Ticket criado com o ID provisório {}: Segundo.", second.key).as_str())
+        );
+    }
+
+    #[test]
+    fn esc_cancels_the_new_ticket_and_stores_nothing() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("fica", "NS-1");
+        f.ch('a');
+        f.type_text("abandonado");
+        f.key(KeyCode::Tab);
+        f.type_text("NS-2");
+        f.app.status = Some("x".into());
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), None);
+        assert_eq!(f.all_tickets().len(), 1);
+    }
+
+    #[test]
+    fn refusals_keep_the_dialog_with_what_was_typed() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("a", "NS-1");
+        let cases = [
+            ("   ", "NS-2", "Informe o título do ticket."),
+            ("b", "a/b", crate::tickets::INVALID_ID_MESSAGE),
+            (
+                "b",
+                "NS-1",
+                "Já existe um ticket com o ID NS-1 neste projeto.",
+            ),
+        ];
+        for (title, jira, message) in cases {
+            f.new_ticket(title, jira);
+            assert_eq!(f.status(), Some(message), "{title:?} {jira:?}");
+            assert_eq!(
+                f.app.dialog,
+                Some(Dialog::NewTicket {
+                    title: title.into(),
+                    jira_id: jira.into(),
+                    focus: TicketField::JiraId,
+                })
+            );
+            f.key(KeyCode::Esc);
+        }
+        assert_eq!(f.all_tickets().len(), 1);
+    }
+
+    #[test]
+    fn e_edits_the_title_prefilled_and_validates_it() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("Velho", "NS-1");
+        let ticket = f.app.ticket_rows[0].clone();
+        assert_eq!(f.ch('e'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::EditTitle {
+                ticket: ticket.clone(),
+                input: "Velho".into(),
+            })
+        );
+        for _ in 0.."Velho".len() {
+            f.key(KeyCode::Backspace);
+        }
+        f.type_text(" ");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Informe o título do ticket."));
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::EditTitle {
+                ticket: ticket.clone(),
+                input: " ".into(),
+            })
+        );
+        f.type_text("Novo q");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some("Título atualizado: NS-1."));
+        assert_eq!(f.app.ticket_rows[0].title, "Novo q");
+        assert_eq!(f.app.ticket_rows[0].key, "NS-1");
+        // Esc cancels without saving.
+        f.ch('e');
+        f.type_text("zzz");
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.ticket_rows[0].title, "Novo q");
+    }
+
+    #[test]
+    fn e_and_o_on_an_empty_list_do_nothing() {
+        let (mut f, _) = with_tickets("proj");
+        for c in ['e', 'o'] {
+            assert_eq!(f.ch(c), Action::None);
+            assert_eq!(f.app.dialog, None);
+        }
+    }
+
+    #[test]
+    fn o_asks_and_only_s_hides() {
+        for (key, hidden) in [
+            (KeyCode::Char('s'), true),
+            (KeyCode::Char('S'), true),
+            (KeyCode::Char('n'), false),
+            (KeyCode::Enter, false),
+            (KeyCode::Esc, false),
+            (KeyCode::Char('q'), false),
+        ] {
+            let (mut f, _) = with_tickets("proj");
+            f.new_ticket("t", "NS-1");
+            let ticket = f.app.ticket_rows[0].clone();
+            assert_eq!(f.ch('o'), Action::None);
+            assert_eq!(f.app.dialog, Some(Dialog::ConfirmHide { ticket }));
+            assert_eq!(f.key(key), Action::None, "{key:?}");
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(f.all_tickets()[0].hidden_at.is_some(), hidden, "{key:?}");
+            assert_eq!(f.keys().is_empty(), hidden, "{key:?}");
+            if hidden {
+                assert_eq!(
+                    f.status(),
+                    Some(
+                        "Ticket ocultado: NS-1. Ele continua no banco e pode ser restaurado \
+                         (f mostra os ocultos)."
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f_shows_the_hidden_ones_and_o_restores_without_asking() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("a", "NS-1");
+        f.new_ticket("b", "NS-2");
+        f.app.ticket_index = 0;
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.keys(), ["NS-2"]);
+        assert_eq!(f.ch('f'), Action::None);
+        assert!(f.app.show_hidden);
+        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+        f.app.ticket_index = 0;
+        assert_eq!(f.ch('o'), Action::None);
+        assert_eq!(f.app.dialog, None, "no confirmation to restore");
+        assert_eq!(f.status(), Some("Ticket restaurado: NS-1."));
+        assert!(f.all_tickets().iter().all(|t| t.hidden_at.is_none()));
+        assert_eq!(f.ch('f'), Action::None);
+        assert!(!f.app.show_hidden);
+        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+    }
+
+    #[test]
+    fn up_down_move_within_the_tickets() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("a", "A");
+        f.new_ticket("b", "B");
+        assert_eq!(f.app.ticket_index, 1);
+        f.key(KeyCode::Down);
+        assert_eq!(f.app.ticket_index, 1, "stops at the last");
+        f.key(KeyCode::Up);
+        f.ch('k');
+        assert_eq!(f.app.ticket_index, 0, "stops at the first");
+        f.ch('j');
+        assert_eq!(f.app.ticket_index, 1);
+    }
+
+    #[test]
+    fn hiding_the_last_ticket_keeps_the_selection_in_range() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("a", "A");
+        f.new_ticket("b", "B");
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.app.ticket_index, 0);
+        assert_eq!(f.keys(), ["A"]);
+    }
+
+    #[test]
+    fn q_quits_the_tickets_list_but_not_its_dialogs() {
+        for c in ['q', 'Q'] {
+            let (mut f, _) = with_tickets("proj");
+            assert_eq!(f.ch(c), Action::Quit);
+        }
+        let (mut f, _) = with_tickets("proj");
+        f.ch('a');
+        assert_eq!(f.ch('q'), Action::None);
+        f.key(KeyCode::Tab);
+        assert_eq!(f.ch('Q'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::NewTicket {
+                title: "q".into(),
+                jira_id: "Q".into(),
+                focus: TicketField::JiraId,
+            })
+        );
+        f.key(KeyCode::Enter);
+        f.ch('e');
+        assert_eq!(f.ch('q'), Action::None);
+        assert!(matches!(f.app.dialog, Some(Dialog::EditTitle { .. })));
+        f.key(KeyCode::Esc);
+        f.ch('o');
+        assert_eq!(f.ch('q'), Action::None, "it cancels the confirmation");
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_tickets_and_every_dialog() {
+        let (mut f, _) = with_tickets("proj");
+        assert_eq!(f.ctrl_c(), Action::Quit);
+        f.ch('a');
+        assert_eq!(f.ctrl_c(), Action::Quit);
+        f.type_text("t");
+        f.key(KeyCode::Enter);
+        f.ch('e');
+        assert_eq!(f.ctrl_c(), Action::Quit);
+        f.key(KeyCode::Esc);
+        f.ch('o');
+        assert_eq!(f.ctrl_c(), Action::Quit);
+    }
+
+    #[test]
+    fn the_tickets_of_a_project_do_not_show_in_another() {
+        let mut f = fixture();
+        let a = f.dir("a", true);
+        let b = f.dir("b", true);
+        f.add(a.to_str().unwrap());
+        f.add(b.to_str().unwrap());
+        f.app.project_index = 0;
+        f.key(KeyCode::Enter);
+        f.new_ticket("de a", "NS-1");
+        f.key(KeyCode::Esc);
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.project.as_ref().unwrap().path, b);
+        assert_eq!(f.keys(), Vec::<String>::new());
+        f.new_ticket("de b", "NS-1");
+        assert_eq!(
+            f.status(),
+            Some("Ticket criado: NS-1 — de b."),
+            "same ID is fine"
+        );
+        assert_eq!(f.app.ticket_rows[0].title, "de b");
+    }
+
+    #[test]
+    fn the_removal_confirmation_counts_the_tickets_and_removes_them() {
+        let (mut f, _) = with_tickets("proj");
+        f.new_ticket("a", "NS-1");
+        f.new_ticket("b", "NS-2");
+        f.ch('o');
+        f.ch('s');
+        let id = f.app.project.as_ref().unwrap().id;
+        f.key(KeyCode::Esc);
+        f.ch('r');
+        match &f.app.dialog {
+            Some(Dialog::ConfirmRemove { tickets, .. }) => assert_eq!(*tickets, 2),
+            other => panic!("{other:?}"),
+        }
+        f.ch('s');
+        assert_eq!(f.stored(), Vec::<PathBuf>::new());
+        assert_eq!(f.app.db.count_tickets(id).unwrap(), 0);
+        // Without tickets, the count is 0.
+        let (mut f, _) = with_one_project();
+        f.ch('r');
+        match &f.app.dialog {
+            Some(Dialog::ConfirmRemove { tickets, .. }) => assert_eq!(*tickets, 0),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

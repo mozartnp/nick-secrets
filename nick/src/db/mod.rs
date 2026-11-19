@@ -9,7 +9,7 @@ pub mod migrations;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, ErrorCode, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 
 /// How long a statement waits for another nick that is writing to the same database before
 /// giving up with "database is locked" (the only transient error of SQLite).
@@ -70,6 +70,35 @@ pub struct Project {
     pub name: String,
     pub path: PathBuf,
     pub created_at: String,
+}
+
+/// A ticket of a project, as stored (migration 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ticket {
+    pub id: i64,
+    pub project_id: i64,
+    /// The Jira ID, or the provisional short UUID.
+    pub key: String,
+    pub is_provisional: bool,
+    pub title: String,
+    pub created_at: String,
+    /// When it was hidden; None while visible.
+    pub hidden_at: Option<String>,
+}
+
+/// The columns of a ticket, in the order of `ticket_from_row`.
+const TICKET_COLUMNS: &str = "id, project_id, key, is_provisional, title, created_at, hidden_at";
+
+fn ticket_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ticket> {
+    Ok(Ticket {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        key: row.get(2)?,
+        is_provisional: row.get(3)?,
+        title: row.get(4)?,
+        created_at: row.get(5)?,
+        hidden_at: row.get(6)?,
+    })
 }
 
 /// True when the error is the UNIQUE constraint (a project already registered in the module).
@@ -185,17 +214,101 @@ impl Db {
         )
     }
 
-    /// Deletes the project row. Nothing else: the files of the project are never touched.
+    /// Deletes the project row (its tickets go with it: ON DELETE CASCADE). Nothing else: the
+    /// files of the project are never touched.
     pub fn delete_project(&self, id: i64) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    /// The tickets of the project, in the order they were created; the hidden ones only when
+    /// `include_hidden`.
+    pub fn list_tickets(
+        &self,
+        project_id: i64,
+        include_hidden: bool,
+    ) -> rusqlite::Result<Vec<Ticket>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TICKET_COLUMNS} FROM tickets \
+             WHERE project_id = ?1 AND (?2 OR hidden_at IS NULL) ORDER BY id"
+        ))?;
+        stmt.query_map(params![project_id, include_hidden], ticket_from_row)?
+            .collect()
+    }
+
+    /// Whether the project has a ticket with `key`: None if not, Some(hidden) if it has.
+    pub fn find_ticket_key(&self, project_id: i64, key: &str) -> rusqlite::Result<Option<bool>> {
+        self.conn
+            .query_row(
+                "SELECT hidden_at IS NOT NULL FROM tickets WHERE project_id = ?1 AND key = ?2",
+                params![project_id, key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Stores a ticket of the project and returns it. A key the project already has fails
+    /// with the UNIQUE constraint (see `is_unique_violation`).
+    pub fn insert_ticket(
+        &self,
+        project_id: i64,
+        key: &str,
+        is_provisional: bool,
+        title: &str,
+    ) -> rusqlite::Result<Ticket> {
+        self.conn.query_row(
+            &format!(
+                "INSERT INTO tickets (project_id, key, is_provisional, title, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) \
+                 RETURNING {TICKET_COLUMNS}"
+            ),
+            params![project_id, key, is_provisional, title],
+            ticket_from_row,
+        )
+    }
+
+    /// A provisional short ID: 8 lowercase hex characters from SQLite's randomblob (plan D2;
+    /// no crate for it). Unique only by the UNIQUE constraint of the insert.
+    pub fn random_short_id(&self) -> rusqlite::Result<String> {
+        self.conn
+            .query_row("SELECT lower(hex(randomblob(4)))", [], |row| row.get(0))
+    }
+
+    /// Changes only the title of the ticket.
+    /// `false` when the ticket is no longer in the database (nothing changed).
+    pub fn update_ticket_title(&self, id: i64, title: &str) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tickets SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Hides the ticket (hidden_at = now) or shows it again (hidden_at = NULL). `false` when
+    /// the ticket is no longer in the database (nothing changed).
+    pub fn set_ticket_hidden(&self, id: i64, hidden: bool) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tickets SET hidden_at = \
+             CASE WHEN ?2 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END WHERE id = ?1",
+            params![id, hidden],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// How many tickets the project has, the hidden ones included.
+    pub fn count_tickets(&self, project_id: i64) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT count(*) FROM tickets WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::migrations::{MIGRATION_1, MIGRATIONS};
+    use super::migrations::{MIGRATION_1, MIGRATION_2, MIGRATIONS};
     use super::*;
 
     fn user_version(conn: &Connection) -> u32 {
@@ -227,12 +340,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_1_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_2_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 1);
+        assert_eq!(user_version(db.connection()), 2);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -241,10 +354,10 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_has_only_modules_and_projects() {
+    fn the_schema_has_only_modules_projects_and_tickets() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("nick.db")).unwrap();
-        assert_eq!(tables(db.connection()), ["modules", "projects"]);
+        assert_eq!(tables(db.connection()), ["modules", "projects", "tickets"]);
     }
 
     #[test]
@@ -256,7 +369,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 1);
+        assert_eq!(user_version(db.connection()), 2);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -303,7 +416,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 7, mais nova que a deste nick (1). \
+                "Erro: o banco {} está na versão 7, mais nova que a deste nick (2). \
                  Atualize o nick.",
                 path.display()
             )
@@ -321,22 +434,27 @@ mod tests {
     fn a_failing_migration_leaves_nothing_applied() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
-        // The 2nd migration fails in its 2nd statement: its 1st statement must be undone.
+        // The 3rd migration fails in its 2nd statement: its 1st statement must be undone.
         let broken = [
             MIGRATION_1,
+            MIGRATION_2,
             "CREATE TABLE half (x); INSERT INTO nope VALUES (1);",
         ];
         let err = Db::open_with(&path, &broken).err().expect("it fails");
         assert!(
             err.to_string().starts_with(&format!(
-                "Erro: não consegui atualizar o banco do nick {} para a versão 2: ",
+                "Erro: não consegui atualizar o banco do nick {} para a versão 3: ",
                 path.display()
             )),
             "{err}"
         );
         let conn = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&conn), 1, "migration 1 stays, 2 does not");
-        assert_eq!(tables(&conn), ["modules", "projects"]);
+        assert_eq!(
+            user_version(&conn),
+            2,
+            "migrations 1 and 2 stay, 3 does not"
+        );
+        assert_eq!(tables(&conn), ["modules", "projects", "tickets"]);
     }
 
     #[test]
@@ -373,7 +491,7 @@ mod tests {
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            1,
+            2,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -396,6 +514,286 @@ INSERT INTO modules (key, name) VALUES ('auto_scrum', 'auto_scrum');
 "
         );
         assert_eq!(MIGRATIONS[0], MIGRATION_1);
+        assert_eq!(
+            MIGRATION_2,
+            "\
+CREATE TABLE tickets (
+    id             INTEGER PRIMARY KEY,
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,     -- the Jira ID, or the provisional short UUID
+    is_provisional INTEGER NOT NULL CHECK (is_provisional IN (0, 1)),
+    title          TEXT NOT NULL CHECK (trim(title) <> ''),
+    created_at     TEXT NOT NULL,     -- RFC 3339, in UTC
+    hidden_at      TEXT,              -- RFC 3339, in UTC; NULL while visible
+    UNIQUE (project_id, key)
+);
+"
+        );
+        assert_eq!(MIGRATIONS[1], MIGRATION_2);
+    }
+
+    // ---- migration 2: tickets ----
+
+    /// Inserts a ticket row by hand (the schema tests check the constraints, not the queries).
+    fn raw_ticket(
+        conn: &Connection,
+        project_id: i64,
+        key: &str,
+        provisional: i64,
+        title: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO tickets (project_id, key, is_provisional, title, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'now')",
+            params![project_id, key, provisional, title],
+        )
+    }
+
+    fn ticket_keys(conn: &Connection) -> Vec<(i64, String)> {
+        let mut stmt = conn
+            .prepare("SELECT project_id, key FROM tickets ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_version_1_database_with_projects_migrates_to_2_and_keeps_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (a, b) = {
+            let old = Db::open_with(&path, &[MIGRATION_1]).unwrap();
+            assert_eq!(user_version(old.connection()), 1);
+            assert_eq!(tables(old.connection()), ["modules", "projects"]);
+            (
+                old.insert_project("auto_scrum", "a", "/a").unwrap(),
+                old.insert_project("auto_scrum", "b", "/b").unwrap(),
+            )
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(db.connection()), 2);
+        assert_eq!(tables(db.connection()), ["modules", "projects", "tickets"]);
+        assert_eq!(db.list_projects("auto_scrum").unwrap(), [a.clone(), b]);
+        raw_ticket(db.connection(), a.id, "NS-1", 0, "t").unwrap();
+    }
+
+    #[test]
+    fn a_ticket_of_a_missing_project_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        assert!(raw_ticket(db.connection(), 99, "NS-1", 0, "t").is_err());
+        assert_eq!(ticket_keys(db.connection()), []);
+    }
+
+    #[test]
+    fn the_key_is_unique_per_project_only_and_case_sensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
+        let conn = db.connection();
+        raw_ticket(conn, a.id, "NS-1", 0, "t").unwrap();
+        let dup = raw_ticket(conn, a.id, "NS-1", 1, "outro").unwrap_err();
+        assert!(is_unique_violation(&dup), "{dup:?}");
+        raw_ticket(conn, b.id, "NS-1", 0, "t").unwrap();
+        raw_ticket(conn, a.id, "ns-1", 0, "t").unwrap();
+        assert_eq!(
+            ticket_keys(conn),
+            [
+                (a.id, "NS-1".to_string()),
+                (b.id, "NS-1".to_string()),
+                (a.id, "ns-1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_title_and_is_provisional_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let conn = db.connection();
+        assert!(raw_ticket(conn, a.id, "K1", 0, "").is_err(), "empty title");
+        assert!(
+            raw_ticket(conn, a.id, "K2", 0, "   ").is_err(),
+            "blank title"
+        );
+        assert!(
+            raw_ticket(conn, a.id, "K3", 2, "t").is_err(),
+            "provisional 2"
+        );
+        assert!(
+            raw_ticket(conn, a.id, "K4", -1, "t").is_err(),
+            "provisional -1"
+        );
+        assert_eq!(ticket_keys(conn), []);
+        raw_ticket(conn, a.id, "K5", 1, "t").unwrap();
+        raw_ticket(conn, a.id, "K6", 0, "t").unwrap();
+        assert_eq!(ticket_keys(conn).len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_project_deletes_its_tickets_and_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
+        let conn = db.connection();
+        raw_ticket(conn, a.id, "A-1", 0, "t").unwrap();
+        raw_ticket(conn, a.id, "A-2", 1, "t").unwrap();
+        conn.execute("UPDATE tickets SET hidden_at = 'x' WHERE key = 'A-2'", [])
+            .unwrap();
+        raw_ticket(conn, b.id, "B-1", 0, "t").unwrap();
+        db.delete_project(a.id).unwrap();
+        assert_eq!(ticket_keys(conn), [(b.id, "B-1".to_string())]);
+    }
+
+    // ---- the queries of the tickets ----
+
+    fn assert_rfc3339_utc(date: &str) {
+        let bytes = date.as_bytes();
+        assert_eq!(bytes.len(), 20, "{date}");
+        assert_eq!(
+            (
+                bytes[4], bytes[7], bytes[10], bytes[13], bytes[16], bytes[19]
+            ),
+            (b'-', b'-', b'T', b':', b':', b'Z'),
+            "{date}"
+        );
+    }
+
+    fn keys(tickets: &[Ticket]) -> Vec<&str> {
+        tickets.iter().map(|t| t.key.as_str()).collect()
+    }
+
+    #[test]
+    fn insert_ticket_returns_the_stored_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let p = db.insert_project("auto_scrum", "p", "/p").unwrap();
+        let t = db.insert_ticket(p.id, "NS-1", false, "Primeiro").unwrap();
+        assert_eq!(t.project_id, p.id);
+        assert_eq!(t.key, "NS-1");
+        assert!(!t.is_provisional);
+        assert_eq!(t.title, "Primeiro");
+        assert_eq!(t.hidden_at, None);
+        assert_rfc3339_utc(&t.created_at);
+        let u = db.insert_ticket(p.id, "3f9a0c7e", true, "Segundo").unwrap();
+        assert!(u.is_provisional);
+        assert_eq!(db.list_tickets(p.id, false).unwrap(), [t, u]);
+        let dup = db.insert_ticket(p.id, "NS-1", false, "x").unwrap_err();
+        assert!(is_unique_violation(&dup), "{dup:?}");
+    }
+
+    #[test]
+    fn list_tickets_is_by_creation_of_that_project_and_hides_the_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
+        db.insert_ticket(a.id, "Z-9", false, "z").unwrap();
+        db.insert_ticket(b.id, "B-1", false, "b").unwrap();
+        let hidden = db.insert_ticket(a.id, "A-1", false, "a").unwrap();
+        db.insert_ticket(a.id, "M-5", false, "m").unwrap();
+        db.set_ticket_hidden(hidden.id, true).unwrap();
+        assert_eq!(keys(&db.list_tickets(a.id, false).unwrap()), ["Z-9", "M-5"]);
+        assert_eq!(
+            keys(&db.list_tickets(a.id, true).unwrap()),
+            ["Z-9", "A-1", "M-5"]
+        );
+        assert_eq!(keys(&db.list_tickets(b.id, true).unwrap()), ["B-1"]);
+        assert_eq!(db.list_tickets(999, true).unwrap(), []);
+    }
+
+    #[test]
+    fn find_ticket_key_says_if_it_exists_and_if_it_is_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
+        db.insert_ticket(a.id, "V-1", false, "v").unwrap();
+        let h = db.insert_ticket(a.id, "H-1", false, "h").unwrap();
+        db.set_ticket_hidden(h.id, true).unwrap();
+        assert_eq!(db.find_ticket_key(a.id, "V-1").unwrap(), Some(false));
+        assert_eq!(db.find_ticket_key(a.id, "H-1").unwrap(), Some(true));
+        assert_eq!(db.find_ticket_key(a.id, "v-1").unwrap(), None);
+        assert_eq!(db.find_ticket_key(b.id, "V-1").unwrap(), None);
+    }
+
+    #[test]
+    fn update_ticket_title_changes_only_the_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let p = db.insert_project("auto_scrum", "p", "/p").unwrap();
+        let t = db.insert_ticket(p.id, "NS-1", false, "Velho").unwrap();
+        let other = db.insert_ticket(p.id, "NS-2", false, "Outro").unwrap();
+        db.update_ticket_title(t.id, "Novo").unwrap();
+        let expected = Ticket {
+            title: "Novo".into(),
+            ..t
+        };
+        assert_eq!(db.list_tickets(p.id, false).unwrap(), [expected, other]);
+    }
+
+    #[test]
+    fn set_ticket_hidden_stores_and_clears_the_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let p = db.insert_project("auto_scrum", "p", "/p").unwrap();
+        let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+        db.set_ticket_hidden(t.id, true).unwrap();
+        let hidden = db.list_tickets(p.id, true).unwrap().remove(0);
+        assert_rfc3339_utc(hidden.hidden_at.as_deref().expect("hidden_at is set"));
+        db.set_ticket_hidden(t.id, false).unwrap();
+        assert_eq!(db.list_tickets(p.id, false).unwrap(), [t]);
+    }
+
+    #[test]
+    fn the_ticket_updates_say_whether_the_row_still_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let p = db.insert_project("auto_scrum", "p", "/p").unwrap();
+        let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+        assert!(db.update_ticket_title(t.id, "Novo").unwrap());
+        assert!(db.set_ticket_hidden(t.id, true).unwrap());
+        assert!(db.set_ticket_hidden(t.id, false).unwrap());
+        db.delete_project(p.id).unwrap();
+        assert!(!db.update_ticket_title(t.id, "Outro").unwrap());
+        assert!(!db.set_ticket_hidden(t.id, true).unwrap());
+        assert!(!db.set_ticket_hidden(t.id, false).unwrap());
+    }
+
+    #[test]
+    fn count_tickets_counts_the_hidden_ones_of_that_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
+        assert_eq!(db.count_tickets(a.id).unwrap(), 0);
+        db.insert_ticket(a.id, "A-1", false, "t").unwrap();
+        let h = db.insert_ticket(a.id, "A-2", false, "t").unwrap();
+        db.set_ticket_hidden(h.id, true).unwrap();
+        db.insert_ticket(b.id, "B-1", false, "t").unwrap();
+        assert_eq!(db.count_tickets(a.id).unwrap(), 2);
+        assert_eq!(db.count_tickets(b.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn random_short_id_is_8_lowercase_hex_and_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let first = db.random_short_id().unwrap();
+        let second = db.random_short_id().unwrap();
+        for id in [&first, &second] {
+            assert_eq!(id.len(), 8, "{id}");
+            assert!(
+                id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+        }
+        assert_ne!(first, second);
     }
 
     #[test]

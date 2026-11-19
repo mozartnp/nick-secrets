@@ -915,6 +915,8 @@ jira_id_check() {
   printf -v quoted '%q' "$1"
   timeout 2 bash -c "source '$AUTO_SCRUM_SH'; t_out=\"\$(jira_id_valid $quoted 2>&1)\" && t_res=aceito || t_res=recusado; [ -z \"\$t_out\" ] || t_res=\"\$t_res|com saída\"; printf '%s' \"\$t_res\"" 2>/dev/null || true
 }
+# A casca nick (Rust) duplica esta regra: nick/src/tickets.rs, testes jira_id_valid_*. Mantenha
+# as duas listas de casos iguais (o teste diferencial de lá roda esta função em cada caso).
 for jira_ok in SC-123 24 ABC_1 v1.2; do
   assert_eq "aceito" "$(jira_id_check "$jira_ok")" "jira_id_valid aceita '$jira_ok', sem saída"
 done

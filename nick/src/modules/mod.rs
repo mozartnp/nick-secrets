@@ -1,5 +1,5 @@
-//! The modules of the nick. Each module defines its own hierarchy when it is designed; in
-//! this slice there is one, auto_scrum, which shows its projects.
+//! The modules of the nick. Each module defines its own hierarchy when it is designed; for
+//! now there is one, auto_scrum, which shows its projects and the tickets of each project.
 //! To add a module: a variant in `ModuleKind` (and in `ALL`), a migration that inserts it in
 //! the `modules` table, and a file in src/modules/. A plain enum with `match`, and not a
 //! trait object: with a single module, a trait would be an abstraction with no real reuse.

@@ -4,9 +4,10 @@ Ferramentas pessoais de automação do dia a dia.
 
 ## O programa `nick`
 
-`nick` é a casca das ferramentas: uma TUI (como o `htop`) que mostra os módulos do nick e os
-projetos de cada módulo. Por enquanto o único módulo é o auto_scrum, e a TUI só cadastra, mostra
-e remove projetos. O resto do fluxo continua no `auto_scrum.sh` (abaixo).
+`nick` é a casca das ferramentas: uma TUI (como o `htop`) que mostra os módulos do nick, os
+projetos de cada módulo e os tickets de cada projeto. Por enquanto o único módulo é o auto_scrum,
+e a TUI cadastra projetos e mantém a lista de tickets de cada um. O resto do fluxo continua no
+`auto_scrum.sh` (abaixo).
 
 Requisito: Rust ([rustup](https://rustup.rs)). Para instalar, rode na raiz do repositório:
 
@@ -21,7 +22,11 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   precisa ter `.nick/nick.conf`. Quando a pasta não tem o arquivo, a TUI oferece criá-lo pelo
   botão "Criar configuração", que roda o `bin/nick-init` na pasta do projeto. Também dá para rodar
   o `bin/nick-init` à mão antes de cadastrar. Remover um projeto só tira o cadastro do nick: nenhum
-  arquivo do projeto é apagado.
+  arquivo do projeto é apagado, mas os tickets dele saem do banco junto.
+- **Tickets:** abrem a partir de um projeto disponível (com a pasta e o `.nick/nick.conf` no
+  lugar). Cada ticket tem um título e o ID do Jira. Sem o ID, o nick gera um ID provisório. Um
+  ticket pode ser ocultado, sem sair do banco, e restaurado depois. Os tickets ficam só no banco
+  do nick: nenhuma ação sobre eles cria ou altera arquivo do projeto.
 - **Banco:** o cadastro fica num SQLite em `$XDG_STATE_HOME/nick/nick.db`, ou em
   `~/.local/state/nick/nick.db` quando `XDG_STATE_HOME` não está definida.
 - **Checkout:** o `nick` instalado usa o `bin/nick-init` do checkout de onde foi compilado. Se

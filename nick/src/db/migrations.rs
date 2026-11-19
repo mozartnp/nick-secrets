@@ -41,5 +41,24 @@ CREATE TABLE tickets (
 );
 ";
 
+/// Migration 3 (NS-33): the agents opened from each ticket. `stage` takes the same values as
+/// the `$TYPE` of auto_scrum.sh; `session_id` is the `claude --session-id`, chosen by the nick
+/// (a UUID v4, `Db::random_session_id`). `state` has no CHECK on purpose: the F5 adds states
+/// ("stopped", "archived"), and SQLite can't alter a CHECK without rebuilding the table, so the
+/// source of the states is the `AgentState` enum (agents.rs), the only writer of the column.
+/// The agents go with their ticket (ON DELETE CASCADE), which goes with its project.
+pub const MIGRATION_3: &str = "\
+CREATE TABLE agents (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    stage      TEXT NOT NULL
+               CHECK (stage IN ('po', 'tech_leader', 'development', 'review')),
+    session_id TEXT NOT NULL UNIQUE,   -- the claude --session-id, chosen by the nick
+    name       TEXT NOT NULL,          -- the claude --name: 'project · Stage · KEY'
+    opened_at  TEXT NOT NULL,          -- RFC 3339, in UTC
+    state      TEXT NOT NULL           -- 'active' or 'ended' (the F5 adds more)
+);
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
-pub const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2];
+pub const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3];

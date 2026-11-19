@@ -1,16 +1,24 @@
 //! The state of the TUI and its transitions by key, with no terminal I/O: `handle_key` takes a
-//! key and returns an `Action`, which the loop (main.rs, through `on_key`) carries out. The
-//! only action that runs bin/nick-init is `Action::RunInit`, and only the "Criar configuração"
-//! button of the missing-config alert produces it (plan D7). The navigation is Modules >
-//! Projects > Tickets; the rules of the tickets are in tickets.rs, and none of them touches a
-//! file of the project. The screen texts are in PT-BR, and drawing is ui.rs's job.
+//! key and returns an `Action`, which the loop (main.rs) carries out. The only action that runs
+//! bin/nick-init is `Action::RunInit`, and only the "Criar configuração" button of the
+//! missing-config alert produces it (plan D7 of NS-31). The navigation is Modules > Projects >
+//! Tickets; the rules of the tickets are in tickets.rs, and none of them touches a file of the
+//! project. From a ticket, `g` and a stage open an agent (NS-33): `Action::OpenAgent`, which
+//! the loop hands to `open_agent` with the real `AgentLauncher` (launch.rs); on the agent
+//! screen every key goes to the program (`Action::Send`). The screen texts are in PT-BR, and
+//! drawing is ui.rs's job.
 
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use crate::agents::{self, OpenAgent, Stage};
 use crate::db::Db;
 use crate::init::{InitOutcome, InitRunner};
+use crate::keys::{self, TermModes};
+use crate::launch::{self, AgentLauncher};
 use crate::modules::ModuleKind;
 use crate::projects::{self, Availability, Check, Project};
 use crate::tickets::{self, Ticket};
@@ -22,6 +30,8 @@ pub enum Screen {
     Projects,
     /// The tickets of the open project (`App::project`).
     Tickets,
+    /// The terminal of the running agent (`App::agent`), over the whole screen.
+    Agent,
 }
 
 /// The buttons of the missing-config alert.
@@ -63,6 +73,15 @@ pub enum Dialog {
     EditTitle { ticket: Ticket, input: String },
     /// The `(s/N)` confirmation of hiding a ticket.
     ConfirmHide { ticket: Ticket },
+    /// "Abrir agente": the stage of an agent for the ticket of the project at `project`
+    /// (`index` in `Stage::ALL`).
+    ChooseStage {
+        project: PathBuf,
+        ticket: Ticket,
+        index: usize,
+    },
+    /// Why no agent was opened (the launcher is missing, or its check failed).
+    AgentError { message: String },
 }
 
 /// What the loop must do after a key.
@@ -74,6 +93,45 @@ pub enum Action {
     RunInit {
         project: PathBuf,
     },
+    /// Open an agent of `stage` for `ticket`, with the cwd at `project` (the path in the
+    /// database); the loop calls `open_agent`.
+    OpenAgent {
+        project: PathBuf,
+        ticket: Ticket,
+        stage: Stage,
+    },
+    /// Write these bytes to the agent's terminal.
+    Send(Vec<u8>),
+    /// Scroll the agent's history one page up (into the history) or down.
+    ScrollPageUp,
+    ScrollPageDown,
+    /// Scroll the agent's history by lines (positive: up, into the history).
+    ScrollLines(i32),
+}
+
+/// Lines scrolled by one step of the mouse wheel, when the wheel scrolls the history.
+pub const WHEEL_LINES: i32 = 3;
+
+/// What the agent's program asked of its terminal, read from its screen by the loop before each
+/// input event: how keys, pastes and the mouse are encoded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentTerm {
+    pub modes: TermModes,
+    pub bracketed_paste: bool,
+    pub mouse_mode: MouseProtocolMode,
+    pub mouse_encoding: MouseProtocolEncoding,
+}
+
+/// The agent being run: its record (the active row and the lock) and what the screen shows.
+#[derive(Debug)]
+pub struct RunningAgent {
+    record: OpenAgent,
+    /// The `claude --name`.
+    pub name: String,
+    /// Whether it runs in the jail (the `jail=` of the check).
+    pub jail: bool,
+    /// What the check wrote on stderr, shown when the agent ends.
+    warning: Option<String>,
 }
 
 /// A project of the list with its availability, computed when the list is refreshed.
@@ -101,6 +159,13 @@ pub struct App {
     pub(crate) ticket_rows: Vec<Ticket>,
     /// The filter of the Tickets screen: the hidden ones are listed too.
     pub(crate) show_hidden: bool,
+    /// bin/nick-agent (launch.rs).
+    pub(crate) launcher: PathBuf,
+    /// Where the locks of the agents live (agents.rs); None until `with_agents`.
+    pub(crate) agents_dir: Option<PathBuf>,
+    /// The agent on the Agent screen.
+    pub(crate) agent: Option<RunningAgent>,
+    pub(crate) agent_term: AgentTerm,
 }
 
 impl App {
@@ -122,7 +187,39 @@ impl App {
             ticket_index: 0,
             ticket_rows: Vec::new(),
             show_hidden: false,
+            launcher: launch::launcher_path(),
+            agents_dir: None,
+            agent: None,
+            agent_term: AgentTerm::default(),
         }
+    }
+
+    /// The agents: `launcher` is the bin/nick-agent to run, and `agents_dir` the directory of
+    /// their locks (in the state directory).
+    pub fn with_agents(mut self, launcher: PathBuf, agents_dir: PathBuf) -> App {
+        self.launcher = launcher;
+        self.agents_dir = Some(agents_dir);
+        self
+    }
+
+    /// The screen on now.
+    pub fn screen(&self) -> Screen {
+        self.screen
+    }
+
+    /// The running agent, if any.
+    pub fn agent(&self) -> Option<&RunningAgent> {
+        self.agent.as_ref()
+    }
+
+    /// Sets what the agent's program asked of its terminal (the loop reads it from the screen).
+    pub fn set_agent_term(&mut self, term: AgentTerm) {
+        self.agent_term = term;
+    }
+
+    /// A message for the status bar (e.g. an error of the cleanup when the nick opens).
+    pub fn set_status(&mut self, message: String) {
+        self.status = Some(message);
     }
 
     /// The module of the Projects screen (the one selected on the Modules screen).
@@ -144,7 +241,13 @@ impl App {
                 self.after_init(outcome);
                 false
             }
-            Action::None => false,
+            // The agents are carried out by the loop (main.rs).
+            Action::None
+            | Action::OpenAgent { .. }
+            | Action::Send(_)
+            | Action::ScrollPageUp
+            | Action::ScrollPageDown
+            | Action::ScrollLines(_) => false,
         }
     }
 
@@ -152,6 +255,11 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;
+        }
+        // On the agent screen every key is the program's, Ctrl+C included: the terminal only
+        // closes when claude ends (the reserved shortcut is the F3b's).
+        if self.screen == Screen::Agent {
+            return self.key_agent(key);
         }
         // Ctrl+C quits from anywhere: raw mode delivers it as a key, and the operator can't
         // be stuck.
@@ -171,10 +279,17 @@ impl App {
             }) => self.key_new_ticket(key, title, jira_id, focus),
             Some(Dialog::EditTitle { ticket, input }) => self.key_edit_title(key, ticket, input),
             Some(Dialog::ConfirmHide { ticket }) => self.key_confirm_hide(key, ticket),
+            Some(Dialog::ChooseStage {
+                project,
+                ticket,
+                index,
+            }) => self.key_choose_stage(key, project, ticket, index),
+            Some(Dialog::AgentError { message }) => self.key_agent_error(key, message),
             None => match self.screen {
                 Screen::Modules => self.key_modules(key),
                 Screen::Projects => self.key_projects(key),
                 Screen::Tickets => self.key_tickets(key),
+                Screen::Agent => Action::None,
             },
         };
         // The availability is computed again after every action on the list (plan D9): not
@@ -185,7 +300,7 @@ impl App {
             match self.screen {
                 Screen::Projects => self.refresh(),
                 Screen::Tickets => self.refresh_tickets(),
-                Screen::Modules => {}
+                Screen::Modules | Screen::Agent => {}
             }
         }
         action
@@ -306,6 +421,7 @@ impl App {
                 }
             }
             KeyCode::Char('f') => self.show_hidden = !self.show_hidden,
+            KeyCode::Char('g') => self.choose_stage(),
             KeyCode::Esc | KeyCode::Left => {
                 self.screen = Screen::Projects;
                 self.project = None;
@@ -398,6 +514,217 @@ impl App {
             });
         }
         Action::None
+    }
+
+    /// `g` on a ticket: the stage dialog, only for a visible ticket of a project available now
+    /// (read from the disk at the key, like the Enter on a project).
+    fn choose_stage(&mut self) {
+        let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() else {
+            return;
+        };
+        if ticket.hidden_at.is_some() {
+            self.status = Some(format!(
+                "O ticket {} está oculto. Restaure-o (o) para abrir um agente.",
+                ticket.key
+            ));
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        if let Some(mark) = projects::unavailable_text(projects::availability(&project.path)) {
+            self.status = Some(format!(
+                "Projeto indisponível: {mark}. O agente só abre com a pasta e o \
+                 .nick/nick.conf no lugar."
+            ));
+            return;
+        }
+        self.dialog = Some(Dialog::ChooseStage {
+            project: project.path.clone(),
+            ticket,
+            index: 0,
+        });
+    }
+
+    fn key_choose_stage(
+        &mut self,
+        key: KeyEvent,
+        project: PathBuf,
+        ticket: Ticket,
+        mut index: usize,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => return Action::None,
+            KeyCode::Enter => {
+                return Action::OpenAgent {
+                    project,
+                    ticket,
+                    stage: Stage::ALL[index],
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => index = (index + 1).min(Stage::ALL.len() - 1),
+            _ => {}
+        }
+        self.dialog = Some(Dialog::ChooseStage {
+            project,
+            ticket,
+            index,
+        });
+        Action::None
+    }
+
+    fn key_agent_error(&mut self, key: KeyEvent, message: String) -> Action {
+        if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            self.dialog = Some(Dialog::AgentError { message });
+        }
+        Action::None
+    }
+
+    /// Opens an agent of `stage` for `ticket` with the cwd at `project` (plan D9): checks that
+    /// the launcher exists, runs its `--check` (a failure becomes the alert, and nothing is
+    /// stored nor launched), then generates the session ID and the name, takes the lock and
+    /// stores the `active` row (agents.rs), and only then starts the PTY. A failing start ends
+    /// the row and releases the lock.
+    pub fn open_agent(
+        &mut self,
+        project: &Path,
+        ticket: &Ticket,
+        stage: Stage,
+        launcher: &mut dyn AgentLauncher,
+    ) {
+        if !self.launcher.is_file() {
+            self.dialog = Some(Dialog::AgentError {
+                message: format!(
+                    "Não encontrei o bin/nick-agent em {}. Nada foi aberto.",
+                    self.launcher.display()
+                ),
+            });
+            return;
+        }
+        let check = match launcher.check(&self.launcher, project) {
+            Ok(check) => check,
+            Err(message) => {
+                // "Nada foi aberto." first: the error of the jail is long, and a short terminal
+                // cuts the end of the alert.
+                self.dialog = Some(Dialog::AgentError {
+                    message: format!("Nada foi aberto.\n\n{message}"),
+                });
+                return;
+            }
+        };
+        let project_name = self.project.as_ref().map_or("", |p| p.name.as_str());
+        let name = agents::agent_name(project_name, stage, &ticket.key);
+        let session_id = match self.db.random_session_id() {
+            Ok(id) => id,
+            Err(err) => {
+                self.status = Some(projects::db_error_message(&err));
+                return;
+            }
+        };
+        let Some(agents_dir) = self.agents_dir.as_deref() else {
+            self.status = Some("Não consegui abrir o agente: sem a pasta das travas.".into());
+            return;
+        };
+        let record = match agents::open(&self.db, agents_dir, ticket.id, stage, &session_id, &name)
+        {
+            Ok(record) => record,
+            Err(message) => {
+                self.status = Some(message);
+                return;
+            }
+        };
+        if let Err(err) = launcher.spawn(&self.launcher, project, &session_id, &name) {
+            let mut message = format!("Não consegui abrir o agente: {err}.");
+            if let Err(db) = agents::end(&self.db, record) {
+                message = format!("{message} {db}");
+            }
+            self.status = Some(message);
+            return;
+        }
+        self.agent = Some(RunningAgent {
+            record,
+            name,
+            jail: check.jail,
+            warning: check.warning,
+        });
+        self.agent_term = AgentTerm::default();
+        self.screen = Screen::Agent;
+        self.status = None;
+    }
+
+    /// The agent's program ended with `code`: the row becomes `ended` and the lock goes
+    /// (agents.rs), and the Tickets screen comes back with the same ticket selected and the
+    /// message of the end (plus the warning of the check, when there was one).
+    pub fn agent_ended(&mut self, code: u32) {
+        let Some(agent) = self.agent.take() else {
+            return;
+        };
+        let mut message = if code == 0 {
+            format!("O agente {} terminou.", agent.name)
+        } else {
+            format!("O agente {} terminou com o código {code}.", agent.name)
+        };
+        if let Some(warning) = &agent.warning {
+            let joined: Vec<&str> = warning.split_whitespace().collect();
+            message = format!("{message} Aviso da verificação: {}", joined.join(" "));
+        }
+        if let Err(err) = agents::end(&self.db, agent.record) {
+            message = format!("{message} {err}");
+        }
+        self.screen = Screen::Tickets;
+        self.agent_term = AgentTerm::default();
+        self.status = Some(message);
+        self.refresh_tickets();
+    }
+
+    /// Ends the record of the running agent without going back to a screen (the nick is
+    /// leaving: a signal). Returns the error of the database, if any.
+    pub fn end_agent_record(&mut self) -> Result<(), String> {
+        match self.agent.take() {
+            Some(agent) => agents::end(&self.db, agent.record),
+            None => Ok(()),
+        }
+    }
+
+    /// A key on the agent screen: Shift+PageUp/PageDown scroll the history; everything else
+    /// is encoded as an xterm would and sent to the program.
+    fn key_agent(&mut self, key: KeyEvent) -> Action {
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            match key.code {
+                KeyCode::PageUp => return Action::ScrollPageUp,
+                KeyCode::PageDown => return Action::ScrollPageDown,
+                _ => {}
+            }
+        }
+        keys::encode_key(&key, self.agent_term.modes).map_or(Action::None, Action::Send)
+    }
+
+    /// A paste: on the agent screen it goes to the program (bracketed and cleaned when the
+    /// program asked for it); elsewhere nothing (bracketed paste is only on there).
+    pub fn handle_paste(&mut self, text: &str) -> Action {
+        if self.screen != Screen::Agent {
+            return Action::None;
+        }
+        Action::Send(keys::encode_paste(text, self.agent_term.bracketed_paste))
+    }
+
+    /// A mouse event over `area` (the agent's terminal on the screen): to the program when it
+    /// asked for the mouse; otherwise the wheel scrolls the history and the rest is ignored.
+    pub fn handle_mouse(&mut self, event: &MouseEvent, area: Rect) -> Action {
+        if self.screen != Screen::Agent {
+            return Action::None;
+        }
+        let term = self.agent_term;
+        if term.mouse_mode != MouseProtocolMode::None {
+            return keys::encode_mouse(event, term.mouse_mode, term.mouse_encoding, area)
+                .map_or(Action::None, Action::Send);
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => Action::ScrollLines(WHEEL_LINES),
+            MouseEventKind::ScrollDown => Action::ScrollLines(-WHEEL_LINES),
+            _ => Action::None,
+        }
     }
 
     /// Reads the tickets of the open project again (with the hidden ones when the filter is
@@ -1696,5 +2023,455 @@ mod tests {
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         assert_eq!(f.app.handle_key(release), Action::None);
+    }
+
+    // ---- agents (NS-33) ----
+
+    use crate::agents::{self, Stage};
+    use crate::launch::{AgentLauncher, Precheck};
+
+    /// A fake launcher: records the calls and returns the scripted results.
+    struct FakeLauncher {
+        checks: Vec<(PathBuf, PathBuf)>,
+        spawns: Vec<(PathBuf, PathBuf, String, String)>,
+        check: Result<Precheck, String>,
+        spawn: Result<(), String>,
+    }
+
+    impl FakeLauncher {
+        fn new(jail: bool) -> FakeLauncher {
+            FakeLauncher {
+                checks: Vec::new(),
+                spawns: Vec::new(),
+                check: Ok(Precheck {
+                    jail,
+                    warning: None,
+                }),
+                spawn: Ok(()),
+            }
+        }
+    }
+
+    impl AgentLauncher for FakeLauncher {
+        fn check(&mut self, launcher: &Path, project: &Path) -> Result<Precheck, String> {
+            self.checks
+                .push((launcher.to_path_buf(), project.to_path_buf()));
+            self.check.clone()
+        }
+
+        fn spawn(
+            &mut self,
+            launcher: &Path,
+            project: &Path,
+            session_id: &str,
+            name: &str,
+        ) -> Result<(), String> {
+            self.spawns.push((
+                launcher.to_path_buf(),
+                project.to_path_buf(),
+                session_id.to_string(),
+                name.to_string(),
+            ));
+            self.spawn.clone()
+        }
+    }
+
+    /// A project `proj` with the tickets NS-1 and NS-2 open, and the agents wired: the
+    /// launcher at <root>/bin/nick-agent (a file) and the locks under <root>/state/agents.
+    fn with_agents() -> (Fixture, PathBuf) {
+        let (mut f, p) = with_tickets("proj");
+        f.new_ticket("Primeiro", "NS-1");
+        f.new_ticket("Segundo", "NS-2");
+        let launcher = f.root.join("bin/nick-agent");
+        fs::write(&launcher, "#!/usr/bin/env bash\n").unwrap();
+        f.app.launcher = launcher;
+        f.app.agents_dir = Some(f.root.join("state/agents"));
+        f.key(KeyCode::Up);
+        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+        (f, p)
+    }
+
+    impl Fixture {
+        fn agents_dir(&self) -> PathBuf {
+            self.root.join("state/agents")
+        }
+
+        /// (session_id, stage, name, state) of every agent row.
+        fn agent_rows(&self) -> Vec<(String, String, String, String)> {
+            let mut stmt = self
+                .app
+                .db
+                .connection()
+                .prepare("SELECT session_id, stage, name, state FROM agents ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        }
+
+        fn stage_index(&self) -> usize {
+            match &self.app.dialog {
+                Some(Dialog::ChooseStage { index, .. }) => *index,
+                other => panic!("not in the stage dialog: {other:?}"),
+            }
+        }
+
+        /// `g`, `Down` x `downs`, `Enter`: the OpenAgent action.
+        fn choose(&mut self, downs: usize) -> Action {
+            assert_eq!(self.ch('g'), Action::None);
+            for _ in 0..downs {
+                self.key(KeyCode::Down);
+            }
+            self.key(KeyCode::Enter)
+        }
+
+        /// Chooses the stage and carries out the action with `launcher`.
+        fn open_agent(&mut self, downs: usize, launcher: &mut FakeLauncher) {
+            let Action::OpenAgent {
+                project,
+                ticket,
+                stage,
+            } = self.choose(downs)
+            else {
+                panic!("no OpenAgent");
+            };
+            self.app.open_agent(&project, &ticket, stage, launcher);
+        }
+
+        fn alert(&self) -> String {
+            match &self.app.dialog {
+                Some(Dialog::AgentError { message }) => message.clone(),
+                other => panic!("not in the agent alert: {other:?}"),
+            }
+        }
+
+        fn mods(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Action {
+            self.app.handle_key(KeyEvent::new(code, modifiers))
+        }
+    }
+
+    #[test]
+    fn g_on_a_visible_ticket_opens_the_stage_dialog_and_the_arrows_move() {
+        let (mut f, _) = with_agents();
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.stage_index(), 0);
+        for (code, expected) in [
+            (KeyCode::Down, 1),
+            (KeyCode::Char('j'), 2),
+            (KeyCode::Down, 3),
+            (KeyCode::Down, 3),
+            (KeyCode::Up, 2),
+            (KeyCode::Char('k'), 1),
+            (KeyCode::Up, 0),
+            (KeyCode::Up, 0),
+        ] {
+            f.key(code);
+            assert_eq!(f.stage_index(), expected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn esc_cancels_the_stage_dialog_and_q_does_not_quit_it() {
+        let (mut f, _) = with_agents();
+        f.ch('g');
+        assert_eq!(f.ch('q'), Action::None);
+        assert_eq!(f.stage_index(), 0, "q stays in the dialog");
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.app.screen, Screen::Tickets);
+        f.ch('g');
+        assert_eq!(f.ctrl_c(), Action::Quit, "Ctrl+C quits, as in every dialog");
+        assert_eq!(f.agent_rows(), []);
+    }
+
+    #[test]
+    fn enter_returns_open_agent_with_the_project_path_the_ticket_and_the_stage() {
+        for (downs, stage) in Stage::ALL.into_iter().enumerate() {
+            let (mut f, p) = with_agents();
+            f.key(KeyCode::Down);
+            let ticket = f.app.ticket_rows[1].clone();
+            assert_eq!(
+                f.choose(downs),
+                Action::OpenAgent {
+                    project: p,
+                    ticket,
+                    stage
+                }
+            );
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(f.agent_rows(), [], "the action itself stores nothing");
+        }
+    }
+
+    #[test]
+    fn g_on_an_empty_list_does_nothing() {
+        let (mut f, _) = with_tickets("vazio");
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), None);
+    }
+
+    #[test]
+    fn g_on_a_hidden_ticket_says_to_restore_it() {
+        let (mut f, _) = with_agents();
+        f.ch('o');
+        f.ch('s');
+        f.ch('f');
+        assert_eq!(f.app.ticket_rows[0].key, "NS-1");
+        assert!(f.app.ticket_rows[0].hidden_at.is_some());
+        f.key(KeyCode::Up);
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some("O ticket NS-1 está oculto. Restaure-o (o) para abrir um agente.")
+        );
+    }
+
+    #[test]
+    fn g_on_an_unavailable_project_says_why() {
+        for dir_missing in [true, false] {
+            let (mut f, p) = with_agents();
+            let mark = if dir_missing {
+                fs::remove_dir_all(&p).unwrap();
+                "[indisponível: pasta não encontrada]"
+            } else {
+                fs::remove_file(projects::config_file(&p)).unwrap();
+                "[indisponível: sem .nick/nick.conf]"
+            };
+            assert_eq!(f.ch('g'), Action::None);
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(
+                f.status(),
+                Some(
+                    format!(
+                        "Projeto indisponível: {mark}. O agente só abre com a pasta e o \
+                         .nick/nick.conf no lugar."
+                    )
+                    .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn opening_runs_the_check_then_the_launch_and_stores_an_active_agent() {
+        let (mut f, p) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.open_agent(2, &mut launcher);
+        let bin = f.root.join("bin/nick-agent");
+        assert_eq!(launcher.checks, [(bin.clone(), p.clone())]);
+        assert_eq!(launcher.spawns.len(), 1);
+        let (spawned, project, session_id, name) = launcher.spawns[0].clone();
+        assert_eq!((spawned, project), (bin, p));
+        assert_eq!(name, "proj · Dev · NS-1");
+        assert_eq!(
+            f.agent_rows(),
+            [(
+                session_id.clone(),
+                "development".to_string(),
+                name.clone(),
+                "active".to_string()
+            )]
+        );
+        assert_eq!(f.app.screen, Screen::Agent);
+        assert_eq!(f.app.dialog, None);
+        let agent = f.app.agent.as_ref().expect("the running agent");
+        assert_eq!(agent.name, name);
+        assert!(!agent.jail);
+        let lock = agents::lock_path(&f.agents_dir(), &session_id);
+        let other = fs::File::open(&lock).unwrap();
+        assert!(other.try_lock().is_err(), "the lock is held while it runs");
+    }
+
+    #[test]
+    fn a_failing_check_shows_the_alert_and_opens_nothing() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        launcher.check = Err("Erro: a jail (ai-jail) não funciona nesta máquina.\nDetalhe".into());
+        f.open_agent(0, &mut launcher);
+        assert_eq!(
+            f.alert(),
+            "Nada foi aberto.\n\nErro: a jail (ai-jail) não funciona nesta máquina.\nDetalhe"
+        );
+        assert_eq!(launcher.checks.len(), 1);
+        assert_eq!(launcher.spawns, []);
+        assert_eq!(f.agent_rows(), []);
+        assert_eq!(f.app.screen, Screen::Tickets);
+        // q does not quit the alert; Esc and Enter close it.
+        assert_eq!(f.ch('q'), Action::None);
+        assert!(matches!(f.app.dialog, Some(Dialog::AgentError { .. })));
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn a_missing_launcher_shows_its_path_and_runs_nothing() {
+        let (mut f, _) = with_agents();
+        let bin = f.root.join("bin/nick-agent");
+        fs::remove_file(&bin).unwrap();
+        let mut launcher = FakeLauncher::new(false);
+        f.open_agent(0, &mut launcher);
+        assert_eq!(
+            f.alert(),
+            format!(
+                "Não encontrei o bin/nick-agent em {}. Nada foi aberto.",
+                bin.display()
+            )
+        );
+        assert_eq!(launcher.checks, []);
+        assert_eq!(launcher.spawns, []);
+        assert_eq!(f.agent_rows(), []);
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn a_failing_spawn_ends_the_row_and_releases_the_lock() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        launcher.spawn = Err("sem PTY".into());
+        f.open_agent(1, &mut launcher);
+        assert_eq!(f.status(), Some("Não consegui abrir o agente: sem PTY."));
+        assert_eq!(f.app.screen, Screen::Tickets);
+        assert!(f.app.agent.is_none());
+        let rows = f.agent_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "ended");
+        assert!(!agents::lock_path(&f.agents_dir(), &rows[0].0).exists());
+    }
+
+    fn running() -> (Fixture, FakeLauncher) {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.key(KeyCode::Down);
+        f.open_agent(1, &mut launcher);
+        assert_eq!(f.app.screen, Screen::Agent);
+        (f, launcher)
+    }
+
+    #[test]
+    fn on_the_agent_screen_every_key_goes_to_the_program() {
+        let (mut f, _) = running();
+        let send = |b: &[u8]| Action::Send(b.to_vec());
+        assert_eq!(f.ch('q'), send(b"q"));
+        assert_eq!(f.key(KeyCode::Esc), send(b"\x1b"));
+        assert_eq!(f.ctrl_c(), send(b"\x03"), "Ctrl+C does not quit the nick");
+        assert_eq!(
+            f.mods(KeyCode::BackTab, KeyModifiers::SHIFT),
+            send(b"\x1b[Z")
+        );
+        assert_eq!(f.key(KeyCode::Enter), send(b"\r"));
+        assert_eq!(f.ch('á'), send("á".as_bytes()));
+        assert_eq!(
+            f.mods(KeyCode::Char('4'), KeyModifiers::CONTROL),
+            send(b"\x1c")
+        );
+        assert_eq!(f.key(KeyCode::Up), send(b"\x1b[A"));
+        f.app.agent_term.modes.application_cursor = true;
+        assert_eq!(f.key(KeyCode::Up), send(b"\x1bOA"));
+        assert_eq!(f.app.screen, Screen::Agent);
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn shift_page_up_and_down_scroll_the_history() {
+        let (mut f, _) = running();
+        assert_eq!(
+            f.mods(KeyCode::PageUp, KeyModifiers::SHIFT),
+            Action::ScrollPageUp
+        );
+        assert_eq!(
+            f.mods(KeyCode::PageDown, KeyModifiers::SHIFT),
+            Action::ScrollPageDown
+        );
+        assert_eq!(f.key(KeyCode::PageUp), Action::Send(b"\x1b[5~".to_vec()));
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_program_through_encode_paste() {
+        let (mut f, _) = running();
+        assert_eq!(
+            f.app.handle_paste("x\x1b[201~rm"),
+            Action::Send(b"x\x1b[201~rm".to_vec())
+        );
+        f.app.agent_term.bracketed_paste = true;
+        assert_eq!(
+            f.app.handle_paste("x\x1b[201~rm"),
+            Action::Send(crate::keys::encode_paste("x\x1b[201~rm", true))
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_unless_the_program_asked_for_the_mouse() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let (mut f, _) = running();
+        let area = Rect::new(0, 1, 80, 20);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            f.app.handle_mouse(&wheel(MouseEventKind::ScrollUp), area),
+            Action::ScrollLines(3)
+        );
+        assert_eq!(
+            f.app.handle_mouse(&wheel(MouseEventKind::ScrollDown), area),
+            Action::ScrollLines(-3)
+        );
+        f.app.agent_term.mouse_mode = vt100::MouseProtocolMode::PressRelease;
+        f.app.agent_term.mouse_encoding = vt100::MouseProtocolEncoding::Sgr;
+        assert_eq!(
+            f.app.handle_mouse(&wheel(MouseEventKind::ScrollUp), area),
+            Action::Send(b"\x1b[<64;5;5M".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_end_of_the_agent_goes_back_to_the_ticket_with_the_message() {
+        for (code, message) in [
+            (0, "O agente proj · Tech Leader · NS-2 terminou."),
+            (
+                3,
+                "O agente proj · Tech Leader · NS-2 terminou com o código 3.",
+            ),
+        ] {
+            let (mut f, launcher) = running();
+            let session_id = launcher.spawns[0].2.clone();
+            f.app.agent_ended(code);
+            assert_eq!(f.app.screen, Screen::Tickets);
+            assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-2");
+            assert_eq!(f.status(), Some(message));
+            assert!(f.app.agent.is_none());
+            assert_eq!(f.agent_rows()[0].3, "ended");
+            assert!(!agents::lock_path(&f.agents_dir(), &session_id).exists());
+            // Back on the list, q quits again.
+            assert_eq!(f.ch('q'), Action::Quit);
+        }
+    }
+
+    #[test]
+    fn the_warning_of_the_check_shows_when_the_agent_ends() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        launcher.check = Ok(Precheck {
+            jail: false,
+            warning: Some("Aviso: falta chave.\n  X=\"\"".into()),
+        });
+        f.open_agent(0, &mut launcher);
+        assert_eq!(f.app.screen, Screen::Agent);
+        f.app.agent_ended(0);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · PO · NS-1 terminou. Aviso da verificação: Aviso: falta chave. X=\"\""
+            )
+        );
     }
 }

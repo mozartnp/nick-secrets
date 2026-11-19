@@ -34,6 +34,21 @@ pub fn fake_init() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin/nick-init")
 }
 
+/// The fake claude and ai-jail of the bin/nick-agent tests (bin/tests/fixtures/bin), the same
+/// ones the bash suite of the launcher uses.
+pub fn fake_bin() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/tests/fixtures/bin")
+}
+
+/// A PATH with the fakes first, then the PATH of whoever runs the tests.
+pub fn fake_path() -> String {
+    format!(
+        "{}:{}",
+        fake_bin().display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 /// The temporary world of a case: HOME, the XDG state directory and the marker of the fake
 /// init, under one canonical root that is removed at the end.
 pub struct World {
@@ -75,6 +90,71 @@ impl World {
             fs::write(dir.join(".nick/nick.conf"), "STACK_DESCRIPTION=\"\"\n").unwrap();
         }
         dir
+    }
+
+    /// A project directory with a complete `.nick/nick.conf` (every key empty, so no warning
+    /// of a missing key) plus `lines`.
+    pub fn project(&self, rel: &str, lines: &[&str]) -> PathBuf {
+        let dir = self.dir(rel, false);
+        fs::create_dir_all(dir.join(".nick")).unwrap();
+        let keys = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(
+                "source lib/config/config.sh; source lib/config/keys.sh; \
+                 config_register_nick_keys; printf '%s\\n' \"${CONFIG_KEYS[@]}\"",
+            )
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
+            .output()
+            .unwrap();
+        let mut conf = String::new();
+        for key in String::from_utf8(keys.stdout).unwrap().lines() {
+            if !lines.iter().any(|l| l.starts_with(&format!("{key}="))) {
+                conf.push_str(&format!("{key}=\"\"\n"));
+            }
+        }
+        for line in lines {
+            conf.push_str(line);
+            conf.push('\n');
+        }
+        fs::write(dir.join(".nick/nick.conf"), conf).unwrap();
+        dir
+    }
+
+    /// The directory of the agents' locks the binary will use.
+    pub fn agents_dir(&self) -> PathBuf {
+        self.state().join("nick/agents")
+    }
+
+    /// Every agent in the database, as (session_id, stage, name, state), in order.
+    pub fn agents(&self) -> Vec<(String, String, String, String)> {
+        if !self.db_path().exists() {
+            return Vec::new();
+        }
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        let mut stmt = db
+            .connection()
+            .prepare("SELECT session_id, stage, name, state FROM agents ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// Stores an `active` agent of the ticket `key` of the project at `dir`, through the library
+    /// (as a nick that died would leave it).
+    pub fn active_agent(&self, dir: &Path, key: &str, session_id: &str) {
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        let id = self.project_id(&db, dir);
+        let ticket = db
+            .list_tickets(id, true)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.key == key)
+            .unwrap();
+        db.insert_agent(ticket.id, "po", session_id, "x").unwrap();
     }
 
     /// Registers `dir` in the database the binary will use, through the library.
@@ -179,6 +259,8 @@ pub struct Nick {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output: Arc<Mutex<Vec<u8>>>,
     code: Option<u32>,
+    /// The size of the PTY now (rows, columns): `resize` changes it.
+    size: (u16, u16),
 }
 
 impl Nick {
@@ -234,6 +316,7 @@ impl Nick {
             writer,
             output,
             code: None,
+            size: (ROWS, COLS),
         }
     }
 
@@ -243,7 +326,7 @@ impl Nick {
     }
 
     fn parser(&self) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+        let mut parser = vt100::Parser::new(self.size.0, self.size.1, 0);
         parser.process(&self.output.lock().unwrap());
         parser
     }
@@ -323,6 +406,36 @@ impl Nick {
     /// The size of the PTY (keeps `master` used).
     pub fn size(&self) -> PtySize {
         self.master.get_size().unwrap()
+    }
+
+    /// Resizes the PTY (the nick gets SIGWINCH), and reads the screen at the new size.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        self.size = (rows, cols);
+    }
+
+    /// The pid of the nick.
+    pub fn pid(&self) -> i32 {
+        self.child.process_id().expect("the nick has a pid") as i32
+    }
+
+    /// Waits until `cond` holds; panics with the screen after the timeout.
+    pub fn wait_until(&self, what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        panic!("{what} never happened. Screen:\n{}", self.screen());
     }
 }
 

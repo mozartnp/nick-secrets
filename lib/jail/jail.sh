@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 #
 # jail.sh: runs the agent of a nick tool inside the ai-jail sandbox (akitaonrails/ai-jail:
-# bubblewrap + Landlock on Linux, sandbox-exec on macOS) — today only auto_scrum uses it. It is
+# bubblewrap + Landlock on Linux, sandbox-exec on macOS) — today auto_scrum and bin/nick-agent
+# use it. It is
 # opt-in per project through the JAIL_ENABLED key, a convention of the whole nick: each tool
 # registers that key in its own config (config_register_key, lib/config/config.sh) and passes
 # the value here; only "true" exactly turns the jail on. JAIL_CLIPBOARD, the same kind of
@@ -246,6 +247,25 @@ jail_nick_hosts() {
     done < "$JAIL_HOSTS_FILE"
   fi
   echo "$hosts"
+}
+
+# jail_mcp_hosts <jira_enabled> <sentry_enabled>: prints (one line, space separated) the hosts
+# of the remote MCP servers a project relies on, for the caller to pass to jail_check,
+# jail_options and jail_exec with its own extra hosts: ai-jail's default allowlist has neither.
+# Only "true" exactly turns each one on: <jira_enabled> adds mcp.atlassian.com and
+# <sentry_enabled> adds mcp.sentry.dev (the hosted servers; a self-hosted one is a project's
+# own extra host), in that order. The values come by parameter (a tool passes its JIRA_ENABLED
+# and SENTRY_ENABLED), never read from the caller's globals. Every nick tool that launches an
+# agent calls it, so the hosts can't diverge between them (auto_scrum.sh, bin/nick-agent).
+jail_mcp_hosts() {
+  local mcp_hosts=()
+  if [ "$1" = "true" ]; then
+    mcp_hosts+=(mcp.atlassian.com)
+  fi
+  if [ "$2" = "true" ]; then
+    mcp_hosts+=(mcp.sentry.dev)
+  fi
+  echo "${mcp_hosts[*]}"
 }
 
 # jail_host_valid <host>: returns 0 when <host> is a plain host name — lowercase letters,

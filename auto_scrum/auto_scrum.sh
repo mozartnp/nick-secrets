@@ -316,12 +316,11 @@ no plano.'
 # relies on, for lib/jail/jail.sh to release in the jail's network (--allow-host): ai-jail's
 # default allowlist has neither. JIRA_ENABLED="true" adds mcp.atlassian.com and
 # SENTRY_ENABLED="true" adds mcp.sentry.dev — the hosted servers; a self-hosted one goes in
-# JAIL_ALLOW_HOSTS (README). Without the jail, the list changes nothing.
+# JAIL_ALLOW_HOSTS (README). Without the jail, the list changes nothing. The list itself lives
+# in lib/ (jail_mcp_hosts), shared with bin/nick-agent (NS-33); this name stays as a thin call
+# because the tests and main() use it.
 mcp_jail_hosts() {
-  local hosts=()
-  [ "$JIRA_ENABLED" = "true" ] && hosts+=(mcp.atlassian.com)
-  [ "$SENTRY_ENABLED" = "true" ] && hosts+=(mcp.sentry.dev)
-  echo "${hosts[*]}"
+  jail_mcp_hosts "$JIRA_ENABLED" "$SENTRY_ENABLED"
 }
 
 # build_permission_blocks: assembles PERMISSION_BLOCK_PO from PERMISSION_ENABLED (set in

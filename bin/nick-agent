@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+#
+# nick-agent: opens the claude of one agent of the nick shell (NS-33) in the project of the cwd,
+# by the same launch path as auto_scrum.sh: the project config (.nick/nick.conf of the cwd,
+# through lib/config/), jail_check, claude_settings_load, jail_agent_notice and jail_exec of
+# lib/. The nick shell runs it as `bash <absolute path of this script> ...` with the cwd at the
+# project, first with --check outside the PTY and then, in the PTY, to launch:
+#   nick-agent --check
+#       only validates (the config and the jail), launching nothing and writing nothing in the
+#       project. On success prints one line on stdout, jail=true or jail=false (the effective
+#       value: true only with JAIL_ENABLED="true" exactly, the rule of jail_exec), and exits
+#       with 0; the warnings of config_load go to stderr and don't change the result. On
+#       failure, the message of the lib on stderr and exit 1.
+#   nick-agent --session-id <uuid> --name <name>
+#       the same checks, then config_dir_prepare (as auto_scrum does before launching),
+#       jail_print_status and jail_exec of claude with the deny/ask rules, the jail notice (only
+#       with the jail on), --session-id and --name. No --permission-mode and no prompt: the
+#       stages get their scripts in a later slice (F4).
+# The UUID format is not checked here (claude checks it; the nick always generates a valid one).
+# There is no variable that swaps this script nor any part of the path: the shell finds it by a
+# path fixed at build time, and this is the path that guarantees the jail and the rules.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The command that creates the project config in the cwd, absolute so the user can paste it from
+# the error message (the same message as auto_scrum's resolve_stack).
+AGENT_INIT_BIN="$SCRIPT_DIR/nick-init"
+# shellcheck source=SCRIPTDIR/../lib/config/config.sh
+source "$SCRIPT_DIR/../lib/config/config.sh"
+# shellcheck source=SCRIPTDIR/../lib/config/keys.sh
+source "$SCRIPT_DIR/../lib/config/keys.sh"
+# shellcheck source=SCRIPTDIR/../lib/jail/jail.sh
+source "$SCRIPT_DIR/../lib/jail/jail.sh"
+# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
+source "$SCRIPT_DIR/../lib/claude/claude.sh"
+
+# The keys of the config (lib/config/keys.sh). A bad registration stops the script on load
+# (set -e): it is a programming error.
+config_register_nick_keys
+
+# The keys this script reads, written by config_load (empty when the file lacks them; an
+# inherited environment variable of the same name never counts).
+JIRA_ENABLED=""
+SENTRY_ENABLED=""
+JAIL_ENABLED=""
+JAIL_CLIPBOARD=""
+JAIL_FORWARD_PORTS=""
+JAIL_ALLOW_HOSTS=""
+# The content of lib/claude/permissions.json (claude_settings_load). Never CLAUDE_*: Claude Code
+# reads CLAUDE_* from the environment.
+NICK_CLAUDE_SETTINGS=""
+# The extra hosts of the jail: the MCPs (jail_mcp_hosts) and then JAIL_ALLOW_HOSTS, the same
+# string auto_scrum.sh builds.
+AGENT_JAIL_HOSTS=""
+
+# usage_error <message>: the error and the usage on stderr, exit 1 (the pattern of bin/nick-init).
+usage_error() {
+  echo "Erro: $1" >&2
+  echo "Uso: nick-agent --check | --session-id <uuid> --name <nome>" >&2
+  exit 1
+}
+
+# load_and_check: the checks of both modes, in order — the old .nick.conf, the cwd config (the
+# message of auto_scrum's resolve_stack when it is missing), config_load, jail_check (the config
+# of the cwd is always the team's shared one) and claude_settings_load. Any failure exits with
+# 1, with the message of the lib on stderr.
+load_and_check() {
+  local cwd_config
+  config_cwd_legacy_check || exit 1
+  cwd_config="$(config_cwd_file)"
+  if [ ! -f "$cwd_config" ]; then
+    echo "Erro: não há configuração do projeto em $cwd_config. Rode na raiz do projeto: $AGENT_INIT_BIN" >&2
+    exit 1
+  fi
+  config_load "$cwd_config"
+  AGENT_JAIL_HOSTS="$(jail_mcp_hosts "$JIRA_ENABLED" "$SENTRY_ENABLED") $JAIL_ALLOW_HOSTS"
+  jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" "$cwd_config" "true" || exit 1
+  claude_settings_load NICK_CLAUDE_SETTINGS || exit 1
+}
+
+main() {
+  local session_id="" name="" claude_args
+  if [ "$#" -eq 0 ]; then
+    usage_error "informe --check ou --session-id <uuid> --name <nome>."
+  fi
+  if [ "$1" = "--check" ]; then
+    [ "$#" -eq 1 ] || usage_error "o --check não aceita outros argumentos."
+    load_and_check
+    if [ "$JAIL_ENABLED" = "true" ]; then
+      echo "jail=true"
+    else
+      echo "jail=false"
+    fi
+    exit 0
+  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --session-id | --name)
+        [ "$#" -ge 2 ] || usage_error "falta o valor de $1."
+        if [ "$1" = "--session-id" ]; then
+          session_id="$2"
+        else
+          name="$2"
+        fi
+        shift 2
+        ;;
+      --check) usage_error "o --check não aceita outros argumentos." ;;
+      *) usage_error "argumento desconhecido: '$1'" ;;
+    esac
+  done
+  [ -n "$session_id" ] || usage_error "informe o --session-id <uuid> (não vazio)."
+  [ -n "$name" ] || usage_error "informe o --name <nome> (não vazio)."
+
+  load_and_check
+  config_dir_prepare || exit 1
+  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
+  # The same argv as auto_scrum.sh, without the prompt and the --permission-mode of the Dev
+  # stage (bin/tests/test_nick_agent.sh compares both): the rules inline, the jail notice only
+  # with the jail on, then the session id and the name the nick chose.
+  claude_args=(--settings "$NICK_CLAUDE_SETTINGS")
+  if [ "$JAIL_ENABLED" = "true" ]; then
+    claude_args+=(--append-system-prompt "$(jail_agent_notice "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS")")
+  fi
+  claude_args+=(--session-id "$session_id" --name "$name")
+  jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

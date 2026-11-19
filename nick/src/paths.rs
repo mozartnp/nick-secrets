@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The file name of the database inside the state directory.
 pub const DB_FILE_NAME: &str = "nick.db";
@@ -49,6 +49,23 @@ pub fn create_state_dir(dir: &Path) -> io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
+}
+
+/// Removes `.` and `..` from an absolute path without touching the disk (the program it names
+/// may be missing, and the message then shows this path). Used for the paths fixed at build
+/// time: bin/nick-init (init.rs) and bin/nick-agent (launch.rs).
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Replaces every control character with `?`, so a path typed by the operator or a message
@@ -140,6 +157,18 @@ mod tests {
         let file = tmp.path().join("nick");
         std::fs::write(&file, "").unwrap();
         assert!(create_state_dir(&file).is_err());
+    }
+
+    #[test]
+    fn normalize_removes_dot_and_dot_dot_without_touching_the_disk() {
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d/../../bin/x")),
+            PathBuf::from("/a/bin/x")
+        );
+        assert_eq!(
+            normalize(Path::new("/nao/existe/../y")),
+            PathBuf::from("/nao/y")
+        );
     }
 
     #[test]

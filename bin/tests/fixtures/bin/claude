@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# Fake claude of the bin/nick-agent tests (NS-33), used by the bash suite
+# (bin/tests/test_nick_agent.sh) and by the Rust tests of the nick shell (nick/src/agent_session.rs
+# and nick/tests/agent.rs), in front of the PATH. It always writes its own argv (one argument per
+# line) to $FAKE_CLAUDE_LOG, its environment to $FAKE_CLAUDE_ENV and appends "claude" to
+# $FAKE_ORDER_LOG (each only if set). Then, by $FAKE_CLAUDE_MODE:
+#   (empty)  prints the marker OK in red (\e[31mOK\e[0m) and exits with 0;
+#   echo     puts the terminal in raw mode (as the real claude does), prints READY, reads
+#            $FAKE_CLAUDE_READ_BYTES bytes and prints each one in hexadecimal (GOT <hex>);
+#   paste    the same, but first turns bracketed paste on (ESC[?2004h) and reads until the end
+#            marker of a paste (ESC[201~), then prints every byte read (GOT <hex>);
+#   winsize  prints SIZE <rows> <columns> when it starts and on every SIGWINCH, until ended;
+#   flood    writes ~1 MB and, at the end, the marker FIM-DO-FLOOD, and exits with 0;
+#   sleep    leaves a sleep in the background (same process group, ignoring SIGHUP, to outlive
+#            the leader), appends "<pid> <pid of the sleep>" to $FAKE_CLAUDE_PIDS, prints READY
+#            and waits until it is ended; with FAKE_CLAUDE_IGNORE_TERM set, it ignores SIGTERM
+#            (and so does the sleep), so only a SIGKILL ends them;
+#   osc52    asks the terminal to copy "olá" (OSC 52, as claude does to copy), prints COPIADO
+#            and exits with 0;
+#   exit     prints BYE and exits with $FAKE_CLAUDE_EXIT (default 0).
+set -euo pipefail
+
+if [ -n "${FAKE_CLAUDE_LOG:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLAUDE_ENV:-}" ]; then
+  env > "$FAKE_CLAUDE_ENV"
+fi
+if [ -n "${FAKE_ORDER_LOG:-}" ]; then
+  echo "claude" >> "$FAKE_ORDER_LOG"
+fi
+
+case "${FAKE_CLAUDE_MODE:-}" in
+  echo)
+    stty raw -echo
+    printf 'READY\r\n'
+    got="$(dd bs=1 count="${FAKE_CLAUDE_READ_BYTES:-1}" 2> /dev/null | od -An -tx1 | tr -s ' \n' ' ')"
+    printf 'GOT%s\r\n' "$got"
+    sleep 0.5
+    ;;
+  paste)
+    stty raw -echo
+    printf '\033[?2004hREADY\r\n'
+    got=""
+    while :; do
+      byte="$(dd bs=1 count=1 2> /dev/null | od -An -tx1 | tr -d ' \n')"
+      [ -n "$byte" ] || break
+      got="$got $byte"
+      case "$got" in
+        *" 1b 5b 32 30 31 7e") break ;;
+      esac
+    done
+    printf 'GOT%s\r\n' "$got"
+    sleep 0.5
+    ;;
+  winsize)
+    trap 'echo "SIZE $(stty size)"' WINCH
+    echo "SIZE $(stty size)"
+    while :; do
+      sleep 0.05
+    done
+    ;;
+  flood)
+    head -c 1048576 /dev/zero | tr '\0' 'x'
+    printf '\r\nFIM-DO-FLOOD\r\n'
+    ;;
+  sleep)
+    if [ -n "${FAKE_CLAUDE_IGNORE_TERM:-}" ]; then
+      trap "" TERM
+    fi
+    (trap "" HUP && exec sleep 300) &
+    printf '%s %s\n' "$$" "$!" >> "$FAKE_CLAUDE_PIDS"
+    echo READY
+    wait
+    ;;
+  osc52)
+    printf '\033]52;c;b2zDoQ==\a'
+    printf 'COPIADO\r\n'
+    ;;
+  exit)
+    printf 'BYE\r\n'
+    exit "${FAKE_CLAUDE_EXIT:-0}"
+    ;;
+  *)
+    printf '\033[31mOK\033[0m\r\n'
+    ;;
+esac

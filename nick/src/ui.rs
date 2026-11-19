@@ -1,22 +1,37 @@
-//! Drawing the TUI with ratatui, with no business rule: everything comes from the `App` state.
-//! The texts are in PT-BR; every text that comes from the operator or the system goes through
-//! `paths::printable` (control characters become `?`).
+//! Drawing the TUI with ratatui, with no business rule: everything comes from the `App` state
+//! (and, on the agent screen, from the vt100 screen of the agent's terminal, drawn with
+//! tui-term). The texts are in PT-BR; every text that comes from the operator or the system
+//! goes through `paths::printable` (control characters become `?`).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use tui_term::widget::{Cursor, PseudoTerminal};
 
+use crate::agents::Stage;
 use crate::app::{App, Button, Dialog, Screen, TicketField};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects;
 
-/// Draws the whole screen: the list, then the status line and the help line of the current
-/// screen, and the open dialog over the list. The status and the help take the rows they need,
-/// word wrapped (up to a third of the screen each), so a long one is not cut.
+/// Draws the whole screen without an agent's terminal (see `draw_with_terminal`).
 pub fn draw(frame: &mut Frame, app: &App) {
+    draw_with_terminal(frame, app, None);
+}
+
+/// Draws the whole screen: on the agent screen, the header and `terminal` (the agent's vt100
+/// screen); otherwise the list, then the status line and the help line of the current screen,
+/// and the open dialog over the list. The status and the help take the rows they need, word
+/// wrapped (up to a third of the screen each), so a long one is not cut.
+pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100::Screen>) {
+    if app.screen == Screen::Agent {
+        if let Some(agent) = app.agent() {
+            draw_agent(frame, &agent.name, agent.jail, terminal);
+        }
+        return;
+    }
     let area = frame.area();
     let status_lines = app.status.as_deref().map_or_else(
         || vec![String::new()],
@@ -39,6 +54,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Modules => draw_modules(frame, app, body),
         Screen::Projects => draw_projects(frame, app, body),
         Screen::Tickets => draw_tickets(frame, app, body),
+        Screen::Agent => {}
     }
     if app.status.is_some() {
         let lines: Vec<Line> = status_lines.into_iter().map(Line::from).collect();
@@ -93,16 +109,59 @@ fn help_text(app: &App) -> &'static str {
         }
         (Some(Dialog::EditTitle { .. }), _) => "Enter confirmar · Esc cancelar",
         (Some(Dialog::ConfirmHide { .. }), _) => "s ocultar · qualquer outra tecla cancela",
+        (Some(Dialog::ChooseStage { .. }), _) => "↑/↓ escolher · Enter abrir · Esc cancelar",
+        (Some(Dialog::AgentError { .. }), _) => "Enter/Esc fechar",
         (None, Screen::Tickets) if app.show_hidden => {
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
-             Esc voltar · q sair"
+             g abrir agente · Esc voltar · q sair"
         }
         (None, Screen::Tickets) => {
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
-             Esc voltar · q sair"
+             g abrir agente · Esc voltar · q sair"
         }
+        // The agent screen has no help line: the whole screen is the terminal.
+        (None, Screen::Agent) => "",
         (None, Screen::Modules) => "↑/↓ mover · Enter abrir · q sair",
         (None, Screen::Projects) => "↑/↓ mover · a adicionar · r remover · Esc voltar · q sair",
+    }
+}
+
+/// The area of the agent's terminal inside the screen `area`: everything below the header
+/// row. The PTY gets this size (at least 2x2: agent_session.rs).
+pub fn agent_area(area: Rect) -> Rect {
+    Rect {
+        y: area.y + area.height.min(1),
+        height: area.height.saturating_sub(1),
+        ..area
+    }
+}
+
+/// The agent screen: one header row (the name, and whether it runs in the jail; out of it, the
+/// text of `jail_print_status` off, in red and bold) and the terminal of the agent below it.
+pub fn draw_agent(frame: &mut Frame, name: &str, jail: bool, terminal: Option<&vt100::Screen>) {
+    let area = frame.area();
+    let header = Rect {
+        height: area.height.min(1),
+        ..area
+    };
+    let mut spans = vec![Span::raw(format!("{} · ", printable(name)))];
+    if jail {
+        spans.push(Span::raw("na jail"));
+    } else {
+        spans.push(Span::styled(
+            "FORA DA JAIL: o agente roda direto no seu shell",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("."));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), header);
+    if let Some(screen) = terminal {
+        // The program's cursor, hidden while the history is scrolled (it is not on screen).
+        let mut cursor = Cursor::default();
+        if screen.scrollback() > 0 || screen.hide_cursor() {
+            cursor.hide();
+        }
+        frame.render_widget(PseudoTerminal::new(screen).cursor(cursor), agent_area(area));
     }
 }
 
@@ -378,6 +437,32 @@ fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             ]));
             (" Configuração do nick ", lines, None)
         }
+        Dialog::ChooseStage { ticket, index, .. } => {
+            let mut lines = vec![
+                Line::from(format!(
+                    "Ticket {} — {}",
+                    printable(&ticket.key),
+                    printable(&ticket.title)
+                )),
+                Line::from(""),
+            ];
+            for (i, stage) in Stage::ALL.iter().enumerate() {
+                lines.push(if i == *index {
+                    Line::from(vec![
+                        Span::raw("> "),
+                        Span::styled(stage.label(), Style::new().add_modifier(Modifier::REVERSED)),
+                    ])
+                } else {
+                    Line::from(format!("  {}", stage.label()))
+                });
+            }
+            (" Abrir agente ", lines, None)
+        }
+        Dialog::AgentError { message } => (
+            " Agente não aberto ",
+            message.lines().map(|l| Line::from(printable(l))).collect(),
+            None,
+        ),
         Dialog::ConfirmRemove { project, tickets } => (
             " Remover projeto ",
             vec![Line::from(removal_question(
@@ -420,7 +505,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
     use std::path::PathBuf;
 
     struct Fixture {
@@ -792,10 +877,13 @@ mod tests {
         let (y, _) = find(&buffer, "NS-1").unwrap();
         assert!(!text(&buffer).lines().nth(y as usize).unwrap().contains('['));
         assert!(find(&buffer, "(com ocultos)").is_none());
+        // With `g abrir agente` (NS-33) the help passes 100 columns and wraps, as with the filter.
+        let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
+        let n = lines.len();
         assert_eq!(
-            last_line(&buffer).trim(),
+            format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()),
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
-             Esc voltar · q sair"
+             g abrir agente · Esc voltar · q sair"
         );
     }
 
@@ -828,7 +916,7 @@ mod tests {
         assert_eq!(
             format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()),
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
-             Esc voltar · q sair"
+             g abrir agente · Esc voltar · q sair"
         );
         assert_eq!(
             lines[n - 3].trim(),
@@ -998,5 +1086,124 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|frame| draw(frame, &f.app)).unwrap();
         }
+    }
+
+    // ---- agents (NS-33) ----
+
+    fn render_agent(name: &str, jail: bool, screen: Option<&vt100::Screen>) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_agent(frame, name, jail, screen))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_agent_header_in_the_jail() {
+        let buffer = render_agent("proj · Dev · NS-1", true, None);
+        assert_eq!(
+            text(&buffer).lines().next().unwrap(),
+            "proj · Dev · NS-1 · na jail"
+        );
+        let (y, x) = find(&buffer, "na jail").unwrap();
+        assert_ne!(buffer[(x, y)].fg, Color::Red);
+        assert!(find(&buffer, "FORA DA JAIL").is_none());
+    }
+
+    #[test]
+    fn the_agent_header_out_of_the_jail_is_red_and_bold() {
+        let buffer = render_agent("proj · Dev · NS-1", false, None);
+        assert_eq!(
+            text(&buffer).lines().next().unwrap(),
+            "proj · Dev · NS-1 · FORA DA JAIL: o agente roda direto no seu shell."
+        );
+        let (y, x) = find(&buffer, "FORA DA JAIL").unwrap();
+        let end = x + "FORA DA JAIL: o agente roda direto no seu shell"
+            .chars()
+            .count() as u16;
+        for column in x..end {
+            assert_eq!(buffer[(column, y)].fg, Color::Red, "column {column}");
+            assert!(buffer[(column, y)].modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn the_agent_terminal_takes_the_rest_of_the_screen() {
+        assert_eq!(
+            agent_area(Rect::new(0, 0, 100, 30)),
+            Rect::new(0, 1, 100, 29)
+        );
+        assert_eq!(agent_area(Rect::new(0, 0, 10, 1)).height, 0);
+        let mut parser = vt100::Parser::new(29, 100, 0);
+        parser.process(b"\x1b[31mlinha um\x1b[0m\r\nlinha dois\x1b[29;1Hfim");
+        let buffer = render_agent("proj · PO · NS-1", true, Some(parser.screen()));
+        let body = text(&buffer);
+        let body: Vec<&str> = body.lines().collect();
+        assert!(body[1].starts_with("linha um"), "{body:?}");
+        assert!(body[2].starts_with("linha dois"), "{body:?}");
+        assert_eq!(
+            buffer[(0, 1)].fg,
+            Color::Indexed(1),
+            "the colors of the program"
+        );
+        // No status line nor help: the last row of the program is the last row of the screen.
+        assert_eq!(find(&buffer, "fim"), Some((29, 0)), "{body:?}");
+    }
+
+    #[test]
+    fn the_agent_screen_of_the_app_draws_the_running_agent_header() {
+        // Without an agent (never on screen in practice), only the header row is blank.
+        let mut f = fixture();
+        f.app.screen = Screen::Agent;
+        let buffer = render(&f.app);
+        assert_eq!(text(&buffer).trim(), "");
+    }
+
+    #[test]
+    fn the_stage_dialog_lists_the_four_stages_with_the_selection() {
+        let mut f = fixture();
+        on_tickets(&mut f);
+        let t = ticket(1, "NS-1", "Corrigir o login", false, false);
+        f.app.ticket_rows = vec![t.clone()];
+        f.app.dialog = Some(Dialog::ChooseStage {
+            project: PathBuf::from("/x/meu-proj"),
+            ticket: t,
+            index: 2,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Abrir agente ");
+        assert_has(&buffer, "Ticket NS-1 — Corrigir o login");
+        let (po, _) = find(&buffer, "  PO").unwrap();
+        let (tl, _) = find(&buffer, "  Tech Leader").unwrap();
+        let (dev, x) = find(&buffer, "> Dev").unwrap();
+        let (review, _) = find(&buffer, "  Review").unwrap();
+        assert!(po < tl && tl < dev && dev < review);
+        assert!(buffer[(x + 2, dev)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "↑/↓ escolher · Enter abrir · Esc cancelar"
+        );
+    }
+
+    #[test]
+    fn the_agent_alert_shows_each_line_of_the_message() {
+        let mut f = fixture();
+        on_tickets(&mut f);
+        f.app.dialog = Some(Dialog::AgentError {
+            message: "Nada foi aberto.\n\nErro: a jail não funciona.\nDetalhe \x1b[2J".into(),
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Agente não aberto ");
+        assert_has(&buffer, "Erro: a jail não funciona.");
+        assert_has(&buffer, "Detalhe ?[2J");
+        let (a, _) = find(&buffer, "Nada foi aberto.").unwrap();
+        let (b, _) = find(&buffer, "Erro: a jail").unwrap();
+        let (c, _) = find(&buffer, "Detalhe").unwrap();
+        assert_eq!(
+            (b, c),
+            (a + 2, a + 3),
+            "one row per line, the blank one included"
+        );
+        assert_eq!(last_line(&buffer).trim(), "Enter/Esc fechar");
     }
 }

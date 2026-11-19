@@ -27,10 +27,13 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   lugar). Cada ticket tem um título e o ID do Jira. Sem o ID, o nick gera um ID provisório. Um
   ticket pode ser ocultado, sem sair do banco, e restaurado depois. Os tickets ficam só no banco
   do nick: nenhuma ação sobre eles cria ou altera arquivo do projeto.
+- **Agentes:** a partir de um ticket, a TUI abre o `claude` da etapa escolhida num terminal
+  embutido, na pasta do projeto e com a configuração dele: o agente roda na jail ou fora dela
+  conforme o `JAIL_ENABLED` do `.nick/nick.conf` do projeto, e fora dela a TUI avisa no topo.
 - **Banco:** o cadastro fica num SQLite em `$XDG_STATE_HOME/nick/nick.db`, ou em
   `~/.local/state/nick/nick.db` quando `XDG_STATE_HOME` não está definida.
-- **Checkout:** o `nick` instalado usa o `bin/nick-init` do checkout de onde foi compilado. Se
-  você mover o checkout, rode o `cargo install --path nick` de novo.
+- **Checkout:** o `nick` instalado usa o `bin/nick-init` e o `bin/nick-agent` do checkout de onde
+  foi compilado. Se você mover o checkout, rode o `cargo install --path nick` de novo.
 
 ## Módulos
 

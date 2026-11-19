@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.29.0"
+nix = { version = "0.31", features = ["signal", "process"] }
+portable-pty = "0.9"
 ratatui = "0.30.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 signal-hook = "0.3.18"
+tui-term = "0.3.4"
+vt100 = "0.16.2"
 
 [dev-dependencies]
-portable-pty = "0.9"
 tempfile = "3.27.0"
-vt100 = "0.16.2"

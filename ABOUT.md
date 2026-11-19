@@ -31,12 +31,14 @@ conteúdo voltado a ele, e trocar isso pra inglês só atrapalharia sem ganho re
 
 ## Qualidade de código bash
 
-As ferramentas e as bibliotecas do nick (`lib/`, `bin/nick-init`, `auto_scrum`) são em bash. O
+As ferramentas e as bibliotecas do nick (`lib/`, `bin/nick-init`, `bin/nick-agent`, `auto_scrum`)
+são em bash. O
 Rust entra em dois lugares, com regras próprias: a casca `nick`, em `nick/` (ver a regra de
 linguagem em "Rust no projeto: a casca `nick` (NS-31)"), e o protótipo descartável do painel,
 em `prototype/panel/` (ver "Rust no projeto: protótipo do painel (NS-29)"). Os scripts bash de
 lá (o `nick/tests/test_cargo.sh`, o init falso dos testes da casca e o `launch_session.sh` do
-protótipo) seguem estas regras. Regras a seguir em todo script novo ou alterado:
+protótipo) e os falsos do `claude`/`ai-jail` em `bin/tests/fixtures/bin/` (NS-33) seguem estas
+regras. Regras a seguir em todo script novo ou alterado:
 
 - `set -euo pipefail` no topo do **script**. Uma biblioteca em `lib/` (carregada com
   `source`) não tem: quem decide isso é o script que a carrega, e ela funciona com ou sem
@@ -1112,7 +1114,9 @@ Hoje as três bibliotecas têm diretório: `lib/config/` (dois arquivos de códi
     configuração" abaixo;
 - `lib/jail/jail.sh`: o mecanismo da jail (ai-jail) — verificação (`jail_check`), requisitos
   (`jail_print_requirements`), status (`jail_print_status`), opções do ai-jail por nível
-  (`jail_options`, a fonte única delas), toolchains montadas (`jail_toolchain_dirs`), aviso
+  (`jail_options`, a fonte única delas), hosts dos MCPs remotos (`jail_mcp_hosts <jira>
+  <sentry>`, desde o NS-33: o `auto_scrum.sh` e o `bin/nick-agent` chamam a mesma função),
+  toolchains montadas (`jail_toolchain_dirs`), aviso
   ao agente (`jail_agent_notice`), navegadores do Playwright (`jail_playwright_browsers`),
   versão do ai-jail (`jail_version_output`, `jail_version_of`, `jail_version_supported`, com a
   versão mínima em `JAIL_VERSION_MIN`) e lançamento (`jail_exec`), com a lista padrão de hosts da rede em `lib/jail/allow_hosts.txt`
@@ -1243,7 +1247,8 @@ refazer código e testes do 13.
 todas, uma de cada vez, e sai com código 0 só se todas passarem (ver seção "Testes: `make
 test` e `tests/run_all.sh`"). Cada suíte continua podendo rodar direto, da raiz, e sai com
 código 1 se houver `FAIL`: `bash auto_scrum/tests/test_auto_scrum.sh`,
-`bash bin/tests/test_nick_init.sh`, `bash lib/tests/test_config.sh`,
+`bash bin/tests/test_nick_init.sh`, `bash bin/tests/test_nick_agent.sh` (o launcher dos agentes da
+casca, NS-33), `bash lib/tests/test_config.sh`,
 `bash lib/tests/test_keys.sh`, `bash lib/tests/test_jail.sh`, `bash lib/tests/test_claude.sh`
 (esta precisa de `jq` ou `python3` pra validar o JSON; sem nenhum dos dois, dá FAIL),
 `bash tests/test_run_all.sh`, `bash tests/test_cargo_suite.sh` (a guarda da suíte Rust, sem o
@@ -2379,7 +2384,8 @@ fecha, seja qual for o jeito. Um projeto indisponível aparece com o estilo apag
   leitora e sem canal. Ainda não há PTY, e uma thread leitora disputaria o stdin com o
   `bin/nick-init` enquanto ele roda no terminal suspenso. **A F3 troca isso por um laço guiado
   por um canal** (achado do NS-29) e, então, a leitura da entrada tem de ser pausada enquanto o
-  init roda;
+  init roda. **Feito no NS-33** (seção "Rust no projeto: agentes na casca `nick` (NS-33)"): o
+  laço é guiado por canal, e a thread de entrada para num portão enquanto o init roda;
 - o **panic hook** é instalado antes de entrar na TUI. Ele restaura o terminal, chama o hook
   padrão (a mensagem sai depois da restauração, legível) e termina com
   `std::process::exit(101)`, em qualquer thread. Sem o `exit`, um panic numa thread secundária
@@ -2392,7 +2398,8 @@ fecha, seja qual for o jeito. Um projeto indisponível aparece com o estilo apag
   chega a entrar nela e não prova a restauração por erro;
 - **SIGTERM/SIGHUP ficam sem tratamento nesta fatia:** não há filhos para encerrar, e o padrão do
   sistema mata o processo. O terminal pode ficar sujo, como no `kill -9` (achado do NS-29), e o
-  `reset` resolve. A F3 trata isso junto com o encerramento dos agentes;
+  `reset` resolve. A F3 trata isso junto com o encerramento dos agentes. **Feito no NS-33:** os
+  dois restauram o terminal, encerram o agente aberto e saem com 143/129;
 - teclas: `q`/`Q` saem só nas listas (regra de "Menus: opção Sair (q)"). No campo de texto o `q`
   é digitado, e nos diálogos ele não sai. `Ctrl+C` sai de qualquer tela, porque o raw mode o
   entrega como tecla e o operador não pode ficar preso. Na remoção, só `s`/`S` confirmam (o "sim"
@@ -2536,3 +2543,155 @@ a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
   da lista (`r remover`), que só aparece com o alerta fechado. Regra para testes novos no PTY:
   **depois de um `ESC`, espere um texto que só existe no estado seguinte** (de preferência o
   rodapé), nunca um texto que já estava na tela.
+
+## Rust no projeto: agentes na casca `nick` (NS-33)
+
+A fatia F3a do épico NS-28. Na tela de tickets, `g` sobre um ticket visível de um projeto
+disponível abre o diálogo "Abrir agente" (PO, Tech Leader, Dev, Review), e a etapa escolhida
+abre o `claude` num terminal embutido que ocupa a tela, com uma linha de cabeçalho. **Um agente
+por vez**, e o terminal do agente **só fecha quando o `claude` termina** (`/exit`, `Ctrl+D`,
+`Ctrl+C` duas vezes): todas as teclas vão para ele, inclusive `Ctrl+C`, `Esc`, `q` e `Ctrl+\`
+(0x1c). O atalho reservado para sair, vários agentes e a confirmação ao sair são da F3b. Fora das
+teclas, só `Shift+PageUp/PageDown` e a roda do mouse (quando o programa não pediu o mouse) rolam
+o histórico; qualquer tecla enviada volta para o fim. Ao terminar, a TUI volta para a lista com o
+mesmo ticket selecionado e `O agente <nome> terminou.` (ou `... terminou com o código <N>.`).
+
+**O lançamento passa só pelo `bin/nick-agent`** (bash, ao lado do `bin/nick-init`). Ele carrega
+as quatro bibliotecas na ordem do `auto_scrum.sh`, chama `config_register_nick_keys` no topo e
+lê o `.nick/nick.conf` do cwd (a casca roda `bash <launcher> ...` com o cwd na pasta do projeto,
+o caminho do banco). Interface:
+- `nick-agent --check`: só valida (o `.nick.conf` antigo, o `.nick/nick.conf` do cwd com a mesma
+  mensagem do `resolve_stack`, o `config_load`, o `jail_check` e o `claude_settings_load`), sem
+  lançar nem gravar nada no projeto. Sucesso: uma linha no stdout, `jail=true` ou `jail=false` (o
+  valor efetivo: `true` só com `"true"` exato), e saída 0; os avisos do `config_load` vão para o
+  stderr. Falha: a mensagem da lib no stderr e saída 1;
+- `nick-agent --session-id <uuid> --name <nome>`: as mesmas validações, `config_dir_prepare`,
+  `jail_print_status` e `jail_exec ... claude --settings <regras> [--append-system-prompt <aviso>
+  só com a jail ligada] --session-id <uuid> --name <nome>`. **Sem `--permission-mode` e sem
+  prompt**: o modo de permissão é o padrão do `claude` em todas as etapas até a F4 (roteiros e
+  modo `auto` do Dev);
+- qualquer outro uso: `Erro: ...` e `Uso: nick-agent --check | --session-id <uuid> --name <nome>`
+  no stderr, saída 1. O formato do UUID não é validado no bash (o `claude` valida; o nick sempre
+  gera um válido).
+
+A casca acha o launcher como acha o init, pelo caminho fixado na compilação
+(`concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-agent")`, normalizado sem tocar no disco;
+o `normalize` saiu do `init.rs` para o `paths.rs`). **Não há variável de ambiente que troque o
+launcher** (diferente do `NICK_INIT_BIN`): ela deixaria lançar outra coisa no lugar do caminho
+que garante a jail e as regras. Os testes usam o launcher real com o `claude` e o `ai-jail`
+falsos (`bin/tests/fixtures/bin/`) à frente do `PATH`; os de unidade do `App` recebem o caminho
+do launcher por parâmetro. A API do `agent_session.rs` só sabe abrir `bash <launcher>
+--session-id ... --name ...`, e um teste estrutural (`nick/tests/agent.rs`) lê os fontes de
+`src/`: o único processo num PTY é `bash` com o launcher, nenhum `Command::new`/
+`CommandBuilder::new` abre `claude` ou `ai-jail`, e nenhum fonte tem `--permission-mode` (com
+controle positivo do filtro). O Rust não reimplementa nada da jail, das regras nem da
+configuração: só sabe o que o `--check` devolve.
+
+**Pré-checagem fora do PTY.** Um erro do `jail_check` ou da configuração dentro do PTY só
+apareceria numa tela que some quando o launcher termina. Por isso a casca roda antes `bash
+<launcher> --check` com o stdin em `/dev/null` e a saída capturada. Saída ≠ 0 → um alerta
+("Agente não aberto") com `Nada foi aberto.` **no topo** e o stderr logo abaixo (cada linha por
+`paths::printable`); nada vai para o banco e nada é lançado. O `Nada foi aberto.` fica no topo
+porque o erro da jail tem umas 25 linhas e, num terminal baixo, o fim do alerta é cortado.
+**Achado, fora do escopo:** o alerta não rola, então o fim de um erro longo pode ficar cortado
+numa tela pequena (o começo, com o motivo, aparece). Saída 0 com qualquer coisa que não seja
+exatamente uma linha `jail=…` também é erro (`O bin/nick-agent respondeu algo inesperado na
+verificação.`), para nunca presumir a jail. **Um stderr de sucesso (aviso da configuração)
+aparece na barra quando o agente termina**, junto com a mensagem de fim (`... terminou. Aviso da
+verificação: ...`): decisão do usuário no NS-33, porque a tela do agente não tem barra de status
+(o próprio launcher repete o aviso no topo do terminal antes de o `claude` limpar a tela). O
+lançamento de verdade repete as validações; se falharem ali, o PTY termina com código ≠ 0 e a
+barra diz o código. A chamada é síncrona, como no `auto_scrum` (o `jail_check` roda o
+`ai-jail ... -- true`).
+
+**Relação com o `auto_scrum.sh`: a lógica não pode divergir.** A única extração foi o
+`mcp_jail_hosts`, que virou `jail_mcp_hosts <jira_enabled> <sentry_enabled>` em `lib/jail/jail.sh`
+(por parâmetro, sem ler global do chamador). O `mcp_jail_hosts` do `auto_scrum.sh` continua como
+chamada fina, porque os testes e o `main()` usam esse nome, e os testes dele passaram sem mudança.
+O resto do caminho já era da lib. Uma função "lançar agente" inteira no `lib/` não cabe: ela
+juntaria config + jail + claude, e as bibliotecas não dependem umas das outras. **Teste
+diferencial** (`bin/tests/test_nick_agent.sh`): para a mesma `.nick/nick.conf` (jail, Jira,
+Sentry, `JAIL_ALLOW_HOSTS`, `JAIL_FORWARD_PORTS`, `JAIL_CLIPBOARD`), o `auto_scrum.sh` (etapa PO,
+`po_discussion`) e o launcher chamam o `ai-jail` com as mesmas opções até o `--`, e o argv do
+`claude` do launcher é o do `auto_scrum` sem o prompt e com `--session-id`/`--name` no fim (e o
+mesmo com a jail desligada). Uma mudança num dos dois que não for para o outro quebra o teste.
+
+**A jail segue o projeto.** Vale o `JAIL_ENABLED` do `.nick/nick.conf` de cada projeto. O
+cabeçalho mostra `<nome> · na jail` ou, fora dela, `<nome> · FORA DA JAIL: o agente roda direto
+no seu shell.` com o aviso em vermelho e negrito (o texto do `jail_print_status` desligado). Se
+o agente roda na jail fica só em memória nesta fatia (a F3b decide se vira coluna).
+
+**Banco: migração 3, tabela `agents`** (`ticket_id → tickets ON DELETE CASCADE`, `stage` com
+`CHECK` nos valores de `$TYPE` do `auto_scrum`, `session_id UNIQUE`, `name`, `opened_at` em RFC
+3339 UTC pelo SQL, `state`). **`state` não tem `CHECK`, de propósito:** a F5 acrescenta
+"parado" e "arquivado", e o SQLite não altera um `CHECK` sem recriar a tabela. A fonte dos
+estados é o enum `AgentState` (`agents.rs`), e só ele grava a coluna (os métodos do `Db` usam
+`AgentState::...key()`, nunca um literal). Estados desta fatia: `active` e `ended`. Um agente sai
+do banco junto com o ticket, que sai com o projeto; a confirmação de remoção do projeto não
+conta agentes. O ID de sessão é um UUID v4 gerado pelo próprio SQLite (`Db::random_session_id`,
+`randomblob` com o nibble de versão `4` e o de variante em `8|9|a|b`), sem crate; o `UNIQUE` é a
+rede de segurança. O nome é `<projeto> · <Etapa> · <ID do ticket>` (`PO`, `Tech Leader`, `Dev`,
+`Review`). Testes de banco do NS-31/NS-32 que citavam a versão 2 passaram a citar a 3; o teste
+`a_version_1_database_with_projects_migrates_to_2_and_keeps_them` passou a abrir só com as
+migrações 1 e 2 (decisão do usuário no NS-33), sem mudar nenhuma asserção.
+
+**Trava por agente e limpeza (D7, decisão do analista no plano do NS-33).** O critério do ticket
+mandava encerrar, na abertura do nick, todo agente marcado como ativo; com dois `nick` abertos, o
+segundo encerraria o agente vivo do primeiro. Por isso, enquanto o agente roda, o nick segura uma
+trava exclusiva (`std::fs::File::lock`, um `flock`; sem crate) em
+`<diretório de estado>/agents/<session_id>.lock` (diretório `0700`). O kernel solta a trava quando
+o processo morre, até no `kill -9`. **Ordem:** pegar a trava antes de inserir a linha `active`;
+ao terminar, `ended`, apagar o arquivo (ainda travado) e soltar. **Na abertura do nick**, antes da
+TUI, para cada agente `active`: `try_lock` livre → `ended` e o arquivo apagado; `WouldBlock` →
+outro nick vivo o segura, fica `active`; outro erro de I/O → fica como está (não se encerra o que
+não dá para provar morto). Um erro do banco nessa limpeza vai para a barra, e a TUI abre.
+
+**Laço guiado por canal** (o que o NS-31 reservava para a F3). A thread principal bloqueia num
+`mpsc` que recebe: a entrada (uma thread com `event::poll(100 ms)` + `read`, viva enquanto a TUI
+estiver aberta), a saída do PTY do agente, as cópias OSC 52 e o fim do processo, e os sinais. A
+thread de entrada **para num portão** (`terminal::InputGate`, `Mutex` + `Condvar`) enquanto o
+`bin/nick-init` roda: o `TerminalInitRunner` fecha o portão (e espera a thread sair da leitura)
+antes de suspender a TUI e o reabre depois; o mesmo portão fica fechado durante o
+`Terminal::clear` da volta do agente, que pergunta a posição do cursor. Custo aceito: 10
+acordadas por segundo com a TUI ociosa. Redesenho no máximo a cada ~16 ms, e só quando algo
+mudou. A cópia OSC 52 é escrita no terminal de fora entre dois quadros. Captura de mouse e
+bracketed paste ligam ao entrar na tela do agente e desligam ao sair; o `terminal::restore`
+desliga os dois sempre.
+
+**Sinais:** uma thread com `signal_hook::iterator::Signals` trata **SIGTERM e SIGHUP** (fechar a
+janela). Com agente aberto: SIGTERM no grupo do processo, SIGKILL depois de 2 s no que sobrar,
+`wait`, `ended` no banco, trava solta, terminal restaurado e saída `128 + sinal` (143 e 129). Sem
+agente: restaura e sai com o mesmo código. Só o grupo de um filho ainda não colhido recebe sinal
+(achado do NS-29). **SIGINT não entra:** no raw mode o `Ctrl+C` é tecla, e o handler do init
+(`IgnoreTerminalSignals`, NS-31) continua sendo o único dono dele enquanto o init roda.
+
+**Panic:** o hook (já existente) liga uma flag, restaura o terminal, encerra os grupos dos agentes
+ainda não colhidos (lista estática do `agent_session.rs`), chama o hook padrão e sai com 101. Ele
+não mexe no banco: a limpeza da próxima abertura resolve. **Achado do NS-33:** sem a flag, a
+thread principal, livre enquanto o hook espera o grupo morrer (até 2 s), recebia o fim do agente,
+gravava `ended` e podia redesenhar sobre o terminal restaurado; com a flag
+(`terminal::panicking`), o laço para de tratar eventos. `NICK_TEST_PANIC=agent` é um gancho só
+de teste (`nick/tests/agent.rs`): panic numa thread pouco depois de um agente abrir.
+
+**Achados do NS-29 reescritos no crate** (nada do `nick/` depende de `prototype/panel/`; o
+código e os testes de lá foram a referência e a fonte dos casos de teste): `keys.rs` (teclas como
+um xterm, colagem que descarta todo controle menos tab e CR dentro dos colchetes, mouse; sem
+atalho reservado: `Ctrl+\` vai como 0x1c), `agent_session.rs` (PTY, `vt100` com o callback OSC 52
+que só repassa cópia, thread leitora contínua, thread que colhe o filho, tela mínima 2x2,
+encerramento por grupo) e o desenho com `tui_term::widget::PseudoTerminal`.
+
+**Dependências novas** (`nick/Cargo.toml`): `portable-pty` 0.9 e `vt100` 0.16.2 passaram de
+dev-dependencies para dependencies; entraram `tui-term` 0.3.4 (só funciona com o `vt100` 0.16) e
+`nix` 0.31 com as features `signal` e `process` (o `killpg`; o 0.31.4 já estava no `Cargo.lock`,
+nenhuma versão duplicada nova). O `signal-hook` continua no 0.3.18.
+
+**Testes:** `bin/tests/test_nick_agent.sh` (achada pelo `make test`): argv exato do `ai-jail` e
+do `claude` falsos calculado pela lib, jail ligada e desligada, dois projetos, `--check` sem
+gravar nada (retrato recursivo), sem configuração, `.nick.conf` antigo, falhas do `jail_check`
+(cada uma com `--check` e com o lançamento, `ai-jail` ausente com controle positivo), argumentos,
+o diferencial com o `auto_scrum.sh`, estrutura e `shellcheck -x`. Na suíte Rust: unidade em
+`db`, `agents`, `keys`, `agent_session` (PTY real com o launcher real e os falsos), `launch`,
+`app` (com um `AgentLauncher` falso), `ui` e `terminal` (o portão); integração no PTY em
+`nick/tests/agent.rs`. A verificação com o `claude` e o ai-jail reais não roda dentro da jail do
+nick: o roteiro fica em `.nick/docs/NS-33/verificacao_manual.md`, para o analista executar fora
+dela.

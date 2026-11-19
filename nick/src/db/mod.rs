@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 
+use crate::agents::AgentState;
+
 /// How long a statement waits for another nick that is writing to the same database before
 /// giving up with "database is locked" (the only transient error of SQLite).
 const BUSY_TIMEOUT_MS: u32 = 5000;
@@ -98,6 +100,36 @@ fn ticket_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ticket> {
         title: row.get(4)?,
         created_at: row.get(5)?,
         hidden_at: row.get(6)?,
+    })
+}
+
+/// An agent of a ticket, as stored (migration 3). `stage` and `state` are the raw keys of
+/// the columns (agents.rs: `Stage`, `AgentState`; the state is only written from the enum).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    pub id: i64,
+    pub ticket_id: i64,
+    pub stage: String,
+    /// The `claude --session-id`.
+    pub session_id: String,
+    /// The `claude --name`.
+    pub name: String,
+    pub opened_at: String,
+    pub state: String,
+}
+
+/// The columns of an agent, in the order of `agent_from_row`.
+const AGENT_COLUMNS: &str = "id, ticket_id, stage, session_id, name, opened_at, state";
+
+fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
+    Ok(Agent {
+        id: row.get(0)?,
+        ticket_id: row.get(1)?,
+        stage: row.get(2)?,
+        session_id: row.get(3)?,
+        name: row.get(4)?,
+        opened_at: row.get(5)?,
+        state: row.get(6)?,
     })
 }
 
@@ -304,11 +336,64 @@ impl Db {
             |row| row.get(0),
         )
     }
+
+    /// A session ID for `claude --session-id`: a lowercase UUID v4 from SQLite's randomblob
+    /// (no crate for it, as `random_short_id`), with the version nibble fixed at 4 and the
+    /// variant one at 8, 9, a or b. Unique only by the UNIQUE constraint of the insert.
+    pub fn random_session_id(&self) -> rusqlite::Result<String> {
+        self.conn.query_row(
+            "SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' \
+             || substr(lower(hex(randomblob(2))), 2) || '-' \
+             || substr('89ab', 1 + (random() & 3), 1) \
+             || substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6)))",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Stores an agent of the ticket, `active`, opened now, and returns it. A session ID
+    /// already stored fails with the UNIQUE constraint (see `is_unique_violation`).
+    pub fn insert_agent(
+        &self,
+        ticket_id: i64,
+        stage: &str,
+        session_id: &str,
+        name: &str,
+    ) -> rusqlite::Result<Agent> {
+        self.conn.query_row(
+            &format!(
+                "INSERT INTO agents (ticket_id, stage, session_id, name, opened_at, state) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?5) \
+                 RETURNING {AGENT_COLUMNS}"
+            ),
+            params![ticket_id, stage, session_id, name, AgentState::Active.key()],
+            agent_from_row,
+        )
+    }
+
+    /// Marks the agent as `ended` (only the state changes). `false` when the agent is no
+    /// longer in the database.
+    pub fn end_agent(&self, id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE agents SET state = ?2 WHERE id = ?1",
+            params![id, AgentState::Ended.key()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Every `active` agent, of any project, in the order they were opened.
+    pub fn list_active_agents(&self) -> rusqlite::Result<Vec<Agent>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents WHERE state = ?1 ORDER BY id"
+        ))?;
+        stmt.query_map(params![AgentState::Active.key()], agent_from_row)?
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::migrations::{MIGRATION_1, MIGRATION_2, MIGRATIONS};
+    use super::migrations::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATIONS};
     use super::*;
 
     fn user_version(conn: &Connection) -> u32 {
@@ -340,12 +425,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_2_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_3_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 2);
+        assert_eq!(user_version(db.connection()), 3);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -354,10 +439,13 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_has_only_modules_projects_and_tickets() {
+    fn the_schema_has_only_modules_projects_tickets_and_agents() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("nick.db")).unwrap();
-        assert_eq!(tables(db.connection()), ["modules", "projects", "tickets"]);
+        assert_eq!(
+            tables(db.connection()),
+            ["agents", "modules", "projects", "tickets"]
+        );
     }
 
     #[test]
@@ -369,7 +457,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 2);
+        assert_eq!(user_version(db.connection()), 3);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -416,7 +504,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 7, mais nova que a deste nick (2). \
+                "Erro: o banco {} está na versão 7, mais nova que a deste nick (3). \
                  Atualize o nick.",
                 path.display()
             )
@@ -491,7 +579,7 @@ mod tests {
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            2,
+            3,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -530,6 +618,22 @@ CREATE TABLE tickets (
 "
         );
         assert_eq!(MIGRATIONS[1], MIGRATION_2);
+        assert_eq!(
+            MIGRATION_3,
+            "\
+CREATE TABLE agents (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    stage      TEXT NOT NULL
+               CHECK (stage IN ('po', 'tech_leader', 'development', 'review')),
+    session_id TEXT NOT NULL UNIQUE,   -- the claude --session-id, chosen by the nick
+    name       TEXT NOT NULL,          -- the claude --name: 'project · Stage · KEY'
+    opened_at  TEXT NOT NULL,          -- RFC 3339, in UTC
+    state      TEXT NOT NULL           -- 'active' or 'ended' (the F5 adds more)
+);
+"
+        );
+        assert_eq!(MIGRATIONS[2], MIGRATION_3);
     }
 
     // ---- migration 2: tickets ----
@@ -572,7 +676,7 @@ CREATE TABLE tickets (
                 old.insert_project("auto_scrum", "b", "/b").unwrap(),
             )
         };
-        let db = Db::open(&path).unwrap();
+        let db = Db::open_with(&path, &[MIGRATION_1, MIGRATION_2]).unwrap();
         assert_eq!(user_version(db.connection()), 2);
         assert_eq!(tables(db.connection()), ["modules", "projects", "tickets"]);
         assert_eq!(db.list_projects("auto_scrum").unwrap(), [a.clone(), b]);
@@ -840,5 +944,234 @@ CREATE TABLE tickets (
         let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
         db.delete_project(a.id).unwrap();
         assert_eq!(db.list_projects("auto_scrum").unwrap(), [b]);
+    }
+
+    // ---- migration 3: agents ----
+
+    /// A project with one ticket, for the agents tests: (db, project id, ticket id).
+    fn with_ticket(tmp: &tempfile::TempDir) -> (Db, i64, i64) {
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let p = db.insert_project("auto_scrum", "p", "/p").unwrap();
+        let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+        (db, p.id, t.id)
+    }
+
+    /// Inserts an agent row by hand (the schema tests check the constraints, not the queries).
+    fn raw_agent(
+        conn: &Connection,
+        ticket_id: i64,
+        stage: &str,
+        session_id: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO agents (ticket_id, stage, session_id, name, opened_at, state) \
+             VALUES (?1, ?2, ?3, 'n', 'now', 'active')",
+            params![ticket_id, stage, session_id],
+        )
+    }
+
+    fn agent_sessions(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT session_id FROM agents ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_version_2_database_with_projects_and_tickets_migrates_to_3_and_keeps_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (projects, tickets) = {
+            let old = Db::open_with(&path, &[MIGRATION_1, MIGRATION_2]).unwrap();
+            assert_eq!(user_version(old.connection()), 2);
+            let a = old.insert_project("auto_scrum", "a", "/a").unwrap();
+            let b = old.insert_project("auto_scrum", "b", "/b").unwrap();
+            let t1 = old.insert_ticket(a.id, "NS-1", false, "um").unwrap();
+            let t2 = old.insert_ticket(a.id, "3f9a0c7e", true, "dois").unwrap();
+            old.set_ticket_hidden(t2.id, true).unwrap();
+            let t3 = old.insert_ticket(b.id, "NS-1", false, "três").unwrap();
+            (
+                old.list_projects("auto_scrum").unwrap(),
+                [
+                    old.list_tickets(a.id, true).unwrap(),
+                    old.list_tickets(b.id, true).unwrap(),
+                    vec![t1, t3],
+                ],
+            )
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(db.connection()), 3);
+        assert_eq!(
+            tables(db.connection()),
+            ["agents", "modules", "projects", "tickets"]
+        );
+        assert_eq!(db.list_projects("auto_scrum").unwrap(), projects);
+        assert_eq!(db.list_tickets(projects[0].id, true).unwrap(), tickets[0]);
+        assert_eq!(db.list_tickets(projects[1].id, true).unwrap(), tickets[1]);
+        assert_eq!(db.list_active_agents().unwrap(), []);
+        raw_agent(db.connection(), tickets[2][0].id, "po", "s-1").unwrap();
+    }
+
+    #[test]
+    fn the_stage_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let conn = db.connection();
+        for (n, stage) in ["po", "tech_leader", "development", "review"]
+            .iter()
+            .enumerate()
+        {
+            raw_agent(conn, ticket, stage, &format!("ok-{n}")).unwrap();
+        }
+        for stage in ["", "PO", "dev", "Review", "po_jira"] {
+            assert!(
+                raw_agent(conn, ticket, stage, &format!("bad-{stage}")).is_err(),
+                "stage {stage:?}"
+            );
+        }
+        assert_eq!(agent_sessions(conn).len(), 4);
+    }
+
+    #[test]
+    fn the_session_id_is_unique() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let other = db.insert_ticket(project, "NS-2", false, "t").unwrap();
+        let conn = db.connection();
+        raw_agent(conn, ticket, "po", "same").unwrap();
+        let dup = raw_agent(conn, other.id, "review", "same").unwrap_err();
+        assert!(is_unique_violation(&dup), "{dup:?}");
+        let dup = db
+            .insert_agent(ticket, "development", "same", "n")
+            .unwrap_err();
+        assert!(is_unique_violation(&dup), "{dup:?}");
+        assert_eq!(agent_sessions(conn), ["same"]);
+    }
+
+    #[test]
+    fn an_agent_of_a_missing_ticket_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, _) = with_ticket(&tmp);
+        assert!(raw_agent(db.connection(), 99, "po", "s").is_err());
+        assert!(db.insert_agent(99, "po", "s", "n").is_err());
+        assert_eq!(agent_sessions(db.connection()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn deleting_a_project_deletes_its_tickets_and_agents_and_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let a = db.insert_project("auto_scrum", "a", "/a").unwrap();
+        let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
+        let ta = db.insert_ticket(a.id, "A-1", false, "t").unwrap();
+        let tb = db.insert_ticket(b.id, "B-1", false, "t").unwrap();
+        db.insert_agent(ta.id, "po", "a-1", "n").unwrap();
+        db.insert_agent(ta.id, "review", "a-2", "n").unwrap();
+        db.insert_agent(tb.id, "development", "b-1", "n").unwrap();
+        db.delete_project(a.id).unwrap();
+        assert_eq!(ticket_keys(db.connection()), [(b.id, "B-1".to_string())]);
+        assert_eq!(agent_sessions(db.connection()), ["b-1"]);
+    }
+
+    #[test]
+    fn random_session_id_is_a_lowercase_uuid_v4_and_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("nick.db")).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let id = db.random_session_id().unwrap();
+            let parts: Vec<&str> = id.split('-').collect();
+            assert_eq!(
+                parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                [8, 4, 4, 4, 12],
+                "{id}"
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c == '-' || matches!(c, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+            assert!(parts[2].starts_with('4'), "version 4: {id}");
+            assert!(
+                matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+                "variant: {id}"
+            );
+            seen.insert(id);
+        }
+        assert_eq!(seen.len(), 200, "it changes between calls");
+    }
+
+    #[test]
+    fn insert_agent_returns_the_stored_row_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let agent = db
+            .insert_agent(ticket, "tech_leader", "s-1", "p · Tech Leader · NS-1")
+            .unwrap();
+        assert_eq!(agent.ticket_id, ticket);
+        assert_eq!(agent.stage, "tech_leader");
+        assert_eq!(agent.session_id, "s-1");
+        assert_eq!(agent.name, "p · Tech Leader · NS-1");
+        assert_eq!(agent.state, "active");
+        assert_rfc3339_utc(&agent.opened_at);
+        assert_eq!(db.list_active_agents().unwrap(), [agent]);
+    }
+
+    #[test]
+    fn end_agent_changes_only_the_state_and_says_whether_the_row_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let first = db.insert_agent(ticket, "po", "s-1", "n1").unwrap();
+        let second = db.insert_agent(ticket, "review", "s-2", "n2").unwrap();
+        assert!(db.end_agent(first.id).unwrap());
+        assert_eq!(
+            db.list_active_agents().unwrap(),
+            std::slice::from_ref(&second)
+        );
+        let stored: (String, String, String, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT stage, session_id, name, opened_at, state FROM agents WHERE id = ?1",
+                params![first.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                first.stage,
+                first.session_id,
+                first.name,
+                first.opened_at,
+                "ended".to_string()
+            )
+        );
+        // Ending again is harmless; a row that is gone says so.
+        assert!(db.end_agent(first.id).unwrap());
+        db.delete_project(project).unwrap();
+        assert!(!db.end_agent(second.id).unwrap());
+    }
+
+    #[test]
+    fn list_active_agents_lists_only_the_active_ones_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let other = db.insert_ticket(project, "NS-2", false, "t").unwrap();
+        let a = db.insert_agent(ticket, "po", "s-1", "n").unwrap();
+        let b = db.insert_agent(other.id, "review", "s-2", "n").unwrap();
+        let c = db.insert_agent(ticket, "development", "s-3", "n").unwrap();
+        db.end_agent(b.id).unwrap();
+        assert_eq!(db.list_active_agents().unwrap(), [a, c]);
     }
 }

@@ -6,15 +6,15 @@
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use signal_hook::consts::{SIGINT, SIGQUIT};
 
-use crate::paths::printable;
-use crate::terminal::TerminalGuard;
+use crate::paths::{normalize, printable};
+use crate::terminal::{InputGate, TerminalGuard};
 
 /// bin/nick-init of the checkout this binary was built from, before normalization.
 const DEFAULT_INIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-init");
@@ -35,24 +35,33 @@ pub trait InitRunner {
     fn run(&mut self, init: &Path, project: &Path) -> InitOutcome;
 }
 
-/// The real runner: suspends the TUI (terminal.rs), runs `bash <init>` with the cwd at the
-/// project and the terminal inherited, and waits for an Enter before the TUI comes back,
-/// whatever the result, so the operator can read the output of the init. A failure to enter
-/// the TUI again is kept in `error`, for the loop to end with it.
+/// The real runner: pauses the input thread (its gate, so the init has the stdin to itself),
+/// suspends the TUI (terminal.rs), runs `bash <init>` with the cwd at the project and the
+/// terminal inherited, and waits for an Enter before the TUI comes back, whatever the result,
+/// so the operator can read the output of the init. A failure to enter the TUI again is kept in
+/// `error`, for the loop to end with it.
 pub struct TerminalInitRunner<'a> {
     guard: &'a mut TerminalGuard,
+    gate: &'a InputGate,
     pub error: Option<io::Error>,
 }
 
 impl<'a> TerminalInitRunner<'a> {
-    pub fn new(guard: &'a mut TerminalGuard) -> TerminalInitRunner<'a> {
-        TerminalInitRunner { guard, error: None }
+    pub fn new(guard: &'a mut TerminalGuard, gate: &'a InputGate) -> TerminalInitRunner<'a> {
+        TerminalInitRunner {
+            guard,
+            gate,
+            error: None,
+        }
     }
 }
 
 impl InitRunner for TerminalInitRunner<'_> {
     fn run(&mut self, init: &Path, project: &Path) -> InitOutcome {
-        match self.guard.suspend(|| run_in_terminal(init, project)) {
+        self.gate.close();
+        let result = self.guard.suspend(|| run_in_terminal(init, project));
+        self.gate.open();
+        match result {
             Ok(outcome) => outcome,
             Err(err) => {
                 let message = err.to_string();
@@ -125,25 +134,10 @@ pub fn init_path(override_path: Option<&OsStr>) -> PathBuf {
     }
 }
 
-/// Removes `.` and `..` from an absolute path without touching the disk (the init may be
-/// missing, and the message then shows this path).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Component;
 
     /// Moving the crate without fixing the path breaks the button: this pins it to
     /// <repository root>/bin/nick-init, and the file must exist.

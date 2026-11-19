@@ -2227,7 +2227,8 @@ pela verificação manual do `nick` no NS-31).
 Rust com ratatui e crossterm que o operador abre de qualquer terminal (como o `htop`). Ela mostra
 **Módulos > Projetos**, lidos de um banco SQLite. Nesta fatia o único módulo é o auto_scrum, e a
 TUI só cadastra, mostra e remove projetos. Tickets, agentes, histórico e o lançamento do
-`claude` ficam para as fatias seguintes. O código do protótipo (`prototype/panel/`) não foi
+`claude` ficam para as fatias seguintes. (O NS-32 acrescentou o nível **Tickets**, abaixo de
+Projetos: seção "Rust no projeto: tickets na casca `nick` (NS-32)".) O código do protótipo (`prototype/panel/`) não foi
 copiado: o crate foi escrito do zero, levando os achados do NS-29.
 
 **A regra de linguagem (bash + Rust), revista no NS-31:**
@@ -2301,7 +2302,8 @@ PT-BR com o caminho no stderr e saída 1. Só o `main.rs` lê o ambiente
   apagado o recriaria vazio sem avisar. Com a TUI aberta, um erro inesperado do banco vira
   `Erro no banco do nick: <erro>.` na barra de status, e a TUI continua;
 - a migração 1 tem só `modules` (com o `auto_scrum`) e `projects`. Ticket, agente e histórico
-  entram nas fatias que os usam. O `created_at` é gravado pelo próprio SQL
+  entram nas fatias que os usam. A migração 2 (NS-32) cria a tabela `tickets`, ligada ao projeto
+  com `ON DELETE CASCADE` (seção do NS-32). O `created_at` é gravado pelo próprio SQL
   (`strftime('%Y-%m-%dT%H:%M:%SZ','now')`, RFC 3339 em UTC), sem crate de data. O caminho é
   `TEXT`: um caminho que não é UTF-8 é recusado no cadastro (`Erro: o caminho tem caracteres
   que o nick não consegue guardar.`), um caso raro que mantém o esquema simples.
@@ -2319,7 +2321,8 @@ com o `HOME` (`~usuario` é um nome relativo comum), resolver o relativo, `canon
 que é pasta, que o caminho é UTF-8 e que ainda não está cadastrado no módulo (dois caminhos para
 a mesma pasta contam como o mesmo, e o `UNIQUE` garante isso e dá a mesma mensagem), e só então
 olhar o `.nick/nick.conf`. Remover faz só `DELETE FROM projects WHERE id = ?`: nenhum arquivo do
-projeto é tocado (um teste compara um retrato recursivo da pasta antes e depois).
+projeto é tocado (um teste compara um retrato recursivo da pasta antes e depois). Desde o NS-32,
+esse `DELETE` também apaga os tickets do projeto, pelo cascade do esquema.
 
 **O projeto pertence a um módulo, e a disponibilidade é calculada:** a navegação é "projetos
 **do módulo**", então `projects.module_id` aponta para `modules`. Um módulo futuro que use o
@@ -2428,3 +2431,108 @@ unidade de `projects.rs` com `#[path]` (review do NS-31, P4). Assim o teste no P
 um `touch`. O harness do PTY responde ao pedido de posição
 do cursor (`ESC[6n`), como faria um terminal: o `Terminal::clear` do ratatui o faz quando a TUI
 volta do init, e sem resposta ele dá erro depois de 2 s.
+
+## Rust no projeto: tickets na casca `nick` (NS-32)
+
+A fatia F2b do épico NS-28. A navegação da casca passa a ser **Módulos > Projetos > Tickets**.
+`Enter`/`→` sobre um projeto disponível abre a lista dos tickets dele, e `Esc`/`←` volta com o
+projeto ainda selecionado. Na lista, o operador cria, corrige o título, oculta e restaura
+tickets. As teclas ficam no rodapé da TUI. As regras, sem tela, ficam em `nick/src/tickets.rs`,
+no molde do `projects.rs`, e o esquema na migração 2 (`nick/src/db/migrations.rs`).
+
+**Tudo fica só no banco.** Nenhuma ação sobre ticket cria, altera ou apaga arquivo do projeto.
+Em especial, nenhuma cria `.nick/docs/<ID>/`: essa pasta continua sendo do `auto_scrum.sh`. Um
+teste de unidade (`tickets.rs`) e um de integração no PTY (`tests/tui.rs`) provam isso com o
+retrato recursivo da pasta (`tests/common/snapshot.rs`). A lista também não importa as pastas
+`.nick/docs/<ID>/` que já existem.
+
+**UUID provisório:** sem o ID do Jira, o nick gera um ID de **8 caracteres hexadecimais
+minúsculos** com o próprio SQLite (`lower(hex(randomblob(4)))`), sem crate de UUID nem de
+número aleatório. O valor sempre passa no `jira_id_valid`. A unicidade é por projeto e vem do
+`UNIQUE (project_id, key)`: numa colisão, o nick gera de novo, até **5 tentativas** no total.
+Depois disso, a barra mostra `Não consegui gerar um ID provisório único para o ticket. Tente de
+novo.`, e nada é gravado. O gerador é injetável (`tickets::create_with`), como as migrações do
+`Db::open_with`, e os testes provam a colisão com um gerador falso. O ID é local à máquina:
+ainda não há como evitar a colisão entre máquinas (Q7 do épico). A coluna `is_provisional` existe
+para que a F4 (Q8) saiba qual ID trocar pelo do Jira. Só pelo texto não dá para saber, porque
+`deadbeef` e `24` são IDs válidos do Jira.
+
+**O título é digitado pelo operador e guardado no banco.** O nick não lê o `plan.md` nem o Jira
+para preencher o título. A lista precisa de um rótulo antes de existir plano, e ler o plano ou o
+Jira acoplaria a casca a formatos e à rede, o que ficou fora do escopo. Se o título do nick
+divergir do título no Jira ou no plano, tudo bem: ele só serve para o operador reconhecer o
+ticket. O título é gravado aparado, e vazio ou só com espaços é recusado (`Informe o título do
+ticket.`). No esquema, um `CHECK` serve de rede de segurança.
+
+**Ocultar no lugar de apagar:** ocultar só grava `hidden_at`, e a linha continua no banco. O
+filtro `f` mostra os ocultos com a marca `[oculto]`, e `o` sobre um oculto o restaura sem pedir
+confirmação, porque restaurar não esconde nada. Ocultar pede `(s/N)`, como a remoção de projeto.
+Não existe limpeza dos ocultos, de propósito. Um ID oculto continua ocupando o ID no projeto, e
+a recusa avisa (`... neste projeto (oculto; f mostra os ocultos).`). Ocultar projetos ficou fora
+do escopo.
+
+**Ticket que sumiu do banco não é dado como alterado** (review do NS-32): corrigir o título,
+ocultar e restaurar conferem quantas linhas o `UPDATE` mudou. Se o ticket não existe mais
+(outro `nick` removeu o projeto enquanto este mostrava a lista), a barra diz `O ticket <ID> não
+existe mais no banco.` no lugar da mensagem de sucesso, e nada é gravado.
+
+**Remover projeto apaga os tickets dele em cascata** (`ON DELETE CASCADE`, decisão do analista no
+NS-32). Sem o cascade, o `DELETE FROM projects` falharia, porque toda conexão liga
+`foreign_keys = ON`. Como o cascade faz parte do próprio `DELETE`, não precisa de transação extra,
+e o `delete_project` não mudou. A confirmação avisa quantos tickets vão junto, ocultos incluídos:
+`Os <N> tickets dele (inclusive os ocultos) serão apagados do banco.` ou, com um, `O ticket dele
+será apagado do banco.` (texto do singular escolhido pelo usuário no NS-32). Com 0 tickets, o
+texto é o do NS-31, byte a byte.
+
+**Validação do ID duplicada (Rust e bash):** `tickets::jira_id_valid` espelha o `jira_id_valid`
+de `auto_scrum/auto_scrum.sh`. Os dois recusam vazio, exatamente `.`, qualquer `/`, qualquer
+`..`, espaço e caractere de controle. **Qualquer mudança vale para os dois lados, com os mesmos
+casos de teste.** O teste Rust copia as listas da suíte bash (`auto_scrum/tests/test_auto_scrum.sh`,
+seção `jira_id_valid`), e um comentário em cada lado aponta para o outro. Um teste diferencial
+roda o `jira_id_valid` real do bash em cada caso, com o locale herdado e com `LC_ALL=C`, e exige o
+mesmo veredito. É ele que pega uma divergência. O ID digitado é aparado antes, como o `read` do
+bash faz, e vazio depois de aparar quer dizer "sem ID" (gera o provisório). **Diferença
+conhecida e aceita:** o Rust usa as classes Unicode (`char::is_whitespace` também pega o NBSP
+U+00A0, e `char::is_control` pega o C1, U+0080–U+009F). Já o `[[:space:]]`/`[[:cntrl:]]` do bash
+depende do locale. O desvio sempre vai para o lado de recusar mais, e o Rust nunca aceita o que o
+bash recusa nos casos de teste. Os dois aceitam acento (`SÃO-1`). A recusa não mostra o valor
+digitado, que pode ter caractere de controle, como no bash.
+
+**Esquema (migração 2):** `tickets (id, project_id → projects ON DELETE CASCADE, key,
+is_provisional ∈ {0,1}, title com CHECK, created_at, hidden_at NULL enquanto visível,
+UNIQUE (project_id, key))`. A comparação do `key` é exata (`BINARY`), como o nome de pasta no
+Linux, então `NS-1` e `ns-1` são IDs diferentes. As datas saem do próprio SQL (`strftime`, RFC
+3339 em UTC), como no NS-31. O teste `migration_1_is_pinned` passou a fixar também o texto da
+migração 2. Um banco na versão 1 com projetos abre num `nick` novo, vai para a 2 e mantém os
+projetos (teste de unidade).
+
+**Barra de status e rodapé com quebra de linha** (decisões do usuário no NS-32): os dois ocupavam
+uma linha cada e cortavam o que passasse da largura. Duas mensagens do NS-32 passam de 100
+colunas (o projeto indisponível e o ID inválido), e o rodapé da lista de tickets com o filtro
+ligado tem 101. Agora cada um ocupa as linhas de que precisa, com quebra por palavra
+(`ui::wrap_words`), até um terço da tela cada, e a lista encolhe. Uma palavra maior que a largura
+é partida. Um texto curto continua numa linha, como no NS-31, e a linha da barra vazia continua
+reservada. Num terminal estreito, o rodapé das outras telas também passa a aparecer inteiro. A conta é exata, e não
+a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
+`Paragraph::line_count` do ratatui daria a conta, mas fica atrás de uma feature instável.
+
+**Reaproveitamento e adaptações no código do NS-31:**
+- `unavailable_mark` saiu do `ui.rs` e virou `projects::unavailable_text`. O `ui.rs` e a recusa
+  de abrir os tickets usam o mesmo texto: `Projeto indisponível: <marca>. Os tickets só abrem com
+  a pasta e o .nick/nick.conf no lugar.`. A disponibilidade é lida do disco na hora do `Enter`;
+- a digitação do campo de texto virou `app::edit_text`, usada pelo `AddPath` (sem mudar o
+  comportamento) e pelos dois diálogos novos (`NewTicket`, com dois campos, e `EditTitle`);
+- `Dialog::ConfirmRemove` ganhou `tickets`, preenchido com `count_tickets` ao abrir. Por isso,
+  dois testes do NS-31 mudaram só na sintaxe: um padrão ganhou `..` e um literal ganhou
+  `tickets: 0`. O texto conferido não mudou;
+- o `snapshot.rs` é incluído uma vez só, pelo `projects.rs` (`pub(crate)`, só em teste), e o
+  `tickets.rs` usa esse módulo. Incluir o mesmo arquivo duas vezes com `#[path]` cai no
+  `clippy::duplicate_mod`;
+- **corrida nos testes de PTY do NS-31 (corrigida no NS-32, com o aval do usuário):** depois de
+  um `ESC` no alerta, três pontos de `tests/tui.rs` esperavam `Nenhum projeto cadastrado`, um
+  texto que já está visível atrás do alerta. Se o `ESC` e a tecla seguinte chegam juntos ao
+  `nick`, o crossterm lê os dois como `Alt+tecla`, e o teste trava até o timeout. Com os testes
+  novos rodando em paralelo, isso apareceu 2 vezes em umas 15 rodadas. Agora eles esperam o rodapé
+  da lista (`r remover`), que só aparece com o alerta fechado. Regra para testes novos no PTY:
+  **depois de um `ESC`, espere um texto que só existe no estado seguinte** (de preferência o
+  rodapé), nunca um texto que já estava na tela.

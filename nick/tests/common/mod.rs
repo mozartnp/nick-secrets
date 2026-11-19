@@ -27,6 +27,7 @@ pub const ENTER: &str = "\r";
 pub const ESC: &str = "\x1b";
 pub const LEFT: &str = "\x1b[D";
 pub const DOWN: &str = "\x1b[B";
+pub const TAB: &str = "\t";
 
 /// The fake bin/nick-init (tests/fixtures/bin/nick-init).
 pub fn fake_init() -> PathBuf {
@@ -95,6 +96,55 @@ impl World {
             .unwrap()
             .into_iter()
             .map(|p| p.path)
+            .collect()
+    }
+
+    /// The id of the registered project at `dir`.
+    fn project_id(&self, db: &nick::db::Db, dir: &Path) -> i64 {
+        let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        db.list_projects("auto_scrum")
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path == canonical)
+            .unwrap_or_else(|| panic!("{} is not registered", dir.display()))
+            .id
+    }
+
+    /// Stores a ticket of the registered project at `dir`, through the library.
+    pub fn ticket(&self, dir: &Path, key: &str, title: &str) {
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        let id = self.project_id(&db, dir);
+        nick::tickets::create(&db, id, title, key).unwrap();
+    }
+
+    /// Hides the ticket `key` of the registered project at `dir`, through the library.
+    pub fn hide_ticket(&self, dir: &Path, key: &str) {
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        let id = self.project_id(&db, dir);
+        let ticket = db
+            .list_tickets(id, true)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.key == key)
+            .unwrap_or_else(|| panic!("{key} is not a ticket of {}", dir.display()));
+        nick::tickets::hide(&db, &ticket).unwrap();
+    }
+
+    /// Every ticket in the database (any project, hidden included), as (key, title, hidden),
+    /// in the order they were created; of the project at `dir` only, when given.
+    pub fn tickets(&self, dir: Option<&Path>) -> Vec<(String, String, bool)> {
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        let only = dir.map(|dir| self.project_id(&db, dir));
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT key, title, hidden_at IS NOT NULL FROM tickets \
+                 WHERE ?1 IS NULL OR project_id = ?1 ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([only], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
             .collect()
     }
 
@@ -201,6 +251,17 @@ impl Nick {
     /// The text on the screen now.
     pub fn screen(&self) -> String {
         self.parser().screen().contents()
+    }
+
+    /// The screen as one line: the dialog borders taken out and the non-empty rows joined by a
+    /// space, so a text wrapped inside a dialog can be checked whole.
+    pub fn flat_screen(&self) -> String {
+        self.screen()
+            .lines()
+            .map(|l| l.replace('│', "").trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// True while the alternate screen (the TUI) is on.

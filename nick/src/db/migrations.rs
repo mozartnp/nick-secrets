@@ -24,5 +24,22 @@ CREATE TABLE projects (
 INSERT INTO modules (key, name) VALUES ('auto_scrum', 'auto_scrum');
 ";
 
+/// Migration 2 (NS-32): the tickets of each project, kept only in the database. `key` is the
+/// Jira ID or, when none was given, a provisional short UUID (`is_provisional = 1`, so the F4
+/// knows which one to replace). Hiding sets `hidden_at`; nothing is ever deleted, except with
+/// the project (ON DELETE CASCADE). A hidden ticket still holds its key in the project.
+pub const MIGRATION_2: &str = "\
+CREATE TABLE tickets (
+    id             INTEGER PRIMARY KEY,
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,     -- the Jira ID, or the provisional short UUID
+    is_provisional INTEGER NOT NULL CHECK (is_provisional IN (0, 1)),
+    title          TEXT NOT NULL CHECK (trim(title) <> ''),
+    created_at     TEXT NOT NULL,     -- RFC 3339, in UTC
+    hidden_at      TEXT,              -- RFC 3339, in UTC; NULL while visible
+    UNIQUE (project_id, key)
+);
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
-pub const MIGRATIONS: &[&str] = &[MIGRATION_1];
+pub const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2];

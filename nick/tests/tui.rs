@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use common::{DOWN, ENTER, ESC, LEFT, World};
+use common::{DOWN, ENTER, ESC, LEFT, TAB, World};
 
 const ALT_ON: &str = "\x1b[?1049h";
 const ALT_OFF: &str = "\x1b[?1049l";
@@ -276,7 +276,9 @@ fn assert_init_failure(mode: &str, message: &str) {
     assert_eq!(world.stored(), Vec::<std::path::PathBuf>::new(), "{mode}");
     assert!(!bare.join(".nick/nick.conf").exists());
     nick.send(ESC);
-    nick.wait_for("Nenhum projeto cadastrado");
+    // The footer of the list, and not a text of the list (visible behind the alert): an ESC
+    // sent together with the next key would be read as Alt+key (NS-32).
+    nick.wait_for("r remover");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0), "{mode}");
 }
@@ -343,7 +345,9 @@ fn the_init_only_runs_from_the_button() {
     add(&mut nick, &bare);
     nick.wait_for("Esta pasta não tem a configuração do nick.");
     nick.send(ESC);
-    nick.wait_for("Nenhum projeto cadastrado");
+    // The footer of the list, and not a text of the list (visible behind the alert): an ESC
+    // sent together with the next key would be read as Alt+key (NS-32).
+    nick.wait_for("r remover");
     // Again, now leaving through the focused "Cancelar".
     add(&mut nick, &bare);
     nick.wait_for("Esta pasta não tem a configuração do nick.");
@@ -382,7 +386,9 @@ fn a_missing_init_shows_the_path_and_the_tui_goes_on() {
         nick.screen()
     );
     nick.send(ESC);
-    nick.wait_for("Nenhum projeto cadastrado");
+    // The footer of the list, and not a text of the list (visible behind the alert): an ESC
+    // sent together with the next key would be read as Alt+key (NS-32).
+    nick.wait_for("r remover");
     nick.send(LEFT);
     nick.wait_for("Módulos");
     nick.send(DOWN);
@@ -433,4 +439,228 @@ fn a_project_whose_directory_is_gone_is_marked_unavailable() {
     nick.wait_for("[indisponível: sem .nick/nick.conf]");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- tickets (NS-32) ----
+
+/// Opens the Projects screen, then the tickets of the selected project.
+fn open_tickets(nick: &mut common::Nick, name: &str) {
+    open_projects(nick);
+    nick.wait_for(name);
+    nick.send(ENTER);
+    nick.wait_for(&format!("auto_scrum > {name} > Tickets"));
+}
+
+/// Creates a ticket through the dialog (empty `jira` generates a provisional ID).
+fn new_ticket(nick: &mut common::Nick, title: &str, jira: &str) {
+    nick.send("a");
+    nick.wait_for("ID do Jira (opcional; vazio gera um ID provisório):");
+    nick.send(title);
+    nick.wait_for(title);
+    nick.send(TAB);
+    nick.send(jira);
+    nick.send(ENTER);
+    nick.wait_for("Ticket criado");
+}
+
+/// The whole flow through the keys: create with and without an ID, edit the title, hide,
+/// show the hidden ones, restore. The project's files are left exactly as they were, and no
+/// `.nick/docs/<ID>/` is created (plan D8).
+#[test]
+fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    fs::create_dir_all(proj.join(".nick/docs/NS-0")).unwrap();
+    fs::write(proj.join(".nick/docs/NS-0/plan.md"), "# plano\n").unwrap();
+    fs::write(proj.join("README.md"), "# proj\n").unwrap();
+    world.register(&proj);
+    let before = common::snapshot(&proj);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.wait_for("Nenhum ticket neste projeto. Pressione a para criar.");
+
+    new_ticket(&mut nick, "Corrigir o login", "NS-7");
+    nick.wait_for("Ticket criado: NS-7 — Corrigir o login.");
+    nick.wait_for("NS-7  Corrigir o login");
+
+    new_ticket(&mut nick, "Sem ID ainda", "");
+    nick.wait_for("Ticket criado com o ID provisório");
+    nick.wait_for("[provisório]");
+    let stored = world.tickets(Some(&proj));
+    assert_eq!(stored.len(), 2);
+    let provisional = stored[1].0.clone();
+    assert_eq!(provisional.len(), 8);
+    assert!(
+        nick.screen()
+            .contains(&format!("{provisional}  Sem ID ainda  [provisório]"))
+    );
+
+    // A blank title is refused and the dialog keeps what was typed.
+    nick.send("a");
+    nick.wait_for("Novo ticket");
+    nick.send("   ");
+    nick.send(TAB);
+    nick.send("NS-9");
+    nick.send(ENTER);
+    nick.wait_for("Informe o título do ticket.");
+    assert!(nick.screen().contains("NS-9"));
+    nick.send(ESC);
+    nick.wait_for("f mostrar ocultos");
+
+    // Edit the title of NS-7 (the first one).
+    nick.send("\x1b[A");
+    nick.send("e");
+    nick.wait_for("Editar título");
+    nick.wait_for("ID: NS-7");
+    nick.send("\x7f\x7f\x7f\x7f\x7f");
+    nick.send("senha");
+    nick.send(ENTER);
+    nick.wait_for("Título atualizado: NS-7.");
+    nick.wait_for("NS-7  Corrigir o senha");
+
+    // Hide it: `n` cancels, `s` confirms and it leaves the list.
+    nick.send("o");
+    nick.wait_for("(s/N)");
+    nick.send("n");
+    nick.wait_for("f mostrar ocultos");
+    assert!(nick.screen().contains("NS-7  Corrigir o senha"));
+    nick.send("o");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    nick.wait_for("Ticket ocultado: NS-7.");
+    assert!(
+        !nick.screen().contains("Corrigir o senha"),
+        "{}",
+        nick.screen()
+    );
+
+    // The filter shows it as [oculto], and `o` restores it.
+    nick.send("f");
+    nick.wait_for("(com ocultos)");
+    nick.wait_for("NS-7  Corrigir o senha  [oculto]");
+    nick.wait_for("f esconder ocultos");
+    nick.send("\x1b[A");
+    nick.send("o");
+    nick.wait_for("Ticket restaurado: NS-7.");
+    nick.send("f");
+    nick.wait_for("f mostrar ocultos");
+    assert!(nick.screen().contains("NS-7  Corrigir o senha"));
+    assert!(!nick.screen().contains("[oculto]"));
+
+    // Back to the projects, with it still there.
+    nick.send(ESC);
+    nick.wait_for("auto_scrum > Projetos");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+
+    assert_eq!(
+        world.tickets(Some(&proj)),
+        [
+            ("NS-7".into(), "Corrigir o senha".into(), false),
+            (provisional.clone(), "Sem ID ainda".into(), false),
+        ]
+    );
+    assert_eq!(
+        common::snapshot(&proj),
+        before,
+        "no file of the project touched"
+    );
+    assert!(!proj.join(".nick/docs/NS-7").exists());
+    assert!(!proj.join(".nick/docs").join(&provisional).exists());
+}
+
+#[test]
+fn an_unavailable_project_does_not_open_its_tickets() {
+    let world = World::new();
+    let noconf = world.dir("noconf", true);
+    world.register(&noconf);
+    world.ticket(&noconf, "NS-1", "Escondido atrás da indisponibilidade");
+    fs::remove_file(noconf.join(".nick/nick.conf")).unwrap();
+    let mut nick = world.spawn(&world.root, &[]);
+    open_projects(&mut nick);
+    nick.wait_for("[indisponível: sem .nick/nick.conf]");
+    nick.send(ENTER);
+    // The message is longer than the screen: it wraps in the status bar, nothing is cut.
+    nick.wait_for("Projeto indisponível: [indisponível: sem .nick/nick.conf].");
+    let screen = nick.screen();
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let n = lines.len();
+    assert_eq!(
+        format!("{} {}", lines[n - 3], lines[n - 2]),
+        "Projeto indisponível: [indisponível: sem .nick/nick.conf]. Os tickets só abrem com a \
+         pasta e o .nick/nick.conf no lugar.",
+        "{screen}"
+    );
+    assert!(nick.screen().contains("auto_scrum > Projetos"));
+    assert!(!nick.screen().contains("Escondido"));
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_tickets_of_a_project_do_not_show_in_another() {
+    let world = World::new();
+    let alfa = world.dir("alfa", true);
+    let beta = world.dir("beta", true);
+    world.register(&alfa);
+    world.register(&beta);
+    world.ticket(&alfa, "NS-1", "Só do alfa");
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "alfa");
+    nick.wait_for("NS-1  Só do alfa");
+    nick.send(ESC);
+    nick.wait_for("auto_scrum > Projetos");
+    nick.send(DOWN);
+    nick.send(ENTER);
+    nick.wait_for("auto_scrum > beta > Tickets");
+    nick.wait_for("Nenhum ticket neste projeto.");
+    assert!(!nick.screen().contains("Só do alfa"));
+    // The same ID in another project is accepted.
+    new_ticket(&mut nick, "Só do beta", "NS-1");
+    nick.wait_for("Ticket criado: NS-1 — Só do beta.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_eq!(
+        world.tickets(Some(&alfa)),
+        [("NS-1".into(), "Só do alfa".into(), false)]
+    );
+    assert_eq!(
+        world.tickets(Some(&beta)),
+        [("NS-1".into(), "Só do beta".into(), false)]
+    );
+}
+
+#[test]
+fn removing_a_project_with_tickets_deletes_them_and_no_other() {
+    let world = World::new();
+    let alfa = world.dir("alfa", true);
+    let beta = world.dir("beta", true);
+    world.register(&alfa);
+    world.register(&beta);
+    world.ticket(&alfa, "A-1", "um");
+    world.ticket(&alfa, "A-2", "dois");
+    world.ticket(&beta, "B-1", "do beta");
+    // A-2 hidden: it goes too.
+    world.hide_ticket(&alfa, "A-2");
+    let before = common::snapshot(&alfa);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_projects(&mut nick);
+    nick.wait_for("alfa");
+    nick.send("r");
+    nick.wait_for("(s/N)");
+    let flat = nick.flat_screen();
+    assert!(
+        flat.contains("Os 2 tickets dele (inclusive os ocultos) serão apagados do banco. (s/N)"),
+        "{flat}"
+    );
+    nick.send("s");
+    nick.wait_for("Projeto removido do nick: alfa. Nenhum arquivo foi apagado.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_eq!(world.stored(), [beta]);
+    assert_eq!(
+        world.tickets(None),
+        [("B-1".into(), "do beta".into(), false)]
+    );
+    assert_eq!(common::snapshot(&alfa), before);
 }

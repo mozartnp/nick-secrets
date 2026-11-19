@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 
 pub use crate::db::Project;
 
+// Also used by the unit tests of tickets.rs (one inclusion only: clippy's duplicate_mod).
 #[cfg(test)]
 #[path = "../tests/common/snapshot.rs"]
-mod snapshot;
+pub(crate) mod snapshot;
 use crate::db::{Db, is_unique_violation};
 use crate::modules::ModuleKind;
 
@@ -41,6 +42,16 @@ pub fn availability(path: &Path) -> Availability {
         Availability::ConfigMissing
     } else {
         Availability::Available
+    }
+}
+
+/// The mark of an unavailable project, shown on its row and in the refusal to open its
+/// tickets; None when it is available.
+pub fn unavailable_text(availability: Availability) -> Option<&'static str> {
+    match availability {
+        Availability::Available => None,
+        Availability::DirMissing => Some("[indisponível: pasta não encontrada]"),
+        Availability::ConfigMissing => Some("[indisponível: sem .nick/nick.conf]"),
     }
 }
 

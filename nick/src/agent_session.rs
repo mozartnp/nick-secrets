@@ -39,7 +39,7 @@ pub fn screen_size(rows: u16, cols: u16) -> (u16, u16) {
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// What the agent threads tell the main loop.
+/// What the agent threads tell the main loop, for one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
     /// New output was parsed: redraw.
@@ -49,6 +49,14 @@ pub enum SessionEvent {
     Clipboard(Vec<u8>),
     /// The child was reaped, with its exit code (portable-pty reports 1 for a signal).
     Exited(u32),
+}
+
+/// An event of the session of the agent `agent` (the `id` of its row): several sessions share
+/// the channel of the loop (NS-34).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEvent {
+    pub agent: i64,
+    pub event: SessionEvent,
 }
 
 /// The vt100 callbacks: keeps the copy requests (OSC 52) the parser sees, for the reader to hand
@@ -106,21 +114,34 @@ pub struct AgentSession {
 impl AgentSession {
     /// Opens a PTY of `rows`x`cols` (at least 2x2) and runs `bash <launcher> --session-id
     /// <session_id> --name <name>` in it, with the cwd at `project`, the environment of the nick
-    /// plus TERM=xterm-256color and COLORTERM=truecolor. Events go to `tx`.
-    pub fn spawn<E: From<SessionEvent> + Send + 'static>(
+    /// plus TERM=xterm-256color and COLORTERM=truecolor. Events go to `tx`, as `AgentEvent`s of
+    /// `agent_id` (the `id` of the row of the agent, stored before the spawn).
+    pub fn spawn<E: From<AgentEvent> + Send + 'static>(
         launcher: &Path,
         project: &Path,
+        agent_id: i64,
         session_id: &str,
         name: &str,
         (rows, cols): (u16, u16),
         tx: Sender<E>,
     ) -> Result<AgentSession, Error> {
-        AgentSession::spawn_with_env(launcher, project, session_id, name, (rows, cols), &[], tx)
+        AgentSession::spawn_with_env(
+            launcher,
+            project,
+            agent_id,
+            session_id,
+            name,
+            (rows, cols),
+            &[],
+            tx,
+        )
     }
 
-    fn spawn_with_env<E: From<SessionEvent> + Send + 'static>(
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_env<E: From<AgentEvent> + Send + 'static>(
         launcher: &Path,
         project: &Path,
+        agent_id: i64,
         session_id: &str,
         name: &str,
         (rows, cols): (u16, u16),
@@ -151,6 +172,13 @@ impl AgentSession {
         let writer = pair.master.take_writer()?;
         let reader_parser = Arc::clone(&parser);
         let reader_tx = tx.clone();
+        let event = move |event| {
+            AgentEvent {
+                agent: agent_id,
+                event,
+            }
+            .into()
+        };
         let (drained_tx, drained_rx) = mpsc::channel::<()>();
         thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
@@ -165,9 +193,9 @@ impl AgentSession {
                         };
                         // The loop may be gone: keep draining anyway.
                         for copy in copies {
-                            let _ = reader_tx.send(SessionEvent::Clipboard(copy).into());
+                            let _ = reader_tx.send(event(SessionEvent::Clipboard(copy)));
                         }
-                        let _ = reader_tx.send(SessionEvent::Output.into());
+                        let _ = reader_tx.send(event(SessionEvent::Output));
                     }
                 }
             }
@@ -184,7 +212,7 @@ impl AgentSession {
             // The last output first, so the screen is complete when the loop hears of the end.
             let _ = drained_rx.recv_timeout(DRAIN_GRACE);
             *lock(&waiter_exit) = Some(code);
-            let _ = tx.send(SessionEvent::Exited(code).into());
+            let _ = tx.send(event(SessionEvent::Exited(code)));
         });
 
         Ok(AgentSession {
@@ -241,20 +269,9 @@ impl AgentSession {
         lock(&self.parser).screen_mut().set_scrollback(0);
     }
 
-    /// Ends the agent: SIGTERM to the process group of the child (not only the child: whatever
-    /// it started in its group goes too), SIGKILL after [`TERM_GRACE`] to what is left, then
-    /// waits for the child to be reaped. Only a group not reaped yet is signaled: once the
-    /// child is reaped, its pid may go to an unrelated group leader (finding of NS-29).
+    /// Ends the agent: `terminate_all` of this session alone.
     pub fn terminate(&mut self) {
-        let registered = lock(&GROUPS).clone();
-        let groups: Vec<i32> = self
-            .pid
-            .map(|p| p as i32)
-            .filter(|g| registered.contains(g))
-            .into_iter()
-            .collect();
-        end_groups(&groups);
-        self.wait();
+        terminate_all(std::slice::from_mut(self));
     }
 
     /// Waits for the waiter thread (the child reaped and the end announced).
@@ -292,6 +309,25 @@ fn end_groups(groups: &[i32]) {
         if group_alive(group) {
             let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
         }
+    }
+}
+
+/// Ends the agents of `sessions`: SIGTERM to the process group of each child (not only the
+/// child: whatever it started in its group goes too), SIGKILL after [`TERM_GRACE`] to what is
+/// left, all in a single `end_groups` (one grace for all of them, not one per agent), then
+/// waits for each child to be reaped. Only a group not reaped yet is signaled: once the child
+/// is reaped, its pid may go to an unrelated group leader (finding of NS-29).
+pub fn terminate_all(sessions: &mut [AgentSession]) {
+    let registered = lock(&GROUPS).clone();
+    let groups: Vec<i32> = sessions
+        .iter()
+        .filter_map(|session| session.pid)
+        .map(|pid| pid as i32)
+        .filter(|group| registered.contains(group))
+        .collect();
+    end_groups(&groups);
+    for session in sessions {
+        session.wait();
     }
 }
 
@@ -390,20 +426,31 @@ mod tests {
     struct Case {
         _tmp: tempfile::TempDir,
         root: PathBuf,
+        /// The directory of the project under the root.
+        project: &'static str,
     }
 
     impl Case {
         fn new() -> Case {
+            Case::named("proj")
+        }
+
+        /// A case whose project directory is named `project`.
+        fn named(project: &'static str) -> Case {
             let tmp = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(tmp.path()).unwrap();
-            fs::create_dir_all(root.join("proj/.nick")).unwrap();
+            fs::create_dir_all(root.join(project).join(".nick")).unwrap();
             fs::create_dir_all(root.join("home")).unwrap();
             fs::write(
-                root.join("proj/.nick/nick.conf"),
+                root.join(project).join(".nick/nick.conf"),
                 "JAIL_ENABLED=\"false\"\n",
             )
             .unwrap();
-            Case { _tmp: tmp, root }
+            Case {
+                _tmp: tmp,
+                root,
+                project,
+            }
         }
 
         fn path(&self, rel: &str) -> PathBuf {
@@ -415,7 +462,21 @@ mod tests {
             mode: &str,
             extra: &[(&str, &str)],
             size: (u16, u16),
-        ) -> (AgentSession, mpsc::Receiver<SessionEvent>) {
+        ) -> (AgentSession, mpsc::Receiver<AgentEvent>) {
+            let (tx, rx) = mpsc::channel();
+            (self.spawn_on(AGENT_ID, mode, extra, size, tx), rx)
+        }
+
+        /// `spawn` as the agent `agent_id`, with the events sent to `tx` (several sessions may
+        /// share one channel, as in the loop of the nick).
+        fn spawn_on(
+            &self,
+            agent_id: i64,
+            mode: &str,
+            extra: &[(&str, &str)],
+            size: (u16, u16),
+            tx: Sender<AgentEvent>,
+        ) -> AgentSession {
             let path = format!(
                 "{}:{}",
                 repo("bin/tests/fixtures/bin").display(),
@@ -434,18 +495,17 @@ mod tests {
                 ("FAKE_CLAUDE_PIDS", pids.as_str()),
             ];
             env.extend_from_slice(extra);
-            let (tx, rx) = mpsc::channel();
-            let session = AgentSession::spawn_with_env(
+            AgentSession::spawn_with_env(
                 &repo("bin/nick-agent"),
-                &self.path("proj"),
+                &self.path(self.project),
+                agent_id,
                 "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60",
                 "proj · Dev · NS-1",
                 size,
                 &env,
                 tx,
             )
-            .expect("spawn the agent");
-            (session, rx)
+            .expect("spawn the agent")
         }
 
         fn pids(&self) -> Vec<i32> {
@@ -455,6 +515,19 @@ mod tests {
                 .map(|p| p.parse().unwrap())
                 .collect()
         }
+    }
+
+    /// The id of the agent of `Case::spawn`.
+    const AGENT_ID: i64 = 42;
+
+    /// The events of `rx` so far, all of them from `AGENT_ID`.
+    fn session_events(rx: &mpsc::Receiver<AgentEvent>) -> Vec<SessionEvent> {
+        rx.try_iter()
+            .map(|e| {
+                assert_eq!(e.agent, AGENT_ID, "{e:?}");
+                e.event
+            })
+            .collect()
     }
 
     fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -507,7 +580,7 @@ mod tests {
         assert!(env.lines().any(|l| l == "COLORTERM=truecolor"), "{env}");
         let pwd = format!("PWD={}", case.path("proj").display());
         assert!(env.lines().any(|l| l == pwd), "{env}");
-        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        let events = session_events(&rx);
         assert!(events.contains(&SessionEvent::Output), "{events:?}");
         assert_eq!(events.last(), Some(&SessionEvent::Exited(0)), "{events:?}");
     }
@@ -633,7 +706,7 @@ mod tests {
         wait_exit(&session);
         session.wait();
         wait_for_text(&session, "COPIADO");
-        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        let events = session_events(&rx);
         assert!(
             events.contains(&SessionEvent::Clipboard(b"\x1b]52;c;b2zDoQ==\x07".to_vec())),
             "{events:?}"
@@ -655,5 +728,115 @@ mod tests {
         session.scroll(4);
         session.scroll_to_bottom();
         assert_eq!(session.with_screen(|s| s.scrollback()), 0);
+    }
+
+    // ---- several sessions at once (NS-34) ----
+
+    #[test]
+    fn two_sessions_tell_their_events_apart_and_a_flood_does_not_block_the_other() {
+        let (a, b) = (Case::new(), Case::new());
+        let (tx, rx) = mpsc::channel();
+        let mut echo = a.spawn_on(
+            7,
+            "echo",
+            &[("FAKE_CLAUDE_READ_BYTES", "2")],
+            (24, 80),
+            tx.clone(),
+        );
+        // Nobody reads the channel nor the screen of the flood while it runs.
+        let flood = b.spawn_on(9, "flood", &[], (24, 80), tx);
+        wait_for_text(&echo, "READY");
+        echo.write(b"ab").unwrap();
+        wait_for_text(&echo, "GOT 61 62");
+        assert_eq!(wait_exit(&flood), 0);
+        wait_for_text(&flood, "FIM-DO-FLOOD");
+        assert_eq!(wait_exit(&echo), 0);
+        echo.wait();
+        assert!(!contents(&echo).contains("xxx"), "{}", contents(&echo));
+        assert!(!contents(&echo).contains("FIM-DO-FLOOD"));
+        assert!(!contents(&flood).contains("READY"));
+        let events: Vec<AgentEvent> = rx.try_iter().collect();
+        for id in [7, 9] {
+            let mine: Vec<&SessionEvent> = events
+                .iter()
+                .filter(|e| e.agent == id)
+                .map(|e| &e.event)
+                .collect();
+            assert!(mine.contains(&&SessionEvent::Output), "{id}: {mine:?}");
+            assert_eq!(mine.last(), Some(&&SessionEvent::Exited(0)), "{id}");
+        }
+        assert!(events.iter().all(|e| [7, 9].contains(&e.agent)));
+    }
+
+    #[test]
+    fn terminate_all_ends_every_group_with_a_single_grace() {
+        let (a, b) = (Case::new(), Case::new());
+        let ignore = [("FAKE_CLAUDE_IGNORE_TERM", "1")];
+        let (first, _rx1) = a.spawn("sleep", &ignore, (24, 80));
+        let (second, _rx2) = b.spawn("sleep", &ignore, (24, 80));
+        wait_for_text(&first, "READY");
+        wait_for_text(&second, "READY");
+        let pids: Vec<i32> = a.pids().into_iter().chain(b.pids()).collect();
+        assert_eq!(pids.len(), 4);
+        assert!(pids.iter().all(|p| alive(*p)), "control: all alive");
+        let started = Instant::now();
+        let mut sessions = [first, second];
+        terminate_all(&mut sessions);
+        let took = started.elapsed();
+        assert!(took >= TERM_GRACE, "the SIGKILL came after the grace");
+        assert!(took < TERM_GRACE * 2, "one grace for both: {took:?}");
+        assert!(sessions.iter().all(|s| s.exit_code().is_some()), "reaped");
+        for pid in pids {
+            assert!(
+                wait_until(Duration::from_secs(3), || !alive(pid)),
+                "pid {pid} survived terminate_all()"
+            );
+        }
+    }
+
+    #[test]
+    fn terminate_all_leaves_the_group_of_a_reaped_child_alone() {
+        let (a, b) = (Case::new(), Case::new());
+        let (reaped, _rx1) = a.spawn("sleep", &[], (24, 80));
+        let (running, _rx2) = b.spawn("sleep", &[], (24, 80));
+        wait_for_text(&reaped, "READY");
+        wait_for_text(&running, "READY");
+        let (leader, leftover) = (a.pids()[0], a.pids()[1]);
+        nix::sys::signal::kill(Pid::from_raw(leader), Signal::SIGKILL).unwrap();
+        wait_exit(&reaped);
+        let others = b.pids();
+        let mut sessions = [reaped, running];
+        terminate_all(&mut sessions);
+        let survived = alive(leftover);
+        let _ = nix::sys::signal::kill(Pid::from_raw(leftover), Signal::SIGKILL);
+        assert!(
+            survived,
+            "terminate_all signaled the group of a reaped child"
+        );
+        for pid in others {
+            assert!(
+                wait_until(Duration::from_secs(3), || !alive(pid)),
+                "pid {pid} survived"
+            );
+        }
+    }
+
+    /// Review NS-34, P3: the fake claude runs in a project whose name is not a variable name
+    /// (FAKE_CLAUDE_MODE_<name> only applies to the valid ones), and the mode by project works.
+    #[test]
+    fn the_fake_claude_runs_in_a_project_whose_name_is_not_a_variable() {
+        let case = Case::named("meu-proj.v2");
+        let (session, _rx) = case.spawn("exit", &[("FAKE_CLAUDE_EXIT", "0")], (24, 80));
+        assert_eq!(wait_exit(&session), 0);
+        wait_for_text(&session, "BYE");
+        // Control: in a project with a valid name, its own mode wins.
+        let case = Case::named("alfa");
+        let (session, _rx) = case.spawn("exit", &[("FAKE_CLAUDE_MODE_alfa", "")], (24, 80));
+        assert_eq!(wait_exit(&session), 0);
+        wait_for_text(&session, "BYE");
+        let case = Case::named("alfa");
+        let (session, _rx) = case.spawn("exit", &[("FAKE_CLAUDE_MODE_alfa", "osc52")], (24, 80));
+        assert_eq!(wait_exit(&session), 0);
+        wait_for_text(&session, "COPIADO");
     }
 }

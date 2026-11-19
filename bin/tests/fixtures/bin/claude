@@ -18,20 +18,63 @@
 #            (and so does the sleep), so only a SIGKILL ends them;
 #   osc52    asks the terminal to copy "olá" (OSC 52, as claude does to copy), prints COPIADO
 #            and exits with 0;
-#   exit     prints BYE and exits with $FAKE_CLAUDE_EXIT (default 0).
+#   exit     prints BYE and exits with $FAKE_CLAUDE_EXIT (default 0);
+#   trigger  prints READY, waits for the file $FAKE_CLAUDE_TRIGGER.1, then rewrites the line of
+#            READY with another color (the same text) and creates $FAKE_CLAUDE_TRIGGER.1.done;
+#            waits for $FAKE_CLAUDE_TRIGGER.2, prints NOVO (new text) and creates
+#            $FAKE_CLAUDE_TRIGGER.2.done; then waits until it is ended;
+#   flood_on_trigger  prints READY, waits for the file $FAKE_CLAUDE_TRIGGER.1, then does what
+#            flood does;
+#   osc52_on_trigger  prints READY; for each n of 1 and 2, waits for the file
+#            $FAKE_CLAUDE_TRIGGER.<n>, asks the terminal to copy "olá" (as osc52 does), prints
+#            COPIADO <n> and creates $FAKE_CLAUDE_TRIGGER.<n>.done; then waits until it is
+#            ended.
+# Several agents of one nick share its environment (NS-34): FAKE_CLAUDE_MODE_<name>, when set,
+# is the mode of the agent whose cwd is named <name> (the basename of the project, only when it
+# is a valid variable name), in place of FAKE_CLAUDE_MODE; and with $FAKE_CLAUDE_LOG_DIR set,
+# the argv and the environment also go to <dir>/<name>.argv and <dir>/<name>.env.
 set -euo pipefail
 
+project="$(basename "$PWD")"
 if [ -n "${FAKE_CLAUDE_LOG:-}" ]; then
   printf '%s\n' "$@" > "$FAKE_CLAUDE_LOG"
 fi
 if [ -n "${FAKE_CLAUDE_ENV:-}" ]; then
   env > "$FAKE_CLAUDE_ENV"
 fi
+if [ -n "${FAKE_CLAUDE_LOG_DIR:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_CLAUDE_LOG_DIR/$project.argv"
+  env > "$FAKE_CLAUDE_LOG_DIR/$project.env"
+fi
 if [ -n "${FAKE_ORDER_LOG:-}" ]; then
   echo "claude" >> "$FAKE_ORDER_LOG"
 fi
+mode="${FAKE_CLAUDE_MODE:-}"
+# Only a project whose name is a valid variable name has a mode of its own: with a "-" or a "."
+# (meu-proj, proj.v2) the indirect expansion would abort the fake in every mode.
+case "$project" in
+  "" | [0-9]* | *[!A-Za-z0-9_]*) ;;
+  *)
+    mode_of_project="FAKE_CLAUDE_MODE_$project"
+    if [ -n "${!mode_of_project:-}" ]; then
+      mode="${!mode_of_project}"
+    fi
+    ;;
+esac
 
-case "${FAKE_CLAUDE_MODE:-}" in
+# Waits until the file $1 exists.
+wait_file() {
+  while [ ! -e "$1" ]; do
+    sleep 0.05
+  done
+}
+
+flood() {
+  head -c 1048576 /dev/zero | tr '\0' 'x'
+  printf '\r\nFIM-DO-FLOOD\r\n'
+}
+
+case "$mode" in
   echo)
     stty raw -echo
     printf 'READY\r\n'
@@ -62,14 +105,46 @@ case "${FAKE_CLAUDE_MODE:-}" in
     done
     ;;
   flood)
-    head -c 1048576 /dev/zero | tr '\0' 'x'
-    printf '\r\nFIM-DO-FLOOD\r\n'
+    flood
+    ;;
+  trigger)
+    printf 'READY\r\n'
+    wait_file "$FAKE_CLAUDE_TRIGGER.1"
+    printf '\033[A\r\033[32mREADY\033[0m\r\n'
+    : > "$FAKE_CLAUDE_TRIGGER.1.done"
+    wait_file "$FAKE_CLAUDE_TRIGGER.2"
+    printf 'NOVO\r\n'
+    : > "$FAKE_CLAUDE_TRIGGER.2.done"
+    while :; do
+      sleep 0.05
+    done
+    ;;
+  osc52_on_trigger)
+    printf 'READY\r\n'
+    for n in 1 2; do
+      wait_file "$FAKE_CLAUDE_TRIGGER.$n"
+      printf '\033]52;c;b2zDoQ==\a'
+      printf 'COPIADO %s\r\n' "$n"
+      : > "$FAKE_CLAUDE_TRIGGER.$n.done"
+    done
+    while :; do
+      sleep 0.05
+    done
+    ;;
+  flood_on_trigger)
+    printf 'READY\r\n'
+    wait_file "$FAKE_CLAUDE_TRIGGER.1"
+    flood
     ;;
   sleep)
     if [ -n "${FAKE_CLAUDE_IGNORE_TERM:-}" ]; then
       trap "" TERM
     fi
-    (trap "" HUP && exec sleep 300) &
+    # Ignored before the fork, so the sleep is born ignoring SIGHUP: with the trap inside the
+    # child, a SIGHUP to the group right after READY could come first (review NS-34, P4).
+    trap "" HUP
+    sleep 300 &
+    trap - HUP
     printf '%s %s\n' "$$" "$!" >> "$FAKE_CLAUDE_PIDS"
     echo READY
     wait

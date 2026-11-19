@@ -17,6 +17,9 @@ use crate::agents::AgentState;
 /// giving up with "database is locked" (the only transient error of SQLite).
 const BUSY_TIMEOUT_MS: u32 = 5000;
 
+/// The key of the reserved shortcut in `settings` (NS-34); its value is `Shortcut::to_db`.
+pub const SETTING_RESERVED_SHORTCUT: &str = "reserved_shortcut";
+
 /// Why the database could not be opened. The messages are what the operator reads on the
 /// stderr before the TUI opens.
 #[derive(Debug)]
@@ -381,6 +384,34 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// The value of the setting `key`, or `None` when it has no row (the default).
+    pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Stores `value` as the setting `key`, replacing the one stored before.
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the setting `key`: back to the default of the code.
+    pub fn delete_setting(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     /// Every `active` agent, of any project, in the order they were opened.
     pub fn list_active_agents(&self) -> rusqlite::Result<Vec<Agent>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -393,7 +424,7 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
-    use super::migrations::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATIONS};
+    use super::migrations::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATIONS};
     use super::*;
 
     fn user_version(conn: &Connection) -> u32 {
@@ -425,12 +456,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_3_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_4_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 3);
+        assert_eq!(user_version(db.connection()), 4);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -439,12 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_has_only_modules_projects_tickets_and_agents() {
+    fn the_schema_has_only_modules_projects_tickets_agents_and_settings() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("nick.db")).unwrap();
         assert_eq!(
             tables(db.connection()),
-            ["agents", "modules", "projects", "tickets"]
+            ["agents", "modules", "projects", "settings", "tickets"]
         );
     }
 
@@ -457,7 +488,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 3);
+        assert_eq!(user_version(db.connection()), 4);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -504,7 +535,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 7, mais nova que a deste nick (3). \
+                "Erro: o banco {} está na versão 7, mais nova que a deste nick (4). \
                  Atualize o nick.",
                 path.display()
             )
@@ -579,7 +610,7 @@ mod tests {
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            3,
+            4,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -634,6 +665,35 @@ CREATE TABLE agents (
 "
         );
         assert_eq!(MIGRATIONS[2], MIGRATION_3);
+        assert_eq!(
+            MIGRATION_4,
+            "\
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,  -- stable identifier in the code: 'reserved_shortcut'
+    value TEXT NOT NULL      -- the setting, in the format of its key (keys.rs: Shortcut::to_db)
+);
+"
+        );
+        assert_eq!(MIGRATIONS[3], MIGRATION_4);
+    }
+
+    #[test]
+    fn a_database_one_version_newer_is_refused_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 5;")
+            .unwrap();
+        let err = Db::open(&path).err().expect("a newer database is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Erro: o banco {} está na versão 5, mais nova que a deste nick (4). \
+                 Atualize o nick.",
+                path.display()
+            )
+        );
     }
 
     // ---- migration 2: tickets ----
@@ -1002,7 +1062,7 @@ CREATE TABLE agents (
                 ],
             )
         };
-        let db = Db::open(&path).unwrap();
+        let db = Db::open_with(&path, &[MIGRATION_1, MIGRATION_2, MIGRATION_3]).unwrap();
         assert_eq!(user_version(db.connection()), 3);
         assert_eq!(
             tables(db.connection()),
@@ -1173,5 +1233,93 @@ CREATE TABLE agents (
         let c = db.insert_agent(ticket, "development", "s-3", "n").unwrap();
         db.end_agent(b.id).unwrap();
         assert_eq!(db.list_active_agents().unwrap(), [a, c]);
+    }
+
+    // ---- migration 4: settings (NS-34) ----
+
+    #[test]
+    fn a_version_3_database_with_projects_tickets_and_agents_migrates_to_4_and_keeps_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (projects, tickets, agents) = {
+            let old = Db::open_with(&path, &[MIGRATION_1, MIGRATION_2, MIGRATION_3]).unwrap();
+            assert_eq!(user_version(old.connection()), 3);
+            let a = old.insert_project("auto_scrum", "a", "/a").unwrap();
+            let b = old.insert_project("auto_scrum", "b", "/b").unwrap();
+            let t1 = old.insert_ticket(a.id, "NS-1", false, "um").unwrap();
+            let t2 = old.insert_ticket(b.id, "3f9a0c7e", true, "dois").unwrap();
+            old.set_ticket_hidden(t2.id, true).unwrap();
+            let g1 = old
+                .insert_agent(t1.id, "po", "s-1", "a · PO · NS-1")
+                .unwrap();
+            old.insert_agent(t2.id, "review", "s-2", "b · Review · 3f9a0c7e")
+                .unwrap();
+            old.end_agent(g1.id).unwrap();
+            (
+                old.list_projects("auto_scrum").unwrap(),
+                [
+                    old.list_tickets(a.id, true).unwrap(),
+                    old.list_tickets(b.id, true).unwrap(),
+                ],
+                old.list_active_agents().unwrap(),
+            )
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(db.connection()), 4);
+        assert_eq!(
+            tables(db.connection()),
+            ["agents", "modules", "projects", "settings", "tickets"]
+        );
+        assert_eq!(db.list_projects("auto_scrum").unwrap(), projects);
+        assert_eq!(db.list_tickets(projects[0].id, true).unwrap(), tickets[0]);
+        assert_eq!(db.list_tickets(projects[1].id, true).unwrap(), tickets[1]);
+        assert_eq!(db.list_active_agents().unwrap(), agents);
+        assert_eq!(agent_sessions(db.connection()), ["s-1", "s-2"]);
+        assert_eq!(
+            db.get_setting(SETTING_RESERVED_SHORTCUT).unwrap(),
+            None,
+            "the shortcut is the default"
+        );
+    }
+
+    #[test]
+    fn a_setting_is_stored_overwritten_and_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get_setting(SETTING_RESERVED_SHORTCUT).unwrap(), None);
+        db.set_setting(SETTING_RESERVED_SHORTCUT, "ctrl+]").unwrap();
+        assert_eq!(
+            db.get_setting(SETTING_RESERVED_SHORTCUT)
+                .unwrap()
+                .as_deref(),
+            Some("ctrl+]")
+        );
+        db.set_setting(SETTING_RESERVED_SHORTCUT, "f7").unwrap();
+        assert_eq!(
+            db.get_setting(SETTING_RESERVED_SHORTCUT)
+                .unwrap()
+                .as_deref(),
+            Some("f7"),
+            "overwritten"
+        );
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT count(*) FROM settings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "one row per key");
+        assert_eq!(db.get_setting("other").unwrap(), None);
+        // It is kept for the next opening.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.get_setting(SETTING_RESERVED_SHORTCUT)
+                .unwrap()
+                .as_deref(),
+            Some("f7")
+        );
+        db.delete_setting(SETTING_RESERVED_SHORTCUT).unwrap();
+        assert_eq!(db.get_setting(SETTING_RESERVED_SHORTCUT).unwrap(), None);
+        db.delete_setting(SETTING_RESERVED_SHORTCUT).unwrap();
     }
 }

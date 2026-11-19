@@ -1,7 +1,9 @@
 //! Drawing the TUI with ratatui, with no business rule: everything comes from the `App` state
-//! (and, on the agent screen, from the vt100 screen of the agent's terminal, drawn with
-//! tui-term). The texts are in PT-BR; every text that comes from the operator or the system
-//! goes through `paths::printable` (control characters become `?`).
+//! (and, with an agent running, from the vt100 screen of the shown agent's terminal, drawn
+//! with tui-term). The texts are in PT-BR; every text that comes from the operator or the
+//! system goes through `paths::printable` (control characters become `?`). Where each part
+//! goes is computed once, by `layout`, which the loop also uses for the size of each PTY and
+//! for the mouse (NS-34): two copies of the count would drift apart.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -11,51 +13,150 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::agents::Stage;
-use crate::app::{App, Button, Dialog, Screen, TicketField};
+use crate::app::{App, Button, Dialog, Focus, RunningAgent, Screen, TicketField};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects;
+
+/// The widest the list gets beside an agent (NS-34); never more than half the window.
+pub const LIST_WIDTH: u16 = 40;
+
+/// Where each part of the screen goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Areas {
+    /// Everything above the status: where the dialogs are centered.
+    pub body: Rect,
+    /// The list of the current screen (the whole body without an agent running).
+    pub list: Rect,
+    /// The panel of the shown agent: its header, then its terminal (empty without agents).
+    pub panel: Rect,
+    pub header: Rect,
+    pub terminal: Rect,
+    pub status: Rect,
+    pub help: Rect,
+}
+
+/// The layout of the screen `area`: the status and the help at the bottom, full width, taking
+/// the rows they need, word wrapped (up to a third of the screen each), so a long one is not
+/// cut; above them, without an agent running, the list over the whole width (the screens of
+/// before the NS-34); with one, the list on the left (`LIST_WIDTH`, at most half the width)
+/// and the panel of the shown agent on the right.
+pub fn layout(app: &App, area: Rect) -> Areas {
+    layout_for(app, area, app.shown_agent())
+}
+
+/// The area of the terminal of `agent` on the screen `area`, as if it were the shown one: the
+/// size of its PTY (at least 2x2: agent_session.rs). Each agent's header has its own height,
+/// so each terminal has its own size.
+pub fn agent_area(app: &App, area: Rect, agent: &RunningAgent) -> Rect {
+    layout_for(app, area, Some(agent)).terminal
+}
+
+/// The panel an agent about to open gets on the screen `area` (review NS-34, P2): the same
+/// count as `layout`, in the state right after the opening (one more agent, the focus on its
+/// terminal, no status message). `terminal_in_panel` gives its terminal once its name and
+/// whether it runs in the jail are known: the size of its PTY at the spawn.
+pub fn new_agent_panel(app: &App, area: Rect) -> Rect {
+    let running = app.agents().len() + 1;
+    let help = help_text_for(app, (app.screen, app.show_hidden), true, None, None);
+    let help_rows = help_rows(app, area.width, running, &help);
+    split(area, 1, help_rows, true).panel
+}
+
+/// The terminal of the agent `name` in `panel`, below its header (`header_rows`).
+pub fn terminal_in_panel(panel: Rect, name: &str, jail: bool) -> Rect {
+    let rows = header_rows(name, jail, panel);
+    Rect {
+        y: panel.y + rows,
+        height: panel.height - rows,
+        ..panel
+    }
+}
+
+fn layout_for(app: &App, area: Rect, agent: Option<&RunningAgent>) -> Areas {
+    let status_rows = status_lines(app, area.width).len();
+    let help_rows = help_rows(app, area.width, app.agents().len(), &help_text(app));
+    let mut areas = split(area, status_rows, help_rows, !app.agents().is_empty());
+    if let Some(agent) = agent.filter(|_| !areas.panel.is_empty()) {
+        areas.terminal = terminal_in_panel(areas.panel, &agent.name, agent.jail);
+        areas.header = Rect {
+            height: areas.terminal.y - areas.panel.y,
+            ..areas.panel
+        };
+    } else {
+        areas.terminal = areas.panel;
+    }
+    areas
+}
+
+/// The status and the help (`status_rows`, `help_rows`, up to a third of the screen each) at
+/// the bottom of `area`, and above them the list, beside the panel of an agent when `beside`.
+fn split(area: Rect, status_rows: usize, help_rows: usize, beside: bool) -> Areas {
+    let rows = |lines: usize| {
+        u16::try_from(lines)
+            .unwrap_or(u16::MAX)
+            .min((area.height / 3).max(1))
+    };
+    let [body, status, help] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(rows(status_rows)),
+        Constraint::Length(rows(help_rows)),
+    ])
+    .areas(area);
+    let mut areas = Areas {
+        body,
+        list: body,
+        status,
+        help,
+        ..Areas::default()
+    };
+    if beside {
+        let [list, panel] = Layout::horizontal([
+            Constraint::Length(LIST_WIDTH.min(area.width / 2)),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        areas.list = list;
+        areas.panel = panel;
+    }
+    areas
+}
+
+/// The status message word wrapped at `width` (one empty row without a message).
+fn status_lines(app: &App, width: u16) -> Vec<String> {
+    app.status.as_deref().map_or_else(
+        || vec![String::new()],
+        |message| wrap_words(&printable(message), width.max(1)),
+    )
+}
+
+fn help_lines(app: &App, width: u16) -> Vec<String> {
+    wrap_words(&help_text(app), width.max(1))
+}
 
 /// Draws the whole screen without an agent's terminal (see `draw_with_terminal`).
 pub fn draw(frame: &mut Frame, app: &App) {
     draw_with_terminal(frame, app, None);
 }
 
-/// Draws the whole screen: on the agent screen, the header and `terminal` (the agent's vt100
-/// screen); otherwise the list, then the status line and the help line of the current screen,
-/// and the open dialog over the list. The status and the help take the rows they need, word
-/// wrapped (up to a third of the screen each), so a long one is not cut.
+/// Draws the whole screen (`layout`): the list of the current screen, the panel of the shown
+/// agent with `terminal` (its vt100 screen) when an agent runs, the status line and the help
+/// line, and the open dialog centered over the body.
 pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100::Screen>) {
-    if app.screen == Screen::Agent {
-        if let Some(agent) = app.agent() {
-            draw_agent(frame, &agent.name, agent.jail, terminal);
-        }
-        return;
-    }
-    let area = frame.area();
-    let status_lines = app.status.as_deref().map_or_else(
-        || vec![String::new()],
-        |message| wrap_words(&printable(message), area.width.max(1)),
-    );
-    let help_lines = wrap_words(help_text(app), area.width.max(1));
-    let rows = |lines: &[String]| {
-        u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .min((area.height / 3).max(1))
-    };
-    let [body, status, help] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(rows(&status_lines)),
-        Constraint::Length(rows(&help_lines)),
-    ])
-    .areas(area);
-
+    let areas = layout(app, frame.area());
+    let (body, status, help) = (areas.list, areas.status, areas.help);
     match app.screen {
         Screen::Modules => draw_modules(frame, app, body),
         Screen::Projects => draw_projects(frame, app, body),
         Screen::Tickets => draw_tickets(frame, app, body),
-        Screen::Agent => {}
+        Screen::ActiveAgents => draw_active_agents(frame, app, body),
+        Screen::Settings => draw_settings(frame, app, body),
     }
+    if let Some(agent) = app.shown_agent() {
+        draw_agent(frame, areas.panel, &agent.name, agent.jail, terminal);
+    }
+    let status_lines = status_lines(app, frame.area().width);
+    let help_lines = help_lines(app, frame.area().width);
     if app.status.is_some() {
         let lines: Vec<Line> = status_lines.into_iter().map(Line::from).collect();
         frame.render_widget(Paragraph::new(lines), status);
@@ -66,7 +167,7 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
         help,
     );
     if let Some(dialog) = &app.dialog {
-        draw_dialog(frame, dialog, body);
+        draw_dialog(frame, app, dialog, areas.body);
     }
 }
 
@@ -98,9 +199,35 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-/// The keys of the current screen, in the help line.
-fn help_text(app: &App) -> &'static str {
-    match (&app.dialog, app.screen) {
+/// The keys of the current screen, in the help line. With the focus on the terminal, only the
+/// way back to the list (every other key is the program's). With agents running, the lists
+/// that open "Agentes ativos" say so, with how many there are and how many are marked.
+fn help_text(app: &App) -> String {
+    let on_terminal = app.focus() == Focus::Terminal && app.shown().is_some();
+    let count = (!app.agents().is_empty()).then(|| agents_count(app));
+    help_text_for(
+        app,
+        (app.screen, app.show_hidden),
+        on_terminal,
+        app.dialog.as_ref(),
+        count,
+    )
+}
+
+/// `help_text` in a given state: the screen (with the filter of the tickets), the focus on the
+/// terminal, the open dialog, and the count of the agents (`None` without agents running).
+fn help_text_for(
+    app: &App,
+    (screen, show_hidden): (Screen, bool),
+    on_terminal: bool,
+    dialog: Option<&Dialog>,
+    count: Option<String>,
+) -> String {
+    let shortcut = app.shortcut().label();
+    if on_terminal {
+        return format!("{shortcut} voltar à lista");
+    }
+    let text = match (dialog, screen) {
         (Some(Dialog::AddPath { .. }), _) => "Enter confirmar · Esc cancelar",
         (Some(Dialog::NeedsConfig { .. }), _) => "←/→/Tab escolher · Enter acionar · Esc cancelar",
         (Some(Dialog::ConfirmRemove { .. }), _) => "s remover · qualquer outra tecla cancela",
@@ -111,7 +238,10 @@ fn help_text(app: &App) -> &'static str {
         (Some(Dialog::ConfirmHide { .. }), _) => "s ocultar · qualquer outra tecla cancela",
         (Some(Dialog::ChooseStage { .. }), _) => "↑/↓ escolher · Enter abrir · Esc cancelar",
         (Some(Dialog::AgentError { .. }), _) => "Enter/Esc fechar",
-        (None, Screen::Tickets) if app.show_hidden => {
+        (Some(Dialog::ConfirmEndAgent { .. }), _) => "s encerrar · qualquer outra tecla cancela",
+        (Some(Dialog::ConfirmQuit), _) => "s encerrar e sair · qualquer outra tecla cancela",
+        (Some(Dialog::CaptureShortcut { .. }), _) => "Esc cancelar",
+        (None, Screen::Tickets) if show_hidden => {
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
              g abrir agente · Esc voltar · q sair"
         }
@@ -119,49 +249,150 @@ fn help_text(app: &App) -> &'static str {
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
              g abrir agente · Esc voltar · q sair"
         }
-        // The agent screen has no help line: the whole screen is the terminal.
-        (None, Screen::Agent) => "",
-        (None, Screen::Modules) => "↑/↓ mover · Enter abrir · q sair",
+        (None, Screen::Modules) => "↑/↓ mover · Enter abrir · c configurações · q sair",
         (None, Screen::Projects) => "↑/↓ mover · a adicionar · r remover · Esc voltar · q sair",
+        (None, Screen::ActiveAgents) => {
+            return format!(
+                "↑/↓ escolher · Enter abrir · x encerrar · {shortcut} alternar · Esc voltar · \
+                 q sair"
+            );
+        }
+        (None, Screen::Settings) => {
+            return "t trocar · p voltar ao padrão · Esc voltar · q sair".to_string();
+        }
+    };
+    let opens_the_view =
+        dialog.is_none() && matches!(screen, Screen::Modules | Screen::Projects | Screen::Tickets);
+    match (text.strip_suffix("q sair"), count) {
+        (Some(start), Some(count)) if opens_the_view => {
+            format!("{start}v agentes ativos ({count}) · q sair")
+        }
+        _ => text.to_string(),
     }
 }
 
-/// The area of the agent's terminal inside the screen `area`: everything below the header
-/// row. The PTY gets this size (at least 2x2: agent_session.rs).
-pub fn agent_area(area: Rect) -> Rect {
-    Rect {
-        y: area.y + area.height.min(1),
-        height: area.height.saturating_sub(1),
-        ..area
+/// Every list screen, with the filter of the tickets: the helps `help_rows` reserves rows for.
+const LIST_SCREENS: [(Screen, bool); 6] = [
+    (Screen::Modules, false),
+    (Screen::Projects, false),
+    (Screen::Tickets, false),
+    (Screen::Tickets, true),
+    (Screen::ActiveAgents, false),
+    (Screen::Settings, false),
+];
+
+/// The rows reserved for the help with `running` agents (review NS-34, P1): never fewer than
+/// the longest help of the lists, with the longest count (`N, N com saída nova`), whatever the
+/// screen, the focus, the dialog or the marks. So toggling the focus, going to another list or
+/// a new mark does not resize every terminal (each resize redraws every claude and marks the
+/// hidden ones). The shorter help of the moment is drawn in the same rows. Without agents, the
+/// rows of the help itself, as before the NS-34.
+fn help_rows(app: &App, width: u16, running: usize, help: &str) -> usize {
+    let rows = wrap_words(help, width.max(1)).len();
+    if running == 0 {
+        return rows;
+    }
+    let count = format!("{running}, {running} com saída nova");
+    LIST_SCREENS
+        .into_iter()
+        .map(|screen| {
+            let text = help_text_for(app, screen, false, None, Some(count.clone()));
+            wrap_words(&text, width.max(1)).len()
+        })
+        .fold(rows, usize::max)
+}
+
+/// `3` or `3, 1 com saída nova`: the running agents and the marked ones.
+fn agents_count(app: &App) -> String {
+    let total = app.agents().len();
+    match app.agents().iter().filter(|agent| agent.unseen).count() {
+        0 => total.to_string(),
+        unseen => format!("{total}, {unseen} com saída nova"),
     }
 }
 
-/// The agent screen: one header row (the name, and whether it runs in the jail; out of it, the
-/// text of `jail_print_status` off, in red and bold) and the terminal of the agent below it.
-pub fn draw_agent(frame: &mut Frame, name: &str, jail: bool, terminal: Option<&vt100::Screen>) {
-    let area = frame.area();
+/// The warning of an agent out of the jail (the text of `jail_print_status` off), in red and
+/// bold in its header.
+const OFF_JAIL: &str = "FORA DA JAIL: o agente roda direto no seu shell";
+
+/// The header of an agent, word wrapped at `width` (decision of the user in the NS-34: the
+/// warning out of the jail is never cut): its name and whether it runs in the jail; out of it,
+/// the warning in red and bold.
+fn header_lines(name: &str, jail: bool, width: u16) -> Vec<Line<'static>> {
+    let start = format!("{} · ", printable(name));
+    let warning = if jail { "na jail" } else { OFF_JAIL };
+    let text = format!("{start}{warning}{}", if jail { "" } else { "." });
+    // The characters of the warning, in `text`, to paint red.
+    let red = start.chars().count()..start.chars().count() + warning.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let mut at = 0;
+    wrap_words(&text, width)
+        .into_iter()
+        .map(|line| {
+            // Each wrapped line is the next piece of the text, after the spaces it broke at.
+            let len = line.chars().count();
+            while at < chars.len() && chars[at] == ' ' && !line.starts_with(' ') {
+                at += 1;
+            }
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (i, c) in (at..at + len).zip(line.chars()) {
+                let style = if !jail && red.contains(&i) {
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                match spans.last_mut() {
+                    Some(span) if span.style == style => span.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), style)),
+                }
+            }
+            at += len;
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The rows of the header of an agent in `panel`: the lines it wraps into, up to a third of
+/// the panel (at least one).
+fn header_rows(name: &str, jail: bool, panel: Rect) -> u16 {
+    let lines = header_lines(name, jail, panel.width).len();
+    u16::try_from(lines)
+        .unwrap_or(u16::MAX)
+        .min((panel.height / 3).max(1))
+        .min(panel.height)
+}
+
+/// The panel of an agent in `area`: its header (wrapped, `header_rows`) and its terminal below
+/// it, the same split as `layout`.
+pub fn draw_agent(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    jail: bool,
+    terminal: Option<&vt100::Screen>,
+) {
+    let rows = header_rows(name, jail, area);
     let header = Rect {
-        height: area.height.min(1),
+        height: rows,
         ..area
     };
-    let mut spans = vec![Span::raw(format!("{} · ", printable(name)))];
-    if jail {
-        spans.push(Span::raw("na jail"));
-    } else {
-        spans.push(Span::styled(
-            "FORA DA JAIL: o agente roda direto no seu shell",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("."));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), header);
+    let lines: Vec<Line> = header_lines(name, jail, area.width)
+        .into_iter()
+        .take(usize::from(rows))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), header);
     if let Some(screen) = terminal {
         // The program's cursor, hidden while the history is scrolled (it is not on screen).
         let mut cursor = Cursor::default();
         if screen.scrollback() > 0 || screen.hide_cursor() {
             cursor.hide();
         }
-        frame.render_widget(PseudoTerminal::new(screen).cursor(cursor), agent_area(area));
+        let below = Rect {
+            y: area.y + rows,
+            height: area.height - rows,
+            ..area
+        };
+        frame.render_widget(PseudoTerminal::new(screen).cursor(cursor), below);
     }
 }
 
@@ -180,6 +411,61 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_style(selected_style());
     let mut state = ListState::default().with_selected(Some(app.module_index));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// "Agentes ativos": every agent of this nick, in the order they were opened, with
+/// `[FORA DA JAIL]` (red) out of the jail and `● saída nova` when marked.
+fn draw_active_agents(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered().title(" Agentes ativos ");
+    if app.agents().is_empty() {
+        frame.render_widget(
+            Paragraph::new("Nenhum agente ativo.")
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .agents()
+        .iter()
+        .map(|agent| {
+            let mut spans = vec![Span::raw(printable(&agent.name))];
+            if !agent.jail {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("[FORA DA JAIL]", Style::new().fg(Color::Red)));
+            }
+            if agent.unseen {
+                spans.push(Span::raw("  ● saída nova"));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_symbol("> ")
+        .highlight_style(selected_style());
+    let mut state = ListState::default().with_selected(Some(app.agent_index));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// "Configurações": the reserved shortcut, with `(padrão)` when the database has none.
+fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
+    let default = if app.shortcut_stored {
+        ""
+    } else {
+        " (padrão)"
+    };
+    let line = format!(
+        "Atalho para alternar entre a lista e o terminal: {}{default}",
+        app.shortcut().label()
+    );
+    frame.render_widget(
+        Paragraph::new(line)
+            .block(Block::bordered().title(" Configurações "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_projects(frame: &mut Frame, app: &App, area: Rect) {
@@ -338,7 +624,24 @@ fn removal_question(name: &str, path: &str, tickets: i64) -> String {
     )
 }
 
-fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
+/// The question of quitting with agents running: how many, and of which projects (no repeats,
+/// in the order they were opened).
+fn quit_question(app: &App) -> String {
+    let mut projects: Vec<String> = Vec::new();
+    for agent in app.agents() {
+        let name = printable(&agent.project);
+        if !projects.contains(&name) {
+            projects.push(name);
+        }
+    }
+    let projects = projects.join(", ");
+    match app.agents().len() {
+        1 => format!("Há 1 agente ativo ({projects}). Encerrar e sair? (s/N)"),
+        n => format!("Há {n} agentes ativos ({projects}). Encerrar todos e sair? (s/N)"),
+    }
+}
+
+fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
     // One-line fields, scrolled to the end (no wrap), so the cursor always shows.
     let inner_width = dialog_width(area).saturating_sub(2);
     let field = |input: &str| input_tail(&printable(input), inner_width);
@@ -463,6 +766,25 @@ fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             message.lines().map(|l| Line::from(printable(l))).collect(),
             None,
         ),
+        Dialog::ConfirmEndAgent { name, .. } => (
+            " Encerrar agente ",
+            vec![Line::from(format!(
+                "Encerrar o agente {}? (s/N)",
+                printable(name)
+            ))],
+            None,
+        ),
+        Dialog::ConfirmQuit => (" Sair do nick ", vec![Line::from(quit_question(app))], None),
+        Dialog::CaptureShortcut { first } => (
+            " Trocar atalho ",
+            vec![Line::from(match first {
+                None => "Aperte a tecla do novo atalho. Esc cancela.".to_string(),
+                Some(shortcut) => {
+                    format!("Aperte {} de novo para confirmar.", shortcut.label())
+                }
+            })],
+            None,
+        ),
         Dialog::ConfirmRemove { project, tickets } => (
             " Remover projeto ",
             vec![Line::from(removal_question(
@@ -579,7 +901,7 @@ mod tests {
         assert_has(&buffer, "auto_scrum");
         assert_eq!(
             last_line(&buffer).trim(),
-            "↑/↓ mover · Enter abrir · q sair"
+            "↑/↓ mover · Enter abrir · c configurações · q sair"
         );
     }
 
@@ -1093,7 +1415,7 @@ mod tests {
     fn render_agent(name: &str, jail: bool, screen: Option<&vt100::Screen>) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|frame| draw_agent(frame, name, jail, screen))
+            .draw(|frame| draw_agent(frame, frame.area(), name, jail, screen))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -1129,11 +1451,11 @@ mod tests {
 
     #[test]
     fn the_agent_terminal_takes_the_rest_of_the_screen() {
-        assert_eq!(
-            agent_area(Rect::new(0, 0, 100, 30)),
-            Rect::new(0, 1, 100, 29)
-        );
-        assert_eq!(agent_area(Rect::new(0, 0, 10, 1)).height, 0);
+        // The header takes one row when it fits, and the terminal the rest (in a panel of one
+        // row, nothing).
+        let name = "proj · PO · NS-1";
+        assert_eq!(header_rows(name, true, Rect::new(0, 0, 100, 30)), 1);
+        assert_eq!(header_rows(name, true, Rect::new(0, 0, 10, 1)), 1);
         let mut parser = vt100::Parser::new(29, 100, 0);
         parser.process(b"\x1b[31mlinha um\x1b[0m\r\nlinha dois\x1b[29;1Hfim");
         let buffer = render_agent("proj · PO · NS-1", true, Some(parser.screen()));
@@ -1151,12 +1473,13 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_screen_of_the_app_draws_the_running_agent_header() {
-        // Without an agent (never on screen in practice), only the header row is blank.
-        let mut f = fixture();
-        f.app.screen = Screen::Agent;
-        let buffer = render(&f.app);
-        assert_eq!(text(&buffer).trim(), "");
+    fn without_an_agent_there_is_no_panel() {
+        // The Agent screen is gone (NS-34): without an agent running, the list takes the body
+        // and the panel is empty.
+        let f = fixture();
+        let areas = layout(&f.app, Rect::new(0, 0, 100, 30));
+        assert_eq!(areas.list, areas.body);
+        assert!(areas.panel.is_empty() && areas.terminal.is_empty());
     }
 
     #[test]
@@ -1205,5 +1528,403 @@ mod tests {
             "one row per line, the blank one included"
         );
         assert_eq!(last_line(&buffer).trim(), "Enter/Esc fechar");
+    }
+
+    // ---- several agents side by side (NS-34) ----
+
+    use crate::keys::Shortcut;
+    use crate::launch::{AgentLauncher, Precheck};
+    use std::path::Path;
+
+    /// Spawns nothing: the app only needs the check to say whether the agent is in the jail.
+    struct NoSpawn(bool);
+
+    impl AgentLauncher for NoSpawn {
+        fn check(&mut self, _: &Path, _: &Path) -> Result<Precheck, String> {
+            Ok(Precheck {
+                jail: self.0,
+                warning: None,
+            })
+        }
+
+        fn spawn(&mut self, _: &Path, _: &Path, _: i64, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The app with real agents (rows and locks) of the projects `names`, out of the jail when
+    /// the name starts with `fora`, opened in that order; the last one is shown with the focus
+    /// on its terminal.
+    fn with_running(names: &[&str]) -> (Fixture, PathBuf) {
+        let mut f = fixture();
+        let root = std::fs::canonicalize(f._tmp.path()).unwrap();
+        let launcher = root.join("nick-agent");
+        std::fs::write(&launcher, "").unwrap();
+        f.app = App::new(
+            Db::open(&root.join("nick.db")).unwrap(),
+            None,
+            None,
+            PathBuf::from("/repo/bin/nick-init"),
+        )
+        .with_agents(launcher, root.join("agents"));
+        // A second connection to the same database, to store the projects and tickets.
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        for name in names {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = db
+                .insert_project("auto_scrum", name, dir.to_str().unwrap())
+                .unwrap();
+            let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+            f.app.project = Some(p);
+            f.app.screen = Screen::Tickets;
+            f.app.open_agent(
+                &dir,
+                &t,
+                Stage::Development,
+                &mut NoSpawn(!name.starts_with("fora")),
+            );
+        }
+        (f, root)
+    }
+
+    fn render_at(app: &App, width: u16, height: u16, screen: Option<&vt100::Screen>) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_with_terminal(frame, app, screen))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn with_an_agent_the_list_is_on_the_left_and_the_agent_on_the_right() {
+        let (f, _) = with_running(&["proj"]);
+        let area = Rect::new(0, 0, 100, 30);
+        let areas = layout(&f.app, area);
+        // The help keeps the two rows the list of the tickets needs (review NS-34, P1).
+        assert_eq!(areas.list, Rect::new(0, 0, 40, 27));
+        assert_eq!(areas.header, Rect::new(40, 0, 60, 1));
+        assert_eq!(areas.terminal, Rect::new(40, 1, 60, 26));
+        assert_eq!(areas.status, Rect::new(0, 27, 100, 1));
+        assert_eq!(areas.help, Rect::new(0, 28, 100, 2));
+        let agent = f.app.shown_agent().unwrap();
+        assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
+        let mut parser = vt100::Parser::new(26, 60, 0);
+        parser.process(b"primeira\x1b[26;1Hultima");
+        let buffer = render_at(&f.app, 100, 30, Some(parser.screen()));
+        assert_eq!(find(&buffer, "proj · Dev · NS-1 · na jail"), Some((0, 40)));
+        assert_eq!(find(&buffer, "primeira"), Some((1, 40)));
+        assert_eq!(
+            find(&buffer, "ultima"),
+            Some((26, 40)),
+            "the last row of the program"
+        );
+        let (y, _) = find(&buffer, "auto_scrum > proj > Tickets").unwrap();
+        assert_eq!(y, 0);
+        assert!(text(&buffer).lines().nth(26).unwrap().starts_with('└'));
+        let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
+        assert_eq!(
+            lines[28].trim(),
+            "Ctrl+\\ voltar à lista",
+            "in the first row"
+        );
+    }
+
+    #[test]
+    fn the_list_takes_at_most_half_of_a_narrow_window() {
+        let (f, _) = with_running(&["proj"]);
+        let areas = layout(&f.app, Rect::new(0, 0, 60, 30));
+        assert_eq!(areas.list.width, 30);
+        assert_eq!((areas.panel.x, areas.panel.width), (30, 30));
+        for (width, height) in [(20, 10), (3, 3), (1, 1), (100, 4)] {
+            let area = Rect::new(0, 0, width, height);
+            let areas = layout(&f.app, area);
+            let terminal = agent_area(&f.app, area, f.app.shown_agent().unwrap());
+            assert_eq!(terminal, areas.terminal, "{width}x{height}");
+            let (rows, cols) = crate::agent_session::screen_size(terminal.height, terminal.width);
+            assert!(rows >= 2 && cols >= 2, "{width}x{height}");
+            let parser = vt100::Parser::new(rows, cols, 0);
+            render_at(&f.app, width, height, Some(parser.screen()));
+        }
+    }
+
+    #[test]
+    fn the_warning_out_of_the_jail_wraps_in_the_header_and_the_terminal_shrinks() {
+        let (f, _) = with_running(&["proj", "fora"]);
+        let area = Rect::new(0, 0, 100, 30);
+        let areas = layout(&f.app, area);
+        assert_eq!(
+            areas.header,
+            Rect::new(40, 0, 60, 2),
+            "decision of the user"
+        );
+        assert_eq!(areas.terminal, Rect::new(40, 2, 60, 25));
+        // Each agent has the size of its own header: the one in the jail, one row.
+        let in_jail = &f.app.agents()[0];
+        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(40, 1, 60, 26));
+        let buffer = render_at(&f.app, 100, 30, None);
+        let header: Vec<String> = text(&buffer)
+            .lines()
+            .take(2)
+            .map(|l| l.chars().skip(40).collect::<String>().trim().to_string())
+            .collect();
+        assert_eq!(
+            header.join(" "),
+            "fora · Dev · NS-1 · FORA DA JAIL: o agente roda direto no seu shell."
+        );
+        for word in ["FORA DA JAIL", "shell"] {
+            let (y, x) = find(&buffer, word).unwrap();
+            assert_eq!(buffer[(x, y)].fg, Color::Red, "{word}");
+            assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+        }
+        let (y, x) = find(&buffer, "fora · Dev").unwrap();
+        assert_ne!(buffer[(x, y)].fg, Color::Red, "the name is not red");
+        let end = find(&buffer, "shell.").unwrap();
+        assert_ne!(
+            buffer[(end.1 + 5, end.0)].fg,
+            Color::Red,
+            "nor the final dot"
+        );
+    }
+
+    #[test]
+    fn a_long_status_takes_rows_from_the_panel_too() {
+        let (mut f, _) = with_running(&["proj"]);
+        f.app.focus = Focus::List;
+        f.app.status = Some("palavra ".repeat(30));
+        let area = Rect::new(0, 0, 100, 30);
+        let areas = layout(&f.app, area);
+        assert_eq!(areas.status.height, 3);
+        assert_eq!(areas.terminal.height, 30 - 1 - 3 - areas.help.height);
+        let agent = f.app.shown_agent().unwrap();
+        assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
+        let buffer = render_at(&f.app, 100, 30, None);
+        let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
+        let help_rows = usize::from(areas.help.height);
+        assert!(
+            lines[30 - help_rows - 1].starts_with("palavra"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_view_of_the_active_agents_marks_out_of_the_jail_and_new_output() {
+        let (mut f, _) = with_running(&["proj", "fora"]);
+        f.app.focus = Focus::List;
+        f.app.screen = Screen::ActiveAgents;
+        f.app.agents[0].unseen = true;
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Agentes ativos ");
+        assert_has(&buffer, "proj · Dev · NS-1  ● saída nova");
+        assert_has(&buffer, "fora · Dev · NS-1  [FORA DA JAIL]");
+        let (y, x) = find(&buffer, "[FORA DA JAIL]").unwrap();
+        assert_eq!(buffer[(x, y)].fg, Color::Red);
+        let (y, _) = find(&buffer, "proj · Dev").unwrap();
+        assert!(
+            !text(&buffer)
+                .lines()
+                .nth(usize::from(y))
+                .unwrap()
+                .contains("[FORA")
+        );
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "↑/↓ escolher · Enter abrir · x encerrar · Ctrl+\\ alternar · Esc voltar · q sair"
+        );
+        // The help shows the shortcut in use.
+        f.app.shortcut = Shortcut::from_db("ctrl+]").unwrap();
+        assert!(last_line(&render(&f.app)).contains("Ctrl+] alternar"));
+    }
+
+    #[test]
+    fn the_view_without_agents_says_so() {
+        let mut f = fixture();
+        f.app.screen = Screen::ActiveAgents;
+        assert_has(&render(&f.app), "Nenhum agente ativo.");
+    }
+
+    #[test]
+    fn the_lists_say_how_many_agents_run_only_with_agents() {
+        let (mut f, _) = with_running(&["proj", "fora", "outro"]);
+        f.app.focus = Focus::List;
+        f.app.screen = Screen::Modules;
+        assert_eq!(
+            last_line(&render(&f.app)).trim(),
+            "↑/↓ mover · Enter abrir · c configurações · v agentes ativos (3) · q sair"
+        );
+        f.app.agents[1].unseen = true;
+        f.app.screen = Screen::Projects;
+        assert_eq!(
+            last_line(&render(&f.app)).trim(),
+            "↑/↓ mover · a adicionar · r remover · Esc voltar · v agentes ativos (3, 1 com \
+             saída nova) · q sair"
+        );
+        f.app.screen = Screen::Tickets;
+        let lines: Vec<String> = text(&render(&f.app)).lines().map(str::to_string).collect();
+        let n = lines.len();
+        assert!(
+            format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()).ends_with(
+                "g abrir agente · Esc voltar · v agentes ativos (3, 1 com saída nova) · q sair"
+            ),
+            "{lines:?}"
+        );
+        // With a dialog, the help of the dialog.
+        f.app.dialog = Some(Dialog::ConfirmQuit);
+        assert!(!last_line(&render(&f.app)).contains("v agentes"));
+    }
+
+    #[test]
+    fn the_settings_show_the_shortcut_and_whether_it_is_the_default() {
+        let mut f = fixture();
+        f.app.screen = Screen::Settings;
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Configurações ");
+        assert_has(
+            &buffer,
+            "Atalho para alternar entre a lista e o terminal: Ctrl+\\ (padrão)",
+        );
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "t trocar · p voltar ao padrão · Esc voltar · q sair"
+        );
+        f.app.shortcut = Shortcut::from_db("alt+x").unwrap();
+        f.app.shortcut_stored = true;
+        let buffer = render(&f.app);
+        assert_has(
+            &buffer,
+            "Atalho para alternar entre a lista e o terminal: Alt+X",
+        );
+        assert!(find(&buffer, "(padrão)").is_none());
+    }
+
+    #[test]
+    fn the_capture_asks_for_the_key_then_for_it_again() {
+        let mut f = fixture();
+        f.app.screen = Screen::Settings;
+        f.app.dialog = Some(Dialog::CaptureShortcut { first: None });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Trocar atalho ");
+        assert_has(&buffer, "Aperte a tecla do novo atalho. Esc cancela.");
+        assert_eq!(last_line(&buffer).trim(), "Esc cancelar");
+        f.app.dialog = Some(Dialog::CaptureShortcut {
+            first: Shortcut::from_db("ctrl+]"),
+        });
+        assert_has(&render(&f.app), "Aperte Ctrl+] de novo para confirmar.");
+    }
+
+    #[test]
+    fn the_confirmations_of_ending_one_and_quitting() {
+        let (mut f, _) = with_running(&["alfa", "beta", "alfa2"]);
+        f.app.focus = Focus::List;
+        f.app.agents[2].project = "alfa".into();
+        f.app.dialog = Some(Dialog::ConfirmEndAgent {
+            id: 1,
+            name: "alfa · Dev · NS-1".into(),
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Encerrar agente ");
+        assert!(flat(&buffer).contains("Encerrar o agente alfa · Dev · NS-1? (s/N)"));
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "s encerrar · qualquer outra tecla cancela"
+        );
+        f.app.dialog = Some(Dialog::ConfirmQuit);
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Sair do nick ");
+        assert!(
+            flat(&buffer)
+                .contains("Há 3 agentes ativos (alfa, beta). Encerrar todos e sair? (s/N)"),
+            "the projects without repeats, in order: {}",
+            flat(&buffer)
+        );
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "s encerrar e sair · qualquer outra tecla cancela"
+        );
+        let (mut f, _) = with_running(&["solo"]);
+        f.app.focus = Focus::List;
+        f.app.dialog = Some(Dialog::ConfirmQuit);
+        assert!(flat(&render(&f.app)).contains("Há 1 agente ativo (solo). Encerrar e sair? (s/N)"));
+    }
+
+    #[test]
+    fn a_dialog_is_centered_over_the_whole_body() {
+        let (mut f, _) = with_running(&["proj"]);
+        f.app.focus = Focus::List;
+        f.app.dialog = Some(Dialog::ConfirmQuit);
+        let buffer = render(&f.app);
+        let (_, x) = find(&buffer, "Sair do nick").unwrap();
+        assert!(x < 40, "the box starts over the list: {x}");
+        let (y, _) = find(&buffer, "Há 1 agente").unwrap();
+        let row = text(&buffer)
+            .lines()
+            .nth(usize::from(y))
+            .unwrap()
+            .to_string();
+        assert!(row.chars().count() > 70, "and spans the panel: {row:?}");
+    }
+
+    /// Review NS-34, P1: the terminal keeps its size when the focus toggles, the list changes,
+    /// a mark comes or a dialog opens (each change of size redraws every claude and marks the
+    /// hidden ones).
+    #[test]
+    fn the_terminal_keeps_its_size_whatever_the_focus_the_marks_and_the_dialog() {
+        let (mut f, _) = with_running(&["proj", "fora"]);
+        for (width, height) in [(100, 30), (50, 30), (140, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut sizes = Vec::new();
+            for (screen, show_hidden) in LIST_SCREENS {
+                for focus in [Focus::Terminal, Focus::List] {
+                    for unseen in [false, true] {
+                        for dialog in [None, Some(Dialog::ConfirmQuit)] {
+                            f.app.screen = screen;
+                            f.app.show_hidden = show_hidden;
+                            f.app.focus = focus;
+                            f.app.agents[0].unseen = unseen;
+                            f.app.dialog = dialog.filter(|_| focus == Focus::List);
+                            sizes.push(layout(&f.app, area).terminal);
+                        }
+                    }
+                }
+            }
+            assert!(
+                sizes.iter().all(|s| *s == sizes[0]),
+                "{width}x{height}: {sizes:?}"
+            );
+        }
+        // Without agents, the help takes only the rows it needs, as before the NS-34.
+        let f = fixture();
+        assert_eq!(layout(&f.app, Rect::new(0, 0, 100, 30)).help.height, 1);
+    }
+
+    /// Review NS-34, P2: the PTY of a new agent is born with the size `layout` gives it once
+    /// it is open.
+    #[test]
+    fn a_new_agent_is_born_with_the_size_of_its_panel() {
+        for names in [&["proj"][..], &["proj", "fora"][..], &["fora", "proj"][..]] {
+            let (mut f, root) = with_running(&names[..names.len() - 1]);
+            let area = Rect::new(0, 0, 100, 30);
+            f.app.focus = Focus::List;
+            f.app.status = Some("palavra ".repeat(30));
+            let panel = new_agent_panel(&f.app, area);
+            let last = names[names.len() - 1];
+            let jail = !last.starts_with("fora");
+            let name = format!("{last} · Dev · NS-1");
+            let expected = terminal_in_panel(panel, &name, jail);
+            // Open it as with_running does.
+            let db = Db::open(&root.join("nick.db")).unwrap();
+            let dir = root.join(last);
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = db
+                .insert_project("auto_scrum", last, dir.to_str().unwrap())
+                .unwrap();
+            let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+            f.app.project = Some(p);
+            f.app
+                .open_agent(&dir, &t, Stage::Development, &mut NoSpawn(jail));
+            let agent = f.app.shown_agent().unwrap();
+            assert_eq!(agent.name, name);
+            assert_eq!(agent_area(&f.app, area, agent), expected, "{names:?}");
+        }
     }
 }

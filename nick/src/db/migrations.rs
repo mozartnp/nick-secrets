@@ -60,5 +60,16 @@ CREATE TABLE agents (
 );
 ";
 
+/// Migration 4 (NS-34): the settings of the nick, a key and its value. A missing row is the
+/// default, which lives only in the code: going back to the default deletes the row, so a
+/// future change of the default reaches whoever never changed the setting. The first key is
+/// the reserved shortcut (`db::SETTING_RESERVED_SHORTCUT`, in the form of `Shortcut::to_db`).
+pub const MIGRATION_4: &str = "\
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,  -- stable identifier in the code: 'reserved_shortcut'
+    value TEXT NOT NULL      -- the setting, in the format of its key (keys.rs: Shortcut::to_db)
+);
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
-pub const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3];
+pub const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4];

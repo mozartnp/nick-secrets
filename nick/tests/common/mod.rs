@@ -19,6 +19,9 @@ pub use snapshot::snapshot;
 
 pub const ROWS: u16 = 30;
 pub const COLS: u16 = 100;
+/// The first column of the panel of an agent at 100 columns (the list takes 40: ui.rs,
+/// `LIST_WIDTH`).
+pub const PANEL_COL: u16 = 40;
 
 /// How long a case waits for a text on the screen or for the exit.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -141,6 +144,17 @@ impl World {
         .unwrap()
         .map(Result::unwrap)
         .collect()
+    }
+
+    /// The value of the setting `key` in the database (NS-34), None without a row.
+    pub fn setting(&self, key: &str) -> Option<String> {
+        if !self.db_path().exists() {
+            return None;
+        }
+        nick::db::Db::open(&self.db_path())
+            .unwrap()
+            .get_setting(key)
+            .unwrap()
     }
 
     /// Stores an `active` agent of the ticket `key` of the project at `dir`, through the library
@@ -345,6 +359,29 @@ impl Nick {
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The panel of the shown agent beside the list (NS-34: the columns from `PANEL_COL` on, at
+    /// 100 columns) as one line: its non-empty rows trimmed and joined by a space, so a wrapped
+    /// header reads whole.
+    pub fn panel(&self) -> String {
+        let parser = self.parser();
+        let (_, cols) = parser.screen().size();
+        let start = PANEL_COL.min(cols);
+        parser
+            .screen()
+            .rows(start, cols - start)
+            .map(|row| row.trim().to_string())
+            .filter(|row| !row.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Waits until `needle` is in the panel of the shown agent (`panel`).
+    pub fn wait_for_panel(&self, needle: &str) {
+        self.wait_until(&format!("{needle:?} in the panel"), || {
+            self.panel().contains(needle)
+        });
     }
 
     /// True while the alternate screen (the TUI) is on.

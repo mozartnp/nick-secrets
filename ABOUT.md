@@ -2176,7 +2176,8 @@ pela verificação manual do `nick` no NS-31).
   segue a versão do `tui-term`, ou desenha o `vt100::Screen` à mão;
 - em raw mode, o `Ctrl+\` (0x1c) chega como tecla (o crossterm o entrega como `Ctrl+4`), sem
   SIGQUIT. O Claude Code não usa esse atalho (documentação de keybindings), e por isso ele é o
-  atalho reservado pra sair do terminal da sessão; o `Ctrl+]` foi evitado;
+  atalho reservado pra sair do terminal da sessão; o `Ctrl+]` foi evitado. Na casca, o atalho é
+  configurável: seção "Rust no projeto: vários agentes na casca `nick` (NS-34)";
 - com o `claude` e o ai-jail reais (2026-11-12, conferido pelo agente fora da jail, por PTY): o
   `claude` sobe e responde dentro do painel; acento, `Esc`/`Ctrl+C` interrompendo uma resposta,
   histórico, menu do `/`, `Shift+Tab`, troca de sessão e resize funcionam. `TERM`/`COLORTERM`
@@ -2192,7 +2193,8 @@ pela verificação manual do `nick` no NS-31).
   Decisão do usuário: manter o `Ctrl+\` no protótipo, com a regra do `keybindings.json` que
   manda o 0x1c (`workbench.action.terminal.sendSequence`, README do protótipo). A casca de
   verdade precisa de um atalho reservado que funcione no VS Code sem configuração, porque é lá
-  que o usuário trabalha;
+  que o usuário trabalha. Na casca, o padrão continua `Ctrl+\`, com as duas saídas para o VS
+  Code: seção "Rust no projeto: vários agentes na casca `nick` (NS-34)";
 - sem leitura contínua, o PTY de uma sessão escondida enche e trava o filho: toda sessão precisa
   da sua thread leitora. Com um laço bloqueado num canal (entrada, sinais, saída e fim de cada
   sessão), o painel ocioso não gasta CPU (0 tick em 5 s, com os falsos);
@@ -2551,7 +2553,8 @@ disponível abre o diálogo "Abrir agente" (PO, Tech Leader, Dev, Review), e a e
 abre o `claude` num terminal embutido que ocupa a tela, com uma linha de cabeçalho. **Um agente
 por vez**, e o terminal do agente **só fecha quando o `claude` termina** (`/exit`, `Ctrl+D`,
 `Ctrl+C` duas vezes): todas as teclas vão para ele, inclusive `Ctrl+C`, `Esc`, `q` e `Ctrl+\`
-(0x1c). O atalho reservado para sair, vários agentes e a confirmação ao sair são da F3b. Fora das
+(0x1c). O atalho reservado para sair, vários agentes e a confirmação ao sair são da F3b (feitos
+no NS-34: seção "Rust no projeto: vários agentes na casca `nick` (NS-34)"). Fora das
 teclas, só `Shift+PageUp/PageDown` e a roda do mouse (quando o programa não pediu o mouse) rolam
 o histórico; qualquer tecla enviada volta para o fim. Ao terminar, a TUI volta para a lista com o
 mesmo ticket selecionado e `O agente <nome> terminou.` (ou `... terminou com o código <N>.`).
@@ -2619,7 +2622,8 @@ mesmo com a jail desligada). Uma mudança num dos dois que não for para o outro
 **A jail segue o projeto.** Vale o `JAIL_ENABLED` do `.nick/nick.conf` de cada projeto. O
 cabeçalho mostra `<nome> · na jail` ou, fora dela, `<nome> · FORA DA JAIL: o agente roda direto
 no seu shell.` com o aviso em vermelho e negrito (o texto do `jail_print_status` desligado). Se
-o agente roda na jail fica só em memória nesta fatia (a F3b decide se vira coluna).
+o agente roda na jail fica só em memória nesta fatia (a F3b decide se vira coluna; decidido no
+NS-34: não vira, seção "Rust no projeto: vários agentes na casca `nick` (NS-34)").
 
 **Banco: migração 3, tabela `agents`** (`ticket_id → tickets ON DELETE CASCADE`, `stage` com
 `CHECK` nos valores de `$TYPE` do `auto_scrum`, `session_id UNIQUE`, `name`, `opened_at` em RFC
@@ -2695,3 +2699,224 @@ o diferencial com o `auto_scrum.sh`, estrutura e `shellcheck -x`. Na suíte Rust
 `nick/tests/agent.rs`. A verificação com o `claude` e o ai-jail reais não roda dentro da jail do
 nick: o roteiro fica em `.nick/docs/NS-33/verificacao_manual.md`, para o analista executar fora
 dela.
+
+## Rust no projeto: vários agentes na casca `nick` (NS-34)
+
+A fatia F3b do épico NS-28, que fecha o P1 do épico (processos simultâneos difíceis de manusear).
+Vários agentes, de tickets e projetos diferentes, ficam vivos ao mesmo tempo, cada um no seu PTY,
+com o cwd e a `.nick/nick.conf` do seu projeto. **Não há limite de agentes, de propósito.** A tela
+do agente em tela cheia do NS-33 (`Screen::Agent`) deixou de existir: o agente fica ao lado da
+lista.
+
+**Layout lado a lado só com agente vivo** (decisão do usuário no plano). Sem nenhum agente vivo, as
+telas são as de antes, byte a byte (a lista em largura total, a barra e o rodapé), menos o rodapé de
+Módulos, que ganhou `c configurações`. Com pelo menos um agente vivo, a área acima da barra e do
+rodapé se divide: à esquerda a lista da tela atual, com `ui::LIST_WIDTH = 40` colunas, mas no
+máximo metade da janela; à direita o painel do agente exibido (o cabeçalho e o terminal). A barra
+e o rodapé continuam em largura total, com a quebra do NS-32, e os diálogos são centrados sobre a
+área inteira, por cima do painel (só abrem com o foco na lista). **A conta tem fonte única:**
+`ui::layout(app, area)` devolve as áreas, e o desenho, o mouse e o tamanho de cada PTY
+(`ui::agent_area`) saem dela. Depois de cada evento que pode mudar o estado (tecla, resize, fim de
+um agente, marca de saída nova), o laço recalcula a área de cada sessão e só chama `resize` quando
+ela mudou. Assim uma mensagem longa na barra, que quebra em mais linhas, também redimensiona os
+terminais. A tela de cada sessão continua com pelo menos 2x2.
+
+**Com agente vivo, a altura do rodapé é fixa** (review do NS-34, P1). O rodapé reserva as linhas do
+mais longo dos rodapés das listas (Módulos, Projetos, Tickets com e sem o filtro, Agentes ativos e
+Configurações), com a contagem na forma mais longa (`N, N com saída nova`). O rodapé curto do
+momento, como o `<atalho> voltar à lista`, é desenhado na primeira dessas linhas. Antes, cada
+`Ctrl+\` na tela de Tickets levava o rodapé de 1 para 2 linhas, e o mesmo acontecia ao ir de
+Tickets para Projetos ou para a visão. Cada mudança redimensionava todos os PTYs: todo `claude`
+recebia um SIGWINCH e redesenhava, e os escondidos ficavam marcados `● saída nova` sem nada novo.
+Agora só a barra com uma mensagem longa e um diálogo com rodapé mais longo que o das listas (numa
+janela estreita) mudam a altura. Sem agente vivo, o rodapé ocupa as linhas de que precisa, como
+antes. **O PTY de um agente novo nasce com o tamanho final** (P2). `ui::new_agent_panel` calcula,
+pela mesma conta, o painel que o agente vai ter depois de aberto (um agente a mais, o foco no
+terminal e a barra vazia). O `TerminalAgentLauncher` recebe uma função de tamanho e a chama no
+spawn com o nome e com a jail que o próprio `--check` informou (`ui::terminal_in_panel`).
+
+**O cabeçalho quebra em mais linhas** (decisão do usuário no NS-34). No painel de 60 colunas de um
+terminal de 100, o aviso `<nome> · FORA DA JAIL: o agente roda direto no seu shell.` não cabe numa
+linha. Ele nunca é cortado: quebra por palavra (`wrap_words`), até um terço do painel, e o
+terminal encolhe. Por isso a altura do terminal depende do cabeçalho do agente: cada sessão tem o
+tamanho do seu painel (`agent_area` calcula como se aquele agente fosse o exibido), e não um
+tamanho só para todas, como o plano previa. Na lista de 40 colunas, um nome longo com
+`[FORA DA JAIL]` ou `● saída nova` é cortado no fim da linha (achado do NS-34, aceito).
+
+**Foco e atalho reservado.** O `App` tem `focus: Focus { List, Terminal }`, os agentes vivos em
+`agents` (na ordem de abertura) e `shown`, o `id` do agente exibido. Abrir um agente o acrescenta,
+o exibe e põe o foco no terminal, e a lista continua nos tickets, com o mesmo ticket. Com o foco no
+terminal, toda tecla vai para o `claude` (inclusive `Ctrl+C`, `Esc` e `q`), menos o atalho, que
+devolve o foco à lista. A colagem e o mouse também vão para o terminal. Com o foco na lista, as
+teclas são as da tela, e nada vai para o `claude`. A captura do mouse e o bracketed paste ligam com
+o foco no terminal e desligam na lista, onde o operador seleciona texto do jeito nativo. O atalho é
+testado antes de tudo, menos da captura de um atalho novo. Só o `Press` alterna: um `Repeat` é
+engolido, para segurar a tecla não piscar o foco. **Com um diálogo aberto, o atalho é ignorado**,
+porque o diálogo é uma pergunta pendente. O `keys::encode_key` não mudou: com o atalho trocado, o
+`Ctrl+\` volta a ir para o `claude` como 0x1c. Quando o `claude` de um agente termina, a linha
+fica `ended`, a trava sai e a barra mostra a mensagem do NS-33. Se ele era o exibido, passa a ser
+exibido o agente vivo aberto mais recentemente, e o foco vai para a lista. Se não era, nada muda. A
+tela da esquerda não muda.
+
+**`Shortcut` e a forma canônica** (`keys.rs`). O atalho é guardado e comparado numa forma que bate
+com a tecla do jeito que o crossterm a entregar:
+- um `Ctrl+<símbolo>` com byte de controle vira o símbolo do byte (`ctrl_byte`, sem o `Shift`).
+  `Ctrl+4` e `Ctrl+\` são `Ctrl+\` (0x1c), `Ctrl+5` é `Ctrl+]`, `Ctrl+6` é `Ctrl+^`,
+  `Ctrl+7` e `Ctrl+/` são `Ctrl+_`, `Ctrl+3` é `Ctrl+[`, e `Ctrl+2` e `Ctrl+Espaço` são `Ctrl+@`;
+- uma letra com `Ctrl`/`Alt` vira minúscula, e o `Shift` vira modificador explícito;
+- as outras teclas (F1–F12 e as nomeadas) ficam com o código e os modificadores. Só `Ctrl`, `Alt`
+  e `Shift` contam: uma tecla com `Super` nunca é atalho. O `Shift+Tab` é `Tab` com `Shift`.
+
+No banco, o texto é minúsculo, com os modificadores na ordem `ctrl+alt+shift+` e depois a tecla
+(`ctrl+\`, `alt+x`, `ctrl+shift+f5`, `f7`, `alt+space`). O `Shortcut::from_db` só aceita a forma
+que o `to_db` escreve: um `ctrl+4`, um modificador repetido ou fora de ordem e uma maiúscula são
+recusados. O padrão é `Shortcut::DEFAULT` (`Ctrl+\`).
+
+**Banco: migração 4, tabela `settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`.** A chave do
+atalho é `db::SETTING_RESERVED_SHORTCUT` (`reserved_shortcut`). Os métodos do `Db` são
+`get_setting`, `set_setting` (`INSERT ... ON CONFLICT(key) DO UPDATE`) e `delete_setting`. **O
+padrão só existe no código:** sem linha vale o padrão, e "voltar ao padrão" (`p`) apaga a linha.
+Assim uma mudança futura do padrão vale para quem nunca trocou o atalho. A leitura acontece na
+abertura do nick (`App::load_shortcut`, no `main.rs`, junto com a limpeza dos agentes). Um valor
+que o `from_db` não entende, ou que hoje seria recusado, cai no padrão, e a barra mostra
+`O atalho gravado no banco (<valor>) não é válido. Usando o padrão Ctrl+\.`. Um erro do banco
+vai para a barra, e a TUI abre com o padrão. Se a limpeza também falhar, as duas mensagens se
+juntam com um espaço. O `migration_1_is_pinned` fixa também o texto da migração 4. Os testes que
+citavam a versão 3 como a última passaram a citar a 4. O teste do banco v2 → v3 passou a abrir só
+com as migrações 1 a 3, como o do v1 → v2 no NS-33, sem mudar nenhuma asserção.
+
+**Tela de Configurações e captura** (`c` em Módulos; o `ModuleKind` não mudou). A tela mostra
+`Atalho para alternar entre a lista e o terminal: <label>`, com ` (padrão)` quando não há linha.
+`t` abre a captura. A primeira tecla válida fica guardada, e a mesma tecla de novo (comparada na
+forma canônica) é gravada, vale na hora e fica para as próximas aberturas. Uma tecla válida
+diferente vira a nova primeira. Uma recusada mostra o motivo na barra e recomeça a captura. `Esc`
+cancela sem gravar, e o `Esc` nunca pode ser atalho. **A segunda tecla prova que o terminal entrega
+aquela tecla ao nick:** no VS Code sem a regra do `keybindings.json`, o `Ctrl+\` nunca chega, então
+nunca é salvo. Na captura, o `Ctrl+C` é recusado e não fecha o nick. Escolher o próprio atalho
+atual é aceito. **A lista de recusa** (`keys::shortcut_refusal`, sobre a forma canônica), com as
+mensagens em PT-BR:
+- `Enter`, `Esc`, `Tab`, `Shift+Tab`, `Backspace` e as setas, com qualquer modificador →
+  `O claude precisa dessa tecla (<label>). Escolha outra.`;
+- `Shift+PageUp`/`Shift+PageDown` (a rolagem do histórico do NS-33) →
+  `O nick usa essa tecla para rolar o histórico. Escolha outra.`;
+- uma tecla sem modificador, ou só com `Shift` → `Use uma tecla com Ctrl ou Alt (ou uma tecla
+  de função, F1–F12).`. As teclas de função sem modificador são aceitas, porque o `claude` não as
+  usa;
+- os atalhos documentados do Claude Code (code.claude.com/docs/en/interactive-mode, conferido em
+  2026-11-19): `Ctrl+` `A B C D E G J K L N O P R S T U V W X Y Z`, `Ctrl+_` e `Ctrl+[`; `Alt+`
+  `B D F M O P T V Y`. Numa letra, a comparação ignora o `Shift`. Os que usam `Enter`,
+  `Backspace` e as setas caem na primeira regra. Mensagem: a do `claude`;
+- os sinônimos de byte, que chegam ao `claude` como outra tecla: `Ctrl+H` (Backspace), `Ctrl+I`
+  (Tab), `Ctrl+M` (Enter) e `Ctrl+[` (Esc). Mensagem: a do `claude`.
+
+A lista é a constante comentada `CLAUDE_SHORTCUTS` em `keys.rs`, com a fonte e a data, e deve
+crescer quando o Claude Code ganhar atalhos. Ela não vai para o README (regra "README genérico").
+Diferença do plano: o `shortcut_refusal` devolve `Option<String>`, e não `Option<&'static str>`,
+porque a mensagem cita o label da tecla.
+
+**VS Code.** O padrão continua `Ctrl+\`, que o terminal integrado do VS Code não repassa (achado do
+NS-29). Há duas saídas, documentadas no README: (1) trocar o atalho na tela de Configurações, ou
+(2) a regra do `keybindings.json` que manda o 0x1c (texto copiado do `prototype/panel/README.md`).
+
+**Visão "Agentes ativos"** (`v` em Módulos, Projetos e Tickets, com o foco na lista e sem diálogo
+aberto; funciona sem agentes e diz `Nenhum agente ativo.`). Ela lista **só os agentes deste
+processo**, na ordem de abertura. Os `active` de outro `nick` aberto têm a trava do outro, e este
+não tem o terminal deles. Cada linha é o nome (`projeto · etapa · ticket`), mais
+`  [FORA DA JAIL]` em vermelho quando o agente roda sem jail e `  ● saída nova` quando está
+marcado. A seleção começa no exibido, e mover a seleção exibe o agente selecionado na hora.
+`Enter`/`→` põem o foco no terminal dele, `x` pede para encerrá-lo, e `Esc`/`←` voltam para a tela
+de origem (`App::back`), com a mesma seleção. Com agente vivo, o rodapé de Módulos, Projetos e
+Tickets ganha `v agentes ativos (N)` ou `(N, M com saída nova)`. O rodapé da visão mostra o label
+do atalho atual, e com o foco no terminal o rodapé é só `<atalho> voltar à lista`.
+**Se o agente roda na jail continua só em memória, e não vira coluna** (a decisão que o NS-33
+deixou para a F3b): todos os agentes da visão são deste processo, e o valor vem do `--check` de
+cada um.
+
+**Aviso de saída nova** (regra escolhida pelo usuário no plano). Cada `RunningAgent` guarda
+`seen_text`, o texto da tela (`vt100::Screen::contents()`) no momento em que ele deixou de ser
+exibido, e `unseen`. Num `Output` de um agente escondido e ainda sem marca, o laço lê o
+`contents()` atual, e `App::hidden_output` (função pura, testada sem PTY) o marca quando o texto
+mudou. Um redesenho só de cor, de cursor ou que reescreve o mesmo texto não marca. Um agente já
+marcado não recalcula nada até ser visto, e o exibido nunca lê o `contents()` a cada `Output`. A
+marca some quando o agente passa a ser exibido, com o foco na lista ou no terminal. O laço só
+redesenha por um escondido quando a marca muda: N agentes trabalhando não fazem a TUI redesenhar à
+toa. **Falsos avisos conhecidos e aceitos:** um resize da janela faz o `claude` redesenhar com
+outra largura, e o texto muda, então um resize pode marcar todos os escondidos. Também é marcado
+um `claude` que muda o texto sem conteúdo novo, como o spinner ou um relógio.
+
+**Eventos com o `id` do agente e OSC 52 só do exibido.** O `AgentSession::spawn` e o
+`AgentLauncher::spawn` recebem o `id` da linha, que já existe antes do spawn. Os eventos passam a
+ser `AgentEvent { agent, event: SessionEvent }`, e o `Shell` guarda `sessions: Vec<(i64,
+AgentSession)>`. Cada sessão continua com a sua thread leitora e a sua thread que colhe o filho:
+uma escondida que inunda a saída não trava (teste de PTY). O `Exited` de um agente que o operador
+já encerrou não acha a sessão e é ignorado. **Só a cópia (OSC 52) do agente exibido vai para o
+terminal de fora; a de um escondido é descartada.** Copiar é uma ação do operador na tela que ele
+vê, e um agente escondido não pode trocar o clipboard sem que o operador perceba.
+
+**Encerrar.**
+- **Um agente pela visão:** `x` abre `Encerrar o agente <nome>? (s/N)`. Só `s`/`S` confirmam
+  (`Action::EndAgent`), e qualquer outra tecla cancela. O laço tira a sessão, chama `terminate()`
+  e depois `App::agent_ended_by_operator`, que grava `ended`, solta a trava, ajusta o exibido e o
+  foco como no fim natural e mostra `O agente <nome> foi encerrado.`.
+- **Ao sair com agentes vivos:** `q`/`Q` numa lista ou `Ctrl+C` com o foco na lista abrem
+  `Há <N> agentes ativos (<projetos>). Encerrar todos e sair? (s/N)` (com um, `Há 1 agente ativo
+  (<projeto>). Encerrar e sair? (s/N)`). Os projetos não se repetem e seguem a ordem de abertura.
+  `s`/`S` → `Action::QuitEndingAgents`, e qualquer outra tecla cancela. **Sem agente vivo, `q` e
+  `Ctrl+C` saem direto, como antes.**
+- **Encerrar todos de uma vez:** `agent_session::terminate_all` manda SIGTERM a todos os grupos
+  ainda não colhidos num único `end_groups` (uma espera de 2 s no total, e não 2 s por agente) e
+  depois faz o `wait` de cada um. O `AgentSession::terminate` é o caso de um só. A mesma função
+  serve à saída confirmada e ao SIGTERM/SIGHUP. Depois vem `App::end_all_records`, que grava
+  `ended` e solta a trava de cada um, seguindo depois de um erro (guarda o primeiro e continua),
+  para não deixar trava presa. O P1 do review do NS-33 (a saída por erro de I/O no laço sem
+  encerrar os agentes) não foi corrigido antes do merge, então esse caminho continua sem
+  encerramento, como no NS-33.
+- o `terminate` é síncrono e pode segurar a TUI até 2 s com um grupo que ignora o SIGTERM. É um
+  custo aceito, e não há thread de encerramento nesta fatia;
+- o panic hook já encerrava todos os grupos registrados (`GROUPS`) e não mudou.
+  `NICK_TEST_PANIC=second_agent` (só de teste) dispara o panic depois do segundo agente. O `agent`
+  do NS-33 continua disparando depois do primeiro.
+
+**Reaproveitamento e o que mudou no código do NS-33.** `agents.rs` não mudou. `launch.rs` só ganhou
+o `agent_id` no `spawn`. `keys.rs` ganhou o `Shortcut` e a recusa, e o `encode_key` não mudou. O
+`app.rs` não ganhou módulo novo: a visão e a captura ficaram nele, ao lado das outras telas, porque
+são poucas funções que dependem do estado do `App`. Já as regras do atalho sem tela ficaram em
+`keys.rs`. Os testes do NS-31 e do NS-32 passaram sem diff, menos o rodapé de Módulos. Os do NS-33
+mudaram só onde o plano previa:
+- `Screen::Agent`/`app.agent` viraram o foco e o exibido;
+- o `Ctrl+4` do teste "toda tecla vai para o programa" virou `Ctrl+]`, porque agora ele é o
+  atalho;
+- `agent_ended` ganhou o `id`;
+- o `spawn` e o casamento dos eventos ganharam o `id`;
+- em `nick/tests/agent.rs`, o cabeçalho é lido no painel (`Nick::wait_for_panel`) e o tamanho do
+  PTY é o do painel (`SIZE 25 60` e, a 40x120, `SIZE 36 80`, com as 2 linhas que o rodapé
+  reserva).
+
+O `claude` falso ganhou, sem mudar os modos existentes, o modo por projeto
+(`FAKE_CLAUDE_MODE_<pasta>`), o log por projeto (`FAKE_CLAUDE_LOG_DIR`) e os modos guiados por
+arquivo `trigger`, `osc52_on_trigger` e `flood_on_trigger`. O modo por projeto só vale quando o
+nome da pasta é um nome de variável válido. Com `-` ou `.` (`meu-proj`, `proj.v2`), a expansão
+indireta abortava o falso em qualquer modo (review do NS-34, P3). No modo `sleep`, o SIGHUP é ignorado no próprio
+falso antes de criar o `sleep` em segundo plano, e não num `trap` dentro do filho. Com o `trap` no
+filho, um SIGHUP ao grupo logo depois do `READY` podia chegar antes dele e matar o sobrevivente, e
+os testes de "grupo já colhido" falhavam ao acaso (review do NS-34, P4; o padrão vinha do NS-33).
+
+**Outros ajustes do review do NS-34:**
+- as três confirmações `(s/N)` usam o mesmo `is_yes`;
+- com o foco no terminal, a roda do mouse só rola o histórico sobre o terminal, e não sobre a
+  lista ao lado;
+- na saída por `q` + `s`, um erro do banco ao gravar os `ended` sai no stderr depois da
+  restauração do terminal. O nick sai com 0, e as travas saem do mesmo jeito, então a limpeza da
+  próxima abertura encerra a linha que ficou `active`.
+
+**Testes:** unidade em `keys` (canonização, ida e volta do banco, label e recusa), `db` (migração
+4, v3 → v4 e `settings`), `agent_session` (duas sessões no mesmo canal com o `id` certo e uma
+inundação, e `terminate_all` numa espera só sem sinal a grupo colhido), `app` (vários agentes, foco,
+atalho, visão, encerrar, sair, captura e leitura do banco, com o `FakeLauncher`) e `ui` (layout,
+cabeçalho quebrado, visão, Configurações, captura e confirmações). Integração no PTY em
+`nick/tests/agent.rs`: dois projetos (um com a jail e outro sem), o atalho nos dois sentidos, o
+aviso de saída nova, o OSC 52 só do exibido, a troca do atalho com a próxima abertura, a recusa na
+captura, encerrar pela visão, sair com dois agentes, SIGTERM e panic com dois agentes e a
+inundação escondida. A verificação com o `claude` e o ai-jail reais, no terminal standalone e no VS
+Code, não roda dentro da jail do nick. O roteiro fica em `.nick/docs/NS-34/verificacao_manual.md`,
+para o analista executar fora dela.

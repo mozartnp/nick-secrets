@@ -5,9 +5,11 @@
 //!
 //! The loop is driven by a channel (finding of NS-29): an input thread reads the terminal
 //! (paused by its gate while bin/nick-init runs), a signal thread turns SIGTERM and SIGHUP into
-//! events, and the agent's threads send its output, its copies (OSC 52) and its end. The main
-//! thread blocks on the channel and redraws only after something changed, at most once a frame.
+//! events, and the threads of each agent send its output, its copies (OSC 52) and its end,
+//! with the id of the agent (NS-34: several run at once). The main thread blocks on the channel
+//! and redraws only after something changed, at most once a frame.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -18,9 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
-use nick::agent_session::{AgentSession, SessionEvent};
+use nick::agent_session::{self, AgentEvent, AgentSession, SessionEvent};
 use nick::agents;
-use nick::app::{Action, AgentTerm, App, Screen};
+use nick::app::{Action, AgentTerm, App, Focus};
 use nick::db::Db;
 use nick::init::{self, TerminalInitRunner};
 use nick::keys::TermModes;
@@ -40,13 +42,13 @@ const INPUT_POLL: Duration = Duration::from_millis(100);
 /// What reaches the main loop.
 enum LoopEvent {
     Input(Event),
-    Agent(SessionEvent),
+    Agent(AgentEvent),
     /// SIGTERM or SIGHUP (closing the window).
     Signal(i32),
 }
 
-impl From<SessionEvent> for LoopEvent {
-    fn from(event: SessionEvent) -> LoopEvent {
+impl From<AgentEvent> for LoopEvent {
+    fn from(event: AgentEvent) -> LoopEvent {
         LoopEvent::Agent(event)
     }
 }
@@ -93,8 +95,12 @@ fn main() -> ExitCode {
         init::init_path(std::env::var_os("NICK_INIT_BIN").as_deref()),
     )
     .with_agents(launch::launcher_path(), agents_dir);
-    if let Err(message) = cleanup {
-        app.set_status(message);
+    // The reserved shortcut of the database (NS-34): an invalid one, or an error, falls back
+    // to the default with a message. The status has a single line: both messages are joined.
+    let shortcut = app.load_shortcut();
+    let messages: Vec<String> = cleanup.err().into_iter().chain(shortcut).collect();
+    if !messages.is_empty() {
+        app.set_status(messages.join(" "));
     }
 
     terminal::install_panic_hook();
@@ -181,17 +187,38 @@ fn run(app: App) -> io::Result<Option<i32>> {
     test_hook()?;
     let mut shell = Shell {
         app,
-        session: None,
+        sessions: Vec::new(),
+        sizes: HashMap::new(),
         tx,
+        shown: None,
+        agent_modes: false,
+        exit_error: None,
     };
-    shell.event_loop(&mut guard, &gate, &rx)
+    let result = shell.event_loop(&mut guard, &gate, &rx);
+    // The error of the database when the agents were ended on the way out goes to the normal
+    // terminal, after it is restored (a row may be left active; its lock is gone, so the cleanup
+    // of the next opening ends it).
+    drop(guard);
+    if let Some(error) = shell.exit_error {
+        eprintln!("{error}");
+    }
+    result
 }
 
-/// The state of the loop: the TUI and the terminal of the running agent.
+/// The state of the loop: the TUI and the terminal of each running agent.
 struct Shell {
     app: App,
-    session: Option<AgentSession>,
+    /// The terminal of each running agent, by the id of its row, in the order they opened.
+    sessions: Vec<(i64, AgentSession)>,
+    /// The size (rows, columns) last given to each session.
+    sizes: HashMap<i64, (u16, u16)>,
     tx: Sender<LoopEvent>,
+    /// The shown agent the loop knows of (to see when it changes).
+    shown: Option<i64>,
+    /// Whether the mouse capture and the bracketed paste are on (with the focus on a terminal).
+    agent_modes: bool,
+    /// The error of the database when every agent was ended on the way out (`end_all`).
+    exit_error: Option<String>,
 }
 
 impl Shell {
@@ -233,23 +260,48 @@ impl Shell {
                     self.end_by_signal();
                     return Ok(Some(signal));
                 }
-                LoopEvent::Agent(SessionEvent::Output) => dirty |= self.session.is_some(),
-                // A copy (OSC 52) goes to the outer terminal, which does it; written between two
-                // frames, never inside one.
-                LoopEvent::Agent(SessionEvent::Clipboard(bytes)) => {
-                    let mut stdout = io::stdout();
-                    stdout.write_all(&bytes)?;
-                    stdout.flush()?;
+                LoopEvent::Agent(AgentEvent {
+                    agent,
+                    event: SessionEvent::Output,
+                }) => {
+                    // The shown one redraws; a hidden one only when its mark changes (N agents
+                    // at work would redraw for nothing), and only a hidden one not marked yet
+                    // reads its text at all.
+                    if Some(agent) == self.app.shown() {
+                        dirty = true;
+                    } else if self.app.wants_hidden_text(agent)
+                        && let Some(session) = self.session(agent)
+                    {
+                        let text = session.with_screen(|screen| screen.contents());
+                        if self.app.hidden_output(agent, &text) {
+                            dirty = true;
+                            self.after_change(guard)?;
+                        }
+                    }
                 }
-                LoopEvent::Agent(SessionEvent::Exited(code)) => {
-                    self.agent_exited(guard, gate, code)?;
+                // A copy (OSC 52) of the shown agent goes to the outer terminal, which does it;
+                // written between two frames, never inside one. A hidden agent must not change
+                // the clipboard without the operator noticing: its copy is dropped.
+                LoopEvent::Agent(AgentEvent {
+                    agent,
+                    event: SessionEvent::Clipboard(bytes),
+                }) => {
+                    if Some(agent) == self.app.shown() {
+                        let mut stdout = io::stdout();
+                        stdout.write_all(&bytes)?;
+                        stdout.flush()?;
+                    }
+                }
+                LoopEvent::Agent(AgentEvent {
+                    agent,
+                    event: SessionEvent::Exited(code),
+                }) => {
+                    self.agent_exited(guard, gate, agent, code)?;
+                    self.after_change(guard)?;
                     dirty = true;
                 }
-                LoopEvent::Input(Event::Resize(width, height)) => {
-                    if let Some(session) = &mut self.session {
-                        let area = ui::agent_area(Rect::new(0, 0, width, height));
-                        let _ = session.resize(area.height, area.width);
-                    }
+                LoopEvent::Input(Event::Resize(..)) => {
+                    self.after_change(guard)?;
                     dirty = true;
                 }
                 LoopEvent::Input(input) => {
@@ -258,7 +310,7 @@ impl Shell {
                     let action = match input {
                         Event::Key(key) => self.app.handle_key(key),
                         Event::Mouse(mouse) => {
-                            let area = ui::agent_area(guard.terminal().size()?.into());
+                            let area = ui::layout(&self.app, self.frame_area(guard)?).terminal;
                             self.app.handle_mouse(&mouse, area)
                         }
                         Event::Paste(text) => self.app.handle_paste(&text),
@@ -269,14 +321,78 @@ impl Shell {
                     if self.carry_out(action, guard, gate)? {
                         return Ok(None);
                     }
+                    if !is_mouse {
+                        self.after_change(guard)?;
+                    }
                 }
             }
         }
     }
 
+    /// The session of the agent `id`.
+    fn session(&self, id: i64) -> Option<&AgentSession> {
+        self.sessions
+            .iter()
+            .find(|(agent, _)| *agent == id)
+            .map(|(_, session)| session)
+    }
+
+    /// The session of the shown agent.
+    fn shown_session(&mut self) -> Option<&mut AgentSession> {
+        let shown = self.app.shown()?;
+        self.sessions
+            .iter_mut()
+            .find(|(agent, _)| *agent == shown)
+            .map(|(_, session)| session)
+    }
+
+    fn frame_area(&self, guard: &mut TerminalGuard) -> io::Result<Rect> {
+        Ok(guard.terminal().size()?.into())
+    }
+
+    /// After anything that may have changed the state of the app: when the shown agent
+    /// changed, the text of the one that stopped being shown is kept (the rule of the mark);
+    /// the modes of the outer terminal follow the focus; and every session whose area changed
+    /// (a resize, the status or the help taking another number of rows, the list getting
+    /// split) gets its new size, from the same `layout` the drawing uses.
+    fn after_change(&mut self, guard: &mut TerminalGuard) -> io::Result<()> {
+        let shown = self.app.shown();
+        if shown != self.shown {
+            if let Some(previous) = self.shown
+                && let Some(session) = self.session(previous)
+            {
+                let text = session.with_screen(|screen| screen.contents());
+                self.app.left_shown(previous, text);
+            }
+            self.shown = shown;
+        }
+        let modes = self.app.focus() == Focus::Terminal && shown.is_some();
+        if modes != self.agent_modes {
+            if modes {
+                terminal::enter_agent_modes()?;
+            } else {
+                terminal::leave_agent_modes()?;
+            }
+            self.agent_modes = modes;
+        }
+        let frame = self.frame_area(guard)?;
+        for (id, session) in &mut self.sessions {
+            let Some(agent) = self.app.agent(*id) else {
+                continue;
+            };
+            let area = ui::agent_area(&self.app, frame, agent);
+            let size = (area.height, area.width);
+            if self.sizes.get(id) != Some(&size) {
+                let _ = session.resize(size.0, size.1);
+                self.sizes.insert(*id, size);
+            }
+        }
+        Ok(())
+    }
+
     fn draw(&mut self, guard: &mut TerminalGuard) -> io::Result<()> {
         let app = &self.app;
-        let session = self.session.as_ref();
+        let session = app.shown().and_then(|id| self.session(id));
         guard.terminal().draw(|frame| match session {
             Some(session) => {
                 session.with_screen(|screen| ui::draw_with_terminal(frame, app, Some(screen)));
@@ -286,9 +402,10 @@ impl Shell {
         Ok(())
     }
 
-    /// Tells the app what the agent's program asked of its terminal, before an input event.
+    /// Tells the app what the shown agent's program asked of its terminal, before an input
+    /// event.
     fn read_agent_term(&mut self) {
-        if let Some(session) = &self.session {
+        if let Some(session) = self.app.shown().and_then(|id| self.session(id)) {
             let term = session.with_screen(|screen| AgentTerm {
                 modes: TermModes {
                     application_cursor: screen.application_cursor(),
@@ -332,18 +449,24 @@ impl Shell {
                 ticket,
                 stage,
             } => {
-                let area = ui::agent_area(guard.terminal().size()?.into());
-                let mut launcher =
-                    TerminalAgentLauncher::new(self.tx.clone(), (area.height, area.width));
+                // The PTY is born with its size: the panel the new agent will have (the same
+                // count as `ui::layout`), less its header, known at the spawn.
+                let panel = ui::new_agent_panel(&self.app, self.frame_area(guard)?);
+                let size_of = move |name: &str, jail: bool| {
+                    let area = ui::terminal_in_panel(panel, name, jail);
+                    (area.height, area.width)
+                };
+                let mut launcher = TerminalAgentLauncher::new(self.tx.clone(), Box::new(size_of));
                 self.app.open_agent(&project, &ticket, stage, &mut launcher);
-                if self.app.screen() == Screen::Agent {
-                    self.session = launcher.session.take();
-                    terminal::enter_agent_modes()?;
-                    agent_test_hook();
+                if let (Some(session), Some(id)) = (launcher.session.take(), self.app.shown()) {
+                    let size = session.with_screen(|screen| screen.size());
+                    self.sizes.insert(id, size);
+                    self.sessions.push((id, session));
+                    agent_test_hook(self.sessions.len());
                 }
             }
             Action::Send(bytes) => {
-                if let Some(session) = &mut self.session {
+                if let Some(session) = self.shown_session() {
                     // Any key sent goes back to the live screen.
                     session.scroll_to_bottom();
                     // A program that already ended has no reader: the input is dropped.
@@ -352,40 +475,56 @@ impl Shell {
             }
             Action::ScrollPageUp => {
                 let page = page(guard)?;
-                if let Some(session) = &self.session {
+                if let Some(session) = self.shown_session() {
                     session.scroll(page);
                 }
             }
             Action::ScrollPageDown => {
                 let page = page(guard)?;
-                if let Some(session) = &self.session {
+                if let Some(session) = self.shown_session() {
                     session.scroll(-page);
                 }
             }
             Action::ScrollLines(lines) => {
-                if let Some(session) = &self.session {
+                if let Some(session) = self.shown_session() {
                     session.scroll(lines);
                 }
+            }
+            Action::EndAgent(id) => {
+                // Synchronous: up to TERM_GRACE when the group ignores SIGTERM (accepted). The
+                // Exited its waiter sends afterwards finds no session and is ignored.
+                if let Some(index) = self.sessions.iter().position(|(agent, _)| *agent == id) {
+                    let (_, mut session) = self.sessions.remove(index);
+                    self.sizes.remove(&id);
+                    session.terminate();
+                }
+                self.app.agent_ended_by_operator(id);
+            }
+            Action::QuitEndingAgents => {
+                self.end_all();
+                return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// The agent's program ended (the PTY closed and the child was reaped): the record ends,
-    /// the modes of the agent screen go off, and the Tickets screen comes back with a full
-    /// redraw.
+    /// The program of the agent `id` ended (the PTY closed and the child was reaped): its
+    /// record ends and it leaves the running ones, with a full redraw. An agent the operator
+    /// already ended has no session any more: its end is ignored.
     fn agent_exited(
         &mut self,
         guard: &mut TerminalGuard,
         gate: &InputGate,
+        id: i64,
         code: u32,
     ) -> io::Result<()> {
-        let Some(mut session) = self.session.take() else {
+        let Some(index) = self.sessions.iter().position(|(agent, _)| *agent == id) else {
             return Ok(());
         };
+        let (_, mut session) = self.sessions.remove(index);
+        self.sizes.remove(&id);
         session.wait();
-        self.app.agent_ended(code);
-        terminal::leave_agent_modes()?;
+        self.app.agent_ended(id, code);
         // The clear asks the terminal for the cursor position: the input thread is paused so
         // the answer is not read as a key.
         gate.close();
@@ -394,13 +533,22 @@ impl Shell {
         cleared
     }
 
-    /// SIGTERM/SIGHUP: the agent's process group is ended (SIGTERM, SIGKILL after 2 s, wait),
-    /// its record ends, and the terminal is restored by the guard on the way out.
+    /// Ends every agent: all the process groups at once (SIGTERM, SIGKILL after a single
+    /// grace of 2 s, wait), then every record (`ended`, the locks released).
+    fn end_all(&mut self) {
+        let mut sessions: Vec<AgentSession> = self
+            .sessions
+            .drain(..)
+            .map(|(_, session)| session)
+            .collect();
+        agent_session::terminate_all(&mut sessions);
+        self.exit_error = self.app.end_all_records().err();
+    }
+
+    /// SIGTERM/SIGHUP: every agent is ended (`end_all`), and the terminal is restored by the
+    /// guard on the way out.
     fn end_by_signal(&mut self) {
-        if let Some(mut session) = self.session.take() {
-            session.terminate();
-        }
-        let _ = self.app.end_agent_record();
+        self.end_all();
     }
 }
 
@@ -423,9 +571,15 @@ fn test_hook() -> io::Result<()> {
 }
 
 /// Test hook (tests/agent.rs): NICK_TEST_PANIC=agent panics in a secondary thread shortly
-/// after an agent opens, to prove the panic hook ends the agent's process group.
-fn agent_test_hook() {
-    if std::env::var("NICK_TEST_PANIC").as_deref() == Ok("agent") {
+/// after an agent opens, and =second_agent after the second one (`running` agents), to prove
+/// the panic hook ends the process groups of the agents.
+fn agent_test_hook(running: usize) {
+    let wanted = match std::env::var("NICK_TEST_PANIC").as_deref() {
+        Ok("agent") => 1,
+        Ok("second_agent") => 2,
+        _ => return,
+    };
+    if running == wanted {
         thread::spawn(|| {
             thread::sleep(Duration::from_millis(500));
             panic!("NICK_TEST_PANIC: panic de teste com um agente aberto");

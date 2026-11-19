@@ -4,9 +4,11 @@
 //! missing-config alert produces it (plan D7 of NS-31). The navigation is Modules > Projects >
 //! Tickets; the rules of the tickets are in tickets.rs, and none of them touches a file of the
 //! project. From a ticket, `g` and a stage open an agent (NS-33): `Action::OpenAgent`, which
-//! the loop hands to `open_agent` with the real `AgentLauncher` (launch.rs); on the agent
-//! screen every key goes to the program (`Action::Send`). The screen texts are in PT-BR, and
-//! drawing is ui.rs's job.
+//! the loop hands to `open_agent` with the real `AgentLauncher` (launch.rs). Several agents
+//! run at once (NS-34): the list stays on the left and the shown agent on the right, and the
+//! reserved shortcut (`keys::Shortcut`, kept in the database) toggles the focus between them;
+//! with the focus on the terminal every other key goes to the program (`Action::Send`). The
+//! screen texts are in PT-BR, and drawing is ui.rs's job.
 
 use std::path::{Path, PathBuf};
 
@@ -15,11 +17,12 @@ use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::agents::{self, OpenAgent, Stage};
-use crate::db::Db;
+use crate::db::{Db, SETTING_RESERVED_SHORTCUT};
 use crate::init::{InitOutcome, InitRunner};
-use crate::keys::{self, TermModes};
+use crate::keys::{self, Shortcut, TermModes};
 use crate::launch::{self, AgentLauncher};
 use crate::modules::ModuleKind;
+use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
 use crate::tickets::{self, Ticket};
 
@@ -30,8 +33,18 @@ pub enum Screen {
     Projects,
     /// The tickets of the open project (`App::project`).
     Tickets,
-    /// The terminal of the running agent (`App::agent`), over the whole screen.
-    Agent,
+    /// "Agentes ativos": every agent this nick runs, of every project (NS-34).
+    ActiveAgents,
+    /// "Configurações": the reserved shortcut (NS-34).
+    Settings,
+}
+
+/// Where the keys go while an agent runs (NS-34): the list on the left or the terminal of the
+/// shown agent on the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    List,
+    Terminal,
 }
 
 /// The buttons of the missing-config alert.
@@ -82,6 +95,13 @@ pub enum Dialog {
     },
     /// Why no agent was opened (the launcher is missing, or its check failed).
     AgentError { message: String },
+    /// The `(s/N)` confirmation of ending the agent `id` from "Agentes ativos".
+    ConfirmEndAgent { id: i64, name: String },
+    /// The `(s/N)` confirmation of quitting with agents running (they are all ended).
+    ConfirmQuit,
+    /// The capture of a new reserved shortcut: `first` is the key pressed once, which must be
+    /// pressed again to be saved.
+    CaptureShortcut { first: Option<Shortcut> },
 }
 
 /// What the loop must do after a key.
@@ -107,6 +127,12 @@ pub enum Action {
     ScrollPageDown,
     /// Scroll the agent's history by lines (positive: up, into the history).
     ScrollLines(i32),
+    /// End the agent with this id (confirmed from "Agentes ativos"): the loop terminates its
+    /// session and calls `agent_ended_by_operator`.
+    EndAgent(i64),
+    /// Quit, ending every agent (confirmed): the loop terminates every session and calls
+    /// `end_all_records`.
+    QuitEndingAgents,
 }
 
 /// Lines scrolled by one step of the mouse wheel, when the wheel scrolls the history.
@@ -122,16 +148,25 @@ pub struct AgentTerm {
     pub mouse_encoding: MouseProtocolEncoding,
 }
 
-/// The agent being run: its record (the active row and the lock) and what the screen shows.
+/// An agent being run: its record (the active row and the lock) and what the screen shows.
 #[derive(Debug)]
 pub struct RunningAgent {
     record: OpenAgent,
+    /// The `id` of its row: its events and its session in the loop carry it.
+    pub id: i64,
     /// The `claude --name`.
     pub name: String,
-    /// Whether it runs in the jail (the `jail=` of the check).
+    /// The name of its project.
+    pub project: String,
+    /// Whether it runs in the jail (the `jail=` of the check). Only in memory: every agent of
+    /// the view is of this process (NS-34, not a column).
     pub jail: bool,
     /// What the check wrote on stderr, shown when the agent ends.
     warning: Option<String>,
+    /// The text of its screen when it stopped being shown (`hidden_output`).
+    seen_text: String,
+    /// Marked: its text changed while hidden ("● saída nova").
+    pub unseen: bool,
 }
 
 /// A project of the list with its availability, computed when the list is refreshed.
@@ -163,9 +198,21 @@ pub struct App {
     pub(crate) launcher: PathBuf,
     /// Where the locks of the agents live (agents.rs); None until `with_agents`.
     pub(crate) agents_dir: Option<PathBuf>,
-    /// The agent on the Agent screen.
-    pub(crate) agent: Option<RunningAgent>,
+    /// The agents running, in the order they were opened.
+    pub(crate) agents: Vec<RunningAgent>,
+    /// The id of the agent shown on the right, if any.
+    pub(crate) shown: Option<i64>,
+    pub(crate) focus: Focus,
+    /// What the shown agent's program asked of its terminal.
     pub(crate) agent_term: AgentTerm,
+    /// The selection of "Agentes ativos".
+    pub(crate) agent_index: usize,
+    /// The screen "Agentes ativos" goes back to.
+    pub(crate) back: Screen,
+    /// The reserved shortcut in use, and whether the database has a row for it (no row: the
+    /// default).
+    pub(crate) shortcut: Shortcut,
+    pub(crate) shortcut_stored: bool,
 }
 
 impl App {
@@ -189,8 +236,14 @@ impl App {
             show_hidden: false,
             launcher: launch::launcher_path(),
             agents_dir: None,
-            agent: None,
+            agents: Vec::new(),
+            shown: None,
+            focus: Focus::List,
             agent_term: AgentTerm::default(),
+            agent_index: 0,
+            back: Screen::Modules,
+            shortcut: Shortcut::DEFAULT,
+            shortcut_stored: false,
         }
     }
 
@@ -207,9 +260,60 @@ impl App {
         self.screen
     }
 
-    /// The running agent, if any.
-    pub fn agent(&self) -> Option<&RunningAgent> {
-        self.agent.as_ref()
+    /// The agents running, in the order they were opened.
+    pub fn agents(&self) -> &[RunningAgent] {
+        &self.agents
+    }
+
+    /// The running agent `id`, if any.
+    pub fn agent(&self, id: i64) -> Option<&RunningAgent> {
+        self.agents.iter().find(|agent| agent.id == id)
+    }
+
+    /// The id of the agent shown on the right.
+    pub fn shown(&self) -> Option<i64> {
+        self.shown
+    }
+
+    /// The agent shown on the right.
+    pub fn shown_agent(&self) -> Option<&RunningAgent> {
+        self.shown.and_then(|id| self.agent(id))
+    }
+
+    /// Where the keys go.
+    pub fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    /// The reserved shortcut in use.
+    pub fn shortcut(&self) -> Shortcut {
+        self.shortcut
+    }
+
+    /// Reads the reserved shortcut of the database (when the nick opens). A value that is not
+    /// a valid shortcut today falls back to the default; the message for the status bar says
+    /// so, or is the error of the database.
+    pub fn load_shortcut(&mut self) -> Option<String> {
+        match self.db.get_setting(SETTING_RESERVED_SHORTCUT) {
+            Err(err) => Some(projects::db_error_message(&err)),
+            Ok(None) => None,
+            Ok(Some(value)) => {
+                let valid = Shortcut::from_db(&value)
+                    .filter(|shortcut| keys::shortcut_refusal(shortcut).is_none());
+                match valid {
+                    Some(shortcut) => {
+                        self.shortcut = shortcut;
+                        self.shortcut_stored = true;
+                        None
+                    }
+                    None => Some(format!(
+                        "O atalho gravado no banco ({}) não é válido. Usando o padrão {}.",
+                        printable(&value),
+                        Shortcut::DEFAULT.label()
+                    )),
+                }
+            }
+        }
     }
 
     /// Sets what the agent's program asked of its terminal (the loop reads it from the screen).
@@ -235,7 +339,7 @@ impl App {
     /// Handles a key and runs the init when the key asks for it. Returns true to quit.
     pub fn on_key(&mut self, key: KeyEvent, runner: &mut dyn InitRunner) -> bool {
         match self.handle_key(key) {
-            Action::Quit => true,
+            Action::Quit | Action::QuitEndingAgents => true,
             Action::RunInit { project } => {
                 let outcome = runner.run(&self.init, &project);
                 self.after_init(outcome);
@@ -247,7 +351,8 @@ impl App {
             | Action::Send(_)
             | Action::ScrollPageUp
             | Action::ScrollPageDown
-            | Action::ScrollLines(_) => false,
+            | Action::ScrollLines(_)
+            | Action::EndAgent(_) => false,
         }
     }
 
@@ -256,15 +361,28 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
-        // On the agent screen every key is the program's, Ctrl+C included: the terminal only
-        // closes when claude ends (the reserved shortcut is the F3b's).
-        if self.screen == Screen::Agent {
+        // The capture of a new shortcut takes every key, the current shortcut and Ctrl+C
+        // included (Ctrl+C is refused there, and does not quit).
+        if let Some(Dialog::CaptureShortcut { first }) = self.dialog {
+            self.dialog = None;
+            return self.key_capture(key, first);
+        }
+        // The reserved shortcut toggles the focus before anything else and never reaches the
+        // program; only a press counts (holding it must not blink the focus).
+        if self.shortcut.matches(&key) {
+            if key.kind == KeyEventKind::Press {
+                self.toggle_focus();
+            }
+            return Action::None;
+        }
+        // With the focus on the terminal every other key is the program's, Ctrl+C included.
+        if self.focus == Focus::Terminal {
             return self.key_agent(key);
         }
         // Ctrl+C quits from anywhere: raw mode delivers it as a key, and the operator can't
-        // be stuck.
+        // be stuck. With agents running, it asks first.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Action::Quit;
+            return self.quit();
         }
         let action = match self.dialog.take() {
             Some(Dialog::AddPath { input }) => self.key_add_path(key, input),
@@ -285,11 +403,16 @@ impl App {
                 index,
             }) => self.key_choose_stage(key, project, ticket, index),
             Some(Dialog::AgentError { message }) => self.key_agent_error(key, message),
+            Some(Dialog::ConfirmEndAgent { id, .. }) => confirmed(key, Action::EndAgent(id)),
+            Some(Dialog::ConfirmQuit) => confirmed(key, Action::QuitEndingAgents),
+            // Taken before the dialogs (above).
+            Some(Dialog::CaptureShortcut { .. }) => Action::None,
             None => match self.screen {
                 Screen::Modules => self.key_modules(key),
                 Screen::Projects => self.key_projects(key),
                 Screen::Tickets => self.key_tickets(key),
-                Screen::Agent => Action::None,
+                Screen::ActiveAgents => self.key_active_agents(key),
+                Screen::Settings => self.key_settings(key),
             },
         };
         // The availability is computed again after every action on the list (plan D9): not
@@ -300,10 +423,195 @@ impl App {
             match self.screen {
                 Screen::Projects => self.refresh(),
                 Screen::Tickets => self.refresh_tickets(),
-                Screen::Modules | Screen::Agent => {}
+                Screen::Modules | Screen::ActiveAgents | Screen::Settings => {}
             }
         }
         action
+    }
+
+    /// The reserved shortcut: from the terminal back to the list; from the list to the terminal
+    /// of the shown agent, but not with a dialog open (it is a pending question) nor without
+    /// an agent shown.
+    fn toggle_focus(&mut self) {
+        match self.focus {
+            Focus::Terminal => self.focus = Focus::List,
+            Focus::List if self.dialog.is_none() && self.shown.is_some() => {
+                self.focus = Focus::Terminal;
+            }
+            Focus::List => {}
+        }
+    }
+
+    /// `q` on a list or Ctrl+C with the focus on it: quits right away without agents (as
+    /// before the NS-34), or asks to end them all.
+    fn quit(&mut self) -> Action {
+        if self.agents.is_empty() {
+            return Action::Quit;
+        }
+        self.dialog = Some(Dialog::ConfirmQuit);
+        Action::None
+    }
+
+    /// `v` on a list: the view "Agentes ativos", with the shown agent selected; `Esc` goes back
+    /// to `screen`.
+    fn open_active_agents(&mut self) {
+        self.back = self.screen;
+        self.screen = Screen::ActiveAgents;
+        self.agent_index = self
+            .shown
+            .and_then(|id| self.agents.iter().position(|agent| agent.id == id))
+            .unwrap_or(0);
+        self.status = None;
+    }
+
+    fn key_active_agents(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.agent_index = self.agent_index.saturating_sub(1);
+                self.show_selected();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.agent_index = (self.agent_index + 1).min(self.agents.len().saturating_sub(1));
+                self.show_selected();
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                if self.agents.get(self.agent_index).is_some() {
+                    self.show_selected();
+                    self.focus = Focus::Terminal;
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(agent) = self.agents.get(self.agent_index) {
+                    self.dialog = Some(Dialog::ConfirmEndAgent {
+                        id: agent.id,
+                        name: agent.name.clone(),
+                    });
+                }
+            }
+            KeyCode::Esc | KeyCode::Left => {
+                self.screen = self.back;
+                self.status = None;
+            }
+            _ if is_quit(key) => return self.quit(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Shows the agent selected on "Agentes ativos".
+    fn show_selected(&mut self) {
+        if let Some(id) = self.agents.get(self.agent_index).map(|agent| agent.id) {
+            self.show(id);
+        }
+    }
+
+    /// Shows the agent `id` on the right: being shown counts as seen, so its mark goes. The
+    /// loop keeps the text of the one that stopped being shown (`left_shown`).
+    fn show(&mut self, id: i64) {
+        if self.shown != Some(id) {
+            self.agent_term = AgentTerm::default();
+        }
+        self.shown = Some(id);
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.unseen = false;
+        }
+    }
+
+    /// The agent `id` stopped being shown, with `text` on its screen (vt100 `contents`).
+    pub fn left_shown(&mut self, id: i64, text: String) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.seen_text = text;
+        }
+    }
+
+    /// Whether an output of the agent `id` needs its text for `hidden_output`: only a hidden
+    /// agent not marked yet (a marked one costs nothing until it is seen).
+    pub fn wants_hidden_text(&self, id: i64) -> bool {
+        self.shown != Some(id) && self.agent(id).is_some_and(|agent| !agent.unseen)
+    }
+
+    /// The rule of the "saída nova" mark (NS-34): an output of the hidden agent `id` whose
+    /// visible `text` differs from the text it had when it stopped being shown marks it. A
+    /// redraw of the same text (colors, cursor) does not. Returns true when the mark changed.
+    pub fn hidden_output(&mut self, id: i64, text: &str) -> bool {
+        if !self.wants_hidden_text(id) {
+            return false;
+        }
+        let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) else {
+            return false;
+        };
+        if agent.seen_text == text {
+            return false;
+        }
+        agent.unseen = true;
+        true
+    }
+
+    fn key_settings(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('t') => {
+                self.status = None;
+                self.dialog = Some(Dialog::CaptureShortcut { first: None });
+            }
+            KeyCode::Char('p') => match self.db.delete_setting(SETTING_RESERVED_SHORTCUT) {
+                Ok(()) => {
+                    self.shortcut = Shortcut::DEFAULT;
+                    self.shortcut_stored = false;
+                    self.status = Some(format!(
+                        "Atalho de volta ao padrão: {}.",
+                        Shortcut::DEFAULT.label()
+                    ));
+                }
+                Err(err) => self.status = Some(projects::db_error_message(&err)),
+            },
+            KeyCode::Esc | KeyCode::Left => {
+                self.screen = Screen::Modules;
+                self.status = None;
+            }
+            _ if is_quit(key) => return self.quit(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// A key in the capture of a new shortcut: Esc cancels; a refused key says why and starts
+    /// over; a valid key once becomes `first`, and the same key again (in the canonical form)
+    /// is saved. The second press proves that the terminal delivers that key to the nick.
+    fn key_capture(&mut self, key: KeyEvent, first: Option<Shortcut>) -> Action {
+        if key.kind == KeyEventKind::Repeat {
+            self.dialog = Some(Dialog::CaptureShortcut { first });
+            return Action::None;
+        }
+        if key.code == KeyCode::Esc {
+            self.status = None;
+            return Action::None;
+        }
+        match keys::shortcut_of_key(&key) {
+            Err(message) => {
+                self.status = Some(message);
+                self.dialog = Some(Dialog::CaptureShortcut { first: None });
+            }
+            Ok(shortcut) if first == Some(shortcut) => {
+                match self
+                    .db
+                    .set_setting(SETTING_RESERVED_SHORTCUT, &shortcut.to_db())
+                {
+                    Ok(()) => {
+                        self.shortcut = shortcut;
+                        self.shortcut_stored = true;
+                        self.status = Some(format!("Atalho salvo: {}.", shortcut.label()));
+                    }
+                    Err(err) => self.status = Some(projects::db_error_message(&err)),
+                }
+            }
+            Ok(shortcut) => {
+                self.status = None;
+                self.dialog = Some(Dialog::CaptureShortcut {
+                    first: Some(shortcut),
+                });
+            }
+        }
+        Action::None
     }
 
     fn key_modules(&mut self, key: KeyEvent) -> Action {
@@ -319,7 +627,12 @@ impl App {
                 self.project_index = 0;
                 self.status = None;
             }
-            _ if is_quit(key) => return Action::Quit,
+            KeyCode::Char('c') => {
+                self.screen = Screen::Settings;
+                self.status = None;
+            }
+            KeyCode::Char('v') => self.open_active_agents(),
+            _ if is_quit(key) => return self.quit(),
             _ => {}
         }
         Action::None
@@ -353,11 +666,12 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Right => self.open_tickets(),
+            KeyCode::Char('v') => self.open_active_agents(),
             KeyCode::Esc | KeyCode::Left => {
                 self.screen = Screen::Modules;
                 self.status = None;
             }
-            _ if is_quit(key) => return Action::Quit,
+            _ if is_quit(key) => return self.quit(),
             _ => {}
         }
         Action::None
@@ -422,6 +736,7 @@ impl App {
             }
             KeyCode::Char('f') => self.show_hidden = !self.show_hidden,
             KeyCode::Char('g') => self.choose_stage(),
+            KeyCode::Char('v') => self.open_active_agents(),
             KeyCode::Esc | KeyCode::Left => {
                 self.screen = Screen::Projects;
                 self.project = None;
@@ -429,7 +744,7 @@ impl App {
                 self.show_hidden = false;
                 self.status = None;
             }
-            _ if is_quit(key) => return Action::Quit,
+            _ if is_quit(key) => return self.quit(),
             _ => {}
         }
         Action::None
@@ -508,7 +823,7 @@ impl App {
 
     fn key_confirm_hide(&mut self, key: KeyEvent, ticket: Ticket) -> Action {
         // Only s/S confirm, as in the removal; any other key cancels.
-        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+        if is_yes(key) {
             self.status = Some(match tickets::hide(&self.db, &ticket) {
                 Ok(message) | Err(message) => message,
             });
@@ -585,7 +900,8 @@ impl App {
     /// the launcher exists, runs its `--check` (a failure becomes the alert, and nothing is
     /// stored nor launched), then generates the session ID and the name, takes the lock and
     /// stores the `active` row (agents.rs), and only then starts the PTY. A failing start ends
-    /// the row and releases the lock.
+    /// the row and releases the lock. The agent joins the running ones, is shown and gets the
+    /// focus; the list stays on the same ticket.
     pub fn open_agent(
         &mut self,
         project: &Path,
@@ -634,7 +950,8 @@ impl App {
                 return;
             }
         };
-        if let Err(err) = launcher.spawn(&self.launcher, project, &session_id, &name) {
+        let id = record.agent.id;
+        if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name) {
             let mut message = format!("Não consegui abrir o agente: {err}.");
             if let Err(db) = agents::end(&self.db, record) {
                 message = format!("{message} {db}");
@@ -642,22 +959,52 @@ impl App {
             self.status = Some(message);
             return;
         }
-        self.agent = Some(RunningAgent {
+        let project = project_name.to_string();
+        self.agents.push(RunningAgent {
             record,
+            id,
             name,
+            project,
             jail: check.jail,
             warning: check.warning,
+            seen_text: String::new(),
+            unseen: false,
         });
-        self.agent_term = AgentTerm::default();
-        self.screen = Screen::Agent;
+        self.show(id);
+        self.focus = Focus::Terminal;
         self.status = None;
     }
 
-    /// The agent's program ended with `code`: the row becomes `ended` and the lock goes
-    /// (agents.rs), and the Tickets screen comes back with the same ticket selected and the
-    /// message of the end (plus the warning of the check, when there was one).
-    pub fn agent_ended(&mut self, code: u32) {
-        let Some(agent) = self.agent.take() else {
+    /// Takes the agent `id` out of the running ones. When it was the shown one, the agent
+    /// opened most recently is shown (or none) and the focus goes to the list; otherwise the
+    /// focus and the shown agent stay.
+    fn take_agent(&mut self, id: i64) -> Option<RunningAgent> {
+        let index = self.agents.iter().position(|agent| agent.id == id)?;
+        let agent = self.agents.remove(index);
+        if self.shown == Some(id) {
+            self.shown = None;
+            self.focus = Focus::List;
+            self.agent_term = AgentTerm::default();
+            if let Some(last) = self.agents.last().map(|agent| agent.id) {
+                self.show(last);
+            }
+        }
+        if self.agents.is_empty() {
+            self.focus = Focus::List;
+        }
+        self.agent_index = self
+            .shown
+            .and_then(|shown| self.agents.iter().position(|agent| agent.id == shown))
+            .unwrap_or(0);
+        Some(agent)
+    }
+
+    /// The program of the agent `id` ended with `code`: the row becomes `ended` and the lock
+    /// goes (agents.rs), it leaves the running ones (`take_agent`), and the status says so
+    /// (plus the warning of the check, when there was one). The screen on the left stays, with
+    /// the tickets read again.
+    pub fn agent_ended(&mut self, id: i64, code: u32) {
+        let Some(agent) = self.take_agent(id) else {
             return;
         };
         let mut message = if code == 0 {
@@ -672,23 +1019,42 @@ impl App {
         if let Err(err) = agents::end(&self.db, agent.record) {
             message = format!("{message} {err}");
         }
-        self.screen = Screen::Tickets;
-        self.agent_term = AgentTerm::default();
         self.status = Some(message);
         self.refresh_tickets();
     }
 
-    /// Ends the record of the running agent without going back to a screen (the nick is
-    /// leaving: a signal). Returns the error of the database, if any.
-    pub fn end_agent_record(&mut self) -> Result<(), String> {
-        match self.agent.take() {
-            Some(agent) => agents::end(&self.db, agent.record),
-            None => Ok(()),
+    /// The operator ended the agent `id` (`Action::EndAgent`, its session already terminated
+    /// by the loop): as `agent_ended`, with the message of an end by the operator.
+    pub fn agent_ended_by_operator(&mut self, id: i64) {
+        let Some(agent) = self.take_agent(id) else {
+            return;
+        };
+        let mut message = format!("O agente {} foi encerrado.", agent.name);
+        if let Err(err) = agents::end(&self.db, agent.record) {
+            message = format!("{message} {err}");
         }
+        self.status = Some(message);
+        self.refresh_tickets();
     }
 
-    /// A key on the agent screen: Shift+PageUp/PageDown scroll the history; everything else
-    /// is encoded as an xterm would and sent to the program.
+    /// Ends the records of every running agent (the nick is leaving, its sessions already
+    /// terminated): each row becomes `ended` and each lock goes, one by one, even after an
+    /// error, so no lock is left held. Returns the first error of the database, if any.
+    pub fn end_all_records(&mut self) -> Result<(), String> {
+        self.shown = None;
+        self.focus = Focus::List;
+        let mut first = Ok(());
+        for agent in std::mem::take(&mut self.agents) {
+            let ended = agents::end(&self.db, agent.record);
+            if first.is_ok() {
+                first = ended;
+            }
+        }
+        first
+    }
+
+    /// A key with the focus on the terminal: Shift+PageUp/PageDown scroll the history;
+    /// everything else is encoded as an xterm would and sent to the program.
     fn key_agent(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::SHIFT) {
             match key.code {
@@ -700,25 +1066,36 @@ impl App {
         keys::encode_key(&key, self.agent_term.modes).map_or(Action::None, Action::Send)
     }
 
-    /// A paste: on the agent screen it goes to the program (bracketed and cleaned when the
-    /// program asked for it); elsewhere nothing (bracketed paste is only on there).
+    /// Whether the input goes to the shown agent's program: the focus is on its terminal.
+    fn on_terminal(&self) -> bool {
+        self.focus == Focus::Terminal && self.shown.is_some()
+    }
+
+    /// A paste: with the focus on the terminal it goes to the program (bracketed and cleaned
+    /// when the program asked for it); on the list nothing (bracketed paste is only on there).
     pub fn handle_paste(&mut self, text: &str) -> Action {
-        if self.screen != Screen::Agent {
+        if !self.on_terminal() {
             return Action::None;
         }
         Action::Send(keys::encode_paste(text, self.agent_term.bracketed_paste))
     }
 
-    /// A mouse event over `area` (the agent's terminal on the screen): to the program when it
-    /// asked for the mouse; otherwise the wheel scrolls the history and the rest is ignored.
+    /// A mouse event over `area` (the agent's terminal on the screen), with the focus on the
+    /// terminal: to the program when it asked for the mouse; otherwise the wheel scrolls the
+    /// history and the rest is ignored. On the list the mouse is the outer terminal's (it is
+    /// not captured there).
     pub fn handle_mouse(&mut self, event: &MouseEvent, area: Rect) -> Action {
-        if self.screen != Screen::Agent {
+        if !self.on_terminal() {
             return Action::None;
         }
         let term = self.agent_term;
         if term.mouse_mode != MouseProtocolMode::None {
             return keys::encode_mouse(event, term.mouse_mode, term.mouse_encoding, area)
                 .map_or(Action::None, Action::Send);
+        }
+        // The wheel over the list (beside the terminal since the NS-34) scrolls nothing.
+        if !area.contains(ratatui::layout::Position::new(event.column, event.row)) {
+            return Action::None;
         }
         match event.kind {
             MouseEventKind::ScrollUp => Action::ScrollLines(WHEEL_LINES),
@@ -845,7 +1222,7 @@ impl App {
 
     fn key_confirm_remove(&mut self, key: KeyEvent, project: Project) -> Action {
         // Only s/S confirm (the "sim" of the auto_scrum confirmations); any other key cancels.
-        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+        if is_yes(key) {
             self.status = Some(match projects::remove(&self.db, &project) {
                 Ok(message) | Err(message) => message,
             });
@@ -932,6 +1309,16 @@ fn edit_text(text: &mut String, key: KeyEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// `s` or `S`: the "sim" of the `(s/N)` confirmations (of auto_scrum too); any other key is no.
+fn is_yes(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+}
+
+/// The answer of an `(s/N)` confirmation: only s/S give `action`; any other key cancels.
+fn confirmed(key: KeyEvent, action: Action) -> Action {
+    if is_yes(key) { action } else { Action::None }
 }
 
 /// `q` or `Q` exactly (Shift is how `Q` is typed): the "Sair (q)" rule of the lists.
@@ -2030,10 +2417,12 @@ mod tests {
     use crate::agents::{self, Stage};
     use crate::launch::{AgentLauncher, Precheck};
 
-    /// A fake launcher: records the calls and returns the scripted results.
+    /// A fake launcher: records the calls and returns the scripted results. `ids` are the
+    /// agent ids of the spawns (NS-34), apart so `spawns` keeps the shape of the NS-33.
     struct FakeLauncher {
         checks: Vec<(PathBuf, PathBuf)>,
         spawns: Vec<(PathBuf, PathBuf, String, String)>,
+        ids: Vec<i64>,
         check: Result<Precheck, String>,
         spawn: Result<(), String>,
     }
@@ -2043,6 +2432,7 @@ mod tests {
             FakeLauncher {
                 checks: Vec::new(),
                 spawns: Vec::new(),
+                ids: Vec::new(),
                 check: Ok(Precheck {
                     jail,
                     warning: None,
@@ -2063,9 +2453,11 @@ mod tests {
             &mut self,
             launcher: &Path,
             project: &Path,
+            agent_id: i64,
             session_id: &str,
             name: &str,
         ) -> Result<(), String> {
+            self.ids.push(agent_id);
             self.spawns.push((
                 launcher.to_path_buf(),
                 project.to_path_buf(),
@@ -2277,11 +2669,18 @@ mod tests {
                 "active".to_string()
             )]
         );
-        assert_eq!(f.app.screen, Screen::Agent);
+        // The agent is shown with the focus on its terminal, and the list stays on the ticket.
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.app.screen, Screen::Tickets);
         assert_eq!(f.app.dialog, None);
-        let agent = f.app.agent.as_ref().expect("the running agent");
+        let agent = f.app.shown_agent().expect("the running agent");
         assert_eq!(agent.name, name);
         assert!(!agent.jail);
+        assert_eq!(
+            launcher.ids,
+            [agent.id],
+            "the spawn carries the id of the row"
+        );
         let lock = agents::lock_path(&f.agents_dir(), &session_id);
         let other = fs::File::open(&lock).unwrap();
         assert!(other.try_lock().is_err(), "the lock is held while it runs");
@@ -2337,7 +2736,9 @@ mod tests {
         f.open_agent(1, &mut launcher);
         assert_eq!(f.status(), Some("Não consegui abrir o agente: sem PTY."));
         assert_eq!(f.app.screen, Screen::Tickets);
-        assert!(f.app.agent.is_none());
+        assert!(f.app.agents.is_empty());
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.app.focus, Focus::List);
         let rows = f.agent_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].3, "ended");
@@ -2349,10 +2750,12 @@ mod tests {
         let mut launcher = FakeLauncher::new(true);
         f.key(KeyCode::Down);
         f.open_agent(1, &mut launcher);
-        assert_eq!(f.app.screen, Screen::Agent);
+        assert_eq!(f.app.focus, Focus::Terminal);
         (f, launcher)
     }
 
+    /// With the focus on the terminal, every key but the reserved shortcut goes to the program
+    /// (the shortcut: `the_shortcut_toggles_the_focus_and_never_reaches_the_program`).
     #[test]
     fn on_the_agent_screen_every_key_goes_to_the_program() {
         let (mut f, _) = running();
@@ -2367,13 +2770,13 @@ mod tests {
         assert_eq!(f.key(KeyCode::Enter), send(b"\r"));
         assert_eq!(f.ch('á'), send("á".as_bytes()));
         assert_eq!(
-            f.mods(KeyCode::Char('4'), KeyModifiers::CONTROL),
-            send(b"\x1c")
+            f.mods(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            send(b"\x1d")
         );
         assert_eq!(f.key(KeyCode::Up), send(b"\x1b[A"));
         f.app.agent_term.modes.application_cursor = true;
         assert_eq!(f.key(KeyCode::Up), send(b"\x1bOA"));
-        assert_eq!(f.app.screen, Screen::Agent);
+        assert_eq!(f.app.focus, Focus::Terminal);
         assert_eq!(f.app.dialog, None);
     }
 
@@ -2444,11 +2847,12 @@ mod tests {
         ] {
             let (mut f, launcher) = running();
             let session_id = launcher.spawns[0].2.clone();
-            f.app.agent_ended(code);
+            f.app.agent_ended(launcher.ids[0], code);
             assert_eq!(f.app.screen, Screen::Tickets);
             assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-2");
             assert_eq!(f.status(), Some(message));
-            assert!(f.app.agent.is_none());
+            assert!(f.app.agents.is_empty());
+            assert_eq!(f.app.focus, Focus::List);
             assert_eq!(f.agent_rows()[0].3, "ended");
             assert!(!agents::lock_path(&f.agents_dir(), &session_id).exists());
             // Back on the list, q quits again.
@@ -2465,13 +2869,699 @@ mod tests {
             warning: Some("Aviso: falta chave.\n  X=\"\"".into()),
         });
         f.open_agent(0, &mut launcher);
-        assert_eq!(f.app.screen, Screen::Agent);
-        f.app.agent_ended(0);
+        assert_eq!(f.app.focus, Focus::Terminal);
+        f.app.agent_ended(launcher.ids[0], 0);
         assert_eq!(
             f.status(),
             Some(
                 "O agente proj · PO · NS-1 terminou. Aviso da verificação: Aviso: falta chave. X=\"\""
             )
+        );
+    }
+
+    // ---- several agents, the focus and the shortcut (NS-34) ----
+
+    impl Fixture {
+        /// The reserved shortcut as crossterm reports Ctrl+\ in raw mode (Ctrl+4).
+        fn shortcut(&mut self) -> Action {
+            self.mods(KeyCode::Char('4'), KeyModifiers::CONTROL)
+        }
+
+        fn kind(&mut self, code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> Action {
+            let mut key = KeyEvent::new(code, modifiers);
+            key.kind = kind;
+            self.app.handle_key(key)
+        }
+
+        fn names_running(&self) -> Vec<String> {
+            self.app.agents.iter().map(|a| a.name.clone()).collect()
+        }
+
+        fn locked(&self, session_id: &str) -> bool {
+            let path = agents::lock_path(&self.agents_dir(), session_id);
+            fs::File::open(path).is_ok_and(|file| file.try_lock().is_err())
+        }
+    }
+
+    /// Two agents of different tickets and projects: `proj · PO · NS-1`, then (Esc back to the
+    /// projects, a new project `beta` with the ticket B-1) `beta · Dev · B-1`, shown.
+    fn two_running() -> (Fixture, FakeLauncher) {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.open_agent(0, &mut launcher);
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.screen, Screen::Projects);
+        let beta = f.dir("beta", true);
+        f.add(beta.to_str().unwrap());
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.screen, Screen::Tickets);
+        f.new_ticket("Beta", "B-1");
+        launcher.check = Ok(Precheck {
+            jail: false,
+            warning: None,
+        });
+        f.open_agent(2, &mut launcher);
+        assert_eq!(f.names_running(), ["proj · PO · NS-1", "beta · Dev · B-1"]);
+        (f, launcher)
+    }
+
+    #[test]
+    fn two_agents_of_different_projects_run_at_once_and_the_last_is_shown() {
+        let (f, launcher) = two_running();
+        assert_eq!(f.app.agents.len(), 2);
+        assert_eq!(f.app.shown, Some(launcher.ids[1]));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(
+            f.app.screen,
+            Screen::Tickets,
+            "the list stays on the tickets"
+        );
+        assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "B-1");
+        assert_eq!(launcher.spawns[0].1, f.root.join("proj"));
+        assert_eq!(launcher.spawns[1].1, f.root.join("beta"));
+        let rows = f.agent_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.3 == "active"));
+        assert!(
+            f.locked(&rows[0].0) && f.locked(&rows[1].0),
+            "two locks held"
+        );
+        assert!(f.app.agents[0].jail && !f.app.agents[1].jail);
+        assert_eq!(f.app.agents[0].project, "proj");
+        assert_eq!(f.app.agents[1].project, "beta");
+    }
+
+    #[test]
+    fn the_shortcut_toggles_the_focus_and_never_reaches_the_program() {
+        let (mut f, _) = running();
+        // Ctrl+4 (raw mode) and Ctrl+\ (kitty) are the same key.
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(
+            f.mods(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            Action::None
+        );
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.app.agents.len(), 1, "the agent goes on");
+        // On the terminal, Ctrl+C, Esc, q and Ctrl+] are the program's.
+        let send = |b: &[u8]| Action::Send(b.to_vec());
+        assert_eq!(f.ctrl_c(), send(b"\x03"));
+        assert_eq!(f.key(KeyCode::Esc), send(b"\x1b"));
+        assert_eq!(f.ch('q'), send(b"q"));
+        assert_eq!(
+            f.mods(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            send(b"\x1d")
+        );
+    }
+
+    #[test]
+    fn another_shortcut_takes_the_place_of_ctrl_backslash() {
+        let (mut f, _) = running();
+        f.app.shortcut = Shortcut::from_db("ctrl+]").unwrap();
+        assert_eq!(
+            f.shortcut(),
+            Action::Send(b"\x1c".to_vec()),
+            "Ctrl+\\ is the program's"
+        );
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(
+            f.mods(KeyCode::Char('5'), KeyModifiers::CONTROL),
+            Action::None
+        );
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(
+            f.mods(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            Action::None
+        );
+        assert_eq!(f.app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn with_the_focus_on_the_list_the_keys_are_the_list_s() {
+        let (mut f, _) = running();
+        f.shortcut();
+        assert_eq!(f.app.ticket_index, 1);
+        assert_eq!(f.key(KeyCode::Up), Action::None);
+        assert_eq!(f.app.ticket_index, 0, "the arrows move the tickets");
+        assert_eq!(f.ch('a'), Action::None);
+        assert!(matches!(f.app.dialog, Some(Dialog::NewTicket { .. })));
+        f.key(KeyCode::Esc);
+        // Nothing goes to the program: a paste and the mouse neither.
+        assert_eq!(f.app.handle_paste("x"), Action::None);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 50,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            f.app.handle_mouse(&wheel, Rect::new(40, 1, 60, 20)),
+            Action::None
+        );
+        // The shortcut takes the focus back to the terminal of the shown agent.
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.app.handle_paste("x"), Action::Send(b"x".to_vec()));
+    }
+
+    #[test]
+    fn without_an_agent_the_shortcut_does_nothing() {
+        let (mut f, _) = with_agents();
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.ch('q'), Action::Quit, "q still quits the list");
+    }
+
+    #[test]
+    fn with_a_dialog_open_the_shortcut_is_ignored() {
+        let (mut f, _) = running();
+        f.shortcut();
+        f.ch('g');
+        assert!(matches!(f.app.dialog, Some(Dialog::ChooseStage { .. })));
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(
+            f.app.focus,
+            Focus::List,
+            "a pending question stays in front"
+        );
+        assert!(matches!(f.app.dialog, Some(Dialog::ChooseStage { .. })));
+    }
+
+    #[test]
+    fn a_repeat_of_the_shortcut_does_not_toggle_and_a_release_is_ignored() {
+        let (mut f, _) = running();
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(
+            f.kind(KeyCode::Char('4'), ctrl, KeyEventKind::Repeat),
+            Action::None
+        );
+        assert_eq!(
+            f.app.focus,
+            Focus::Terminal,
+            "holding it does not blink the focus"
+        );
+        assert_eq!(
+            f.kind(KeyCode::Char('4'), ctrl, KeyEventKind::Release),
+            Action::None
+        );
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(
+            f.kind(KeyCode::Char('4'), ctrl, KeyEventKind::Press),
+            Action::None
+        );
+        assert_eq!(f.app.focus, Focus::List);
+        // Another key held on the terminal is still the program's.
+        f.shortcut();
+        assert_eq!(
+            f.kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat),
+            Action::Send(b"a".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_end_of_the_shown_agent_shows_the_most_recent_one_on_the_list() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.app.agent_ended(second, 0);
+        assert_eq!(f.status(), Some("O agente beta · Dev · B-1 terminou."));
+        assert_eq!(f.app.shown, Some(first));
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.agent_rows()[1].3, "ended");
+        assert!(!agents::lock_path(&f.agents_dir(), &launcher.spawns[1].2).exists());
+        assert_eq!(f.agent_rows()[0].3, "active");
+        // The last one: nothing shown.
+        f.app.agent_ended(first, 0);
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert!(f.app.agents.is_empty());
+        // An end that is not of a running agent changes nothing.
+        f.app.status = None;
+        f.app.agent_ended(first, 0);
+        assert_eq!(f.status(), None);
+    }
+
+    #[test]
+    fn the_end_of_a_hidden_agent_keeps_the_focus_and_the_shown_one() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.app.agent_ended(first, 3);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · PO · NS-1 terminou com o código 3.")
+        );
+        assert_eq!(f.app.shown, Some(second));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.names_running(), ["beta · Dev · B-1"]);
+    }
+
+    #[test]
+    fn the_mark_of_new_output_compares_the_visible_text() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        // The loop kept the text of the first when it stopped being shown.
+        f.app.left_shown(first, "tela antiga".into());
+        assert!(f.app.wants_hidden_text(first));
+        assert!(
+            !f.app.hidden_output(first, "tela antiga"),
+            "the same text: no mark"
+        );
+        assert!(!f.app.agents[0].unseen);
+        assert!(f.app.hidden_output(first, "tela nova"), "the mark changed");
+        assert!(f.app.agents[0].unseen);
+        assert!(
+            !f.app.wants_hidden_text(first),
+            "marked: nothing to compare"
+        );
+        assert!(!f.app.hidden_output(first, "outra"), "true once only");
+        // The shown one is never marked.
+        assert!(!f.app.wants_hidden_text(second));
+        assert!(!f.app.hidden_output(second, "qualquer coisa"));
+        assert!(!f.app.agents[1].unseen);
+        // Being shown clears it.
+        f.shortcut();
+        f.ch('v');
+        f.key(KeyCode::Up);
+        assert_eq!(f.app.shown, Some(first));
+        assert!(!f.app.agents[0].unseen);
+    }
+
+    // ---- "Agentes ativos", ending and quitting (NS-34) ----
+
+    #[test]
+    fn v_opens_the_active_agents_from_every_list_and_esc_goes_back() {
+        let (mut f, _) = two_running();
+        f.shortcut();
+        for back in [KeyCode::Esc, KeyCode::Left] {
+            // From the tickets, with the same ticket selected.
+            assert_eq!(f.app.screen, Screen::Tickets);
+            let ticket = f.app.ticket_index;
+            assert_eq!(f.ch('v'), Action::None);
+            assert_eq!(f.app.screen, Screen::ActiveAgents);
+            assert_eq!(f.key(back), Action::None);
+            assert_eq!(f.app.screen, Screen::Tickets);
+            assert_eq!(f.app.ticket_index, ticket);
+        }
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.screen, Screen::Projects);
+        let project = f.app.project_index;
+        f.ch('v');
+        assert_eq!(f.app.screen, Screen::ActiveAgents);
+        f.key(KeyCode::Esc);
+        assert_eq!(
+            (f.app.screen, f.app.project_index),
+            (Screen::Projects, project)
+        );
+        f.key(KeyCode::Esc);
+        f.ch('v');
+        assert_eq!(f.app.screen, Screen::ActiveAgents);
+        f.key(KeyCode::Left);
+        assert_eq!(f.app.screen, Screen::Modules);
+    }
+
+    #[test]
+    fn v_works_without_agents_and_is_typed_in_a_text_field() {
+        let mut f = fixture();
+        assert_eq!(f.ch('v'), Action::None);
+        assert_eq!(f.app.screen, Screen::ActiveAgents);
+        assert!(f.app.agents.is_empty());
+        f.key(KeyCode::Esc);
+        f.key(KeyCode::Enter);
+        f.ch('a');
+        f.ch('v');
+        assert_eq!(f.app.dialog, Some(Dialog::AddPath { input: "v".into() }));
+        assert_eq!(f.app.screen, Screen::Projects);
+    }
+
+    #[test]
+    fn moving_on_the_view_shows_the_selected_agent_and_enter_focuses_it() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.shortcut();
+        f.ch('v');
+        assert_eq!(f.app.agent_index, 1, "it starts on the shown one");
+        f.key(KeyCode::Up);
+        assert_eq!(f.app.shown, Some(first));
+        assert_eq!(f.app.focus, Focus::List);
+        f.ch('k');
+        assert_eq!(f.app.shown, Some(first), "stops at the first");
+        f.ch('j');
+        assert_eq!(f.app.shown, Some(second));
+        f.key(KeyCode::Down);
+        assert_eq!(f.app.shown, Some(second), "stops at the last");
+        f.key(KeyCode::Up);
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!((f.app.shown, f.app.focus), (Some(first), Focus::Terminal));
+        f.shortcut();
+        f.key(KeyCode::Esc);
+        f.ch('v');
+        assert_eq!(f.app.agent_index, 0, "the shown one again");
+        f.key(KeyCode::Down);
+        assert_eq!(f.key(KeyCode::Right), Action::None);
+        assert_eq!((f.app.shown, f.app.focus), (Some(second), Focus::Terminal));
+    }
+
+    #[test]
+    fn x_asks_and_only_s_ends_the_agent() {
+        for (key, ends) in [
+            (KeyCode::Char('s'), true),
+            (KeyCode::Char('S'), true),
+            (KeyCode::Char('n'), false),
+            (KeyCode::Enter, false),
+            (KeyCode::Esc, false),
+            (KeyCode::Char('q'), false),
+        ] {
+            let (mut f, launcher) = two_running();
+            let first = launcher.ids[0];
+            f.shortcut();
+            f.ch('v');
+            f.key(KeyCode::Up);
+            assert_eq!(f.ch('x'), Action::None);
+            assert_eq!(
+                f.app.dialog,
+                Some(Dialog::ConfirmEndAgent {
+                    id: first,
+                    name: "proj · PO · NS-1".into()
+                })
+            );
+            let expected = if ends {
+                Action::EndAgent(first)
+            } else {
+                Action::None
+            };
+            assert_eq!(f.key(key), expected, "{key:?}");
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(f.app.agents.len(), 2, "the loop ends it: {key:?}");
+        }
+    }
+
+    #[test]
+    fn an_agent_ended_by_the_operator_leaves_with_its_record() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.shortcut();
+        f.ch('v');
+        f.app.agent_ended_by_operator(second);
+        assert_eq!(f.status(), Some("O agente beta · Dev · B-1 foi encerrado."));
+        assert_eq!(f.names_running(), ["proj · PO · NS-1"]);
+        assert_eq!(f.app.shown, Some(first));
+        assert_eq!(f.app.agent_index, 0);
+        assert_eq!(f.app.focus, Focus::List);
+        let rows = f.agent_rows();
+        assert_eq!(
+            (rows[0].3.as_str(), rows[1].3.as_str()),
+            ("active", "ended")
+        );
+        assert!(!agents::lock_path(&f.agents_dir(), &rows[1].0).exists());
+        assert!(f.locked(&rows[0].0), "the other one goes on");
+    }
+
+    #[test]
+    fn quitting_with_agents_asks_first_and_without_them_does_not() {
+        let mut f = fixture();
+        assert_eq!(f.ch('q'), Action::Quit);
+        assert_eq!(f.ctrl_c(), Action::Quit);
+        for quit in ['q', 'Q', 'c'] {
+            let (mut f, _) = two_running();
+            f.shortcut();
+            let action = if quit == 'c' { f.ctrl_c() } else { f.ch(quit) };
+            assert_eq!(action, Action::None, "{quit}");
+            assert_eq!(f.app.dialog, Some(Dialog::ConfirmQuit));
+            assert_eq!(f.ch('s'), Action::QuitEndingAgents);
+        }
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+            KeyCode::Esc,
+        ] {
+            let (mut f, _) = two_running();
+            f.shortcut();
+            f.ch('q');
+            assert_eq!(f.key(key), Action::None, "{key:?}");
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(f.app.agents.len(), 2);
+            assert!(f.agent_rows().iter().all(|r| r.3 == "active"));
+        }
+        // From the view too.
+        let (mut f, _) = two_running();
+        f.shortcut();
+        f.ch('v');
+        f.ch('q');
+        assert_eq!(f.app.dialog, Some(Dialog::ConfirmQuit));
+    }
+
+    #[test]
+    fn end_all_records_goes_on_after_an_error() {
+        let (mut f, launcher) = two_running();
+        let first = launcher.ids[0];
+        f.app
+            .db
+            .connection()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail BEFORE UPDATE ON agents WHEN old.id = {first} \
+                 BEGIN SELECT RAISE(ABORT, 'falha de teste'); END;"
+            ))
+            .unwrap();
+        let err = f.app.end_all_records().unwrap_err();
+        assert!(err.contains("falha de teste"), "{err}");
+        let rows = f.agent_rows();
+        assert_eq!(
+            (rows[0].3.as_str(), rows[1].3.as_str()),
+            ("active", "ended")
+        );
+        for row in &rows {
+            assert!(
+                !agents::lock_path(&f.agents_dir(), &row.0).exists(),
+                "{row:?}"
+            );
+        }
+        assert!(f.app.agents.is_empty());
+        assert_eq!((f.app.shown, f.app.focus), (None, Focus::List));
+    }
+
+    // ---- the settings and the capture of the shortcut (NS-34) ----
+
+    impl Fixture {
+        fn stored_shortcut(&self) -> Option<String> {
+            self.app.db.get_setting(SETTING_RESERVED_SHORTCUT).unwrap()
+        }
+
+        fn first(&self) -> Option<Shortcut> {
+            match &self.app.dialog {
+                Some(Dialog::CaptureShortcut { first }) => *first,
+                other => panic!("not in the capture: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn c_opens_the_settings_only_on_the_modules() {
+        let mut f = fixture();
+        assert_eq!(f.ch('c'), Action::None);
+        assert_eq!(f.app.screen, Screen::Settings);
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.screen, Screen::Modules);
+        f.ch('c');
+        f.key(KeyCode::Left);
+        assert_eq!(f.app.screen, Screen::Modules);
+        f.key(KeyCode::Enter);
+        f.ch('c');
+        assert_eq!(f.app.screen, Screen::Projects, "not on the projects");
+        let mut f = fixture();
+        f.ch('c');
+        assert_eq!(f.ch('q'), Action::Quit, "q quits the settings");
+    }
+
+    #[test]
+    fn the_new_shortcut_is_saved_only_when_pressed_twice() {
+        let mut f = fixture();
+        f.ch('c');
+        assert!(!f.app.shortcut_stored);
+        assert_eq!(f.ch('t'), Action::None);
+        assert_eq!(f.first(), None);
+        let ctrl_q = |f: &mut Fixture| f.mods(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let ctrl_bracket = |f: &mut Fixture| f.mods(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        ctrl_q(&mut f);
+        assert_eq!(f.first(), Shortcut::from_db("ctrl+q"));
+        assert_eq!(f.stored_shortcut(), None, "once is not saved");
+        // Another valid key becomes the new first.
+        ctrl_bracket(&mut f);
+        assert_eq!(f.first(), Shortcut::from_db("ctrl+]"));
+        assert_eq!(f.stored_shortcut(), None);
+        // The same key again (Ctrl+5 and Ctrl+] are one), saved.
+        assert_eq!(
+            f.mods(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            Action::None
+        );
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.stored_shortcut().as_deref(), Some("ctrl+]"));
+        assert_eq!(f.status(), Some("Atalho salvo: Ctrl+]."));
+        assert_eq!(f.app.shortcut, Shortcut::from_db("ctrl+]").unwrap());
+        assert!(f.app.shortcut_stored);
+    }
+
+    #[test]
+    fn a_refused_key_says_why_and_starts_the_capture_over() {
+        let mut f = fixture();
+        f.ch('c');
+        f.ch('t');
+        f.mods(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(f.first().is_some());
+        for (code, modifiers, message) in [
+            (
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                "O claude precisa dessa tecla (Enter). Escolha outra.",
+            ),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                "O claude precisa dessa tecla (Ctrl+C). Escolha outra.",
+            ),
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                "Use uma tecla com Ctrl ou Alt (ou uma tecla de função, F1–F12).",
+            ),
+            (
+                KeyCode::PageUp,
+                KeyModifiers::SHIFT,
+                "O nick usa essa tecla para rolar o histórico. Escolha outra.",
+            ),
+        ] {
+            assert_eq!(
+                f.mods(code, modifiers),
+                Action::None,
+                "Ctrl+C does not quit"
+            );
+            assert_eq!(f.status(), Some(message));
+            assert_eq!(f.first(), None, "the capture stays open, from the start");
+        }
+        assert_eq!(f.stored_shortcut(), None);
+        // q is refused too, and does not quit.
+        assert_eq!(f.ch('q'), Action::None);
+        assert_eq!(f.first(), None);
+    }
+
+    #[test]
+    fn esc_cancels_the_capture_without_saving() {
+        let mut f = fixture();
+        f.ch('c');
+        f.ch('t');
+        f.mods(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        f.app.status = Some("x".into());
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.app.screen, Screen::Settings);
+        assert_eq!(f.status(), None);
+        assert_eq!(f.stored_shortcut(), None);
+        assert_eq!(f.app.shortcut, Shortcut::DEFAULT);
+    }
+
+    #[test]
+    fn the_current_shortcut_can_be_chosen_again_in_the_capture() {
+        let (mut f, _) = running();
+        f.shortcut();
+        f.key(KeyCode::Esc);
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.screen, Screen::Modules);
+        f.ch('c');
+        f.ch('t');
+        // The shortcut is captured, not taken as the toggle.
+        f.shortcut();
+        assert_eq!(f.first(), Some(Shortcut::DEFAULT));
+        assert_eq!(f.app.focus, Focus::List);
+        f.shortcut();
+        assert_eq!(f.stored_shortcut().as_deref(), Some("ctrl+\\"));
+    }
+
+    #[test]
+    fn a_saved_shortcut_works_right_away_and_p_goes_back_to_the_default() {
+        let (mut f, _) = running();
+        f.shortcut();
+        f.key(KeyCode::Esc);
+        f.key(KeyCode::Esc);
+        f.ch('c');
+        f.ch('t');
+        f.mods(KeyCode::F(7), KeyModifiers::NONE);
+        f.mods(KeyCode::F(7), KeyModifiers::NONE);
+        assert_eq!(f.stored_shortcut().as_deref(), Some("f7"));
+        // The new one toggles, the old one is the program's.
+        assert_eq!(f.mods(KeyCode::F(7), KeyModifiers::NONE), Action::None);
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.shortcut(), Action::Send(b"\x1c".to_vec()));
+        assert_eq!(f.mods(KeyCode::F(7), KeyModifiers::NONE), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        // p: the row is deleted, and Ctrl+\ is the shortcut again.
+        assert_eq!(f.ch('p'), Action::None);
+        assert_eq!(f.stored_shortcut(), None);
+        assert_eq!(f.status(), Some("Atalho de volta ao padrão: Ctrl+\\."));
+        assert!(!f.app.shortcut_stored);
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::Terminal);
+        // p on the default says the same.
+        f.shortcut();
+        f.app.status = None;
+        f.ch('p');
+        assert_eq!(f.status(), Some("Atalho de volta ao padrão: Ctrl+\\."));
+    }
+
+    #[test]
+    fn the_shortcut_of_the_database_is_used_when_the_nick_opens() {
+        let mut f = fixture();
+        assert_eq!(f.app.load_shortcut(), None, "no row: the default");
+        assert_eq!(f.app.shortcut, Shortcut::DEFAULT);
+        assert!(!f.app.shortcut_stored);
+        f.app
+            .db
+            .set_setting(SETTING_RESERVED_SHORTCUT, "ctrl+]")
+            .unwrap();
+        assert_eq!(f.app.load_shortcut(), None);
+        assert_eq!(f.app.shortcut, Shortcut::from_db("ctrl+]").unwrap());
+        assert!(f.app.shortcut_stored);
+    }
+
+    #[test]
+    fn an_invalid_shortcut_of_the_database_falls_back_to_the_default() {
+        // Not a shortcut at all, and one that would be refused today.
+        for value in ["banana\x1b[2J", "ctrl+c"] {
+            let mut f = fixture();
+            f.app
+                .db
+                .set_setting(SETTING_RESERVED_SHORTCUT, value)
+                .unwrap();
+            assert_eq!(
+                f.app.load_shortcut(),
+                Some(format!(
+                    "O atalho gravado no banco ({}) não é válido. Usando o padrão Ctrl+\\.",
+                    printable(value)
+                ))
+            );
+            assert_eq!(f.app.shortcut, Shortcut::DEFAULT);
+        }
+    }
+
+    /// Review NS-34, N2: the wheel scrolls the history only over the terminal, not over the
+    /// list beside it.
+    #[test]
+    fn the_wheel_over_the_list_scrolls_nothing() {
+        let (mut f, _) = running();
+        let area = Rect::new(40, 1, 60, 20);
+        let wheel = |column, row| MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(f.app.handle_mouse(&wheel(10, 5), area), Action::None);
+        assert_eq!(f.app.handle_mouse(&wheel(50, 0), area), Action::None);
+        assert_eq!(
+            f.app.handle_mouse(&wheel(50, 5), area),
+            Action::ScrollLines(WHEEL_LINES)
         );
     }
 }

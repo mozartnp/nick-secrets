@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
-use crate::agent_session::{AgentSession, SessionEvent};
+use crate::agent_session::{AgentEvent, AgentSession};
 use crate::paths::normalize;
 
 /// bin/nick-agent of the checkout this binary was built from, before normalization.
@@ -82,52 +82,66 @@ pub trait AgentLauncher {
     /// `bash <launcher> --check` with the cwd at `project`.
     fn check(&mut self, launcher: &Path, project: &Path) -> Result<Precheck, String>;
     /// Starts `bash <launcher> --session-id <session_id> --name <name>` in a PTY with the cwd
-    /// at `project`. The error is the system's.
+    /// at `project`, for the agent whose row has the id `agent_id` (its events carry it). The
+    /// error is the system's.
     fn spawn(
         &mut self,
         launcher: &Path,
         project: &Path,
+        agent_id: i64,
         session_id: &str,
         name: &str,
     ) -> Result<(), String>;
 }
 
-/// The real launcher: the check by `run_check`, and the launch in an `AgentSession` of `size`
-/// (rows, columns) whose events go to `tx`. The loop takes the session from `session`.
+/// The size (rows, columns) of the PTY of an agent, from its name and whether it runs in the
+/// jail (its header, which wraps, takes rows from its terminal: ui.rs).
+pub type SizeOf = Box<dyn Fn(&str, bool) -> (u16, u16)>;
+
+/// The real launcher: the check by `run_check`, and the launch in an `AgentSession` whose
+/// events go to `tx`, of the size `size_of` gives for its name and the jail of the last check
+/// (review NS-34, P2: the PTY is born with its final size). The loop takes the session from
+/// `session`.
 pub struct TerminalAgentLauncher<E> {
     tx: Sender<E>,
-    size: (u16, u16),
+    size_of: SizeOf,
+    jail: bool,
     pub session: Option<AgentSession>,
 }
 
 impl<E> TerminalAgentLauncher<E> {
-    pub fn new(tx: Sender<E>, size: (u16, u16)) -> TerminalAgentLauncher<E> {
+    pub fn new(tx: Sender<E>, size_of: SizeOf) -> TerminalAgentLauncher<E> {
         TerminalAgentLauncher {
             tx,
-            size,
+            size_of,
+            jail: false,
             session: None,
         }
     }
 }
 
-impl<E: From<SessionEvent> + Send + 'static> AgentLauncher for TerminalAgentLauncher<E> {
+impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLauncher<E> {
     fn check(&mut self, launcher: &Path, project: &Path) -> Result<Precheck, String> {
-        run_check(launcher, project)
+        let check = run_check(launcher, project)?;
+        self.jail = check.jail;
+        Ok(check)
     }
 
     fn spawn(
         &mut self,
         launcher: &Path,
         project: &Path,
+        agent_id: i64,
         session_id: &str,
         name: &str,
     ) -> Result<(), String> {
         let session = AgentSession::spawn(
             launcher,
             project,
+            agent_id,
             session_id,
             name,
-            self.size,
+            (self.size_of)(name, self.jail),
             self.tx.clone(),
         )
         .map_err(|err| err.to_string())?;

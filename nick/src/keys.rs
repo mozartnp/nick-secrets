@@ -2,8 +2,10 @@
 //! xterm sends to the program running in it, for the terminal of an agent (NS-33). Pure: no
 //! PTY and no I/O, so every rule is unit tested. Written from the findings of the panel
 //! prototype (NS-29, prototype/panel/src/keys.rs), whose cases are the source of the tests.
-//! There is no reserved shortcut in this slice (the F3b brings it): every key goes to the
-//! program, Ctrl+\ included (0x1c).
+//! `encode_key` knows no reserved shortcut: every key it gets goes to the program, Ctrl+\
+//! included (0x1c). The reserved shortcut that toggles the focus between the list and the
+//! terminal (NS-34) is a `Shortcut`, tested by the app before a key reaches `encode_key`, with
+//! the refusal of the keys the operator can't choose (`shortcut_refusal`).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
@@ -44,6 +46,258 @@ fn ctrl_byte(c: char) -> Option<u8> {
         '_' | '7' | '/' => Some(0x1f),
         _ => None,
     }
+}
+
+/// The symbol a control byte of a non-letter is kept as in a `Shortcut` (the inverse of
+/// `ctrl_byte` for 0x00 and 0x1b..0x1f).
+fn ctrl_symbol(byte: u8) -> Option<char> {
+    match byte {
+        0x00 => Some('@'),
+        0x1b => Some('['),
+        0x1c => Some('\\'),
+        0x1d => Some(']'),
+        0x1e => Some('^'),
+        0x1f => Some('_'),
+        _ => None,
+    }
+}
+
+/// The modifiers a `Shortcut` keeps.
+const SHORTCUT_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SHIFT);
+
+/// The modifiers of a `Shortcut`, in their order, in the database and on the screen.
+const MODIFIER_NAMES: [(KeyModifiers, &str, &str); 3] = [
+    (KeyModifiers::CONTROL, "ctrl+", "Ctrl+"),
+    (KeyModifiers::ALT, "alt+", "Alt+"),
+    (KeyModifiers::SHIFT, "shift+", "Shift+"),
+];
+
+/// The names of the keys that are not a character, in the database and on the screen.
+const NAMED_KEYS: &[(KeyCode, &str, &str)] = &[
+    (KeyCode::Enter, "enter", "Enter"),
+    (KeyCode::Esc, "esc", "Esc"),
+    (KeyCode::Tab, "tab", "Tab"),
+    (KeyCode::Backspace, "backspace", "Backspace"),
+    (KeyCode::Up, "up", "↑"),
+    (KeyCode::Down, "down", "↓"),
+    (KeyCode::Left, "left", "←"),
+    (KeyCode::Right, "right", "→"),
+    (KeyCode::Home, "home", "Home"),
+    (KeyCode::End, "end", "End"),
+    (KeyCode::PageUp, "pageup", "PageUp"),
+    (KeyCode::PageDown, "pagedown", "PageDown"),
+    (KeyCode::Insert, "insert", "Insert"),
+    (KeyCode::Delete, "delete", "Delete"),
+];
+
+/// The reserved shortcut that toggles the focus between the list and the terminal (NS-34), in
+/// its canonical form, so a key matches itself however crossterm reports it: a Ctrl+symbol
+/// with a control byte is the symbol of the byte (Ctrl+4 and Ctrl+\ are Ctrl+\, 0x1c) without
+/// Shift; a letter with Ctrl or Alt is lowercase, with Shift as an explicit modifier; any other
+/// key keeps its code and modifiers (only Ctrl, Alt and Shift; Shift+Tab is Tab with Shift).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl Shortcut {
+    /// The default, Ctrl+\ (0x1c, which claude does not use). It only exists in the code: going
+    /// back to the default deletes the row of the database.
+    pub const DEFAULT: Shortcut = Shortcut {
+        code: KeyCode::Char('\\'),
+        modifiers: KeyModifiers::CONTROL,
+    };
+
+    /// The canonical form of a key, or `None` when it can't be a shortcut (another modifier,
+    /// such as Super, or a key that is neither a character, a function key nor a named key).
+    pub fn from_key(event: &KeyEvent) -> Option<Shortcut> {
+        if !(event.modifiers - SHORTCUT_MODIFIERS).is_empty() {
+            return None;
+        }
+        let mut modifiers = event.modifiers;
+        let code = match event.code {
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                if c.is_ascii_uppercase() {
+                    modifiers |= KeyModifiers::SHIFT;
+                }
+                KeyCode::Char(c.to_ascii_lowercase())
+            }
+            KeyCode::Char(c) => {
+                // The Shift of a symbol is in the symbol itself ('^' is Shift+6).
+                modifiers -= KeyModifiers::SHIFT;
+                let symbol = modifiers
+                    .contains(KeyModifiers::CONTROL)
+                    .then(|| ctrl_byte(c).and_then(ctrl_symbol))
+                    .flatten();
+                KeyCode::Char(symbol.unwrap_or(c))
+            }
+            KeyCode::BackTab => {
+                modifiers |= KeyModifiers::SHIFT;
+                KeyCode::Tab
+            }
+            KeyCode::F(n @ 1..=12) => KeyCode::F(n),
+            code if NAMED_KEYS.iter().any(|(named, _, _)| *named == code) => code,
+            _ => return None,
+        };
+        Some(Shortcut { code, modifiers })
+    }
+
+    /// Whether `event` is this shortcut (whatever its kind: press, repeat or release).
+    pub fn matches(&self, event: &KeyEvent) -> bool {
+        Shortcut::from_key(event) == Some(*self)
+    }
+
+    /// The text kept in the database: lowercase, the modifiers in the order `ctrl+alt+shift+`,
+    /// then the key (`ctrl+\`, `alt+x`, `ctrl+shift+f5`, `f7`).
+    pub fn to_db(&self) -> String {
+        let mut text = String::new();
+        for (modifier, name, _) in MODIFIER_NAMES {
+            if self.modifiers.contains(modifier) {
+                text.push_str(name);
+            }
+        }
+        match self.code {
+            KeyCode::Char(' ') => text.push_str("space"),
+            KeyCode::Char(c) => text.push(c),
+            KeyCode::F(n) => text.push_str(&format!("f{n}")),
+            code => {
+                let name = NAMED_KEYS.iter().find(|(named, _, _)| *named == code);
+                text.push_str(name.map_or("", |(_, name, _)| name));
+            }
+        }
+        text
+    }
+
+    /// The shortcut of a text of the database, only in the canonical form `to_db` writes:
+    /// anything else (unknown, repeated or out of order modifiers, uppercase, `ctrl+4` for
+    /// `ctrl+\`) is `None`.
+    pub fn from_db(text: &str) -> Option<Shortcut> {
+        let mut rest = text;
+        let mut modifiers = KeyModifiers::NONE;
+        for (modifier, name, _) in MODIFIER_NAMES {
+            if let Some(after) = rest.strip_prefix(name)
+                && !after.is_empty()
+            {
+                modifiers |= modifier;
+                rest = after;
+            }
+        }
+        let mut chars = rest.chars();
+        let code = match (chars.next(), chars.next()) {
+            (Some(c), None) => KeyCode::Char(c),
+            _ if rest == "space" => KeyCode::Char(' '),
+            _ => match rest.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                Some(n) if rest == format!("f{n}") => KeyCode::F(n),
+                _ => NAMED_KEYS
+                    .iter()
+                    .find(|(_, name, _)| *name == rest)
+                    .map(|(code, _, _)| *code)?,
+            },
+        };
+        let shortcut = Shortcut::from_key(&KeyEvent::new(code, modifiers))?;
+        (shortcut.to_db() == text).then_some(shortcut)
+    }
+
+    /// What the screen shows: `Ctrl+\`, `Alt+X`, `Ctrl+Shift+F5`, `F7`.
+    pub fn label(&self) -> String {
+        let mut text = String::new();
+        for (modifier, _, label) in MODIFIER_NAMES {
+            if self.modifiers.contains(modifier) {
+                text.push_str(label);
+            }
+        }
+        match self.code {
+            KeyCode::Char(' ') => text.push_str("Espaço"),
+            KeyCode::Char(c) => text.push(c.to_ascii_uppercase()),
+            KeyCode::F(n) => text.push_str(&format!("F{n}")),
+            code => {
+                let name = NAMED_KEYS.iter().find(|(named, _, _)| *named == code);
+                text.push_str(name.map_or("", |(_, _, label)| label));
+            }
+        }
+        text
+    }
+}
+
+/// The keys claude needs, refused as the shortcut with any modifier: typing and moving.
+const CLAUDE_KEYS: &[KeyCode] = &[
+    KeyCode::Enter,
+    KeyCode::Esc,
+    KeyCode::Tab,
+    KeyCode::Backspace,
+    KeyCode::Up,
+    KeyCode::Down,
+    KeyCode::Left,
+    KeyCode::Right,
+];
+
+/// The documented shortcuts of Claude Code, in the form of `Shortcut::to_db` (a letter is
+/// compared without its Shift). Source: code.claude.com/docs/en/interactive-mode, checked on
+/// 2026-11-19. Extend it when Claude Code gets new shortcuts. The ones with Enter, Backspace
+/// and the arrows (Ctrl+Enter, Ctrl+Backspace, Ctrl+↑/↓, Alt+↑/↓, Alt+Enter, Shift+Enter,
+/// Shift+←/→) are refused with every key of `CLAUDE_KEYS`.
+const CLAUDE_SHORTCUTS: &[&str] = &[
+    "ctrl+a", "ctrl+b", "ctrl+c", "ctrl+d", "ctrl+e", "ctrl+g", "ctrl+j", "ctrl+k", "ctrl+l",
+    "ctrl+n", "ctrl+o", "ctrl+p", "ctrl+r", "ctrl+s", "ctrl+t", "ctrl+u", "ctrl+v", "ctrl+w",
+    "ctrl+x", "ctrl+y", "ctrl+z", "ctrl+_", "ctrl+[", "alt+b", "alt+d", "alt+f", "alt+m", "alt+o",
+    "alt+p", "alt+t", "alt+v", "alt+y",
+];
+
+/// The Ctrl+letters whose byte reaches claude as another key: Ctrl+H is Backspace, Ctrl+I Tab,
+/// Ctrl+M Enter and Ctrl+[ Esc.
+const BYTE_SYNONYMS: &[&str] = &["ctrl+h", "ctrl+i", "ctrl+m", "ctrl+["];
+
+/// The refusal of a key without Ctrl nor Alt (and of a key that can't be a shortcut at all).
+const MODIFIER_REFUSAL: &str = "Use uma tecla com Ctrl ou Alt (ou uma tecla de função, F1–F12).";
+
+/// The shortcut of a key pressed in the capture, or why it is refused (`shortcut_refusal`).
+pub fn shortcut_of_key(event: &KeyEvent) -> Result<Shortcut, String> {
+    let shortcut = Shortcut::from_key(event).ok_or_else(|| MODIFIER_REFUSAL.to_string())?;
+    match shortcut_refusal(&shortcut) {
+        Some(refusal) => Err(refusal),
+        None => Ok(shortcut),
+    }
+}
+
+/// Why `shortcut` can't be the reserved shortcut, in PT-BR, or `None` when it can. Independent
+/// of the current shortcut: choosing it again is fine.
+pub fn shortcut_refusal(shortcut: &Shortcut) -> Option<String> {
+    let claude = || {
+        Some(format!(
+            "O claude precisa dessa tecla ({}). Escolha outra.",
+            shortcut.label()
+        ))
+    };
+    let mods = shortcut.modifiers;
+    if CLAUDE_KEYS.contains(&shortcut.code) {
+        return claude();
+    }
+    if matches!(shortcut.code, KeyCode::PageUp | KeyCode::PageDown)
+        && mods.contains(KeyModifiers::SHIFT)
+    {
+        return Some("O nick usa essa tecla para rolar o histórico. Escolha outra.".into());
+    }
+    if !matches!(shortcut.code, KeyCode::F(_))
+        && !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Some(MODIFIER_REFUSAL.into());
+    }
+    let unshifted = match shortcut.code {
+        KeyCode::Char(c) if c.is_ascii_alphabetic() => Shortcut {
+            modifiers: mods - KeyModifiers::SHIFT,
+            ..*shortcut
+        },
+        _ => *shortcut,
+    }
+    .to_db();
+    if CLAUDE_SHORTCUTS.contains(&unshifted.as_str()) || BYTE_SYNONYMS.contains(&unshifted.as_str())
+    {
+        return claude();
+    }
+    None
 }
 
 /// A cursor key (arrows, Home, End): CSI or SS3 by DECCKM, CSI 1;m with modifiers.
@@ -402,6 +656,328 @@ mod tests {
         // A plain backslash and a plain 4 are text.
         assert_eq!(plain(KeyCode::Char('\\')), bytes("\\"));
         assert_eq!(plain(KeyCode::Char('4')), bytes("4"));
+    }
+
+    // ---- the reserved shortcut (NS-34) ----
+
+    fn sc(code: KeyCode, modifiers: KeyModifiers) -> Shortcut {
+        Shortcut::from_key(&key(code, modifiers)).expect("a shortcut")
+    }
+
+    fn ctrl(c: char) -> Shortcut {
+        sc(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_symbols_are_kept_in_the_canonical_form_of_their_byte() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(ctrl('4'), ctrl('\\'), "raw mode and kitty");
+        assert_eq!(ctrl('4'), Shortcut::DEFAULT);
+        assert_eq!(ctrl('5'), ctrl(']'));
+        assert_eq!(sc(KeyCode::Char('6'), ctrl_shift), ctrl('6'));
+        assert_eq!(ctrl('6'), ctrl('^'));
+        assert_eq!(sc(KeyCode::Char('^'), ctrl_shift), ctrl('^'));
+        assert_eq!(ctrl('7'), ctrl('/'));
+        assert_eq!(ctrl('7'), ctrl('_'));
+        assert_eq!(ctrl('3'), ctrl('['));
+        assert_eq!(ctrl('2'), ctrl('@'));
+        assert_eq!(ctrl(' '), ctrl('@'));
+        // The Shift stays on a letter (the refusal takes both, see below).
+        assert_ne!(sc(KeyCode::Char('A'), ctrl_shift), ctrl('a'));
+        assert_eq!(
+            sc(KeyCode::Char('A'), ctrl_shift),
+            sc(KeyCode::Char('a'), ctrl_shift)
+        );
+        assert_eq!(
+            ctrl('A'),
+            sc(KeyCode::Char('a'), ctrl_shift),
+            "uppercase is Shift"
+        );
+        assert_eq!(
+            sc(KeyCode::BackTab, KeyModifiers::SHIFT),
+            sc(KeyCode::Tab, KeyModifiers::SHIFT)
+        );
+    }
+
+    #[test]
+    fn the_shortcut_goes_to_the_database_and_back() {
+        let cases = [
+            (ctrl('\\'), "ctrl+\\"),
+            (ctrl(']'), "ctrl+]"),
+            (ctrl('^'), "ctrl+^"),
+            (ctrl('_'), "ctrl+_"),
+            (ctrl('@'), "ctrl+@"),
+            (ctrl('q'), "ctrl+q"),
+            (sc(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x"),
+            (sc(KeyCode::Char(' '), KeyModifiers::ALT), "alt+space"),
+            (
+                sc(KeyCode::Char('X'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+                "alt+shift+x",
+            ),
+            (
+                sc(KeyCode::F(5), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                "ctrl+shift+f5",
+            ),
+            (
+                sc(
+                    KeyCode::Char('k'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ),
+                "ctrl+alt+k",
+            ),
+            (sc(KeyCode::F(7), KeyModifiers::NONE), "f7"),
+            (sc(KeyCode::Home, KeyModifiers::ALT), "alt+home"),
+            (
+                sc(KeyCode::PageDown, KeyModifiers::CONTROL),
+                "ctrl+pagedown",
+            ),
+            (sc(KeyCode::Delete, KeyModifiers::CONTROL), "ctrl+delete"),
+            (sc(KeyCode::Char('+'), KeyModifiers::ALT), "alt++"),
+        ];
+        for (shortcut, text) in cases {
+            assert_eq!(shortcut.to_db(), text);
+            assert_eq!(Shortcut::from_db(text), Some(shortcut), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_database_value_that_is_not_canonical_is_refused() {
+        for text in [
+            "",
+            "ctrl+",
+            "ctrl+zz",
+            "banana",
+            "ctrl+ctrl+x",
+            "alt+ctrl+x",
+            "shift+ctrl+x",
+            "CTRL+\\",
+            "ctrl+A",
+            "ctrl+4",
+            "ctrl+f13",
+            "f0",
+            "super+x",
+            " ctrl+x",
+            "ctrl+x ",
+        ] {
+            assert_eq!(Shortcut::from_db(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_label_is_what_the_screen_shows() {
+        assert_eq!(ctrl('\\').label(), "Ctrl+\\");
+        assert_eq!(ctrl(']').label(), "Ctrl+]");
+        assert_eq!(sc(KeyCode::Char('x'), KeyModifiers::ALT).label(), "Alt+X");
+        assert_eq!(
+            sc(KeyCode::F(5), KeyModifiers::CONTROL | KeyModifiers::SHIFT).label(),
+            "Ctrl+Shift+F5"
+        );
+        assert_eq!(sc(KeyCode::F(7), KeyModifiers::NONE).label(), "F7");
+        assert_eq!(
+            sc(KeyCode::Char(' '), KeyModifiers::ALT).label(),
+            "Alt+Espaço"
+        );
+        assert_eq!(sc(KeyCode::Up, KeyModifiers::CONTROL).label(), "Ctrl+↑");
+        assert_eq!(sc(KeyCode::Enter, KeyModifiers::NONE).label(), "Enter");
+        assert_eq!(
+            sc(KeyCode::BackTab, KeyModifiers::SHIFT).label(),
+            "Shift+Tab"
+        );
+        assert_eq!(
+            sc(KeyCode::PageUp, KeyModifiers::SHIFT).label(),
+            "Shift+PageUp"
+        );
+    }
+
+    #[test]
+    fn the_default_matches_ctrl_4_and_ctrl_backslash_of_crossterm() {
+        assert_eq!(Shortcut::DEFAULT.to_db(), "ctrl+\\");
+        assert!(Shortcut::DEFAULT.matches(&key(KeyCode::Char('4'), KeyModifiers::CONTROL)));
+        assert!(Shortcut::DEFAULT.matches(&key(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
+        assert!(!Shortcut::DEFAULT.matches(&key(KeyCode::Char('\\'), KeyModifiers::NONE)));
+        assert!(!Shortcut::DEFAULT.matches(&key(KeyCode::Char('4'), KeyModifiers::NONE)));
+        assert!(!Shortcut::DEFAULT.matches(&key(KeyCode::Char(']'), KeyModifiers::CONTROL)));
+        // A key with a modifier the nick doesn't keep is never a shortcut.
+        assert_eq!(
+            Shortcut::from_key(&key(
+                KeyCode::Char('\\'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER
+            )),
+            None
+        );
+        assert_eq!(
+            Shortcut::from_key(&key(KeyCode::CapsLock, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    const NEEDS: fn(&str) -> String =
+        |label| format!("O claude precisa dessa tecla ({label}). Escolha outra.");
+    const MODIFIER: &str = "Use uma tecla com Ctrl ou Alt (ou uma tecla de função, F1–F12).";
+    const SCROLL: &str = "O nick usa essa tecla para rolar o histórico. Escolha outra.";
+
+    fn refusal(code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
+        shortcut_refusal(&sc(code, modifiers))
+    }
+
+    #[test]
+    fn keys_without_ctrl_or_alt_are_refused_but_the_function_keys() {
+        for (code, modifiers) in [
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Char('A'), KeyModifiers::SHIFT),
+            (KeyCode::Char('1'), KeyModifiers::NONE),
+            (KeyCode::Char('!'), KeyModifiers::SHIFT),
+            (KeyCode::Char(' '), KeyModifiers::NONE),
+            (KeyCode::Home, KeyModifiers::NONE),
+            (KeyCode::PageUp, KeyModifiers::NONE),
+            (KeyCode::Delete, KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(
+                refusal(code, modifiers),
+                Some(MODIFIER.to_string()),
+                "{code:?} {modifiers:?}"
+            );
+        }
+        for n in 1..=12 {
+            assert_eq!(refusal(KeyCode::F(n), KeyModifiers::NONE), None, "F{n}");
+            assert_eq!(
+                refusal(KeyCode::F(n), KeyModifiers::SHIFT),
+                None,
+                "Shift+F{n}"
+            );
+            assert_eq!(
+                refusal(KeyCode::F(n), KeyModifiers::CONTROL),
+                None,
+                "Ctrl+F{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keys_claude_needs_are_refused_with_any_modifier() {
+        let mods = [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ];
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ] {
+            for modifiers in mods {
+                let shortcut = sc(code, modifiers);
+                assert_eq!(
+                    shortcut_refusal(&shortcut),
+                    Some(NEEDS(&shortcut.label())),
+                    "{code:?} {modifiers:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_documented_shortcuts_of_claude_are_refused() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        for c in "abcdegjklnoprstuvwxyz".chars() {
+            let label = format!("Ctrl+{}", c.to_ascii_uppercase());
+            assert_eq!(
+                refusal(KeyCode::Char(c), KeyModifiers::CONTROL),
+                Some(NEEDS(&label)),
+                "Ctrl+{c}"
+            );
+            assert!(
+                refusal(KeyCode::Char(c.to_ascii_uppercase()), ctrl_shift).is_some(),
+                "Ctrl+Shift+{c}"
+            );
+        }
+        for c in "bdfmoptvy".chars() {
+            let label = format!("Alt+{}", c.to_ascii_uppercase());
+            assert_eq!(
+                refusal(KeyCode::Char(c), KeyModifiers::ALT),
+                Some(NEEDS(&label)),
+                "Alt+{c}"
+            );
+            assert!(
+                refusal(KeyCode::Char(c.to_ascii_uppercase()), alt_shift).is_some(),
+                "Alt+Shift+{c}"
+            );
+        }
+        for c in ['_', '7', '/', '[', '3'] {
+            assert!(
+                refusal(KeyCode::Char(c), KeyModifiers::CONTROL).is_some(),
+                "Ctrl+{c}"
+            );
+        }
+        assert_eq!(
+            refusal(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some(NEEDS("Ctrl+D"))
+        );
+        assert_eq!(
+            refusal(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(NEEDS("Ctrl+C"))
+        );
+    }
+
+    #[test]
+    fn the_byte_synonyms_are_refused() {
+        // They reach claude as another key: Backspace, Tab, Enter and Esc.
+        for (c, label) in [
+            ('h', "Ctrl+H"),
+            ('i', "Ctrl+I"),
+            ('m', "Ctrl+M"),
+            ('[', "Ctrl+["),
+        ] {
+            assert_eq!(
+                refusal(KeyCode::Char(c), KeyModifiers::CONTROL),
+                Some(NEEDS(label)),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_page_up_and_down_are_the_history_of_the_nick() {
+        for code in [KeyCode::PageUp, KeyCode::PageDown] {
+            assert_eq!(refusal(code, KeyModifiers::SHIFT), Some(SCROLL.to_string()));
+            assert_eq!(
+                refusal(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                Some(SCROLL.to_string())
+            );
+            assert_eq!(refusal(code, KeyModifiers::CONTROL), None, "Ctrl alone");
+        }
+    }
+
+    #[test]
+    fn the_free_keys_are_accepted() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        for (code, modifiers) in [
+            (KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            (KeyCode::Char('4'), KeyModifiers::CONTROL),
+            (KeyCode::Char(']'), KeyModifiers::CONTROL),
+            (KeyCode::Char('^'), KeyModifiers::CONTROL),
+            (KeyCode::Char('6'), ctrl_shift),
+            (KeyCode::Char('@'), KeyModifiers::CONTROL),
+            (KeyCode::Char(' '), KeyModifiers::CONTROL),
+            (KeyCode::Char('f'), KeyModifiers::CONTROL),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            (KeyCode::F(1), KeyModifiers::NONE),
+            (KeyCode::F(5), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::ALT),
+            (KeyCode::Char('a'), KeyModifiers::ALT),
+            (KeyCode::Home, KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(refusal(code, modifiers), None, "{code:?} {modifiers:?}");
+        }
     }
 
     #[test]

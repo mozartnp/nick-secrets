@@ -28,8 +28,25 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   ticket pode ser ocultado, sem sair do banco, e restaurado depois. Os tickets ficam só no banco
   do nick: nenhuma ação sobre eles cria ou altera arquivo do projeto.
 - **Agentes:** a partir de um ticket, a TUI abre o `claude` da etapa escolhida num terminal
-  embutido, na pasta do projeto e com a configuração dele: o agente roda na jail ou fora dela
-  conforme o `JAIL_ENABLED` do `.nick/nick.conf` do projeto, e fora dela a TUI avisa no topo.
+  embutido, ao lado da lista, na pasta do projeto e com a configuração dele: o agente roda na
+  jail ou fora dela conforme o `JAIL_ENABLED` do `.nick/nick.conf` do projeto, e fora dela a TUI
+  avisa no topo do terminal. Vários agentes, de tickets e projetos diferentes, ficam abertos ao
+  mesmo tempo, e a visão "Agentes ativos" mostra todos.
+- **Atalho entre a lista e o terminal:** `Ctrl+\` por padrão. Para trocar, abra
+  "Configurações" na tela de Módulos. O terminal integrado do VS Code fica com o `Ctrl+\` (é
+  atalho dele, "dividir editor"). Para usar o nick ali, troque o atalho nas Configurações ou
+  acrescente uma vez ao `keybindings.json` do usuário (`Ctrl+Shift+P` → "Preferences: Open
+  Keyboard Shortcuts (JSON)"; no Linux, fica em `~/.config/Code/User/keybindings.json`), dentro
+  da lista `[...]`:
+
+  ```json
+  {
+    "key": "ctrl+\\",
+    "command": "workbench.action.terminal.sendSequence",
+    "args": { "text": "\u001c" },
+    "when": "terminalFocus"
+  }
+  ```
 - **Banco:** o cadastro fica num SQLite em `$XDG_STATE_HOME/nick/nick.db`, ou em
   `~/.local/state/nick/nick.db` quando `XDG_STATE_HOME` não está definida.
 - **Checkout:** o `nick` instalado usa o `bin/nick-init` e o `bin/nick-agent` do checkout de onde

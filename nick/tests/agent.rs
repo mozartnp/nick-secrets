@@ -10,7 +10,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{DOWN, ENTER, Nick, World};
+use common::{DOWN, ENTER, ESC, Nick, World};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -132,7 +132,8 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
     let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "3")]);
     open_tickets(&mut nick, "proj");
     open_agent(&mut nick, 2);
-    nick.wait_for(&format!("proj · Dev · NS-1 · {OFF_JAIL}"));
+    // The header, in the panel beside the list: wrapped there (NS-34), so read as one line.
+    nick.wait_for_panel(&format!("proj · Dev · NS-1 · {OFF_JAIL}"));
     nick.wait_for("READY");
     // Active while it runs, with the lock held.
     let agents = world.agents();
@@ -349,9 +350,13 @@ fn a_resize_reaches_claude_below_the_header() {
     let mut nick = spawn(&world, "winsize", &[]);
     open_tickets(&mut nick, "proj");
     open_agent(&mut nick, 0);
-    nick.wait_for("SIZE 29 100");
+    // The panel beside the list (NS-34): 100 - 40 columns, and 30 rows less the header (two
+    // rows: the warning out of the jail wraps at 60 columns), the status and the help (two
+    // rows: the ones the help of the tickets needs, whatever the focus; review NS-34, P1).
+    nick.wait_for("SIZE 25 60");
+    // At 120 columns the list takes 40 and the header fits in one row: 40 - 1 - 1 - 2.
     nick.resize(40, 120);
-    nick.wait_for("SIZE 39 120");
+    nick.wait_for("SIZE 36 80");
     // Ctrl+C goes to the program (cooked in this mode: it ends it).
     nick.send("\x03");
     nick.wait_for("O agente proj · PO · NS-1 terminou");
@@ -466,6 +471,538 @@ fn an_agent_whose_lock_another_nick_holds_stays_active() {
     assert_eq!(world.agents()[0].3, "ended");
     again.send("q");
     assert_eq!(again.wait_exit(), Some(0));
+}
+
+// ---- several agents side by side (NS-34) ----
+
+/// The reserved shortcut by default, Ctrl+\ (0x1c in the PTY).
+const SHORTCUT: &str = "\x1c";
+const UP: &str = "\x1b[A";
+
+/// A world with the projects `alfa` (in the jail) and `beta` (out of it), each with the
+/// ticket NS-1, and a directory for the logs of each fake claude by project.
+fn world_two() -> World {
+    let world = World::new();
+    let alfa = world.project("alfa", &["JAIL_ENABLED=\"true\""]);
+    let beta = world.project("beta", &["JAIL_ENABLED=\"false\""]);
+    for dir in [&alfa, &beta] {
+        world.register(dir);
+        world.ticket(dir, "NS-1", "Primeiro");
+    }
+    fs::create_dir_all(world.root.join("logs")).unwrap();
+    world
+}
+
+/// Runs the nick of `world_two` with the fakes in the mode `sleep` (changed by project in
+/// `extra`, FAKE_CLAUDE_MODE_<project>), their logs by project and `extra`.
+fn spawn_two(world: &World, extra: &[(&str, &str)]) -> Nick {
+    let logs = world.root.join("logs").display().to_string();
+    let mut all = vec![("FAKE_CLAUDE_LOG_DIR", logs.as_str())];
+    all.extend_from_slice(extra);
+    spawn(world, "sleep", &all)
+}
+
+/// Waits until `text` is on the screen read as one line (a wrapped help line reads whole).
+fn wait_flat(nick: &Nick, text: &str) {
+    nick.wait_until(&format!("{text:?} on the screen"), || {
+        nick.flat_screen().contains(text)
+    });
+}
+
+/// Opens `alfa · Tech Leader · NS-1` (in the jail), back to the list by the shortcut, then
+/// `beta · Dev · NS-1` (out of it), shown with the focus on its terminal; both READY.
+fn open_both(nick: &mut Nick) {
+    open_tickets(nick, "alfa");
+    open_agent(nick, 1);
+    nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
+    nick.wait_for_panel("READY");
+    open_beta(nick, 1);
+    nick.wait_for_panel("READY");
+}
+
+/// With an agent open on the tickets of alfa, focused: back to the list, the projects, and the
+/// agent of beta (`running` agents in the end).
+fn open_beta(nick: &mut Nick, running: usize) {
+    nick.send(SHORTCUT);
+    wait_flat(nick, &format!("v agentes ativos ({running})"));
+    nick.send(ESC);
+    nick.wait_for("r remover");
+    nick.send(DOWN);
+    nick.wait_for("> beta");
+    nick.send(ENTER);
+    nick.wait_for("auto_scrum > beta > Tickets");
+    open_agent(nick, 2);
+    nick.wait_for_panel(&format!("beta · Dev · NS-1 · {OFF_JAIL}"));
+}
+
+fn lock_of(world: &World, session_id: &str) -> PathBuf {
+    world.agents_dir().join(format!("{session_id}.lock"))
+}
+
+#[test]
+fn two_agents_of_two_projects_run_at_once_each_with_its_cwd_and_config() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[]);
+    open_both(&mut nick);
+    let pids = pids(&world);
+    assert_eq!(pids.len(), 4, "two fakes and their sleeps");
+    assert!(pids.iter().all(|p| alive(*p)), "both alive at once");
+    for (project, name) in [
+        ("alfa", "alfa · Tech Leader · NS-1"),
+        ("beta", "beta · Dev · NS-1"),
+    ] {
+        let env = read(&world.root.join(format!("logs/{project}.env")));
+        let pwd = format!("PWD={}", world.root.join(project).display());
+        assert!(env.lines().any(|l| l == pwd), "{project}: {env}");
+        let argv = read(&world.root.join(format!("logs/{project}.argv")));
+        assert!(argv.contains(&format!("--name\n{name}\n")), "{argv}");
+    }
+    // Only alfa goes through the ai-jail (its config), beta runs out of it.
+    let jail = read(&logs(&world).jail);
+    assert!(jail.contains("alfa · Tech Leader · NS-1"), "{jail}");
+    assert!(!jail.contains("beta"), "{jail}");
+    let agents = world.agents();
+    assert_eq!(agents.len(), 2);
+    assert!(agents.iter().all(|a| a.3 == "active"));
+    assert!(agents.iter().all(|a| lock_of(&world, &a.0).exists()));
+    // The view lists both, [FORA DA JAIL] only on beta.
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (2)");
+    nick.send("v");
+    nick.wait_for("Agentes ativos");
+    nick.wait_for("beta · Dev · NS-1  [FORA DA JAIL]");
+    let screen = nick.screen();
+    let alfa = screen
+        .lines()
+        .find(|l| l.contains("alfa · Tech Leader · NS-1"))
+        .unwrap_or_else(|| panic!("alfa on the view:\n{screen}"));
+    assert!(!alfa.contains("FORA DA JAIL"), "{alfa}");
+    nick.send("q");
+    nick.wait_for("Há 2 agentes ativos (alfa, beta). Encerrar todos e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_shortcut_toggles_the_focus_and_never_reaches_claude() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "2")]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    // On the list, q is the list's: it asks to quit, and claude gets nothing.
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (1)");
+    nick.send("q");
+    nick.wait_for("Há 1 agente ativo (proj). Encerrar e sair? (s/N)");
+    nick.send("n");
+    nick.wait_until("the confirmation closed", || {
+        !nick.screen().contains("Há 1 agente")
+    });
+    // On the terminal, q is claude's; the shortcut, both ways, never reaches it.
+    nick.send(SHORTCUT);
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    nick.send("q");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (1)");
+    nick.send(SHORTCUT);
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    nick.send("z");
+    nick.wait_for("GOT 71 7a");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn a_hidden_agent_whose_text_changed_is_marked_until_it_is_shown() {
+    let world = world_two();
+    let trigger = world.root.join("trigger");
+    let trigger_text = trigger.display().to_string();
+    let mut nick = spawn_two(
+        &world,
+        &[
+            ("FAKE_CLAUDE_MODE_alfa", "trigger"),
+            ("FAKE_CLAUDE_TRIGGER", trigger_text.as_str()),
+        ],
+    );
+    open_both(&mut nick);
+    // alfa is hidden. A redraw of the same text (another color) does not mark it.
+    fs::write(world.root.join("trigger.1"), "").unwrap();
+    nick.wait_until("the redraw of alfa", || {
+        world.root.join("trigger.1.done").exists()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (2)");
+    assert!(
+        !nick.flat_screen().contains("saída nova"),
+        "{}",
+        nick.screen()
+    );
+    nick.send("v");
+    nick.wait_for("Agentes ativos");
+    assert!(!nick.screen().contains("saída nova"), "{}", nick.screen());
+    // New text marks it, on the view (the list of 40 columns cuts the end of this line) and on
+    // the help of the lists.
+    fs::write(world.root.join("trigger.2"), "").unwrap();
+    nick.wait_for("alfa · Tech Leader · NS-1  ● saída");
+    nick.send(ESC);
+    wait_flat(&nick, "v agentes ativos (2, 1 com saída nova)");
+    nick.send("v");
+    nick.wait_for("● saída");
+    // Shown, it is seen: the mark goes.
+    nick.send(UP);
+    nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
+    nick.wait_for_panel("NOVO");
+    nick.wait_until("the mark gone", || !nick.screen().contains("saída nova"));
+    nick.send("q");
+    nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Review NS-34, P1: toggling the focus does not change the size of the terminals, so a hidden
+/// claude gets no SIGWINCH (which redraws it and marks it with no new output).
+#[test]
+fn toggling_the_focus_neither_resizes_nor_marks_a_hidden_agent() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[("FAKE_CLAUDE_MODE_alfa", "winsize")]);
+    open_tickets(&mut nick, "alfa");
+    open_agent(&mut nick, 1);
+    nick.wait_for_panel("SIZE");
+    open_beta(&mut nick, 1);
+    nick.wait_for_panel("READY");
+    for _ in 0..3 {
+        nick.send(SHORTCUT);
+        wait_flat(&nick, "v agentes ativos (2)");
+        nick.send(SHORTCUT);
+        nick.wait_for("Ctrl+\\ voltar à lista");
+    }
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (2)");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !nick.flat_screen().contains("saída nova"),
+        "{}",
+        nick.screen()
+    );
+    nick.send("v");
+    nick.wait_for("Agentes ativos");
+    nick.send(UP);
+    nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
+    let panel = nick.panel();
+    assert_eq!(
+        panel.matches("SIZE").count(),
+        1,
+        "a single size, never resized: {panel}"
+    );
+    nick.send("q");
+    nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn only_the_copy_of_the_shown_agent_reaches_the_outer_terminal() {
+    const COPY: &str = "\x1b]52;c;b2zDoQ==\x07";
+    let world = world_two();
+    let trigger = world.root.join("trigger");
+    let trigger_text = trigger.display().to_string();
+    let mut nick = spawn_two(
+        &world,
+        &[
+            ("FAKE_CLAUDE_MODE_alfa", "osc52_on_trigger"),
+            ("FAKE_CLAUDE_TRIGGER", trigger_text.as_str()),
+        ],
+    );
+    open_both(&mut nick);
+    // alfa, hidden, copies: dropped.
+    fs::write(world.root.join("trigger.1"), "").unwrap();
+    nick.wait_until("the copy of alfa", || {
+        world.root.join("trigger.1.done").exists()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    nick.send(SHORTCUT);
+    // The text of alfa changed (COPIADO 1): it is marked.
+    wait_flat(&nick, "v agentes ativos (2, 1 com saída nova)");
+    nick.send("v");
+    nick.wait_for("Agentes ativos");
+    nick.send(UP);
+    nick.wait_for_panel("COPIADO 1");
+    assert!(
+        !nick.raw().contains(COPY),
+        "the copy of a hidden agent was forwarded"
+    );
+    // Control: shown, its copy goes to the outer terminal.
+    fs::write(world.root.join("trigger.2"), "").unwrap();
+    nick.wait_for_panel("COPIADO 2");
+    nick.wait_for_raw(COPY);
+    nick.send("q");
+    nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn a_shortcut_saved_in_the_settings_works_right_away_and_at_the_next_opening() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    nick.wait_for("Módulos");
+    nick.send("c");
+    nick.wait_for("Atalho para alternar entre a lista e o terminal: Ctrl+\\ (padrão)");
+    nick.send("t");
+    nick.wait_for("Aperte a tecla do novo atalho. Esc cancela.");
+    nick.send("\x1d");
+    nick.wait_for("Aperte Ctrl+] de novo para confirmar.");
+    assert_eq!(
+        world.setting("reserved_shortcut"),
+        None,
+        "once is not saved"
+    );
+    nick.send("\x1d");
+    nick.wait_for("Atalho salvo: Ctrl+].");
+    assert_eq!(
+        world.setting("reserved_shortcut").as_deref(),
+        Some("ctrl+]")
+    );
+    nick.wait_for("Atalho para alternar entre a lista e o terminal: Ctrl+]");
+    assert!(!nick.screen().contains("(padrão)"));
+    // Right away: Ctrl+] toggles, and Ctrl+\ goes to claude.
+    nick.send(ESC);
+    nick.wait_for("c configurações");
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.wait_for("Ctrl+] voltar à lista");
+    nick.send("\x1d");
+    wait_flat(&nick, "v agentes ativos (1)");
+    nick.send("\x1d");
+    nick.wait_for("Ctrl+] voltar à lista");
+    nick.send(SHORTCUT);
+    nick.wait_for("GOT 1c");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    // At the next opening, from the database; p goes back to the default.
+    let mut again = world.spawn(&world.root, &[]);
+    again.wait_for("Módulos");
+    again.send("c");
+    again.wait_for("Atalho para alternar entre a lista e o terminal: Ctrl+]");
+    assert!(!again.screen().contains("(padrão)"));
+    again.send("p");
+    again.wait_for("Atalho de volta ao padrão: Ctrl+\\.");
+    again.wait_for("Ctrl+\\ (padrão)");
+    assert_eq!(world.setting("reserved_shortcut"), None);
+    again.send("q");
+    assert_eq!(again.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_capture_refuses_enter_and_ctrl_c_without_saving_nor_quitting() {
+    let world = World::new();
+    let mut nick = world.spawn(&world.root, &[]);
+    nick.wait_for("Módulos");
+    nick.send("c");
+    nick.wait_for("(padrão)");
+    nick.send("t");
+    nick.wait_for("Aperte a tecla do novo atalho.");
+    nick.send(ENTER);
+    nick.wait_for("O claude precisa dessa tecla (Enter). Escolha outra.");
+    nick.send("\x03");
+    nick.wait_for("O claude precisa dessa tecla (Ctrl+C). Escolha outra.");
+    assert!(
+        nick.screen().contains("Aperte a tecla do novo atalho."),
+        "still capturing"
+    );
+    assert_eq!(world.setting("reserved_shortcut"), None);
+    nick.send(ESC);
+    nick.wait_for("t trocar");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_eq!(world.setting("reserved_shortcut"), None);
+}
+
+#[test]
+fn an_agent_ended_from_the_view_dies_alone() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[]);
+    open_both(&mut nick);
+    let pids = pids(&world);
+    let (alfa, beta) = (&pids[..2], &pids[2..]);
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (2)");
+    nick.send("v");
+    nick.wait_for("Agentes ativos");
+    nick.send(UP);
+    nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
+    // n: nothing changes.
+    nick.send("x");
+    nick.wait_for("Encerrar o agente alfa · Tech Leader · NS-1? (s/N)");
+    nick.send("n");
+    nick.wait_until("the confirmation closed", || {
+        !nick.screen().contains("Encerrar o agente")
+    });
+    assert!(pids.iter().all(|p| alive(*p)));
+    assert!(world.agents().iter().all(|a| a.3 == "active"));
+    // s: the group of alfa dies, its row ends, its lock goes; beta goes on.
+    nick.send("x");
+    nick.wait_for("Encerrar o agente alfa");
+    nick.send("s");
+    nick.wait_for("O agente alfa · Tech Leader · NS-1 foi encerrado.");
+    for pid in alfa {
+        wait_dead(&nick, *pid);
+    }
+    assert!(beta.iter().all(|p| alive(*p)), "beta goes on");
+    let agents = world.agents();
+    assert_eq!(
+        (agents[0].3.as_str(), agents[1].3.as_str()),
+        ("ended", "active")
+    );
+    assert!(!lock_of(&world, &agents[0].0).exists());
+    assert!(lock_of(&world, &agents[1].0).exists());
+    nick.wait_for_panel("beta · Dev · NS-1");
+    nick.send("q");
+    nick.wait_for("Há 1 agente ativo (beta). Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+    for pid in beta {
+        wait_dead(&nick, *pid);
+    }
+}
+
+#[test]
+fn quitting_with_two_agents_asks_and_ends_both() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[]);
+    open_both(&mut nick);
+    let pids = pids(&world);
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (2)");
+    nick.send("q");
+    nick.wait_for("Há 2 agentes ativos (alfa, beta). Encerrar todos e sair? (s/N)");
+    nick.send("n");
+    nick.wait_until("the confirmation closed", || {
+        !nick.screen().contains("Há 2 agentes")
+    });
+    assert!(pids.iter().all(|p| alive(*p)), "n changes nothing");
+    assert!(world.agents().iter().all(|a| a.3 == "active"));
+    nick.send("q");
+    nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_restored_at_the_end(&nick.raw());
+    for pid in pids {
+        wait_dead(&nick, pid);
+    }
+    let agents = world.agents();
+    assert!(agents.iter().all(|a| a.3 == "ended"), "{agents:?}");
+    assert!(agents.iter().all(|a| !lock_of(&world, &a.0).exists()));
+}
+
+/// Review NS-34, N3: an error of the database while ending the agents on the way out is
+/// printed after the terminal is restored; the locks go anyway.
+#[test]
+fn an_error_of_the_database_on_the_way_out_is_printed_after_the_restore() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[]);
+    open_both(&mut nick);
+    nick::db::Db::open(&world.db_path())
+        .unwrap()
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER fail BEFORE UPDATE ON agents \
+             BEGIN SELECT RAISE(ABORT, 'falha de teste'); END;",
+        )
+        .unwrap();
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (2)");
+    nick.send("q");
+    nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+    let raw = nick.raw();
+    let off = raw.rfind(ALT_OFF).expect("restored");
+    let message = raw.rfind("falha de teste").expect("the error is printed");
+    assert!(off < message, "after the restore: {raw:?}");
+    let agents = world.agents();
+    assert!(agents.iter().all(|a| !lock_of(&world, &a.0).exists()));
+}
+
+#[test]
+fn sigterm_with_two_agents_ends_both_and_exits_with_143() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[]);
+    open_both(&mut nick);
+    let pids = pids(&world);
+    assert_eq!(pids.len(), 4);
+    kill(Pid::from_raw(nick.pid()), Signal::SIGTERM).unwrap();
+    assert_eq!(nick.wait_exit(), Some(143));
+    assert_restored_at_the_end(&nick.raw());
+    for pid in pids {
+        wait_dead(&nick, pid);
+    }
+    let agents = world.agents();
+    assert!(agents.iter().all(|a| a.3 == "ended"), "{agents:?}");
+    assert!(agents.iter().all(|a| !lock_of(&world, &a.0).exists()));
+}
+
+#[test]
+fn a_panic_with_two_agents_ends_both_groups_and_exits_with_101() {
+    let world = world_two();
+    let mut nick = spawn_two(&world, &[("NICK_TEST_PANIC", "second_agent")]);
+    open_tickets(&mut nick, "alfa");
+    open_agent(&mut nick, 1);
+    nick.wait_for_panel("READY");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (1)");
+    nick.send(ESC);
+    nick.wait_for("r remover");
+    nick.send(DOWN);
+    nick.wait_for("> beta");
+    nick.send(ENTER);
+    nick.wait_for("auto_scrum > beta > Tickets");
+    open_agent(&mut nick, 2);
+    nick.wait_until("both fakes started", || pids(&world).len() == 4);
+    let pids = pids(&world);
+    assert_eq!(nick.wait_exit(), Some(101));
+    assert!(
+        nick.raw()
+            .contains("NICK_TEST_PANIC: panic de teste com um agente aberto"),
+        "{:?}",
+        nick.raw()
+    );
+    for pid in pids {
+        wait_dead(&nick, pid);
+    }
+}
+
+#[test]
+fn a_hidden_agent_that_floods_does_not_block_the_shown_one() {
+    let world = world_two();
+    let trigger = world.root.join("trigger");
+    let trigger_text = trigger.display().to_string();
+    let mut nick = spawn_two(
+        &world,
+        &[
+            ("FAKE_CLAUDE_MODE_alfa", "flood_on_trigger"),
+            ("FAKE_CLAUDE_MODE_beta", "echo"),
+            ("FAKE_CLAUDE_READ_BYTES", "2"),
+            ("FAKE_CLAUDE_TRIGGER", trigger_text.as_str()),
+        ],
+    );
+    open_both(&mut nick);
+    // alfa, hidden, writes ~1 MB that nobody looks at, while beta answers.
+    fs::write(world.root.join("trigger.1"), "").unwrap();
+    nick.send("a");
+    nick.wait_for("O agente alfa · Tech Leader · NS-1 terminou.");
+    nick.send("b");
+    nick.wait_for_panel("GOT 61 62");
+    assert!(!nick.panel().contains("xxx"), "{}", nick.panel());
+    nick.wait_for("O agente beta · Dev · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
 }
 
 // ---- structure: the only launch is bash with the launcher ----

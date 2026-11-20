@@ -1433,8 +1433,9 @@ impl App {
         keys::encode_key(&key, self.agent_term.modes).map_or(Action::None, Action::Send)
     }
 
-    /// Whether the input goes to the shown agent's program: the focus is on its terminal.
-    fn on_terminal(&self) -> bool {
+    /// Whether the input goes to the shown agent's program: the focus is on its terminal. The
+    /// one rule of the focus: the help and the borders of the panels (NS-37) follow it too.
+    pub fn on_terminal(&self) -> bool {
         self.focus == Focus::Terminal && self.shown.is_some()
     }
 

@@ -9,11 +9,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::agents::AgentState;
-use crate::app::{App, Button, Dialog, Focus, RunningAgent, Screen, TicketField};
+use crate::app::{App, Button, Dialog, RunningAgent, Screen, TicketField};
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
 use crate::modules::ModuleKind;
@@ -25,6 +25,35 @@ use crate::tickets::{self, TicketStage};
 /// The widest the list gets beside an agent (NS-34); never more than half the window.
 pub const LIST_WIDTH: u16 = 40;
 
+/// The color of the border of the focused panel beside an agent (NS-37).
+pub const FOCUS_COLOR: Color = Color::Cyan;
+
+/// The block of a panel beside an agent (NS-37): thick and in `FOCUS_COLOR` with the focus,
+/// plain and dim without it. Both take one cell, so toggling the focus resizes nothing; the
+/// thickness alone tells them apart where the color is weak (16 colors, a light theme).
+fn pane_block(focused: bool) -> Block<'static> {
+    if focused {
+        Block::bordered()
+            .border_type(BorderType::Thick)
+            .border_style(Style::new().fg(FOCUS_COLOR))
+    } else {
+        Block::bordered()
+            .border_type(BorderType::Plain)
+            .border_style(Style::new().add_modifier(Modifier::DIM))
+    }
+}
+
+/// The block of the list: `Block::bordered()` as before the NS-37 without an agent running
+/// (the whole-width screens stay byte for byte), `pane_block` beside one, focused unless the
+/// focus is on the terminal (`App::on_terminal`, the same rule as the help).
+fn list_block(app: &App) -> Block<'static> {
+    if app.agents().is_empty() {
+        Block::bordered()
+    } else {
+        pane_block(!app.on_terminal())
+    }
+}
+
 /// Where each part of the screen goes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Areas {
@@ -32,7 +61,8 @@ pub struct Areas {
     pub body: Rect,
     /// The list of the current screen (the whole body without an agent running).
     pub list: Rect,
-    /// The panel of the shown agent: its header, then its terminal (empty without agents).
+    /// The panel of the shown agent, with its border (NS-37): inside it, its header, then its
+    /// terminal (empty without agents).
     pub panel: Rect,
     pub header: Rect,
     pub terminal: Rect,
@@ -67,13 +97,16 @@ pub fn new_agent_panel(app: &App, area: Rect) -> Rect {
     split(area, 1, help_rows, true).panel
 }
 
-/// The terminal of the agent `name` in `panel`, below its header (`header_rows`).
+/// The terminal of the agent `name` in `panel`: inside the border of the panel (NS-37, one cell
+/// on each side, whatever the focus), below its header (`header_rows`). The one count of the
+/// size of each PTY: the drawing, the mouse and the spawn take it from here.
 pub fn terminal_in_panel(panel: Rect, name: &str, jail: bool) -> Rect {
-    let rows = header_rows(name, jail, panel);
+    let inner = Block::bordered().inner(panel);
+    let rows = header_rows(name, jail, inner);
     Rect {
-        y: panel.y + rows,
-        height: panel.height - rows,
-        ..panel
+        y: inner.y + rows,
+        height: inner.height - rows,
+        ..inner
     }
 }
 
@@ -83,14 +116,20 @@ fn layout_for(app: &App, area: Rect, agent: Option<&RunningAgent>) -> Areas {
     let mut areas = split(area, status_rows, help_rows, !app.agents().is_empty());
     if let Some(agent) = agent.filter(|_| !areas.panel.is_empty()) {
         areas.terminal = terminal_in_panel(areas.panel, &agent.name, agent.jail);
-        areas.header = Rect {
-            height: areas.terminal.y - areas.panel.y,
-            ..areas.panel
-        };
+        areas.header = header_in_panel(areas.panel, areas.terminal);
     } else {
         areas.terminal = areas.panel;
     }
     areas
+}
+
+/// The header of the panel: inside its border, from the top down to `terminal`.
+fn header_in_panel(panel: Rect, terminal: Rect) -> Rect {
+    let inner = Block::bordered().inner(panel);
+    Rect {
+        height: terminal.y - inner.y,
+        ..inner
+    }
 }
 
 /// The status and the help (`status_rows`, `help_rows`, up to a third of the screen each) at
@@ -158,7 +197,14 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
         Screen::Settings => draw_settings(frame, app, body),
     }
     if let Some(agent) = app.shown_agent() {
-        draw_agent(frame, areas.panel, &agent.name, agent.jail, terminal);
+        draw_agent(
+            frame,
+            areas.panel,
+            &agent.name,
+            agent.jail,
+            app.on_terminal(),
+            terminal,
+        );
     }
     let status_lines = status_lines(app, frame.area().width);
     let help_lines = help_lines(app, frame.area().width);
@@ -222,12 +268,11 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
 /// way back to the list (every other key is the program's). With agents running, the lists
 /// that open "Agentes ativos" say so, with how many there are and how many are marked.
 fn help_text(app: &App) -> String {
-    let on_terminal = app.focus() == Focus::Terminal && app.shown().is_some();
     let count = (!app.agents().is_empty()).then(|| agents_count(app));
     help_text_for(
         app,
         (app.screen, app.show_hidden),
-        on_terminal,
+        app.on_terminal(),
         app.dialog.as_ref(),
         count,
     )
@@ -400,23 +445,23 @@ fn header_rows(name: &str, jail: bool, panel: Rect) -> u16 {
         .min(panel.height)
 }
 
-/// The panel of an agent in `area`: its header (wrapped, `header_rows`) and its terminal below
-/// it, the same split as `layout`.
+/// The panel of an agent in `area`: its border (`pane_block`, thick and cyan when `focused`),
+/// and inside it its header (wrapped, `header_rows`) and its terminal below it, the same split
+/// as `layout` (`terminal_in_panel`).
 pub fn draw_agent(
     frame: &mut Frame,
     area: Rect,
     name: &str,
     jail: bool,
+    focused: bool,
     terminal: Option<&vt100::Screen>,
 ) {
-    let rows = header_rows(name, jail, area);
-    let header = Rect {
-        height: rows,
-        ..area
-    };
-    let lines: Vec<Line> = header_lines(name, jail, area.width)
+    frame.render_widget(pane_block(focused), area);
+    let below = terminal_in_panel(area, name, jail);
+    let header = header_in_panel(area, below);
+    let lines: Vec<Line> = header_lines(name, jail, header.width)
         .into_iter()
-        .take(usize::from(rows))
+        .take(usize::from(header.height))
         .collect();
     frame.render_widget(Paragraph::new(lines), header);
     if let Some(screen) = terminal {
@@ -425,11 +470,6 @@ pub fn draw_agent(
         if screen.scrollback() > 0 || screen.hide_cursor() {
             cursor.hide();
         }
-        let below = Rect {
-            y: area.y + rows,
-            height: area.height - rows,
-            ..area
-        };
         frame.render_widget(PseudoTerminal::new(screen).cursor(cursor), below);
     }
 }
@@ -444,7 +484,7 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
         .map(|module| ListItem::new(module.name()))
         .collect();
     let list = List::new(items)
-        .block(Block::bordered().title(" Módulos "))
+        .block(list_block(app).title(" Módulos "))
         .highlight_symbol("> ")
         .highlight_style(selected_style());
     let mut state = ListState::default().with_selected(Some(app.module_index));
@@ -454,7 +494,7 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
 /// "Agentes ativos": every agent of this nick, in the order they were opened, with
 /// `[FORA DA JAIL]` (red) out of the jail and `● saída nova` when marked.
 fn draw_active_agents(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(" Agentes ativos ");
+    let block = list_block(app).title(" Agentes ativos ");
     if app.agents().is_empty() {
         frame.render_widget(
             Paragraph::new("Nenhum agente ativo.")
@@ -500,14 +540,14 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(line)
-            .block(Block::bordered().title(" Configurações "))
+            .block(list_block(app).title(" Configurações "))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
 fn draw_projects(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(format!(" {} > Projetos ", app.module().name()));
+    let block = list_block(app).title(format!(" {} > Projetos ", app.module().name()));
     if app.rows.is_empty() {
         frame.render_widget(
             Paragraph::new("Nenhum projeto cadastrado. Pressione a para adicionar.")
@@ -553,7 +593,7 @@ fn draw_tickets(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         ""
     };
-    let block = Block::bordered().title(format!(
+    let block = list_block(app).title(format!(
         " {} > {project} > Tickets{filter} ",
         app.module().name()
     ));
@@ -639,11 +679,11 @@ fn draw_ticket(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map_or(String::new(), |p| printable(&p.name));
     let Some(detail) = app.ticket_detail.as_ref() else {
-        frame.render_widget(Block::bordered(), area);
+        frame.render_widget(list_block(app), area);
         return;
     };
     let ticket = &detail.ticket;
-    let block = Block::bordered().title(format!(
+    let block = list_block(app).title(format!(
         " {} > {project} > {} ",
         app.module().name(),
         printable(&ticket.key)
@@ -1414,7 +1454,7 @@ fn draw_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Button, Dialog, Row, Screen, TicketField};
+    use crate::app::{Button, Dialog, Focus, Row, Screen, TicketField};
     use crate::db::Db;
     use crate::projects::{Availability, Project};
     use crate::stages::StageType;
@@ -2014,21 +2054,33 @@ mod tests {
 
     // ---- agents (NS-33) ----
 
+    /// The panel of an agent over a 100x30 screen, with the focus. Its border (NS-37) takes
+    /// the first and the last row and column: the header is on row 1, from column 1.
     fn render_agent(name: &str, jail: bool, screen: Option<&vt100::Screen>) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|frame| draw_agent(frame, frame.area(), name, jail, screen))
+            .draw(|frame| draw_agent(frame, frame.area(), name, jail, true, screen))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// The row `y` of `buffer` inside the border of the panel (NS-37): from column 1, without
+    /// the right side, trailing spaces removed.
+    fn inside_row(buffer: &Buffer, y: u16) -> String {
+        let width = usize::from(buffer.area.width);
+        let row = text(buffer)
+            .lines()
+            .nth(usize::from(y))
+            .unwrap_or("")
+            .to_string();
+        let inner: String = row.chars().skip(1).take(width.saturating_sub(2)).collect();
+        inner.trim_end().to_string()
     }
 
     #[test]
     fn the_agent_header_in_the_jail() {
         let buffer = render_agent("proj · Dev · NS-1", true, None);
-        assert_eq!(
-            text(&buffer).lines().next().unwrap(),
-            "proj · Dev · NS-1 · na jail"
-        );
+        assert_eq!(inside_row(&buffer, 1), "proj · Dev · NS-1 · na jail");
         let (y, x) = find(&buffer, "na jail").unwrap();
         assert_ne!(buffer[(x, y)].fg, Color::Red);
         assert!(find(&buffer, "FORA DA JAIL").is_none());
@@ -2038,7 +2090,7 @@ mod tests {
     fn the_agent_header_out_of_the_jail_is_red_and_bold() {
         let buffer = render_agent("proj · Dev · NS-1", false, None);
         assert_eq!(
-            text(&buffer).lines().next().unwrap(),
+            inside_row(&buffer, 1),
             "proj · Dev · NS-1 · FORA DA JAIL: o agente roda direto no seu shell."
         );
         let (y, x) = find(&buffer, "FORA DA JAIL").unwrap();
@@ -2058,20 +2110,21 @@ mod tests {
         let name = "proj · PO · NS-1";
         assert_eq!(header_rows(name, true, Rect::new(0, 0, 100, 30)), 1);
         assert_eq!(header_rows(name, true, Rect::new(0, 0, 10, 1)), 1);
-        let mut parser = vt100::Parser::new(29, 100, 0);
-        parser.process(b"\x1b[31mlinha um\x1b[0m\r\nlinha dois\x1b[29;1Hfim");
+        // Inside the border (NS-37): 98x28, the header on its first row.
+        let mut parser = vt100::Parser::new(27, 98, 0);
+        parser.process(b"\x1b[31mlinha um\x1b[0m\r\nlinha dois\x1b[27;1Hfim");
         let buffer = render_agent("proj · PO · NS-1", true, Some(parser.screen()));
-        let body = text(&buffer);
-        let body: Vec<&str> = body.lines().collect();
-        assert!(body[1].starts_with("linha um"), "{body:?}");
-        assert!(body[2].starts_with("linha dois"), "{body:?}");
+        assert!(inside_row(&buffer, 2).starts_with("linha um"));
+        assert!(inside_row(&buffer, 3).starts_with("linha dois"));
         assert_eq!(
-            buffer[(0, 1)].fg,
+            buffer[(1, 2)].fg,
             Color::Indexed(1),
             "the colors of the program"
         );
-        // No status line nor help: the last row of the program is the last row of the screen.
-        assert_eq!(find(&buffer, "fim"), Some((29, 0)), "{body:?}");
+        // No status line nor help: the last row of the program is the last one inside the
+        // border, above its bottom.
+        assert_eq!(find(&buffer, "fim"), Some((28, 1)), "{}", text(&buffer));
+        assert_eq!(buffer[(0, 29)].symbol(), "┗");
     }
 
     #[test]
@@ -2449,20 +2502,22 @@ mod tests {
         let areas = layout(&f.app, area);
         // The help keeps the two rows the list of the tickets needs (review NS-34, P1).
         assert_eq!(areas.list, Rect::new(0, 0, 40, 27));
-        assert_eq!(areas.header, Rect::new(40, 0, 60, 1));
-        assert_eq!(areas.terminal, Rect::new(40, 1, 60, 26));
+        // The panel keeps its border (NS-37): the header and the terminal are inside it.
+        assert_eq!(areas.panel, Rect::new(40, 0, 60, 27));
+        assert_eq!(areas.header, Rect::new(41, 1, 58, 1));
+        assert_eq!(areas.terminal, Rect::new(41, 2, 58, 24));
         assert_eq!(areas.status, Rect::new(0, 27, 100, 1));
         assert_eq!(areas.help, Rect::new(0, 28, 100, 2));
         let agent = f.app.shown_agent().unwrap();
         assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
-        let mut parser = vt100::Parser::new(26, 60, 0);
-        parser.process(b"primeira\x1b[26;1Hultima");
+        let mut parser = vt100::Parser::new(24, 58, 0);
+        parser.process(b"primeira\x1b[24;1Hultima");
         let buffer = render_at(&f.app, 100, 30, Some(parser.screen()));
-        assert_eq!(find(&buffer, "proj · Dev · NS-1 · na jail"), Some((0, 40)));
-        assert_eq!(find(&buffer, "primeira"), Some((1, 40)));
+        assert_eq!(find(&buffer, "proj · Dev · NS-1 · na jail"), Some((1, 41)));
+        assert_eq!(find(&buffer, "primeira"), Some((2, 41)));
         assert_eq!(
             find(&buffer, "ultima"),
-            Some((26, 40)),
+            Some((25, 41)),
             "the last row of the program"
         );
         let (y, _) = find(&buffer, "auto_scrum > proj > Tickets").unwrap();
@@ -2499,20 +2554,29 @@ mod tests {
         let (f, _) = with_running(&["proj", "fora"]);
         let area = Rect::new(0, 0, 100, 30);
         let areas = layout(&f.app, area);
+        // Inside the border (NS-37) the header wraps at 58 columns.
         assert_eq!(
             areas.header,
-            Rect::new(40, 0, 60, 2),
+            Rect::new(41, 1, 58, 2),
             "decision of the user"
         );
-        assert_eq!(areas.terminal, Rect::new(40, 2, 60, 25));
+        assert_eq!(areas.terminal, Rect::new(41, 3, 58, 23));
         // Each agent has the size of its own header: the one in the jail, one row.
         let in_jail = &f.app.agents()[0];
-        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(40, 1, 60, 26));
+        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(41, 2, 58, 24));
         let buffer = render_at(&f.app, 100, 30, None);
         let header: Vec<String> = text(&buffer)
             .lines()
+            .skip(1)
             .take(2)
-            .map(|l| l.chars().skip(40).collect::<String>().trim().to_string())
+            .map(|l| {
+                l.chars()
+                    .skip(41)
+                    .take(58)
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             header.join(" "),
@@ -2541,7 +2605,8 @@ mod tests {
         let area = Rect::new(0, 0, 100, 30);
         let areas = layout(&f.app, area);
         assert_eq!(areas.status.height, 3);
-        assert_eq!(areas.terminal.height, 30 - 1 - 3 - areas.help.height);
+        // 2 rows of the border (NS-37), 1 of the header and 3 of the status.
+        assert_eq!(areas.terminal.height, 30 - 2 - 1 - 3 - areas.help.height);
         let agent = f.app.shown_agent().unwrap();
         assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
         let buffer = render_at(&f.app, 100, 30, None);
@@ -2989,9 +3054,10 @@ mod tests {
         let areas = layout(&f.app, Rect::new(0, 0, 140, 40));
         assert_eq!(areas.list.width, LIST_WIDTH);
         // The state of each artifact comes before its path, so the 40 columns keep it (review of
-        // the NS-36, P3.1): only the end of the path is cut.
-        assert_has(&buffer, "│Plano (não existe):  .nick/docs/NS-1/");
-        assert_has(&buffer, "│Review (não existe):  .nick/docs/NS-1/");
+        // the NS-36, P3.1): only the end of the path is cut. The focus is on the list: its
+        // border is the thick one (NS-37).
+        assert_has(&buffer, "┃Plano (não existe):  .nick/docs/NS-1/");
+        assert_has(&buffer, "┃Review (não existe):  .nick/docs/NS-1/");
         let help = help_text(&f.app);
         assert!(
             help.ends_with("Esc voltar · v agentes ativos (1) · q sair"),
@@ -3096,5 +3162,235 @@ mod tests {
         assert_eq!(buffer[(x, y)].fg, Color::Yellow);
         let (fields, _) = find(&buffer, "ID do Jira").unwrap();
         assert!(y < fields, "above the fields");
+    }
+
+    // ---- the focused panel (NS-37) ----
+
+    /// `block` drawn alone over `width`x`height`.
+    fn render_block(block: Block<'static>, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(block, frame.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The border at (`x`, `y`) is thick and in `FOCUS_COLOR` (`thick`), or plain, dim and
+    /// without a color.
+    fn assert_border(buffer: &Buffer, (x, y): (u16, u16), thick: bool, symbol: &str) {
+        let cell = &buffer[(x, y)];
+        assert_eq!(cell.symbol(), symbol, "({x}, {y})\n{}", text(buffer));
+        if thick {
+            assert_eq!(cell.fg, FOCUS_COLOR, "({x}, {y})");
+            assert!(!cell.modifier.contains(Modifier::DIM), "({x}, {y})");
+        } else {
+            assert_eq!(cell.fg, Color::Reset, "({x}, {y}) without a color");
+            assert!(cell.modifier.contains(Modifier::DIM), "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn the_focused_block_is_thick_and_cyan_the_other_plain_and_dim() {
+        assert_eq!(FOCUS_COLOR, Color::Cyan);
+        let buffer = render_block(pane_block(true), 6, 4);
+        assert_border(&buffer, (0, 0), true, "┏");
+        assert_border(&buffer, (5, 0), true, "┓");
+        assert_border(&buffer, (0, 3), true, "┗");
+        assert_border(&buffer, (5, 3), true, "┛");
+        assert_border(&buffer, (2, 0), true, "━");
+        assert_border(&buffer, (0, 1), true, "┃");
+        assert_border(&buffer, (5, 2), true, "┃");
+        let buffer = render_block(pane_block(false), 6, 4);
+        assert_border(&buffer, (0, 0), false, "┌");
+        assert_border(&buffer, (5, 0), false, "┐");
+        assert_border(&buffer, (0, 3), false, "└");
+        assert_border(&buffer, (5, 3), false, "┘");
+        assert_border(&buffer, (2, 3), false, "─");
+        assert_border(&buffer, (0, 2), false, "│");
+        assert_border(&buffer, (5, 1), false, "│");
+        // Both take one cell: the inside is the same.
+        let area = Rect::new(3, 2, 10, 8);
+        assert_eq!(pane_block(true).inner(area), pane_block(false).inner(area));
+        assert_eq!(pane_block(true).inner(area), Block::bordered().inner(area));
+    }
+
+    #[test]
+    fn the_focused_panel_has_the_thick_cyan_border() {
+        let (mut f, _) = with_running(&["proj"]);
+        // The focus on the terminal: the panel of the agent thick and cyan, the list plain.
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_border(&buffer, (40, 0), true, "┏");
+        assert_border(&buffer, (99, 0), true, "┓");
+        assert_border(&buffer, (99, 10), true, "┃");
+        assert_border(&buffer, (40, 26), true, "┗");
+        assert_border(&buffer, (0, 0), false, "┌");
+        assert_border(&buffer, (39, 10), false, "│");
+        // The focus on the list: the other way around.
+        f.app.focus = Focus::List;
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_border(&buffer, (0, 0), true, "┏");
+        assert_border(&buffer, (39, 10), true, "┃");
+        assert_border(&buffer, (0, 26), true, "┗");
+        assert_border(&buffer, (40, 0), false, "┌");
+        assert_border(&buffer, (99, 10), false, "│");
+        // The title of the list stays on the border.
+        assert_has(&buffer, "auto_scrum > proj > Tickets");
+    }
+
+    #[test]
+    fn every_list_screen_shows_where_the_focus_is() {
+        let (mut f, _) = with_running(&["proj"]);
+        // The ticket screen without its detail is the empty block; with it, the titled one.
+        for (screen, show_hidden) in LIST_SCREENS {
+            for focus in [Focus::List, Focus::Terminal] {
+                f.app.screen = screen;
+                f.app.show_hidden = show_hidden;
+                f.app.focus = focus;
+                let on_list = focus == Focus::List;
+                let buffer = render_at(&f.app, 100, 30, None);
+                let corner = if on_list { "┏" } else { "┌" };
+                let side = if on_list { "┃" } else { "│" };
+                let panel = if on_list { "┌" } else { "┏" };
+                assert_border(&buffer, (0, 0), on_list, corner);
+                assert_border(&buffer, (39, 5), on_list, side);
+                assert_border(&buffer, (40, 0), !on_list, panel);
+            }
+        }
+    }
+
+    #[test]
+    fn the_ticket_screen_with_its_detail_shows_where_the_focus_is() {
+        let (mut f, _) = with_running(&["proj"]);
+        on_ticket(&mut f, vec![], vec![]);
+        f.app.focus = Focus::List;
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_has(&buffer, "> NS-12 ");
+        assert_border(&buffer, (0, 0), true, "┏");
+        f.app.focus = Focus::Terminal;
+        assert_border(&render_at(&f.app, 100, 30, None), (0, 0), false, "┌");
+    }
+
+    /// Without an agent running the screens are those of before, byte for byte: the list keeps
+    /// the plain border without a style, and nothing on the screen is thick or cyan.
+    #[test]
+    fn without_an_agent_the_border_of_the_list_is_as_before() {
+        let mut f = fixture();
+        let mut screens = vec![Screen::Modules, Screen::Settings, Screen::ActiveAgents];
+        f.app.project = Some(project(1, "proj", "/p"));
+        f.app.ticket_rows = vec![ticket(1, "NS-1", "Um", false, false)];
+        screens.push(Screen::Tickets);
+        for screen in screens {
+            f.app.screen = screen;
+            let buffer = render(&f.app);
+            let cell = &buffer[(0, 0)];
+            assert_eq!(cell.symbol(), "┌", "{screen:?}");
+            assert_eq!(cell.fg, Color::Reset, "{screen:?}");
+            assert!(cell.modifier.is_empty(), "{screen:?}");
+            assert_eq!(
+                buffer[(99, 10)].symbol(),
+                "│",
+                "{screen:?}: the whole width"
+            );
+            assert!(buffer[(99, 10)].modifier.is_empty(), "{screen:?}");
+            for cell in buffer.content() {
+                assert_ne!(cell.fg, FOCUS_COLOR, "{screen:?}");
+                assert!(!"┏┓┗┛━┃".contains(cell.symbol()), "{screen:?}");
+            }
+        }
+    }
+
+    /// The border takes a cell on each side of the panel (NS-37): the terminal (the size of the
+    /// PTY) is inside it, whatever the size, without an underflow on a tiny panel.
+    #[test]
+    fn the_terminal_is_inside_the_border_of_the_panel() {
+        let name = "proj · Dev · NS-1";
+        let panel = Rect::new(40, 0, 60, 27);
+        assert_eq!(
+            terminal_in_panel(panel, name, true),
+            Rect::new(41, 2, 58, 24)
+        );
+        for panel in [
+            Rect::new(40, 0, 60, 27),
+            Rect::new(5, 3, 20, 10),
+            Rect::new(0, 0, 3, 3),
+            Rect::new(0, 0, 2, 2),
+            Rect::new(0, 0, 1, 1),
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 50, 1),
+        ] {
+            for jail in [true, false] {
+                let inner = Block::bordered().inner(panel);
+                let terminal = terminal_in_panel(panel, name, jail);
+                assert_eq!(terminal.union(inner), inner, "{panel:?} {jail}");
+                assert_eq!((terminal.x, terminal.width), (inner.x, inner.width));
+                assert_eq!(terminal.bottom(), inner.bottom(), "{panel:?} {jail}");
+            }
+        }
+        // agent_area, the size of each PTY, comes from the same count.
+        let (f, _) = with_running(&["proj", "fora"]);
+        let area = Rect::new(0, 0, 100, 30);
+        let panel = layout(&f.app, area).panel;
+        for agent in f.app.agents() {
+            assert_eq!(
+                agent_area(&f.app, area, agent),
+                terminal_in_panel(panel, &agent.name, agent.jail)
+            );
+        }
+    }
+
+    /// The program's cursor at (0, 0) is drawn on the first cell of the terminal, inside the
+    /// border (NS-37).
+    #[test]
+    fn the_cursor_of_the_program_is_inside_the_border() {
+        let (f, _) = with_running(&["proj"]);
+        let areas = layout(&f.app, Rect::new(0, 0, 100, 30));
+        let parser = vt100::Parser::new(areas.terminal.height, areas.terminal.width, 0);
+        let buffer = render_at(&f.app, 100, 30, Some(parser.screen()));
+        assert_eq!(buffer[(areas.terminal.x, areas.terminal.y)].symbol(), "█");
+        assert_eq!((areas.terminal.x, areas.terminal.y), (41, 2));
+        assert_eq!(buffer[(40, 2)].symbol(), "┃", "the border stays");
+    }
+
+    /// The mouse goes to the program with the coordinates of the terminal; over the border it
+    /// is outside the terminal, so it is dropped (NS-37).
+    #[test]
+    fn the_mouse_over_the_border_goes_nowhere() {
+        use crate::app::{Action, AgentTerm};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (mut f, _) = with_running(&["proj"]);
+        let terminal = layout(&f.app, Rect::new(0, 0, 100, 30)).terminal;
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let click = |column, row| event(MouseEventKind::Down(MouseButton::Left), column, row);
+        let wheel = |column, row| event(MouseEventKind::ScrollUp, column, row);
+        // Without the mouse asked by the program, the wheel scrolls only over the terminal.
+        assert_ne!(f.app.handle_mouse(&wheel(41, 2), terminal), Action::None);
+        for (column, row) in [(40, 5), (99, 5), (60, 0), (60, 26)] {
+            assert_eq!(
+                f.app.handle_mouse(&wheel(column, row), terminal),
+                Action::None
+            );
+        }
+        f.app.agent_term = AgentTerm {
+            mouse_mode: vt100::MouseProtocolMode::PressRelease,
+            mouse_encoding: vt100::MouseProtocolEncoding::Sgr,
+            ..AgentTerm::default()
+        };
+        assert_eq!(
+            f.app.handle_mouse(&click(41, 2), terminal),
+            Action::Send(b"\x1b[<0;1;1M".to_vec()),
+            "the first cell inside the border is the program's (1, 1)"
+        );
+        for (column, row) in [(40, 5), (99, 5), (60, 0), (60, 1), (60, 26)] {
+            assert_eq!(
+                f.app.handle_mouse(&click(column, row), terminal),
+                Action::None,
+                "({column}, {row})"
+            );
+        }
     }
 }

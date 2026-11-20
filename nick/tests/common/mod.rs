@@ -22,6 +22,9 @@ pub const COLS: u16 = 100;
 /// The first column of the panel of an agent at 100 columns (the list takes 40: ui.rs,
 /// `LIST_WIDTH`).
 pub const PANEL_COL: u16 = 40;
+/// The sides of the border of a panel beside an agent (NS-37): thick with the focus, plain
+/// without it.
+const PANEL_SIDES: [&str; 2] = ["┃", "│"];
 
 /// How long a case waits for a text on the screen or for the exit.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
@@ -364,12 +367,13 @@ impl Nick {
         writeln!(file, "===== {label} =====\n{}\n", self.screen()).unwrap();
     }
 
-    /// The screen as one line: the dialog borders taken out and the non-empty rows joined by a
-    /// space, so a text wrapped inside a dialog can be checked whole.
+    /// The screen as one line: the dialog borders (and the thick one of the focused list,
+    /// NS-37) taken out and the non-empty rows joined by a space, so a text wrapped inside a
+    /// dialog can be checked whole.
     pub fn flat_screen(&self) -> String {
         self.screen()
             .lines()
-            .map(|l| l.replace('│', "").trim().to_string())
+            .map(|l| l.replace(['│', '┃'], "").trim().to_string())
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
@@ -377,18 +381,43 @@ impl Nick {
 
     /// The panel of the shown agent beside the list (NS-34: the columns from `PANEL_COL` on, at
     /// 100 columns) as one line: its non-empty rows trimmed and joined by a space, so a wrapped
-    /// header reads whole.
+    /// header reads whole. Only the inside of its border (NS-37) is read: the rows with a side
+    /// of the border on `PANEL_COL` (not the top nor the bottom), without the first and the last
+    /// column. So a wrapped header does not read `seu ┃ ┃shell.`, and a rule or a box the
+    /// program draws at the ends of a row stays whole.
     pub fn panel(&self) -> String {
         let parser = self.parser();
-        let (_, cols) = parser.screen().size();
+        let screen = parser.screen();
+        let (_, cols) = screen.size();
         let start = PANEL_COL.min(cols);
-        parser
-            .screen()
-            .rows(start, cols - start)
-            .map(|row| row.trim().to_string())
+        let inside = (start + 1).min(cols);
+        screen
+            .rows(inside, cols.saturating_sub(start).saturating_sub(2))
+            .enumerate()
+            .filter(|(row, _)| {
+                let side = u16::try_from(*row)
+                    .ok()
+                    .and_then(|row| screen.cell(row, start))
+                    .map(|cell| cell.contents());
+                side.is_some_and(|side| PANEL_SIDES.contains(&side))
+            })
+            .map(|(_, row)| row.trim().to_string())
             .filter(|row| !row.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The symbol and the color of the text of the cell at `row`, `col` of the screen, from
+    /// the same cell in a single parse (empty and the default when out of it): the border of the
+    /// focused panel is `FOCUS_COLOR` (NS-37). By the cell, and not by the text of `screen`,
+    /// so a wide character before `col` does not shift it.
+    pub fn cell(&self, row: u16, col: u16) -> (String, vt100::Color) {
+        self.parser()
+            .screen()
+            .cell(row, col)
+            .map_or((String::new(), vt100::Color::Default), |cell| {
+                (cell.contents().to_string(), cell.fgcolor())
+            })
     }
 
     /// Waits until `needle` is in the panel of the shown agent (`panel`).

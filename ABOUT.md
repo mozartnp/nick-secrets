@@ -2465,7 +2465,9 @@ no molde do `projects.rs`, e o esquema na migração 2 (`nick/src/db/migrations.
 Em especial, nenhuma cria `.nick/docs/<ID>/`: essa pasta continua sendo do `auto_scrum.sh`. Um
 teste de unidade (`tickets.rs`) e um de integração no PTY (`tests/tui.rs`) provam isso com o
 retrato recursivo da pasta (`tests/common/snapshot.rs`). A lista também não importa as pastas
-`.nick/docs/<ID>/` que já existem.
+`.nick/docs/<ID>/` que já existem. **Desde o NS-36**, o "Editar ID" renomeia a pasta
+`.nick/docs/<ID>/` do ticket, a única escrita do nick no projeto (seção "Rust no projeto: etapa
+do ticket, histórico e edição do ID (NS-36)").
 
 **UUID provisório:** sem o ID do Jira, o nick gera um ID de **8 caracteres hexadecimais
 minúsculos** com o próprio SQLite (`lower(hex(randomblob(4)))`), sem crate de UUID nem de
@@ -2476,7 +2478,8 @@ novo.`, e nada é gravado. O gerador é injetável (`tickets::create_with`), com
 `Db::open_with`, e os testes provam a colisão com um gerador falso. O ID é local à máquina:
 ainda não há como evitar a colisão entre máquinas (Q7 do épico). A coluna `is_provisional` existe
 para que a F4 (Q8) saiba qual ID trocar pelo do Jira. Só pelo texto não dá para saber, porque
-`deadbeef` e `24` são IDs válidos do Jira.
+`deadbeef` e `24` são IDs válidos do Jira. (Desde o NS-36, o "Editar ID" troca o ID e zera o
+`is_provisional`: seção "Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)".)
 
 **O título é digitado pelo operador e guardado no banco.** O nick não lê o `plan.md` nem o Jira
 para preencher o título. A lista precisa de um rótulo antes de existir plano, e ler o plano ou o
@@ -3060,7 +3063,9 @@ bash; o rótulo do plano mostra esse padrão com o ID digitado no momento.
 
 **O ID vem do ticket, editável, e o nome do agente fica com o ID do ticket.** O campo do ID nasce
 com o `ticket.key`. Se o operador o troca, o prompt usa o ID digitado, mas o nome do agente
-continua `<projeto> · <Etapa> · <ID do ticket>` (a troca do ID do ticket é da F4b). O banco não
+continua `<projeto> · <Etapa> · <ID do ticket>` (a troca do ID do ticket é da F4b; desde o
+NS-36, depois de um "Editar ID", os agentes novos usam o ID novo, e os já registrados mantêm o
+nome antigo). O banco não
 mudou (nenhuma migração): `agents.stage` continua com a `Stage`, e o tipo não é gravado
 (histórico e etapa atual são do NS-36).
 
@@ -3186,3 +3191,197 @@ editor, que só interrompe o editor.
 
 A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nick. O roteiro fica em
 `.nick/docs/NS-35/verificacao_manual.md`, para o analista executar fora dela.
+
+## Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)
+
+A fatia F4b do épico NS-28. O ticket ganha uma **etapa atual**, com histórico, uma **tela do
+ticket** e a ação **"Editar ID"**, que renomeia a pasta `.nick/docs/<ID>/`.
+
+**As cinco etapas e quem as muda.** `PO`, `Tech Leader`, `Dev`, `Review` e `Concluído`
+(`tickets::TicketStage`; as quatro primeiras reaproveitam a chave e o rótulo de `agents::Stage`,
+e a `Done` é a única só do ticket). A etapa é **só um registro**: o operador a muda para
+qualquer uma, para a frente ou para trás, pela tela do ticket (`m`), com confirmação `(s/N)`.
+**O nick nunca muda a etapa sozinho**: abrir um agente, o fim dele, encerrá-lo pelo operador ou
+ao sair não tocam a etapa nem o histórico, e nada impede abrir um Dev com o ticket em PO. A
+etapa também não fecha nem esconde agente nenhum (mudar para Concluído deixa o agente vivo do
+ticket como estava). O único caminho que grava a etapa é `tickets::change_stage`, chamado só
+pela confirmação do diálogo (`Dialog::ConfirmStageChange`). Um teste estrutural
+(`the_stage_is_only_written_by_the_confirmation_of_the_operator`, em `nick/tests/agent.rs`,
+com controle positivo) cobra isso no código de produção: `change_ticket_stage` só no
+`db/mod.rs` e no `tickets.rs`, `change_stage` numa única chamada no `app.rs` dentro da
+confirmação, e nenhum `UPDATE tickets SET stage` nem `ticket_stage_changes` fora de `src/db/`.
+
+**Banco: migração 5.** `tickets.stage TEXT NOT NULL DEFAULT 'po'` com `CHECK` nas cinco chaves
+(`po`, `tech_leader`, `development`, `review`, `done`), e a tabela `ticket_stage_changes (id,
+ticket_id → tickets ON DELETE CASCADE, from_stage, to_stage, changed_at)`, com o mesmo `CHECK`
+nas duas etapas e `from_stage <> to_stage`. Os tickets que já existiam ficam em `po` pelo
+`DEFAULT`, e um ticket novo nasce lá (o `insert_ticket` não mudou). **Por que `CHECK` aqui e
+não no `agents.state`:** as cinco etapas são o fluxo do auto_scrum, e não um conjunto que a F5
+vai aumentar; uma etapa nova viria com uma migração que recria a coluna. O histórico guarda
+**só as mudanças** (a criação já tem o `created_at`; um ticket sem mudança tem o histórico vazio,
+"começou em PO"), sem autor (um operador só), e sai com o ticket, que sai com o projeto (a
+confirmação de remoção do projeto não mudou). A mudança é `Db::change_ticket_stage`, numa
+transação (`unchecked_transaction`, porque o `Db` tem `&self`): `UPDATE ... WHERE id = ? AND
+stage = <origem>` e o `INSERT` do histórico entram juntos ou nenhum entra (provado com um
+gatilho de teste que faz o `INSERT` falhar). Com 0 linhas, nada é gravado, e o resultado diz se
+o ticket sumiu (`O ticket <ID> não existe mais no banco.`) ou se outro nick mudou a etapa nesse
+meio-tempo (`A etapa do ticket <ID> mudou em outro nick. Nada foi gravado.`). A mesma etapa é
+recusada (`O ticket <ID> já está em <etapa>.`). Uma chave desconhecida no banco (o `CHECK`
+impede) aparece crua na tela, sem `panic!`.
+
+**Tela do ticket** (`Screen::Ticket`; `Enter`/`→` na lista, inclusive num oculto com o filtro;
+`Esc`/`←` voltam com o mesmo ticket selecionado). Mostra o ID, o título e as marcas, a etapa
+atual, o plano e o review (`Plano (existe):  .nick/docs/<ID>/plan.md` e o mesmo para o
+`review.md`, com `(não existe)`; o estado vem antes do caminho para não ser cortado a 40
+colunas, como a etapa logo depois do ID na lista: P3 do review do NS-36),
+o histórico do mais antigo para o mais novo (data `AAAA-MM-DD HH:MM UTC`, por fatia de string,
+sem crate de data; um valor fora do formato aparece cru; se não couber, as mais novas e
+`(+N mudanças mais antigas)` no topo da seção) e os agentes do ticket de todas as etapas, numa
+lista com seleção: `● vivo` (este nick o roda), `ativo em outro nick` (linha `active` sem
+sessão aqui) ou `encerrado`. `Enter`/`→` num vivo o exibe com o foco no terminal, **qualquer que
+seja a etapa**; num não vivo, a barra diz `O agente <nome> não está rodando neste nick.` (retomar
+é da F5). `m` muda a etapa, `i` edita o ID, `g` abre um agente (a mesma função `choose_stage`
+do `g` da lista, que passou a receber o ticket, com as mesmas recusas), `v` abre "Agentes
+ativos" (o `Esc` dela volta para a tela do ticket) e `q`/`Ctrl+C` seguem as regras de sair. A
+tela é relida depois de cada ação e quando um agente abre ou termina (o ticket pelo
+`Db::get_ticket`, pelo `id`, sem reler a lista do projeto: P3 do review do NS-36); um ticket que
+sumiu do banco volta para a lista com a mensagem. Com agente vivo, a tela fica na coluna da esquerda
+(40 colunas), e o fim das linhas longas é cortado, como na lista (achado do NS-34).
+
+**Artefatos lidos do disco na hora** (`nick/src/docs.rs`, novo): `docs::artifacts` faz um
+`is_file()` de cada arquivo a cada atualização da tela, sem cache, sem ler o conteúdo e sem
+copiar nada para o banco (uma pasta chamada `plan.md` não conta). **Aviso de plano ausente** no
+formulário do Dev e do Review (NS-35): com o campo do plano vazio, um ID válido no campo do ID e
+sem `.nick/docs/<ID>/plan.md`, o formulário mostra em amarelo, acima dos campos, `Aviso: não
+existe .nick/docs/<ID>/plan.md. Informe outro caminho no campo do plano, ou siga sem ele.`. A
+conta roda ao abrir o formulário e a cada tecla nele (um `stat`), e fica no estado do diálogo
+(`plan_missing`): o `ui.rs` não lê o disco. Com um caminho digitado no plano não há checagem (o
+script também não confere), e com o ID vazio ou inválido não há aviso (a validação já recusa).
+**O aviso não impede nada**: `Enter` segue para o `--render`, e o `warn_legacy_plan` do bash
+continua na prévia.
+
+**Fonte única do caminho do plano** (P2 do review do NS-36): o rótulo do campo do plano do
+NS-35 (`stages::field_label`) passou a montar o `.nick/docs/<ID>/plan.md` pelo
+`docs::plan_path`, como o aviso do plano no mesmo formulário. A saída não mudou: o teste do
+rótulo do NS-35 passou sem mudança.
+
+**Concluído não oculta.** A lista mostra a etapa logo depois do ID (`<ID>  [<etapa>]  <título>
+[provisório]  [oculto]`), porque com agente vivo a lista tem 40 colunas e o fim da linha é
+cortado. Os concluídos aparecem com `[✓ Concluído]` em verde e **continuam na lista**: só o `o`
+os oculta, e o filtro não mudou.
+
+**"Editar ID"** (`i` na tela do ticket; `tickets::edit_id`, com o `edit_id_with` que recebe a
+gravação do banco por parâmetro para os testes, no molde do `create_with`). Vale para um ticket
+provisório ou com ID do Jira. Ordem, e cada recusa sai sem mudar nada:
+1. o ID novo é aparado como na criação; vazio → `Informe o novo ID do ticket.`;
+2. `jira_id_valid` → `INVALID_ID_MESSAGE`;
+3. igual ao atual → `O ID não mudou.` (outra caixa é outro ID: `BINARY`, como o nome de pasta);
+4. a unicidade no projeto, visível ou oculto (os textos da criação);
+5. agente `active` do ticket → `O ticket <ID> tem agente ativo. Encerre os agentes dele antes de
+   editar o ID: o prompt deles cita a pasta .nick/docs/<ID>/.`. Vale também para o `active` de
+   outro nick aberto e para o de um nick que morreu, até a limpeza da próxima abertura (NS-33):
+   a recusa é o lado seguro;
+6. a pasta `.nick/docs/<antigo>/` é renomeada **primeiro** (`docs::rename`): sem ela, nada é
+   feito nem criado (nem `.nick/docs/`); com destino existente, de qualquer tipo (pasta, mesmo
+   vazia, arquivo ou link), `Já existe a pasta .nick/docs/<novo>/ no projeto. Nada foi mudado.`;
+7. o banco é gravado **depois** (`update_ticket_key`, condicionado ao ID antigo, com
+   `is_provisional = 0`: o ID digitado nunca é provisório, mesmo o UUID de antes com outra
+   caixa). Sucesso: `ID atualizado: <antigo> → <novo>.`, mais ` A pasta .nick/docs/<antigo>/
+   virou .nick/docs/<novo>/.` quando houve pasta. Se o banco falhar (o ticket sumiu, o ID mudou
+   em outro nick, o `UNIQUE` de um ID criado nesse meio-tempo ou outro erro), a renomeação é
+   desfeita, e a mensagem do banco ganha ` A pasta voltou para .nick/docs/<antigo>/.`. Se o
+   desfazer falhar, a mensagem diz onde a pasta ficou e que o ticket continua com o ID antigo.
+   **Nada é apagado nem mesclado para "consertar".**
+
+O diálogo abre com o ID atual, o `Enter` faz as checagens 1 a 5 sem renomear (a recusa fica na
+barra, com o diálogo aberto), e a confirmação `(s/N)` diz se a pasta será renomeada e que `A
+branch do git, o ticket no Jira e os agentes já registrados não mudam.`. O `s` chama o
+`edit_id`, que refaz todas as checagens. O projeto indisponível é recusado ao abrir o diálogo
+(`Projeto indisponível: <marca>. O ID só é editado com a pasta e o .nick/nick.conf no lugar.`).
+
+**`renameat2(RENAME_NOREPLACE)`, e não `std::fs::rename`:** o `rename(2)` troca em silêncio um
+diretório vazio no destino, e a edição nunca pode sobrescrever nem mesclar pastas. O
+`symlink_metadata` antes da renomeação recusa o destino que já existe, e o `RENAME_NOREPLACE`
+cobre a janela entre a checagem e a renomeação (o `EEXIST` vira a mesma recusa). O teste que
+prova isso cria a pasta vazia nessa janela, por um gancho do `rename_with` (privado): na
+sabotagem, só ele pegou a troca por `std::fs::rename`, porque a checagem anterior já recusava o
+destino existente. O desfazer usa o mesmo `RENAME_NOREPLACE`. O `renameat2` do `nix` existe em
+Linux com glibc, a plataforma do nick. **A feature `fs` do `nix` foi a única mudança no
+`Cargo.toml`**: ela não puxa crate nenhum, e o `Cargo.lock` não mudou.
+
+**A única escrita do nick num projeto é essa renomeação.** Um teste estrutural
+(`no_source_but_docs_rs_writes_in_a_project`, com controle positivo) proíbe no código de
+produção, fora do `docs.rs`, `renameat2`, `fs::rename`, `remove_dir`, `remove_file`,
+`create_dir`, `fs::write`, `File::create` e `OpenOptions`, menos os usos que já existiam e não
+tocam projeto: a trava de cada agente, no diretório de estado do nick (`agents.rs`, NS-33, com
+`OpenOptions` e `remove_file`). O temporário do editor (NS-35) é um `NamedTempFile`, fora dessa
+lista. Os dois estruturais novos olham só o código de produção (sem o `mod tests` e sem
+comentários), porque os testes de unidade gravam arquivos de propósito. O estrutural do NS-35
+que proíbe nomes de template ganhou uma isenção só para o `review.md` no `src/docs.rs`
+(decisão do usuário no NS-36): ali ele é o artefato do ticket, e não o template; as outras
+regras continuam valendo para o arquivo, e o controle positivo continua pegando o nome em
+outro fonte.
+
+**O que não acompanha a edição** (fora do escopo, dito também na confirmação): a branch do git,
+o ticket no Jira, o nome dos agentes já registrados (`agents.name` não muda; os agentes novos
+usam o ID novo) e o histórico da conversa dos agentes encerrados (pendência para a F5). A pasta
+renomeada pode estar versionada num projeto que mudou o `.nick/.gitignore`, e aí o git vê
+arquivos apagados e criados (impacto aceito no ticket). Renomear também muda o mtime de
+`.nick/docs/`, a pasta-mãe: os retratos dos testes de sucesso ignoram só esse mtime.
+
+**Rodapés.** Tela do ticket: `↑/↓ mover · Enter abrir agente · m mudar etapa · i editar ID · g
+novo agente · Esc voltar · q sair`, com o `v agentes ativos (N)` do NS-34 quando há agente vivo.
+Lista de tickets: ganhou `Enter detalhes`, **depois de `g abrir agente`**. Logo depois de `↑/↓
+mover`, ele levava a quebra da linha para o meio de `g abrir agente` (o `g` sozinho no fim da
+primeira linha), e os testes de PTY que esperam esse texto deixariam de achá-lo; assim a quebra
+cai num separador. Os diálogos novos: `↑/↓ escolher · Enter escolher · Esc cancelar`, `s mudar ·
+qualquer outra tecla cancela`, `Enter confirmar · Esc cancelar` e `s trocar · qualquer outra
+tecla cancela`. A tela do ticket entrou no `LIST_SCREENS`, para a altura fixa do rodapé com
+agente vivo (P1 do review do NS-34). Hoje o rodapé dela cabe nas linhas do rodapé da lista de
+tickets em qualquer largura (conferido de 10 a 219 colunas), então a altura não mudaria sem
+ela: a entrada protege contra uma mudança futura do rodapé. Por isso o teste da altura não
+pegou a sabotagem, e entrou o `every_list_screen_is_in_list_screens`, com um `match` exaustivo
+que obriga uma tela nova a entrar na lista.
+
+**Testes adaptados, com o motivo:**
+- `nick/src/db/mod.rs`: `a_new_database_gets_version_5_with_auto_scrum_and_no_project` (era o
+  da versão 4; renomeado), `opening_twice_duplicates_nothing` (versão 5),
+  `the_schema_has_only_modules_projects_tickets_agents_settings_and_stage_changes` (inclui
+  `ticket_stage_changes`; renomeado), `a_newer_database_is_refused_without_being_written` e
+  `a_database_one_version_newer_is_refused_too` (citam a `(5)`, e o "um a mais" é a 6) e
+  `migration_1_is_pinned` (5 migrações e o texto da 5). Os testes de migração v2 → v3 e v3 → v4
+  passaram a gravar e ler os tickets do banco antigo por helpers de SQL cru
+  (`old_insert_ticket`, `old_tickets`), com as colunas da migração 2 (decisão do usuário no
+  NS-36): com o `stage` no `TICKET_COLUMNS`, o `insert_ticket`/`list_tickets` falham num banco
+  anterior à 5. As asserções comparam os mesmos campos de antes, e o v3 → v4 passou a abrir só
+  com as migrações 1 a 4;
+- `nick/src/ui.rs`: o literal de `Ticket` ganhou o `stage` (só sintaxe), o `form` dos testes
+  ganhou `plan_missing: false` (só sintaxe), as linhas da lista ganharam a etapa
+  (`the_tickets_screen_lists_id_and_title_with_the_provisional_mark`,
+  `with_the_filter_the_hidden_ones_are_dimmed_and_marked` e
+  `control_characters_in_tickets_are_shown_as_question_marks`), o rodapé da lista ganhou `Enter
+  detalhes` (os dois primeiros e `the_lists_say_how_many_agents_run_only_with_agents`), e
+  `the_terminal_keeps_its_size_whatever_the_focus_the_marks_and_the_dialog` ganhou a tela do
+  ticket no laço;
+- `nick/tests/tui.rs`: as linhas da lista ganharam a etapa
+  (`the_ticket_flow_works_and_touches_no_file_of_the_project` e
+  `the_tickets_of_a_project_do_not_show_in_another`);
+- `nick/tests/agent.rs`: a isenção do `review.md` no `src/docs.rs` em
+  `no_rust_source_builds_the_prompt_nor_reads_the_config` (acima).
+
+Os testes do "nada no projeto" do NS-32 passaram sem mudança, e o bash (`auto_scrum.sh`,
+`prompt.sh`, `bin/nick-agent`, templates) não mudou. O harness do PTY ganhou o `keep_screen`, que
+grava a tela num arquivo só quando a variável `NICK_TEST_SCREENS` está definida (as telas da
+validação do ticket); sem ela, não faz nada.
+
+**Testes novos:** `db` (migração v4 → v5 com dados, os `CHECK`, o cascade, o tudo ou nada, o
+`Gone`/`Moved` e as consultas), `tickets` (`TicketStage`, `change_stage` e os casos do "Editar
+ID", cada um com o retrato recursivo do projeto), `docs` (caminhos, artefatos, renomeação,
+destino pasta vazia/arquivo/link, a pasta que aparece depois da checagem e o desfazer), `app`
+(tela do ticket, `m`, `i`, `g`/`v`, a etapa que não muda sozinha e o aviso do plano), `ui` (a
+lista com a etapa, a tela do ticket, o corte do histórico, os estados dos agentes, os diálogos e
+o aviso amarelo), os dois estruturais (`nick/tests/agent.rs`) e, no PTY, `tui.rs` (mudar a
+etapa até Concluído, o plano lido do disco, o "Editar ID" com a pasta e com o destino
+existente) e `agent.rs` (o agente vivo aberto da tela do ticket depois de mudar a etapa, o `i`
+recusado com agente vivo e o formulário do Dev sem plano). As sabotagens e as telas ficam em
+`.nick/docs/NS-36/`.

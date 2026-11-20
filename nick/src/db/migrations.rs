@@ -71,5 +71,34 @@ CREATE TABLE settings (
 );
 ";
 
+/// Migration 5 (NS-36): the current stage of each ticket and the history of its changes. The
+/// existing tickets get `po` by the DEFAULT, and a new one is born there too. Unlike
+/// `agents.state`, the stage has a CHECK: the five stages are the flow of auto_scrum, not a set
+/// the F5 will grow; a new stage comes with a migration that rebuilds the column. The history
+/// keeps only the changes (the creation is the `created_at` of the ticket, so a ticket never
+/// changed has an empty history, "it started in PO"), without who changed it (a single
+/// operator), and goes with its ticket (ON DELETE CASCADE), which goes with its project. Only
+/// the operator changes the stage (`tickets::change_stage`); the nick never does it alone.
+pub const MIGRATION_5: &str = "\
+ALTER TABLE tickets ADD COLUMN stage TEXT NOT NULL DEFAULT 'po'
+    CHECK (stage IN ('po', 'tech_leader', 'development', 'review', 'done'));
+CREATE TABLE ticket_stage_changes (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    from_stage TEXT NOT NULL
+               CHECK (from_stage IN ('po', 'tech_leader', 'development', 'review', 'done')),
+    to_stage   TEXT NOT NULL
+               CHECK (to_stage IN ('po', 'tech_leader', 'development', 'review', 'done')),
+    changed_at TEXT NOT NULL,   -- RFC 3339, in UTC
+    CHECK (from_stage <> to_stage)
+);
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
-pub const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4];
+pub const MIGRATIONS: &[&str] = &[
+    MIGRATION_1,
+    MIGRATION_2,
+    MIGRATION_3,
+    MIGRATION_4,
+    MIGRATION_5,
+];

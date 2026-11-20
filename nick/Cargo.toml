@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.29.0"
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process", "fs"] }
 portable-pty = "0.9"
 ratatui = "0.30.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }

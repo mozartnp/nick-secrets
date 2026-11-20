@@ -481,7 +481,7 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
 
     new_ticket(&mut nick, "Corrigir o login", "NS-7");
     nick.wait_for("Ticket criado: NS-7 — Corrigir o login.");
-    nick.wait_for("NS-7  Corrigir o login");
+    nick.wait_for("NS-7  [PO]  Corrigir o login");
 
     new_ticket(&mut nick, "Sem ID ainda", "");
     nick.wait_for("Ticket criado com o ID provisório");
@@ -492,7 +492,7 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     assert_eq!(provisional.len(), 8);
     assert!(
         nick.screen()
-            .contains(&format!("{provisional}  Sem ID ainda  [provisório]"))
+            .contains(&format!("{provisional}  [PO]  Sem ID ainda  [provisório]"))
     );
 
     // A blank title is refused and the dialog keeps what was typed.
@@ -516,14 +516,14 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     nick.send("senha");
     nick.send(ENTER);
     nick.wait_for("Título atualizado: NS-7.");
-    nick.wait_for("NS-7  Corrigir o senha");
+    nick.wait_for("NS-7  [PO]  Corrigir o senha");
 
     // Hide it: `n` cancels, `s` confirms and it leaves the list.
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("n");
     nick.wait_for("f mostrar ocultos");
-    assert!(nick.screen().contains("NS-7  Corrigir o senha"));
+    assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("s");
@@ -537,14 +537,14 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     // The filter shows it as [oculto], and `o` restores it.
     nick.send("f");
     nick.wait_for("(com ocultos)");
-    nick.wait_for("NS-7  Corrigir o senha  [oculto]");
+    nick.wait_for("NS-7  [PO]  Corrigir o senha  [oculto]");
     nick.wait_for("f esconder ocultos");
     nick.send("\x1b[A");
     nick.send("o");
     nick.wait_for("Ticket restaurado: NS-7.");
     nick.send("f");
     nick.wait_for("f mostrar ocultos");
-    assert!(nick.screen().contains("NS-7  Corrigir o senha"));
+    assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
     assert!(!nick.screen().contains("[oculto]"));
 
     // Back to the projects, with it still there.
@@ -607,7 +607,7 @@ fn the_tickets_of_a_project_do_not_show_in_another() {
     world.ticket(&alfa, "NS-1", "Só do alfa");
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "alfa");
-    nick.wait_for("NS-1  Só do alfa");
+    nick.wait_for("NS-1  [PO]  Só do alfa");
     nick.send(ESC);
     nick.wait_for("auto_scrum > Projetos");
     nick.send(DOWN);
@@ -663,4 +663,203 @@ fn removing_a_project_with_tickets_deletes_them_and_no_other() {
         [("B-1".into(), "do beta".into(), false)]
     );
     assert_eq!(common::snapshot(&alfa), before);
+}
+
+// ---- the stage of the ticket and editing its ID (NS-36) ----
+
+/// The stored stage of the ticket `key` (any project).
+fn stage_of(world: &World, key: &str) -> String {
+    let db = nick::db::Db::open(&world.db_path()).unwrap();
+    db.connection()
+        .query_row("SELECT stage FROM tickets WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// On the ticket screen: `m`, ↓ from the current stage until `label` (each ↓ waits), Enter,
+/// the confirmation and `s`.
+fn change_stage(nick: &mut common::Nick, label: &str) {
+    nick.send("m");
+    nick.wait_for("Para qual etapa?");
+    nick.keep_screen("diálogo de mudar etapa");
+    while !nick.screen().contains(&format!("> {label}")) {
+        let before = nick.screen();
+        nick.send(DOWN);
+        nick.wait_until("the selection to move", || nick.screen() != before);
+    }
+    nick.send(ENTER);
+    nick.wait_for("(s/N)");
+    nick.keep_screen("confirmação da mudança de etapa");
+    nick.send("s");
+    nick.wait_for("Etapa do ticket");
+}
+
+#[test]
+fn the_operator_changes_the_stage_and_done_stays_on_the_list() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    new_ticket(&mut nick, "Corrigir o login", "NS-7");
+    nick.wait_for("NS-7  [PO]  Corrigir o login");
+    nick.keep_screen("lista de tickets com a etapa");
+    nick.send(ENTER);
+    nick.wait_for("m mudar etapa");
+    nick.wait_for("Etapa atual: PO");
+    nick.wait_for("Nenhuma mudança: o ticket começou em PO.");
+    nick.keep_screen("tela do ticket sem histórico");
+    change_stage(&mut nick, "Review");
+    nick.wait_for("Etapa do ticket NS-7: PO → Review.");
+    nick.wait_for("Etapa atual: Review");
+    nick.wait_for("UTC  PO → Review");
+    assert_eq!(stage_of(&world, "NS-7"), "review");
+    nick.send(ESC);
+    nick.wait_for("Enter detalhes");
+    nick.wait_for("NS-7  [Review]  Corrigir o login");
+    nick.send(ENTER);
+    nick.wait_for("m mudar etapa");
+    change_stage(&mut nick, "Concluído");
+    nick.wait_for("Etapa do ticket NS-7: Review → Concluído.");
+    nick.wait_for("UTC  Review → Concluído");
+    nick.keep_screen("tela do ticket com histórico");
+    nick.send(ESC);
+    nick.wait_for("Enter detalhes");
+    nick.wait_for("NS-7  [✓ Concluído]  Corrigir o login");
+    nick.keep_screen("lista com um ticket concluído");
+    assert_eq!(stage_of(&world, "NS-7"), "done");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_ticket_screen_reads_the_plan_from_the_disk() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    world.ticket(&proj, "NS-7", "Com plano");
+    let docs = proj.join(".nick/docs/NS-7");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("plan.md"), "# plano\n").unwrap();
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.send(ENTER);
+    nick.wait_for("Plano (existe):  .nick/docs/NS-7/plan.md");
+    nick.wait_for("Review (não existe):  .nick/docs/NS-7/review.md");
+    nick.keep_screen("tela do ticket com o plano");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// `snapshot` with `.nick/docs/<old>` moved to `.nick/docs/<new>`, without the mtime of
+/// `.nick/docs` (renaming an entry changes its parent's mtime, nothing else).
+fn renamed(
+    snap: std::collections::BTreeMap<std::path::PathBuf, common::snapshot::Entry>,
+    old: &str,
+    new: &str,
+) -> std::collections::BTreeMap<std::path::PathBuf, common::snapshot::Entry> {
+    let from = Path::new(".nick/docs").join(old);
+    let to = Path::new(".nick/docs").join(new);
+    snap.into_iter()
+        .map(|(k, mut v)| {
+            if k == Path::new(".nick/docs") {
+                v.modified = std::time::UNIX_EPOCH;
+            }
+            match k.strip_prefix(&from) {
+                Ok(rest) => (to.join(rest), v),
+                Err(_) => (k, v),
+            }
+        })
+        .collect()
+}
+
+/// On the ticket screen: `i`, the current ID erased, `new` typed, Enter.
+fn type_new_id(nick: &mut common::Nick, current: &str, new: &str) {
+    nick.send("i");
+    nick.wait_for("Novo ID do ticket (ex: SC-123):");
+    nick.send(&"\x7f".repeat(current.chars().count()));
+    nick.send(new);
+    nick.send(ENTER);
+    nick.wait_for("Trocar o ID");
+}
+
+#[test]
+fn editing_the_id_renames_only_the_docs_folder() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    fs::write(proj.join("README.md"), "# proj\n").unwrap();
+    world.register(&proj);
+    world.ticket(&proj, "", "Sem ID");
+    let uuid = world.tickets(Some(&proj))[0].0.clone();
+    let docs = proj.join(".nick/docs").join(&uuid);
+    fs::create_dir_all(docs.join("prints")).unwrap();
+    fs::write(docs.join("plan.md"), "# plano\n").unwrap();
+    fs::write(docs.join("prints/tela.txt"), "tela\n").unwrap();
+    let before = common::snapshot(&proj);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.send(ENTER);
+    nick.wait_for("m mudar etapa");
+    nick.send("i");
+    nick.wait_for("Novo ID do ticket (ex: SC-123):");
+    nick.keep_screen("diálogo de editar ID");
+    nick.send(ESC);
+    nick.wait_for("m mudar etapa");
+    type_new_id(&mut nick, &uuid, "NS-99");
+    let flat = nick.flat_screen();
+    assert!(
+        flat.contains(&format!(
+            "Trocar o ID {uuid} por NS-99? A pasta .nick/docs/{uuid}/ será renomeada para \
+             .nick/docs/NS-99/. A branch do git, o ticket no Jira e os agentes já registrados \
+             não mudam. (s/N)"
+        )),
+        "{flat}"
+    );
+    nick.keep_screen("confirmação de editar ID com a pasta");
+    nick.send("s");
+    nick.wait_for(&format!("ID atualizado: {uuid} → NS-99."));
+    nick.wait_for("auto_scrum > proj > NS-99");
+    nick.keep_screen("tela do ticket depois de editar o ID");
+    assert_eq!(
+        renamed(common::snapshot(&proj), "", ""),
+        renamed(before, &uuid, "NS-99"),
+        "only the name of the folder changed"
+    );
+    assert_eq!(
+        world.tickets(Some(&proj)),
+        [("NS-99".into(), "Sem ID".into(), false)]
+    );
+    nick.send(ESC);
+    nick.wait_for("Enter detalhes");
+    assert!(!nick.screen().contains("[provisório]"));
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn editing_the_id_onto_an_existing_folder_is_refused_and_changes_nothing() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    world.ticket(&proj, "NS-1", "Um");
+    fs::create_dir_all(proj.join(".nick/docs/NS-1")).unwrap();
+    fs::write(proj.join(".nick/docs/NS-1/plan.md"), "# plano\n").unwrap();
+    fs::create_dir_all(proj.join(".nick/docs/NS-99")).unwrap();
+    let before = common::snapshot(&proj);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.send(ENTER);
+    nick.wait_for("m mudar etapa");
+    type_new_id(&mut nick, "NS-1", "NS-99");
+    nick.send("s");
+    nick.wait_for("Já existe a pasta .nick/docs/NS-99/ no projeto. Nada foi mudado.");
+    nick.keep_screen("recusa de editar ID com o destino existente");
+    assert_eq!(common::snapshot(&proj), before);
+    assert_eq!(
+        world.tickets(Some(&proj)),
+        [("NS-1".into(), "Um".into(), false)]
+    );
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
 }

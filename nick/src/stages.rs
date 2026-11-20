@@ -7,6 +7,7 @@
 //! --render`), and nothing here reads a template or the project config.
 
 use crate::agents::Stage;
+use crate::docs;
 use crate::tickets::{INVALID_ID_MESSAGE, jira_id_valid};
 
 /// A type of conversation of the auto_scrum menu (`$TYPE` of the script).
@@ -230,10 +231,7 @@ pub fn trim_read(text: &str) -> &str {
 /// sent to the prompt is computed by bash).
 pub fn field_label(field: &Field, jira_id: &str) -> String {
     match field.rule {
-        Rule::Plan => format!(
-            "{PLAN_LABEL_START}.nick/docs/{}/plan.md)",
-            trim_read(jira_id)
-        ),
+        Rule::Plan => format!("{PLAN_LABEL_START}{})", docs::plan_path(trim_read(jira_id))),
         _ => field.label.to_string(),
     }
 }

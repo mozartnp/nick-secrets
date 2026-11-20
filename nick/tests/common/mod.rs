@@ -350,6 +350,20 @@ impl Nick {
         self.parser().screen().contents()
     }
 
+    /// Appends the screen now, under `label`, to the file named by `NICK_TEST_SCREENS`, when it
+    /// is set (NS-36: the screens of the validation of a ticket); otherwise does nothing.
+    pub fn keep_screen(&self, label: &str) {
+        let Some(path) = std::env::var_os("NICK_TEST_SCREENS") else {
+            return;
+        };
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "===== {label} =====\n{}\n", self.screen()).unwrap();
+    }
+
     /// The screen as one line: the dialog borders taken out and the non-empty rows joined by a
     /// space, so a text wrapped inside a dialog can be checked whole.
     pub fn flat_screen(&self) -> String {

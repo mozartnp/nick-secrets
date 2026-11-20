@@ -9,6 +9,7 @@ pub mod agent_session;
 pub mod agents;
 pub mod app;
 pub mod db;
+pub mod docs;
 pub mod editor;
 pub mod init;
 pub mod keys;

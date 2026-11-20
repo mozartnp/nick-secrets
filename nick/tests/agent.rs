@@ -1500,8 +1500,20 @@ fn prompt_violations(source: &str) -> Vec<String> {
 #[test]
 fn no_rust_source_builds_the_prompt_nor_reads_the_config() {
     for (name, source) in sources() {
-        assert_eq!(prompt_violations(&source), Vec::<String>::new(), "{name}");
+        let mut violations = prompt_violations(&source);
+        // NS-36 (decision of the user): src/docs.rs names the artifact of the ticket,
+        // `.nick/docs/<ID>/review.md`, not the template of the Review; only that name is
+        // exempt there, every other rule still applies to it.
+        if Path::new(&name).ends_with("src/docs.rs") {
+            violations.retain(|v| v != "review.md");
+        }
+        assert_eq!(violations, Vec::<String>::new(), "{name}");
     }
+    // The exemption is only of docs.rs: the same name elsewhere is still caught.
+    assert_eq!(
+        prompt_violations("pub const REVIEW_FILE_NAME: &str = \"review.md\";"),
+        ["review.md"]
+    );
     // Positive control: the filter sees each kind of violation, and not a comment.
     for bad in [
         "let t = root.join(\"auto_scrum/templates/\");",
@@ -1524,4 +1536,316 @@ fn no_rust_source_builds_the_prompt_nor_reads_the_config() {
         prompt_violations("let log = \"logs/x_1.md\"; let p = \"plan.md\";"),
         Vec::<String>::new()
     );
+}
+
+// ---- structure: the stage of a ticket and the writes in a project (NS-36) ----
+
+/// The production code of a source: without its `#[cfg(test)] mod tests` (the unit tests write
+/// files and call everything on purpose) and without comment lines.
+fn production(source: &str) -> String {
+    let code = source
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap_or_default();
+    code.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The violations of the stage rule (plan D2/D9 of NS-36) in the production code of the file
+/// `name` (a path ending in `src/...`): `change_ticket_stage` only in db/mod.rs (its
+/// definition) and in tickets.rs (`change_stage`); `change_stage(` only in tickets.rs and, in
+/// app.rs, a single call inside the confirmation of the dialog; no write of the stage nor of
+/// its history outside src/db/.
+fn stage_violations(name: &str, code: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let file = name.rsplit("src/").next().unwrap_or(name);
+    if code.contains("change_ticket_stage") && !matches!(file, "db/mod.rs" | "tickets.rs") {
+        violations.push("change_ticket_stage outside db/ and tickets.rs".into());
+    }
+    let calls: Vec<usize> = code
+        .match_indices("change_stage(")
+        .map(|(at, _)| at)
+        .filter(|at| !code[..*at].ends_with("ticket_"))
+        .collect();
+    match file {
+        "tickets.rs" | "db/mod.rs" => {}
+        "app.rs" => {
+            if calls.len() != 1 {
+                violations.push(format!("{} calls of change_stage in app.rs", calls.len()));
+            }
+            for at in &calls {
+                let before = &code[at.saturating_sub(600)..*at];
+                let arm = before.rfind("Some(Dialog::ConfirmStageChange");
+                let other = before.rfind("Some(Dialog::").filter(|o| Some(*o) != arm);
+                if arm.is_none() || other > arm {
+                    violations.push("change_stage outside the confirmation".into());
+                }
+            }
+        }
+        _ if !calls.is_empty() => violations.push(format!("change_stage in {file}")),
+        _ => {}
+    }
+    if !file.starts_with("db/") {
+        for needle in ["UPDATE tickets SET stage", "ticket_stage_changes"] {
+            if code.contains(needle) {
+                violations.push(format!("{needle} outside db/"));
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn the_stage_is_only_written_by_the_confirmation_of_the_operator() {
+    let mut app_calls = 0;
+    for (name, source) in sources() {
+        let code = production(&source);
+        assert_eq!(
+            stage_violations(&name, &code),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        if name.ends_with("src/app.rs") {
+            app_calls = code.matches("tickets::change_stage(").count();
+        }
+    }
+    assert_eq!(app_calls, 1, "the confirmation calls it");
+    // Positive control: the filter sees each kind of violation, and not a comment nor a test.
+    let confirmation = "Some(Dialog::ConfirmStageChange { ticket, to }) => {\n    if is_yes(key) \
+                        { tickets::change_stage(&self.db, &ticket, to); }\n}";
+    assert_eq!(
+        stage_violations("src/app.rs", confirmation),
+        Vec::<String>::new()
+    );
+    for (name, bad) in [
+        (
+            "src/app.rs",
+            "pub fn agent_ended(&mut self) { tickets::change_stage(&db, &t, d); }",
+        ),
+        (
+            "src/app.rs",
+            "Some(Dialog::ConfirmHide { ticket }) => { tickets::change_stage(&db, &t, d); }",
+        ),
+        (
+            "src/agents.rs",
+            "tickets::change_stage(db, &t, TicketStage::Done)",
+        ),
+        (
+            "src/app.rs",
+            "self.db.change_ticket_stage(id, \"po\", \"done\")",
+        ),
+        (
+            "src/agents.rs",
+            "conn.execute(\"UPDATE tickets SET stage = 'done'\", [])",
+        ),
+        (
+            "src/app.rs",
+            "\"INSERT INTO ticket_stage_changes VALUES (1)\"",
+        ),
+    ] {
+        assert!(
+            !stage_violations(name, &production(bad)).is_empty(),
+            "{bad}"
+        );
+    }
+    let two = format!("{confirmation}\n{confirmation}");
+    assert!(
+        !stage_violations("src/app.rs", &two).is_empty(),
+        "two calls"
+    );
+    assert_eq!(
+        production(
+            "// tickets::change_stage(db, &t, d)\n#[cfg(test)]\nmod tests { change_stage(); }"
+        ),
+        ""
+    );
+}
+
+/// The calls that write in a project. The only one allowed is the rename of docs.rs.
+const PROJECT_WRITES: [&str; 8] = [
+    "renameat2",
+    "fs::rename",
+    "remove_dir",
+    "remove_file",
+    "create_dir",
+    "fs::write",
+    "File::create",
+    "OpenOptions",
+];
+
+/// The uses that already existed, none of them in a project: the lock of an agent, in the
+/// state dir of the nick (agents.rs, NS-33), is opened with `OpenOptions` and removed with
+/// `remove_file` when it is released. (The temporary file of the editor, NS-35, is a
+/// `tempfile::NamedTempFile` in the temporary dir, not one of these calls.)
+const PROJECT_WRITE_EXCEPTIONS: [(&str, &str); 2] =
+    [("agents.rs", "OpenOptions"), ("agents.rs", "remove_file")];
+
+fn project_write_violations(name: &str, code: &str) -> Vec<String> {
+    let file = name.rsplit("src/").next().unwrap_or(name);
+    if file == "docs.rs" {
+        return Vec::new();
+    }
+    PROJECT_WRITES
+        .into_iter()
+        .filter(|needle| code.contains(needle))
+        .filter(|needle| !PROJECT_WRITE_EXCEPTIONS.contains(&(file, needle)))
+        .map(|needle| format!("{needle} in {file}"))
+        .collect()
+}
+
+#[test]
+fn no_source_but_docs_rs_writes_in_a_project() {
+    let mut docs_renames = false;
+    for (name, source) in sources() {
+        let code = production(&source);
+        assert_eq!(
+            project_write_violations(&name, &code),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        if name.ends_with("src/docs.rs") {
+            docs_renames = code.contains("renameat2(");
+        }
+    }
+    assert!(docs_renames, "docs.rs renames with renameat2");
+    // Positive control: each call is seen outside docs.rs, the exceptions only in agents.rs.
+    for needle in PROJECT_WRITES {
+        let bad = format!("let _ = std::{needle}(dir);");
+        assert!(
+            !project_write_violations("src/tickets.rs", &bad).is_empty(),
+            "{needle}"
+        );
+    }
+    assert!(!project_write_violations("src/app.rs", "std::fs::remove_file(p)").is_empty());
+    assert_eq!(
+        project_write_violations("src/agents.rs", "std::fs::remove_file(p)"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        project_write_violations("src/docs.rs", "std::fs::rename(a, b)"),
+        Vec::<String>::new()
+    );
+}
+
+// ---- the ticket screen with agents (NS-36) ----
+
+/// The stored stage of the ticket `key`.
+fn stage_of(world: &World, key: &str) -> String {
+    let db = nick::db::Db::open(&world.db_path()).unwrap();
+    db.connection()
+        .query_row("SELECT stage FROM tickets WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// From the list beside a live agent: Enter on the ticket, its screen.
+fn open_ticket_screen(nick: &mut Nick) {
+    nick.send(ENTER);
+    wait_flat(nick, "m mudar etapa");
+}
+
+#[test]
+fn a_live_agent_opens_from_the_ticket_screen_whatever_the_stage() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (1)");
+    open_ticket_screen(&mut nick);
+    nick.wait_for("proj · PO · NS-1  ● vivo");
+    nick.keep_screen("tela do ticket ao lado de um agente vivo");
+    // The ticket goes to Dev.
+    nick.send("m");
+    nick.wait_for("Para qual etapa?");
+    for label in ["> Tech Leader", "> Dev"] {
+        nick.send(DOWN);
+        nick.wait_for(label);
+    }
+    nick.send(ENTER);
+    wait_flat(&nick, "Mudar a etapa do ticket NS-1 de PO para Dev? (s/N)");
+    nick.send("s");
+    wait_flat(&nick, "Etapa do ticket NS-1: PO → Dev.");
+    assert_eq!(stage_of(&world, "NS-1"), "development");
+    // Its PO agent opens from there, with the focus on its terminal.
+    nick.send(ENTER);
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    nick.send("x");
+    nick.wait_for("GOT 78");
+    wait_flat(&nick, "O agente proj · PO · NS-1 terminou.");
+    nick.wait_for("proj · PO · NS-1  encerrado");
+    assert_eq!(
+        stage_of(&world, "NS-1"),
+        "development",
+        "the end changes no stage"
+    );
+    assert_eq!(world.agents()[0].3, "ended");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn editing_the_id_with_a_live_agent_is_refused() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    fs::create_dir_all(proj.join(".nick/docs/NS-1")).unwrap();
+    fs::write(proj.join(".nick/docs/NS-1/plan.md"), "# plano\n").unwrap();
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (1)");
+    open_ticket_screen(&mut nick);
+    let before = common::snapshot(&proj);
+    nick.send("i");
+    nick.wait_for("Novo ID do ticket (ex: SC-123):");
+    nick.send("9");
+    nick.send(ENTER);
+    wait_flat(
+        &nick,
+        "O ticket NS-1 tem agente ativo. Encerre os agentes dele antes de editar",
+    );
+    nick.keep_screen("recusa de editar ID com agente ativo");
+    assert_eq!(common::snapshot(&proj), before);
+    assert_eq!(
+        world.tickets(Some(&proj)),
+        [("NS-1".into(), "Primeiro".into(), false)]
+    );
+    nick.send(ESC);
+    wait_flat(&nick, "m mudar etapa");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_dev_form_without_a_plan_warns_and_opens_anyway() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "Desenvolvimento");
+    wait_flat(
+        &nick,
+        "Aviso: não existe .nick/docs/NS-1/plan.md. Informe outro caminho no campo do plano, \
+         ou siga sem ele.",
+    );
+    nick.keep_screen("formulário do Dev com o aviso de plano ausente");
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    nick.send("s");
+    nick.wait_for("O agente proj · Dev · NS-1 terminou.");
+    assert_eq!(world.agents().len(), 1);
+    assert_eq!(
+        stage_of(&world, "NS-1"),
+        "po",
+        "opening a Dev changes no stage"
+    );
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
 }

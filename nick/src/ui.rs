@@ -12,12 +12,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
+use crate::agents::AgentState;
 use crate::app::{App, Button, Dialog, Focus, RunningAgent, Screen, TicketField};
+use crate::docs;
 use crate::launch::{Precheck, Rendered};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects;
 use crate::stages::{self, Input, Rule};
+use crate::tickets::{self, TicketStage};
 
 /// The widest the list gets beside an agent (NS-34); never more than half the window.
 pub const LIST_WIDTH: u16 = 40;
@@ -150,6 +153,7 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
         Screen::Modules => draw_modules(frame, app, body),
         Screen::Projects => draw_projects(frame, app, body),
         Screen::Tickets => draw_tickets(frame, app, body),
+        Screen::Ticket => draw_ticket(frame, app, body),
         Screen::ActiveAgents => draw_active_agents(frame, app, body),
         Screen::Settings => draw_settings(frame, app, body),
     }
@@ -261,13 +265,23 @@ fn help_text_for(
         (Some(Dialog::ConfirmEndAgent { .. }), _) => "s encerrar · qualquer outra tecla cancela",
         (Some(Dialog::ConfirmQuit), _) => "s encerrar e sair · qualquer outra tecla cancela",
         (Some(Dialog::CaptureShortcut { .. }), _) => "Esc cancelar",
+        (Some(Dialog::ChooseTicketStage { .. }), _) => {
+            "↑/↓ escolher · Enter escolher · Esc cancelar"
+        }
+        (Some(Dialog::ConfirmStageChange { .. }), _) => "s mudar · qualquer outra tecla cancela",
+        (Some(Dialog::EditId { .. }), _) => "Enter confirmar · Esc cancelar",
+        (Some(Dialog::ConfirmEditId { .. }), _) => "s trocar · qualquer outra tecla cancela",
         (None, Screen::Tickets) if show_hidden => {
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
-             g abrir agente · Esc voltar · q sair"
+             g abrir agente · Enter detalhes · Esc voltar · q sair"
         }
         (None, Screen::Tickets) => {
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
-             g abrir agente · Esc voltar · q sair"
+             g abrir agente · Enter detalhes · Esc voltar · q sair"
+        }
+        (None, Screen::Ticket) => {
+            "↑/↓ mover · Enter abrir agente · m mudar etapa · i editar ID · g novo agente · \
+             Esc voltar · q sair"
         }
         (None, Screen::Modules) => "↑/↓ mover · Enter abrir · c configurações · q sair",
         (None, Screen::Projects) => "↑/↓ mover · a adicionar · r remover · Esc voltar · q sair",
@@ -281,8 +295,11 @@ fn help_text_for(
             return "t trocar · p voltar ao padrão · Esc voltar · q sair".to_string();
         }
     };
-    let opens_the_view =
-        dialog.is_none() && matches!(screen, Screen::Modules | Screen::Projects | Screen::Tickets);
+    let opens_the_view = dialog.is_none()
+        && matches!(
+            screen,
+            Screen::Modules | Screen::Projects | Screen::Tickets | Screen::Ticket
+        );
     match (text.strip_suffix("q sair"), count) {
         (Some(start), Some(count)) if opens_the_view => {
             format!("{start}v agentes ativos ({count}) · q sair")
@@ -292,11 +309,12 @@ fn help_text_for(
 }
 
 /// Every list screen, with the filter of the tickets: the helps `help_rows` reserves rows for.
-const LIST_SCREENS: [(Screen, bool); 6] = [
+const LIST_SCREENS: [(Screen, bool); 7] = [
     (Screen::Modules, false),
     (Screen::Projects, false),
     (Screen::Tickets, false),
     (Screen::Tickets, true),
+    (Screen::Ticket, false),
     (Screen::ActiveAgents, false),
     (Screen::Settings, false),
 ];
@@ -557,8 +575,12 @@ fn draw_tickets(frame: &mut Frame, app: &App, area: Rect) {
         .ticket_rows
         .iter()
         .map(|ticket| {
+            // The stage right after the ID: beside an agent the list has 40 columns, and the
+            // end of the row is cut (NS-36).
             let mut spans = vec![
                 Span::raw(printable(&ticket.key)),
+                Span::raw("  "),
+                stage_mark(&ticket.stage),
                 Span::raw("  "),
                 Span::raw(printable(&ticket.title)),
             ];
@@ -579,6 +601,180 @@ fn draw_tickets(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_style(selected_style());
     let mut state = ListState::default().with_selected(Some(app.ticket_index));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The mark of a stage on the list and on the ticket screen: `[<label>]`, and `[✓ Concluído]` in
+/// green for the done ones (which stay on the list: only `o` hides a ticket).
+fn stage_mark(key: &str) -> Span<'static> {
+    if key == TicketStage::Done.key() {
+        Span::styled(
+            format!("[✓ {}]", TicketStage::Done.label()),
+            Style::new().fg(Color::Green),
+        )
+    } else {
+        Span::raw(format!("[{}]", printable(&tickets::stage_label(key))))
+    }
+}
+
+/// `AAAA-MM-DD HH:MM UTC` from the RFC 3339 of the database, by string slicing (no date
+/// crate); anything else shows raw.
+fn short_date(date: &str) -> String {
+    let b = date.as_bytes();
+    let shaped = b.len() == 20
+        && date.is_ascii()
+        && (b[4], b[7], b[10], b[13], b[16], b[19]) == (b'-', b'-', b'T', b':', b':', b'Z');
+    if shaped {
+        format!("{} {} UTC", &date[..10], &date[11..16])
+    } else {
+        printable(date)
+    }
+}
+
+/// The ticket screen (NS-36): the ticket, its stage and its artifacts on top; then the history
+/// of the stage (the newest when it does not fit, with how many older ones are left out) and
+/// the agents of the ticket, a list with selection.
+fn draw_ticket(frame: &mut Frame, app: &App, area: Rect) {
+    let project = app
+        .project
+        .as_ref()
+        .map_or(String::new(), |p| printable(&p.name));
+    let Some(detail) = app.ticket_detail.as_ref() else {
+        frame.render_widget(Block::bordered(), area);
+        return;
+    };
+    let ticket = &detail.ticket;
+    let block = Block::bordered().title(format!(
+        " {} > {project} > {} ",
+        app.module().name(),
+        printable(&ticket.key)
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut head = vec![Span::raw(format!(
+        "{}  {}",
+        printable(&ticket.key),
+        printable(&ticket.title)
+    ))];
+    if ticket.is_provisional {
+        head.push(Span::raw("  [provisório]"));
+    }
+    if ticket.hidden_at.is_some() {
+        head.push(Span::raw("  [oculto]"));
+    }
+    let stage = if ticket.stage == TicketStage::Done.key() {
+        stage_mark(&ticket.stage)
+    } else {
+        Span::raw(printable(&tickets::stage_label(&ticket.stage)))
+    };
+    let exists = |there: bool| if there { "(existe)" } else { "(não existe)" };
+    let top = vec![
+        Line::from(head),
+        Line::from(vec![Span::raw("Etapa atual: "), stage]),
+        // The state before the path: beside an agent the screen has 40 columns, and the end of
+        // the line is cut (review of the NS-36, P3.1; as the stage after the ID on the list).
+        Line::from(format!(
+            "Plano {}:  {}",
+            exists(detail.artifacts.plan),
+            printable(&docs::plan_path(&ticket.key))
+        )),
+        Line::from(format!(
+            "Review {}:  {}",
+            exists(detail.artifacts.review),
+            printable(&docs::review_path(&ticket.key))
+        )),
+        Line::from(""),
+    ];
+    let top_rows = u16::try_from(top.len())
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    frame.render_widget(
+        Paragraph::new(top),
+        Rect {
+            height: top_rows,
+            ..inner
+        },
+    );
+    let rest = inner.height - top_rows;
+    // Each section: its title, its rows (at least the "none" one); the history also a blank
+    // row below. The agents keep at least half of what is left (or what they need).
+    let as_rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let agents_need = 1 + as_rows(detail.agents.len().max(1));
+    let history_need = 2 + as_rows(detail.changes.len().max(1));
+    let agents_min = agents_need.min((rest / 2).max(2)).min(rest);
+    let history_rows = history_need.min(rest - agents_min);
+    let history_area = Rect {
+        y: inner.y + top_rows,
+        height: history_rows,
+        ..inner
+    };
+    let agents_area = Rect {
+        y: history_area.y + history_rows,
+        height: rest - history_rows,
+        ..inner
+    };
+    let mut history = vec![Line::from("Histórico de etapas")];
+    if detail.changes.is_empty() {
+        history.push(Line::from("Nenhuma mudança: o ticket começou em PO."));
+    } else {
+        let slots = usize::from(history_rows.saturating_sub(2));
+        let mut shown = &detail.changes[..];
+        if shown.len() > slots {
+            let keep = slots.saturating_sub(1);
+            let older = shown.len() - keep;
+            history.push(Line::from(format!("(+{older} mudanças mais antigas)")));
+            shown = &shown[older..];
+        }
+        for change in shown {
+            history.push(Line::from(format!(
+                "  {}  {} → {}",
+                short_date(&change.changed_at),
+                printable(&tickets::stage_label(&change.from_stage)),
+                printable(&tickets::stage_label(&change.to_stage))
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(history), history_area);
+    if agents_area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new("Agentes do ticket"),
+        Rect {
+            height: 1,
+            ..agents_area
+        },
+    );
+    let list_area = Rect {
+        y: agents_area.y + 1,
+        height: agents_area.height - 1,
+        ..agents_area
+    };
+    if detail.agents.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Nenhum agente aberto para este ticket."),
+            list_area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = detail
+        .agents
+        .iter()
+        .map(|agent| {
+            let state = if app.agent(agent.id).is_some() {
+                "● vivo"
+            } else if agent.state == AgentState::Active.key() {
+                "ativo em outro nick"
+            } else {
+                "encerrado"
+            };
+            ListItem::new(format!("{}  {state}", printable(&agent.name)))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_symbol("> ")
+        .highlight_style(selected_style());
+    let mut state = ListState::default().with_selected(Some(app.ticket_agent_index));
+    frame.render_stateful_widget(list, list_area, &mut state);
 }
 
 /// How many rows `lines` take wrapped at `width` (an estimate that never falls short by much:
@@ -792,6 +988,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             kind,
             values,
             focus,
+            plan_missing,
             ..
         } => {
             let mut lines = vec![
@@ -808,6 +1005,18 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
                 .iter()
                 .position(|f| f.rule == Rule::JiraId)
                 .map_or("", |i| values[i].as_str());
+            if *plan_missing {
+                // Wrapped here, so each row is a line and the cursor row stays right (NS-36).
+                let warning = format!(
+                    "Aviso: não existe {}. Informe outro caminho no campo do plano, ou siga \
+                     sem ele.",
+                    docs::plan_path(stages::trim_read(jira_id))
+                );
+                lines.push(Line::from(""));
+                for row in wrap_words(&printable(&warning), inner_width.max(1)) {
+                    lines.push(Line::styled(row, Style::new().fg(Color::Yellow)));
+                }
+            }
             let mut cursor = None;
             for (i, question) in fields.iter().enumerate() {
                 lines.push(Line::from(""));
@@ -860,6 +1069,79 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             })],
             None,
         ),
+        Dialog::ChooseTicketStage { ticket, index } => {
+            let mut lines = vec![
+                Line::from(format!(
+                    "Ticket {} — {}",
+                    printable(&ticket.key),
+                    printable(&ticket.title)
+                )),
+                Line::from(""),
+                Line::from("Para qual etapa?"),
+            ];
+            for (i, stage) in TicketStage::ALL.iter().enumerate() {
+                let current = if stage.key() == ticket.stage {
+                    " (atual)"
+                } else {
+                    ""
+                };
+                let label = format!("{}{current}", stage.label());
+                lines.push(if i == *index {
+                    Line::from(vec![
+                        Span::raw("> "),
+                        Span::styled(label, Style::new().add_modifier(Modifier::REVERSED)),
+                    ])
+                } else {
+                    Line::from(format!("  {label}"))
+                });
+            }
+            (" Mudar etapa ", lines, None)
+        }
+        Dialog::ConfirmStageChange { ticket, to } => (
+            " Mudar etapa ",
+            vec![Line::from(format!(
+                "Mudar a etapa do ticket {} de {} para {}? (s/N)",
+                printable(&ticket.key),
+                printable(&tickets::stage_label(&ticket.stage)),
+                to.label()
+            ))],
+            None,
+        ),
+        Dialog::EditId { ticket, input } => {
+            let typed = field(input);
+            let cursor = typed.chars().count();
+            (
+                " Editar ID ",
+                vec![
+                    Line::from(format!("ID atual: {}", printable(&ticket.key))),
+                    Line::from(""),
+                    Line::from("Novo ID do ticket (ex: SC-123):"),
+                    Line::from(typed),
+                ],
+                Some((3, cursor)),
+            )
+        }
+        Dialog::ConfirmEditId { ticket, new, moves } => {
+            let folder = if *moves {
+                format!(
+                    " A pasta {} será renomeada para {}.",
+                    printable(&docs::dir_text(&ticket.key)),
+                    printable(&docs::dir_text(new))
+                )
+            } else {
+                String::new()
+            };
+            (
+                " Editar ID ",
+                vec![Line::from(format!(
+                    "Trocar o ID {} por {}?{folder} A branch do git, o ticket no Jira e os \
+                     agentes já registrados não mudam. (s/N)",
+                    printable(&ticket.key),
+                    printable(new)
+                ))],
+                None,
+            )
+        }
         Dialog::ConfirmRemove { project, tickets } => (
             " Remover projeto ",
             vec![Line::from(removal_question(
@@ -1479,6 +1761,7 @@ mod tests {
             title: title.into(),
             created_at: "2026-11-18T00:00:00Z".into(),
             hidden_at: hidden.then(|| "2026-11-18T01:00:00Z".into()),
+            stage: "po".into(),
         }
     }
 
@@ -1507,10 +1790,16 @@ mod tests {
         ];
         let buffer = render(&f.app);
         assert_has(&buffer, " auto_scrum > meu-proj > Tickets ");
-        assert_has(&buffer, "NS-1  Corrigir o login");
-        assert_has(&buffer, "3f9a0c7e  Sem ID ainda  [provisório]");
+        assert_has(&buffer, "NS-1  [PO]  Corrigir o login");
+        assert_has(&buffer, "3f9a0c7e  [PO]  Sem ID ainda  [provisório]");
         let (y, _) = find(&buffer, "NS-1").unwrap();
-        assert!(!text(&buffer).lines().nth(y as usize).unwrap().contains('['));
+        assert!(
+            !text(&buffer)
+                .lines()
+                .nth(y as usize)
+                .unwrap()
+                .contains("[provisório]")
+        );
         assert!(find(&buffer, "(com ocultos)").is_none());
         // With `g abrir agente` (NS-33) the help passes 100 columns and wraps, as with the filter.
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
@@ -1518,7 +1807,7 @@ mod tests {
         assert_eq!(
             format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()),
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
-             g abrir agente · Esc voltar · q sair"
+             g abrir agente · Enter detalhes · Esc voltar · q sair"
         );
     }
 
@@ -1534,10 +1823,10 @@ mod tests {
         ];
         let buffer = render(&f.app);
         assert_has(&buffer, " auto_scrum > meu-proj > Tickets (com ocultos) ");
-        assert_has(&buffer, "NS-2  Escondido  [oculto]");
+        assert_has(&buffer, "NS-2  [PO]  Escondido  [oculto]");
         assert_has(
             &buffer,
-            "abcd1234  Provisório escondido  [provisório]  [oculto]",
+            "abcd1234  [PO]  Provisório escondido  [provisório]  [oculto]",
         );
         for key in ["NS-2", "abcd1234"] {
             let (y, x) = find(&buffer, key).unwrap();
@@ -1551,7 +1840,7 @@ mod tests {
         assert_eq!(
             format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()),
             "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
-             g abrir agente · Esc voltar · q sair"
+             g abrir agente · Enter detalhes · Esc voltar · q sair"
         );
         assert_eq!(
             lines[n - 3].trim(),
@@ -1687,7 +1976,7 @@ mod tests {
         f.app.ticket_rows = vec![ticket(1, "NS-1", "a\x1b[2Jb", false, false)];
         let buffer = render(&f.app);
         assert_has(&buffer, "auto_scrum > p?q > Tickets");
-        assert_has(&buffer, "NS-1  a?[2Jb");
+        assert_has(&buffer, "NS-1  [PO]  a?[2Jb");
     }
 
     #[test]
@@ -1852,6 +2141,7 @@ mod tests {
             kind,
             values: values.iter().map(|v| v.to_string()).collect(),
             focus,
+            plan_missing: false,
         });
         f
     }
@@ -2320,7 +2610,8 @@ mod tests {
         let n = lines.len();
         assert!(
             format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()).ends_with(
-                "g abrir agente · Esc voltar · v agentes ativos (3, 1 com saída nova) · q sair"
+                "g abrir agente · Enter detalhes · Esc voltar · v agentes ativos (3, 1 com saída \
+                 nova) · q sair"
             ),
             "{lines:?}"
         );
@@ -2429,7 +2720,8 @@ mod tests {
         for (width, height) in [(100, 30), (50, 30), (140, 40)] {
             let area = Rect::new(0, 0, width, height);
             let mut sizes = Vec::new();
-            for (screen, show_hidden) in LIST_SCREENS {
+            // The ticket screen (NS-36) by itself, so a LIST_SCREENS without it is caught.
+            for (screen, show_hidden) in LIST_SCREENS.into_iter().chain([(Screen::Ticket, false)]) {
                 for focus in [Focus::Terminal, Focus::List] {
                     for unseen in [false, true] {
                         for dialog in [None, Some(Dialog::ConfirmQuit)] {
@@ -2451,6 +2743,35 @@ mod tests {
         // Without agents, the help takes only the rows it needs, as before the NS-34.
         let f = fixture();
         assert_eq!(layout(&f.app, Rect::new(0, 0, 100, 30)).help.height, 1);
+    }
+
+    /// Every screen of a list is in `LIST_SCREENS` (NS-36), so the rows of the help with an
+    /// agent running never change between them. Today the help of the ticket screen fits in
+    /// the rows of the tickets list, so the size test above alone would not catch it missing.
+    #[test]
+    fn every_list_screen_is_in_list_screens() {
+        for screen in [
+            Screen::Modules,
+            Screen::Projects,
+            Screen::Tickets,
+            Screen::Ticket,
+            Screen::ActiveAgents,
+            Screen::Settings,
+        ] {
+            // Exhaustive: a new screen does not compile here until it is listed above.
+            match screen {
+                Screen::Modules
+                | Screen::Projects
+                | Screen::Tickets
+                | Screen::Ticket
+                | Screen::ActiveAgents
+                | Screen::Settings => {}
+            }
+            assert!(
+                LIST_SCREENS.iter().any(|(listed, _)| *listed == screen),
+                "{screen:?} is not in LIST_SCREENS"
+            );
+        }
     }
 
     /// Review NS-34, P2: the PTY of a new agent is born with the size `layout` gives it once
@@ -2488,5 +2809,292 @@ mod tests {
             assert_eq!(agent.name, name);
             assert_eq!(agent_area(&f.app, area, agent), expected, "{names:?}");
         }
+    }
+
+    // ---- the stage on the list, the ticket screen and its dialogs (NS-36) ----
+
+    use crate::app::TicketDetail;
+    use crate::db::{Agent, StageChangeRow};
+    use crate::docs::Artifacts;
+    use crate::tickets::TicketStage;
+
+    fn staged(id: i64, key: &str, title: &str, stage: &str, hidden: bool) -> Ticket {
+        Ticket {
+            stage: stage.into(),
+            ..ticket(id, key, title, false, hidden)
+        }
+    }
+
+    fn change(from: &str, to: &str, at: &str) -> StageChangeRow {
+        StageChangeRow {
+            from_stage: from.into(),
+            to_stage: to.into(),
+            changed_at: at.into(),
+        }
+    }
+
+    fn agent(id: i64, stage: &str, name: &str, state: &str) -> Agent {
+        Agent {
+            id,
+            ticket_id: 1,
+            stage: stage.into(),
+            session_id: format!("s-{id}"),
+            name: name.into(),
+            opened_at: "2026-11-19T00:00:00Z".into(),
+            state: state.into(),
+        }
+    }
+
+    /// The ticket screen of NS-12 (in Dev) of meu-proj, with `changes` and `agents`.
+    fn on_ticket(f: &mut Fixture, changes: Vec<StageChangeRow>, agents: Vec<Agent>) {
+        on_tickets(f);
+        f.app.screen = Screen::Ticket;
+        f.app.ticket_detail = Some(TicketDetail {
+            ticket: staged(1, "NS-12", "Título do ticket", "development", false),
+            changes,
+            agents,
+            artifacts: Artifacts {
+                plan: true,
+                review: false,
+            },
+        });
+    }
+
+    #[test]
+    fn the_list_shows_the_stage_after_the_id_and_done_in_green() {
+        let mut f = fixture();
+        on_tickets(&mut f);
+        f.app.show_hidden = true;
+        f.app.ticket_rows = vec![
+            staged(1, "NS-1", "Um", "tech_leader", false),
+            staged(2, "NS-2", "Dois", "done", false),
+            staged(3, "NS-3", "Três", "done", true),
+            staged(4, "NS-4", "Quatro", "archived", false),
+        ];
+        let buffer = render(&f.app);
+        assert_has(&buffer, "NS-1  [Tech Leader]  Um");
+        assert_has(&buffer, "NS-2  [✓ Concluído]  Dois");
+        assert_has(&buffer, "NS-3  [✓ Concluído]  Três  [oculto]");
+        assert_has(&buffer, "NS-4  [archived]  Quatro");
+        let (y, x) = find(&buffer, "[✓ Concluído]  Dois").unwrap();
+        assert_eq!(buffer[(x + 1, y)].fg, Color::Green);
+        let (y, x) = find(&buffer, "[Tech Leader]").unwrap();
+        assert_ne!(buffer[(x + 1, y)].fg, Color::Green);
+    }
+
+    #[test]
+    fn the_ticket_screen_shows_the_stage_the_artifacts_the_history_and_the_help() {
+        let mut f = fixture();
+        on_ticket(&mut f, Vec::new(), Vec::new());
+        let buffer = render(&f.app);
+        assert_has(&buffer, " auto_scrum > meu-proj > NS-12 ");
+        assert_has(&buffer, "NS-12  Título do ticket");
+        assert_has(&buffer, "Etapa atual: Dev");
+        assert_has(&buffer, "Plano (existe):  .nick/docs/NS-12/plan.md");
+        // The path from docs.rs: the name of the artifact is also the one of a template, which
+        // a structural test of the NS-35 keeps out of every other source.
+        assert_has(
+            &buffer,
+            &format!("Review (não existe):  {}", docs::review_path("NS-12")),
+        );
+        assert_has(&buffer, "Histórico de etapas");
+        assert_has(&buffer, "Nenhuma mudança: o ticket começou em PO.");
+        assert_has(&buffer, "Agentes do ticket");
+        assert_has(&buffer, "Nenhum agente aberto para este ticket.");
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "↑/↓ mover · Enter abrir agente · m mudar etapa · i editar ID · g novo agente · \
+             Esc voltar · q sair"
+        );
+        // A history, oldest first, with the date as AAAA-MM-DD HH:MM UTC (raw when odd).
+        on_ticket(
+            &mut f,
+            vec![
+                change("po", "tech_leader", "2026-11-19T21:46:05Z"),
+                change("tech_leader", "development", "ontem"),
+            ],
+            Vec::new(),
+        );
+        let buffer = render(&f.app);
+        let (first, _) = find(&buffer, "2026-11-19 21:46 UTC  PO → Tech Leader").unwrap();
+        let (second, _) = find(&buffer, "ontem  Tech Leader → Dev").unwrap();
+        assert!(first < second);
+        assert!(find(&buffer, "Nenhuma mudança").is_none());
+        // Done, hidden and provisional, with the marks of the list.
+        let mut t = staged(1, "abcd1234", "Fim", "done", true);
+        t.is_provisional = true;
+        f.app.ticket_detail.as_mut().unwrap().ticket = t;
+        let buffer = render(&f.app);
+        assert_has(&buffer, "abcd1234  Fim  [provisório]  [oculto]");
+        assert_has(&buffer, "Etapa atual: [✓ Concluído]");
+        let (y, x) = find(&buffer, "[✓ Concluído]").unwrap();
+        assert_eq!(buffer[(x + 1, y)].fg, Color::Green);
+    }
+
+    #[test]
+    fn a_long_history_shows_the_newest_and_how_many_are_older() {
+        let mut f = fixture();
+        let changes: Vec<StageChangeRow> = (0..30)
+            .map(|i| {
+                let (from, to) = if i % 2 == 0 {
+                    ("po", "review")
+                } else {
+                    ("review", "po")
+                };
+                change(from, to, &format!("2026-11-19T10:{i:02}:00Z"))
+            })
+            .collect();
+        on_ticket(
+            &mut f,
+            changes,
+            vec![agent(9, "po", "meu-proj · PO · NS-12", "ended")],
+        );
+        let buffer = render(&f.app);
+        assert_has(&buffer, "2026-11-19 10:29 UTC  Review → PO");
+        assert!(
+            find(&buffer, "2026-11-19 10:00 UTC").is_none(),
+            "the oldest go"
+        );
+        let screen = text(&buffer);
+        let shown = screen.matches("2026-11-19 10:").count();
+        assert_has(&buffer, &format!("(+{} mudanças mais antigas)", 30 - shown));
+        let (cut, _) = find(&buffer, "mudanças mais antigas").unwrap();
+        let (newest, _) = find(&buffer, "10:29").unwrap();
+        assert!(cut < newest, "the count on top of the section");
+        assert_has(&buffer, "meu-proj · PO · NS-12  encerrado");
+    }
+
+    #[test]
+    fn the_agents_of_the_ticket_show_their_state_and_the_selection() {
+        let (mut f, root) = with_running(&["p"]);
+        f.app.focus = Focus::List;
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let mut agents = db.list_ticket_agents(1).unwrap();
+        assert_eq!(agents.len(), 1);
+        agents.push(agent(900, "po", "p · PO · NS-1", "active"));
+        agents.push(agent(901, "tech_leader", "p · Tech Leader · NS-1", "ended"));
+        f.app.screen = Screen::Ticket;
+        f.app.ticket_detail = Some(TicketDetail {
+            ticket: staged(1, "NS-1", "t", "po", false),
+            changes: Vec::new(),
+            agents,
+            artifacts: Artifacts::default(),
+        });
+        f.app.ticket_agent_index = 1;
+        let buffer = render_at(&f.app, 140, 40, None);
+        assert_has(&buffer, "p · Dev · NS-1  ● vivo");
+        assert_has(&buffer, "> p · PO · NS-1  ativo em outro nick");
+        assert_has(&buffer, "p · Tech Leader · NS-1  encerrado");
+        // Beside the agent, the screen is on the left (40 columns), and the help has the view.
+        let areas = layout(&f.app, Rect::new(0, 0, 140, 40));
+        assert_eq!(areas.list.width, LIST_WIDTH);
+        // The state of each artifact comes before its path, so the 40 columns keep it (review of
+        // the NS-36, P3.1): only the end of the path is cut.
+        assert_has(&buffer, "│Plano (não existe):  .nick/docs/NS-1/");
+        assert_has(&buffer, "│Review (não existe):  .nick/docs/NS-1/");
+        let help = help_text(&f.app);
+        assert!(
+            help.ends_with("Esc voltar · v agentes ativos (1) · q sair"),
+            "{help}"
+        );
+        // Narrow terminals do not panic.
+        for (w, h) in [(40, 12), (20, 6), (10, 3), (3, 3)] {
+            render_at(&f.app, w, h, None);
+        }
+        let mut f = fixture();
+        on_ticket(&mut f, vec![change("po", "done", "x")], Vec::new());
+        for (w, h) in [(30, 8), (12, 4), (2, 2)] {
+            render_at(&f.app, w, h, None);
+        }
+    }
+
+    #[test]
+    fn the_dialogs_of_the_stage_and_of_the_id() {
+        let mut f = fixture();
+        on_ticket(&mut f, Vec::new(), Vec::new());
+        let t = f.app.ticket_detail.as_ref().unwrap().ticket.clone();
+        f.app.dialog = Some(Dialog::ChooseTicketStage {
+            ticket: t.clone(),
+            index: 3,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Mudar etapa ");
+        assert_has(&buffer, "Ticket NS-12 — Título do ticket");
+        assert_has(&buffer, "  PO");
+        assert_has(&buffer, "  Dev (atual)");
+        assert_has(&buffer, "> Review");
+        assert_has(&buffer, "  Concluído");
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "↑/↓ escolher · Enter escolher · Esc cancelar"
+        );
+        f.app.dialog = Some(Dialog::ConfirmStageChange {
+            ticket: t.clone(),
+            to: TicketStage::Done,
+        });
+        let buffer = render(&f.app);
+        assert!(
+            flat(&buffer).contains("Mudar a etapa do ticket NS-12 de Dev para Concluído? (s/N)"),
+            "{}",
+            flat(&buffer)
+        );
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "s mudar · qualquer outra tecla cancela"
+        );
+        f.app.dialog = Some(Dialog::EditId {
+            ticket: t.clone(),
+            input: "NS-1".into(),
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Editar ID ");
+        assert_has(&buffer, "Novo ID do ticket (ex: SC-123):");
+        assert_eq!(last_line(&buffer).trim(), "Enter confirmar · Esc cancelar");
+        for (moves, expected) in [
+            (
+                false,
+                "Trocar o ID NS-12 por NS-99? A branch do git, o ticket no Jira e os agentes \
+                 já registrados não mudam. (s/N)",
+            ),
+            (
+                true,
+                "Trocar o ID NS-12 por NS-99? A pasta .nick/docs/NS-12/ será renomeada para \
+                 .nick/docs/NS-99/. A branch do git, o ticket no Jira e os agentes já \
+                 registrados não mudam. (s/N)",
+            ),
+        ] {
+            f.app.dialog = Some(Dialog::ConfirmEditId {
+                ticket: t.clone(),
+                new: "NS-99".into(),
+                moves,
+            });
+            let buffer = render(&f.app);
+            assert!(flat(&buffer).contains(expected), "{}", flat(&buffer));
+            assert_eq!(
+                last_line(&buffer).trim(),
+                "s trocar · qualquer outra tecla cancela"
+            );
+        }
+    }
+
+    #[test]
+    fn the_form_shows_the_warning_of_the_missing_plan_in_yellow() {
+        let mut f = form(StageType::Development, &[" NS-1 ", ""], 1);
+        let buffer = render(&f.app);
+        assert!(
+            find(&buffer, "Aviso:").is_none(),
+            "no warning when not missing"
+        );
+        if let Some(Dialog::StageForm { plan_missing, .. }) = f.app.dialog.as_mut() {
+            *plan_missing = true;
+        }
+        let buffer = render(&f.app);
+        let warning = "Aviso: não existe .nick/docs/NS-1/plan.md. Informe outro caminho no \
+                       campo do plano, ou siga sem ele.";
+        assert!(flat(&buffer).contains(warning), "{}", flat(&buffer));
+        let (y, x) = find(&buffer, "Aviso:").unwrap();
+        assert_eq!(buffer[(x, y)].fg, Color::Yellow);
+        let (fields, _) = find(&buffer, "ID do Jira").unwrap();
+        assert!(y < fields, "above the fields");
     }
 }

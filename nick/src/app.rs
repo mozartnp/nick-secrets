@@ -20,8 +20,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-use crate::agents::{self, OpenAgent};
-use crate::db::{Db, SETTING_RESERVED_SHORTCUT};
+use crate::agents::{self, Agent, OpenAgent};
+use crate::db::{Db, SETTING_RESERVED_SHORTCUT, StageChangeRow};
+use crate::docs::{self, Artifacts};
 use crate::editor::{EditorOutcome, EditorRunner};
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
@@ -29,8 +30,8 @@ use crate::launch::{self, AgentLauncher, Precheck, RenderRequest, Rendered};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
-use crate::stages::{self, Input, StageType};
-use crate::tickets::{self, Ticket};
+use crate::stages::{self, Input, Rule, StageType};
+use crate::tickets::{self, Ticket, TicketStage};
 
 /// The list on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,9 @@ pub enum Screen {
     Projects,
     /// The tickets of the open project (`App::project`).
     Tickets,
+    /// One ticket of the open project (`App::ticket_detail`, NS-36): its stage, its history,
+    /// its artifacts and its agents.
+    Ticket,
     /// "Agentes ativos": every agent this nick runs, of every project (NS-34).
     ActiveAgents,
     /// "Configurações": the reserved shortcut (NS-34).
@@ -109,6 +113,10 @@ pub enum Dialog {
         kind: StageType,
         values: Vec<String>,
         focus: usize,
+        /// Dev and Review (NS-36): the plan field is empty, the ID is valid and
+        /// `.nick/docs/<ID>/plan.md` does not exist, computed at the opening and at each key
+        /// (the ui reads no disk). Only a warning: it blocks nothing.
+        plan_missing: bool,
     },
     /// The prompt bash built, before the launch: the `(s/N)` confirmation, with the prompt
     /// scrolled `scroll` lines down.
@@ -129,6 +137,18 @@ pub enum Dialog {
     /// The capture of a new reserved shortcut: `first` is the key pressed once, which must be
     /// pressed again to be saved.
     CaptureShortcut { first: Option<Shortcut> },
+    /// "Mudar etapa" (NS-36): the stages of `TicketStage::ALL`, `index` selected.
+    ChooseTicketStage { ticket: Ticket, index: usize },
+    /// The `(s/N)` confirmation of changing the stage of the ticket to `to`.
+    ConfirmStageChange { ticket: Ticket, to: TicketStage },
+    /// "Editar ID" (NS-36): the new ID, starting with the current one.
+    EditId { ticket: Ticket, input: String },
+    /// The `(s/N)` confirmation of the new ID; `moves` when `.nick/docs/<old>/` exists now.
+    ConfirmEditId {
+        ticket: Ticket,
+        new: String,
+        moves: bool,
+    },
 }
 
 /// What the loop must do after a key.
@@ -210,6 +230,18 @@ pub struct RunningAgent {
     pub unseen: bool,
 }
 
+/// The ticket of the ticket screen (NS-36), read when the screen opens and again after every
+/// action, like the lists: the artifacts come from the disk each time, with no cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketDetail {
+    pub ticket: Ticket,
+    /// The history of its stage, oldest first.
+    pub changes: Vec<StageChangeRow>,
+    /// Its agents, of every stage and state, in the order they were opened.
+    pub agents: Vec<Agent>,
+    pub artifacts: Artifacts,
+}
+
 /// A project of the list with its availability, computed when the list is refreshed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -258,6 +290,10 @@ pub struct App {
     /// largest scroll (its end). The loop computes it from the screen (`ui::prompt_window`) and
     /// sets it before each key, so the App does not know the drawing.
     pub(crate) prompt_window: (usize, usize),
+    /// The ticket of the ticket screen (NS-36).
+    pub(crate) ticket_detail: Option<TicketDetail>,
+    /// The selection of the agents of the ticket screen.
+    pub(crate) ticket_agent_index: usize,
 }
 
 impl App {
@@ -290,6 +326,8 @@ impl App {
             shortcut: Shortcut::DEFAULT,
             shortcut_stored: false,
             prompt_window: (0, 0),
+            ticket_detail: None,
+            ticket_agent_index: 0,
         }
     }
 
@@ -476,6 +514,7 @@ impl App {
                 kind,
                 values,
                 focus,
+                ..
             }) => self.key_stage_form(key, project, ticket, precheck, kind, values, focus),
             Some(Dialog::ConfirmPrompt {
                 project,
@@ -490,10 +529,28 @@ impl App {
             Some(Dialog::ConfirmQuit) => confirmed(key, Action::QuitEndingAgents),
             // Taken before the dialogs (above).
             Some(Dialog::CaptureShortcut { .. }) => Action::None,
+            Some(Dialog::ChooseTicketStage { ticket, index }) => {
+                self.key_choose_ticket_stage(key, ticket, index)
+            }
+            Some(Dialog::ConfirmStageChange { ticket, to }) => {
+                // Only s/S confirm; any other key cancels. The only call of change_stage: the
+                // nick never changes the stage alone (plan D9 of NS-36).
+                if is_yes(key) {
+                    self.status = Some(match tickets::change_stage(&self.db, &ticket, to) {
+                        Ok(message) | Err(message) => message,
+                    });
+                }
+                Action::None
+            }
+            Some(Dialog::EditId { ticket, input }) => self.key_edit_id(key, ticket, input),
+            Some(Dialog::ConfirmEditId { ticket, new, .. }) => {
+                self.key_confirm_edit_id(key, ticket, new)
+            }
             None => match self.screen {
                 Screen::Modules => self.key_modules(key),
                 Screen::Projects => self.key_projects(key),
                 Screen::Tickets => self.key_tickets(key),
+                Screen::Ticket => self.key_ticket(key),
                 Screen::ActiveAgents => self.key_active_agents(key),
                 Screen::Settings => self.key_settings(key),
             },
@@ -505,7 +562,7 @@ impl App {
         if self.dialog.is_none() {
             match self.screen {
                 Screen::Projects => self.refresh(),
-                Screen::Tickets => self.refresh_tickets(),
+                Screen::Tickets | Screen::Ticket => self.refresh_tickets(),
                 Screen::Modules | Screen::ActiveAgents | Screen::Settings => {}
             }
         }
@@ -818,7 +875,10 @@ impl App {
                 }
             }
             KeyCode::Char('f') => self.show_hidden = !self.show_hidden,
-            KeyCode::Char('g') => return self.choose_stage(),
+            KeyCode::Char('g') => {
+                return self.choose_stage(self.ticket_rows.get(self.ticket_index).cloned());
+            }
+            KeyCode::Enter | KeyCode::Right => self.open_ticket(),
             KeyCode::Char('v') => self.open_active_agents(),
             KeyCode::Esc | KeyCode::Left => {
                 self.screen = Screen::Projects;
@@ -914,11 +974,11 @@ impl App {
         Action::None
     }
 
-    /// `g` on a ticket: the check of the launcher (`Action::CheckAgent`), then the menu, only for
-    /// a visible ticket of a project available now (read from the disk at the key, like the Enter
-    /// on a project).
-    fn choose_stage(&mut self) -> Action {
-        let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() else {
+    /// `g` on a ticket (of the list, or of the ticket screen since the NS-36): the check of the
+    /// launcher (`Action::CheckAgent`), then the menu, only for a visible ticket of a project
+    /// available now (read from the disk at the key, like the Enter on a project).
+    fn choose_stage(&mut self, ticket: Option<Ticket>) -> Action {
+        let Some(ticket) = ticket else {
             return Action::None;
         };
         if ticket.hidden_at.is_some() {
@@ -999,8 +1059,10 @@ impl App {
             KeyCode::Esc => return Action::None,
             KeyCode::Enter => {
                 if let Some(kind) = types.get(index).copied() {
+                    let values = kind.initial_values(&ticket.key);
                     self.dialog = Some(Dialog::StageForm {
-                        values: kind.initial_values(&ticket.key),
+                        plan_missing: plan_missing(&project, kind, &values),
+                        values,
                         project,
                         ticket,
                         precheck,
@@ -1068,6 +1130,7 @@ impl App {
             _ => {}
         }
         self.dialog = Some(Dialog::StageForm {
+            plan_missing: plan_missing(&project, kind, &values),
             project,
             ticket,
             precheck,
@@ -1275,6 +1338,8 @@ impl App {
         self.show(id);
         self.focus = Focus::Terminal;
         self.status = None;
+        // The ticket screen lists the new agent (reading only: the stage does not change).
+        self.refresh_ticket();
     }
 
     /// Takes the agent `id` out of the running ones. When it was the shown one, the agent
@@ -1428,6 +1493,208 @@ impl App {
         self.ticket_index = self
             .ticket_index
             .min(self.ticket_rows.len().saturating_sub(1));
+        self.refresh_ticket();
+    }
+
+    /// `Enter`/`→` on the list of the tickets: the ticket screen of the selected ticket.
+    fn open_ticket(&mut self) {
+        let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() else {
+            return;
+        };
+        self.ticket_detail = Some(TicketDetail {
+            ticket,
+            changes: Vec::new(),
+            agents: Vec::new(),
+            artifacts: Artifacts::default(),
+        });
+        self.screen = Screen::Ticket;
+        self.ticket_agent_index = 0;
+        self.status = None;
+        self.refresh_ticket();
+    }
+
+    /// Reads the ticket of the ticket screen again (its row, history and agents from the
+    /// database, its artifacts from the disk). Only reads: nothing here writes the stage. A
+    /// ticket gone from the database goes back to the list, saying so.
+    fn refresh_ticket(&mut self) {
+        if self.screen != Screen::Ticket {
+            return;
+        }
+        let (Some(detail), Some(project)) = (self.ticket_detail.as_ref(), self.project.as_ref())
+        else {
+            return;
+        };
+        let id = detail.ticket.id;
+        let read = || -> rusqlite::Result<Option<TicketDetail>> {
+            let Some(ticket) = self.db.get_ticket(id)? else {
+                return Ok(None);
+            };
+            Ok(Some(TicketDetail {
+                changes: self.db.list_stage_changes(id)?,
+                agents: self.db.list_ticket_agents(id)?,
+                artifacts: docs::artifacts(&project.path, &ticket.key),
+                ticket,
+            }))
+        };
+        match read() {
+            Ok(Some(fresh)) => {
+                self.ticket_agent_index = self
+                    .ticket_agent_index
+                    .min(fresh.agents.len().saturating_sub(1));
+                self.ticket_detail = Some(fresh);
+            }
+            Ok(None) => {
+                let gone = tickets::gone_message(&detail.ticket);
+                self.ticket_detail = None;
+                self.screen = Screen::Tickets;
+                self.status = Some(gone);
+                self.refresh_tickets();
+            }
+            Err(err) => self.status = Some(projects::db_error_message(&err)),
+        }
+    }
+
+    fn key_ticket(&mut self, key: KeyEvent) -> Action {
+        let Some(detail) = self.ticket_detail.as_ref() else {
+            return Action::None;
+        };
+        let ticket = detail.ticket.clone();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.ticket_agent_index = self.ticket_agent_index.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.ticket_agent_index =
+                    (self.ticket_agent_index + 1).min(detail.agents.len().saturating_sub(1));
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                // A live agent of this nick opens, whatever the stage of the ticket; the
+                // others only show (resuming them is the F5's).
+                if let Some(agent) = detail.agents.get(self.ticket_agent_index) {
+                    if self.agent(agent.id).is_some() {
+                        let id = agent.id;
+                        self.show(id);
+                        self.focus = Focus::Terminal;
+                        self.status = None;
+                    } else {
+                        self.status = Some(format!(
+                            "O agente {} não está rodando neste nick.",
+                            agent.name
+                        ));
+                    }
+                }
+            }
+            KeyCode::Char('m') => {
+                let index = TicketStage::ALL
+                    .iter()
+                    .position(|stage| stage.key() == ticket.stage)
+                    .unwrap_or(0);
+                self.status = None;
+                self.dialog = Some(Dialog::ChooseTicketStage { ticket, index });
+            }
+            KeyCode::Char('i') => {
+                let path = self.project.as_ref().map(|p| p.path.clone());
+                let mark =
+                    path.and_then(|path| projects::unavailable_text(projects::availability(&path)));
+                if let Some(mark) = mark {
+                    self.status = Some(format!(
+                        "Projeto indisponível: {mark}. O ID só é editado com a pasta e o \
+                         .nick/nick.conf no lugar."
+                    ));
+                } else {
+                    self.status = None;
+                    self.dialog = Some(Dialog::EditId {
+                        input: ticket.key.clone(),
+                        ticket,
+                    });
+                }
+            }
+            KeyCode::Char('g') => return self.choose_stage(Some(ticket)),
+            KeyCode::Char('v') => self.open_active_agents(),
+            KeyCode::Esc | KeyCode::Left => {
+                self.screen = Screen::Tickets;
+                self.ticket_detail = None;
+                self.status = None;
+            }
+            _ if is_quit(key) => return self.quit(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn key_choose_ticket_stage(
+        &mut self,
+        key: KeyEvent,
+        ticket: Ticket,
+        mut index: usize,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                index = (index + 1).min(TicketStage::ALL.len() - 1);
+            }
+            KeyCode::Enter => {
+                let to = TicketStage::ALL[index];
+                if to.key() == ticket.stage {
+                    self.status = Some(tickets::same_stage_message(&ticket, to));
+                } else {
+                    self.status = None;
+                    self.dialog = Some(Dialog::ConfirmStageChange { ticket, to });
+                    return Action::None;
+                }
+            }
+            _ => {}
+        }
+        self.dialog = Some(Dialog::ChooseTicketStage { ticket, index });
+        Action::None
+    }
+
+    /// The field of the new ID: Enter runs the checks 1 to 5 of plan D5 of NS-36, renaming
+    /// nothing (a refusal stays on the bar with the field open, as in `EditTitle`); then the
+    /// confirmation, which says whether the folder will be renamed.
+    fn key_edit_id(&mut self, key: KeyEvent, ticket: Ticket, mut input: String) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Enter => match tickets::check_new_id(&self.db, &ticket, &input) {
+                Ok(new) => {
+                    let moves = self
+                        .project
+                        .as_ref()
+                        .is_some_and(|p| docs::has_dir(&p.path, &ticket.key));
+                    self.status = None;
+                    self.dialog = Some(Dialog::ConfirmEditId { ticket, new, moves });
+                    return Action::None;
+                }
+                Err(message) => self.status = Some(message),
+            },
+            _ => {
+                edit_text(&mut input, key);
+            }
+        }
+        self.dialog = Some(Dialog::EditId { ticket, input });
+        Action::None
+    }
+
+    /// Only s/S apply the new ID (`tickets::edit_id` runs every check again: the state may have
+    /// changed); any other key cancels, renaming nothing.
+    fn key_confirm_edit_id(&mut self, key: KeyEvent, ticket: Ticket, new: String) -> Action {
+        if is_yes(key)
+            && let Some(project) = self.project.as_ref()
+        {
+            self.status = Some(
+                match tickets::edit_id(&self.db, &project.path, &ticket, &new) {
+                    Ok(message) | Err(message) => message,
+                },
+            );
+        }
+        Action::None
     }
 
     fn key_add_path(&mut self, key: KeyEvent, mut input: String) -> Action {
@@ -1594,6 +1861,25 @@ impl App {
             note: Some(note),
         });
     }
+}
+
+/// Whether the form of `kind` warns that the plan is missing (plan D7 of NS-36): only the plan
+/// field of Dev and Review, empty, with a valid ID typed, and `.nick/docs/<ID>/plan.md` not
+/// there now (one `stat`). A path typed in the plan field is not checked (the script does not
+/// check it either); an empty or invalid ID is the validation's job.
+fn plan_missing(project: &Path, kind: StageType, values: &[String]) -> bool {
+    let fields = kind.fields();
+    let value = |rule: Rule| {
+        fields
+            .iter()
+            .position(|field| field.rule == rule)
+            .and_then(|i| values.get(i))
+            .map(|v| stages::trim_read(v))
+    };
+    let (Some(plan), Some(id)) = (value(Rule::Plan), value(Rule::JiraId)) else {
+        return false;
+    };
+    plan.is_empty() && tickets::jira_id_valid(id) && !docs::artifacts(project, id).plan
 }
 
 /// The typing of a one-line text field: Backspace erases the last character, and a character
@@ -4432,5 +4718,536 @@ mod tests {
             f.app.handle_mouse(&wheel(50, 5), area),
             Action::ScrollLines(WHEEL_LINES)
         );
+    }
+
+    // ---- the ticket screen, its stage and editing its ID (NS-36) ----
+
+    use crate::docs::Artifacts;
+    use crate::tickets::TicketStage;
+
+    impl Fixture {
+        fn detail(&self) -> &TicketDetail {
+            self.app
+                .ticket_detail
+                .as_ref()
+                .expect("on the ticket screen")
+        }
+
+        /// The stored stage of the ticket `key` of the open project.
+        fn stage_of(&self, key: &str) -> String {
+            self.all_tickets()
+                .into_iter()
+                .find(|t| t.key == key)
+                .unwrap()
+                .stage
+        }
+
+        fn history_of(&self, key: &str) -> Vec<(String, String)> {
+            let id = self
+                .all_tickets()
+                .into_iter()
+                .find(|t| t.key == key)
+                .unwrap()
+                .id;
+            self.app
+                .db
+                .list_stage_changes(id)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.from_stage, c.to_stage))
+                .collect()
+        }
+
+        /// From the ticket screen: `m`, ↓/↑ until `to`, Enter (the confirmation).
+        fn choose_ticket_stage(&mut self, to: TicketStage) {
+            assert_eq!(self.ch('m'), Action::None);
+            let Some(Dialog::ChooseTicketStage { index, .. }) = self.app.dialog else {
+                panic!("not in the stage dialog: {:?}", self.app.dialog);
+            };
+            let at = TicketStage::ALL.iter().position(|s| *s == to).unwrap();
+            for _ in index..at {
+                self.key(KeyCode::Down);
+            }
+            for _ in at..index {
+                self.key(KeyCode::Up);
+            }
+            assert_eq!(self.key(KeyCode::Enter), Action::None);
+        }
+
+        /// Whether the open form shows the warning of the missing plan.
+        fn plan_missing(&self) -> bool {
+            match &self.app.dialog {
+                Some(Dialog::StageForm { plan_missing, .. }) => *plan_missing,
+                other => panic!("not in the form: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn enter_and_right_open_the_ticket_and_esc_and_left_go_back_with_the_same_selection() {
+        for open in [KeyCode::Enter, KeyCode::Right] {
+            for back in [KeyCode::Esc, KeyCode::Left] {
+                let (mut f, _) = with_agents();
+                f.key(KeyCode::Down);
+                f.app.status = Some("x".into());
+                assert_eq!(f.key(open), Action::None);
+                assert_eq!(f.app.screen, Screen::Ticket);
+                assert_eq!(f.detail().ticket.key, "NS-2");
+                assert_eq!(f.status(), None);
+                assert_eq!(f.key(back), Action::None);
+                assert_eq!(f.app.screen, Screen::Tickets);
+                assert_eq!(f.app.ticket_detail, None);
+                assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-2");
+            }
+        }
+        // A hidden one, with the filter on, opens too.
+        let (mut f, _) = with_agents();
+        f.ch('o');
+        f.ch('s');
+        f.ch('f');
+        f.key(KeyCode::Up);
+        assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-1");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.detail().ticket.key, "NS-1");
+        assert!(f.detail().ticket.hidden_at.is_some());
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-1");
+        assert!(f.app.show_hidden, "the filter stays");
+        // An empty list opens nothing.
+        let (mut f, _) = with_tickets("vazio");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.screen, Screen::Tickets);
+    }
+
+    #[test]
+    fn the_ticket_screen_shows_the_history_the_agents_and_the_artifacts_read_now() {
+        let (mut f, p) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.open_agent(0, &mut launcher);
+        f.shortcut();
+        f.open_agent(2, &mut launcher);
+        f.shortcut();
+        f.app.agent_ended(launcher.ids[1], 0);
+        f.key(KeyCode::Enter);
+        let detail = f.detail();
+        assert_eq!(detail.ticket.key, "NS-1");
+        assert_eq!(detail.changes, []);
+        assert_eq!(
+            detail
+                .agents
+                .iter()
+                .map(|a| (a.name.as_str(), a.state.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("proj · PO · NS-1", "active"),
+                ("proj · Dev · NS-1", "ended")
+            ]
+        );
+        assert_eq!(detail.artifacts, Artifacts::default());
+        // Created with the screen open: the next refresh reads it.
+        let docs = p.join(".nick/docs/NS-1");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("plan.md"), "# plano\n").unwrap();
+        f.key(KeyCode::Down);
+        assert_eq!(
+            f.detail().artifacts,
+            Artifacts {
+                plan: true,
+                review: false
+            }
+        );
+        assert_eq!(f.app.ticket_agent_index, 1);
+        f.choose_ticket_stage(TicketStage::Review);
+        f.ch('s');
+        assert_eq!(f.detail().changes.len(), 1);
+        assert_eq!(f.detail().ticket.stage, "review");
+    }
+
+    #[test]
+    fn a_ticket_gone_from_the_database_goes_back_to_the_list() {
+        let (mut f, _) = with_agents();
+        f.key(KeyCode::Enter);
+        let id = f.detail().ticket.id;
+        f.app
+            .db
+            .connection()
+            .execute("DELETE FROM tickets WHERE id = ?1", [id])
+            .unwrap();
+        f.key(KeyCode::Down);
+        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.app.ticket_detail, None);
+        assert_eq!(f.status(), Some("O ticket NS-1 não existe mais no banco."));
+        assert_eq!(f.keys(), ["NS-2"]);
+    }
+
+    #[test]
+    fn enter_on_a_live_agent_shows_it_whatever_the_stage_and_on_an_ended_one_says_so() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.open_agent(0, &mut launcher);
+        f.shortcut();
+        f.open_agent(1, &mut launcher);
+        f.shortcut();
+        f.app.agent_ended(launcher.ids[1], 0);
+        f.key(KeyCode::Enter);
+        // The ticket goes to Dev; its live PO agent still opens.
+        f.choose_ticket_stage(TicketStage::Development);
+        f.ch('s');
+        assert_eq!(f.stage_of("NS-1"), "development");
+        f.app.shown = None;
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.app.shown, Some(launcher.ids[0]));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.app.screen, Screen::Ticket, "the list stays on the ticket");
+        f.shortcut();
+        f.key(KeyCode::Down);
+        assert_eq!(f.key(KeyCode::Right), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-1 não está rodando neste nick.")
+        );
+        // An active one of another nick does not open either.
+        f.app
+            .db
+            .insert_agent(
+                f.detail().ticket.id,
+                "review",
+                "outro",
+                "proj · Review · NS-1",
+            )
+            .unwrap();
+        // The first key reads it (the refresh comes after the key), the second reaches it.
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Down);
+        assert_eq!(f.app.ticket_agent_index, 2);
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Review · NS-1 não está rodando neste nick.")
+        );
+    }
+
+    #[test]
+    fn m_lists_the_five_stages_and_only_s_changes_the_stage() {
+        let (mut f, _) = with_agents();
+        f.key(KeyCode::Enter);
+        assert_eq!(f.ch('m'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage {
+                ticket: f.detail().ticket.clone(),
+                index: 0
+            })
+        );
+        // Enter on the current one refuses, with the dialog open.
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("O ticket NS-1 já está em PO."));
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { .. })
+        ));
+        for _ in 0..9 {
+            f.key(KeyCode::Down);
+        }
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { index: 4, .. })
+        ));
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmStageChange {
+                ticket: f.detail().ticket.clone(),
+                to: TicketStage::Done
+            })
+        );
+        // Any other key cancels, nothing stored.
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.stage_of("NS-1"), "po");
+        f.choose_ticket_stage(TicketStage::Done);
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.stage_of("NS-1"), "po");
+        // s stores it, with its history; S too, and backwards.
+        f.choose_ticket_stage(TicketStage::Done);
+        f.ch('s');
+        assert_eq!(f.status(), Some("Etapa do ticket NS-1: PO → Concluído."));
+        assert_eq!(f.stage_of("NS-1"), "done");
+        f.choose_ticket_stage(TicketStage::Review);
+        f.ch('S');
+        assert_eq!(f.stage_of("NS-1"), "review");
+        assert_eq!(
+            f.history_of("NS-1"),
+            [
+                ("po".to_string(), "done".to_string()),
+                ("done".to_string(), "review".to_string())
+            ]
+        );
+        // The dialog starts on the current stage; Esc cancels it.
+        f.ch('m');
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { index: 3, .. })
+        ));
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.app.screen, Screen::Ticket);
+        // Done stays on the list.
+        f.choose_ticket_stage(TicketStage::Done);
+        f.ch('s');
+        f.key(KeyCode::Esc);
+        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+    }
+
+    /// The nick never changes the stage alone (plan D9): opening, the end of an agent, ending
+    /// it by the operator or on the way out change neither the stage nor the history; and
+    /// moving to Done ends and hides no agent.
+    #[test]
+    fn the_stage_never_changes_alone_and_done_closes_no_agent() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.open_kind(StageType::Development, &mut launcher);
+        f.app.agent_ended(launcher.ids[0], 0);
+        f.open_kind(StageType::Development, &mut launcher);
+        f.app.agent_ended_by_operator(launcher.ids[1]);
+        f.open_kind(StageType::Review, &mut launcher);
+        f.app.end_all_records().unwrap();
+        assert_eq!(f.stage_of("NS-1"), "po");
+        assert_eq!(f.history_of("NS-1"), []);
+        // Done does not end nor hide the live agent of the ticket.
+        f.open_kind(StageType::Development, &mut launcher);
+        f.shortcut();
+        let before = (f.names_running(), f.app.shown);
+        f.key(KeyCode::Enter);
+        f.choose_ticket_stage(TicketStage::Done);
+        f.ch('s');
+        assert_eq!(f.stage_of("NS-1"), "done");
+        assert_eq!((f.names_running(), f.app.shown), before);
+        assert_eq!(f.agent_rows().last().unwrap().3, "active");
+    }
+
+    #[test]
+    fn g_and_v_work_from_the_ticket_screen() {
+        let (mut f, p) = with_agents();
+        f.key(KeyCode::Enter);
+        let ticket = f.detail().ticket.clone();
+        assert_eq!(
+            f.ch('g'),
+            Action::CheckAgent {
+                project: p.clone(),
+                ticket
+            }
+        );
+        let mut launcher = FakeLauncher::new(true);
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
+        assert_eq!(f.app.screen, Screen::Ticket);
+        assert_eq!(f.detail().agents.len(), 1, "the new agent is listed");
+        f.shortcut();
+        f.ch('v');
+        assert_eq!(f.app.screen, Screen::ActiveAgents);
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.screen, Screen::Ticket);
+        // The refusals of the g of the list: a hidden ticket.
+        f.key(KeyCode::Esc);
+        f.key(KeyCode::Down);
+        f.ch('o');
+        f.ch('s');
+        f.ch('f');
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Enter);
+        assert_eq!(f.detail().ticket.key, "NS-2");
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("O ticket NS-2 está oculto. Restaure-o (o) para abrir um agente.")
+        );
+    }
+
+    #[test]
+    fn q_quits_the_ticket_screen_but_not_its_dialogs() {
+        let (mut f, _) = with_agents();
+        f.key(KeyCode::Enter);
+        f.ch('i');
+        assert_eq!(f.ch('q'), Action::None, "typed in the ID");
+        f.key(KeyCode::Esc);
+        f.ch('m');
+        assert_eq!(f.ch('q'), Action::None);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { .. })
+        ));
+        f.key(KeyCode::Esc);
+        assert_eq!(f.ch('q'), Action::Quit);
+    }
+
+    #[test]
+    fn i_refusals_stay_on_the_bar_with_the_dialog_open() {
+        let (mut f, p) = with_agents();
+        f.key(KeyCode::Enter);
+        let ticket = f.detail().ticket.clone();
+        assert_eq!(f.ch('i'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::EditId {
+                ticket: ticket.clone(),
+                input: "NS-1".into()
+            })
+        );
+        for (typed, message) in [
+            ("", "O ID não mudou."),
+            ("\u{8}\u{8}\u{8}\u{8}", "Informe o novo ID do ticket."),
+            ("a b", tickets::INVALID_ID_MESSAGE),
+            (
+                "\u{8}\u{8}\u{8}NS-2",
+                "Já existe um ticket com o ID NS-2 neste projeto.",
+            ),
+        ] {
+            for c in typed.chars() {
+                if c == '\u{8}' {
+                    f.key(KeyCode::Backspace);
+                } else {
+                    f.ch(c);
+                }
+            }
+            f.key(KeyCode::Enter);
+            assert_eq!(f.status(), Some(message), "{typed:?}");
+            assert!(matches!(f.app.dialog, Some(Dialog::EditId { .. })));
+        }
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), None);
+        // An active agent (of this nick or not) is refused at Enter too.
+        f.app
+            .db
+            .insert_agent(ticket.id, "po", "outro", "proj · PO · NS-1")
+            .unwrap();
+        f.ch('i');
+        f.ch('9');
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O ticket NS-1 tem agente ativo. Encerre os agentes dele antes de editar o ID: o \
+                 prompt deles cita a pasta .nick/docs/NS-1/."
+            )
+        );
+        f.key(KeyCode::Esc);
+        // An unavailable project is refused when the dialog would open.
+        fs::remove_file(p.join(".nick/nick.conf")).unwrap();
+        f.ch('i');
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some(
+                "Projeto indisponível: [indisponível: sem .nick/nick.conf]. O ID só é editado \
+                 com a pasta e o .nick/nick.conf no lugar."
+            )
+        );
+        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+    }
+
+    #[test]
+    fn i_confirms_with_and_without_the_folder_and_only_s_applies() {
+        let (mut f, p) = with_agents();
+        f.key(KeyCode::Enter);
+        let ticket = f.detail().ticket.clone();
+        f.ch('i');
+        f.ch('0');
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmEditId {
+                ticket: ticket.clone(),
+                new: "NS-10".into(),
+                moves: false
+            })
+        );
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+        // With the folder: it says so, and another key cancels without renaming.
+        let docs = p.join(".nick/docs/NS-1");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("plan.md"), "# plano\n").unwrap();
+        f.ch('i');
+        f.ch('0');
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmEditId {
+                ticket: ticket.clone(),
+                new: "NS-10".into(),
+                moves: true
+            })
+        );
+        f.key(KeyCode::Enter);
+        assert!(docs.join("plan.md").is_file());
+        f.ch('i');
+        f.ch('0');
+        f.key(KeyCode::Enter);
+        f.ch('s');
+        assert_eq!(
+            f.status(),
+            Some("ID atualizado: NS-1 → NS-10. A pasta .nick/docs/NS-1/ virou .nick/docs/NS-10/.")
+        );
+        assert!(!docs.exists());
+        assert!(p.join(".nick/docs/NS-10/plan.md").is_file());
+        assert_eq!(f.app.screen, Screen::Ticket);
+        assert_eq!(f.detail().ticket.key, "NS-10");
+        assert!(f.detail().artifacts.plan);
+        assert_eq!(f.keys(), ["NS-10", "NS-2"]);
+    }
+
+    #[test]
+    fn the_form_of_dev_and_review_warns_of_a_missing_plan_without_blocking() {
+        for kind in [StageType::Development, StageType::Review] {
+            let (mut f, p) = with_agents();
+            let mut launcher = FakeLauncher::new(true);
+            f.g(&mut launcher);
+            f.pick(kind);
+            assert!(f.plan_missing(), "no plan: warned at the opening");
+            // Enter still renders.
+            assert_eq!(f.key(KeyCode::Enter), Action::RenderPrompt);
+            f.key(KeyCode::Esc);
+            let docs = p.join(".nick/docs/NS-1");
+            fs::create_dir_all(&docs).unwrap();
+            fs::write(docs.join("plan.md"), "# plano\n").unwrap();
+            f.g(&mut launcher);
+            f.pick(kind);
+            assert!(!f.plan_missing(), "with the plan");
+            // The warning follows the ID typed.
+            f.key(KeyCode::Backspace);
+            assert!(f.plan_missing(), "NS- has no plan");
+            f.ch('1');
+            assert!(!f.plan_missing());
+            f.ch('x');
+            assert!(f.plan_missing());
+            // An invalid or empty ID: no warning (the validation refuses it).
+            f.ch(' ');
+            f.ch('b');
+            assert!(!f.plan_missing(), "invalid ID");
+            for _ in 0.."NS-1x b".len() {
+                f.key(KeyCode::Backspace);
+            }
+            assert_eq!(f.form().1[0], "");
+            assert!(!f.plan_missing(), "empty ID");
+            f.type_text("NS-2");
+            assert!(f.plan_missing());
+            // A path typed in the plan field: no warning, no check.
+            f.key(KeyCode::Tab);
+            f.type_text("outro/plano.md");
+            assert!(!f.plan_missing(), "a path typed");
+            assert_eq!(f.key(KeyCode::Enter), Action::RenderPrompt);
+            f.key(KeyCode::Esc);
+            fs::remove_dir_all(p.join(".nick/docs")).unwrap();
+        }
+        // The other types never warn.
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeader);
+        assert!(!f.plan_missing());
     }
 }

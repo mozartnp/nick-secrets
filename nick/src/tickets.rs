@@ -1,12 +1,18 @@
 //! The rules of the tickets of a project, with no screen (in the mold of projects.rs): the
 //! title, the Jira ID (the same rules as `jira_id_valid` of auto_scrum.sh), the provisional
-//! short UUID when there is no ID, renaming, hiding and restoring. Everything lives only in the
-//! database: no function here touches a file of the project (no `.nick/docs/<ID>/` either).
-//! The errors are the messages for the status bar, in PT-BR.
+//! short UUID when there is no ID, renaming, hiding and restoring, the stage of the ticket and
+//! its history (NS-36), and editing the ID. Everything lives only in the database, with one
+//! exception: `edit_id` renames `.nick/docs/<old ID>/` to `.nick/docs/<new ID>/` (docs.rs), the
+//! only write of the nick in a project; no function here creates, changes nor deletes any other
+//! file of the project. The errors are the messages for the status bar, in PT-BR.
+
+use std::path::Path;
 
 pub use crate::db::Ticket;
 
-use crate::db::{Db, is_unique_violation};
+use crate::agents::Stage;
+use crate::db::{Db, StageChange, is_unique_violation};
+use crate::docs::{self, Renamed};
 use crate::projects::db_error_message;
 
 /// How many provisional IDs are tried before giving up (plan D2).
@@ -150,8 +156,197 @@ pub fn restore(db: &Db, ticket: &Ticket) -> Result<String, String> {
 fn still_there(ticket: &Ticket, updated: rusqlite::Result<bool>) -> Result<(), String> {
     match updated {
         Ok(true) => Ok(()),
-        Ok(false) => Err(format!("O ticket {} não existe mais no banco.", ticket.key)),
+        Ok(false) => Err(gone_message(ticket)),
         Err(err) => Err(db_error_message(&err)),
+    }
+}
+
+/// The ticket is no longer in the database.
+pub fn gone_message(ticket: &Ticket) -> String {
+    format!("O ticket {} não existe mais no banco.", ticket.key)
+}
+
+/// The stage of a ticket (NS-36): the four stages of the agents, then "Concluído". Only a
+/// record, changed only by the operator (`change_stage`), to any stage: it opens, closes and
+/// hides no agent, and nothing of the agents changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketStage {
+    Po,
+    TechLeader,
+    Development,
+    Review,
+    Done,
+}
+
+impl From<Stage> for TicketStage {
+    fn from(stage: Stage) -> TicketStage {
+        match stage {
+            Stage::Po => TicketStage::Po,
+            Stage::TechLeader => TicketStage::TechLeader,
+            Stage::Development => TicketStage::Development,
+            Stage::Review => TicketStage::Review,
+        }
+    }
+}
+
+impl TicketStage {
+    /// Every stage, in the order of the flow (the order of the dialog).
+    pub const ALL: [TicketStage; 5] = [
+        TicketStage::Po,
+        TicketStage::TechLeader,
+        TicketStage::Development,
+        TicketStage::Review,
+        TicketStage::Done,
+    ];
+
+    /// The stage of the agents with the same key and label; None for `Done`.
+    pub fn agent_stage(self) -> Option<Stage> {
+        match self {
+            TicketStage::Po => Some(Stage::Po),
+            TicketStage::TechLeader => Some(Stage::TechLeader),
+            TicketStage::Development => Some(Stage::Development),
+            TicketStage::Review => Some(Stage::Review),
+            TicketStage::Done => None,
+        }
+    }
+
+    /// The key stored in `tickets.stage` and in the history.
+    pub fn key(self) -> &'static str {
+        self.agent_stage().map_or("done", Stage::key)
+    }
+
+    /// What the screen shows.
+    pub fn label(self) -> &'static str {
+        self.agent_stage().map_or("Concluído", Stage::label)
+    }
+
+    /// The stage of a stored key.
+    pub fn from_key(key: &str) -> Option<TicketStage> {
+        TicketStage::ALL
+            .into_iter()
+            .find(|stage| stage.key() == key)
+    }
+}
+
+/// The label of a stored stage key, or the key itself when it is unknown (the CHECK of the
+/// schema keeps it from happening; the screen never panics on it).
+pub fn stage_label(key: &str) -> String {
+    TicketStage::from_key(key).map_or_else(|| key.to_string(), |stage| stage.label().into())
+}
+
+/// The refusal of changing the ticket to the stage it is already at.
+pub fn same_stage_message(ticket: &Ticket, to: TicketStage) -> String {
+    format!("O ticket {} já está em {}.", ticket.key, to.label())
+}
+
+/// Changes the stage of the ticket to `to`, with its row in the history (one transaction:
+/// `Db::change_ticket_stage`). The only path that writes the stage; only the confirmation of
+/// the dialog of the ticket screen calls it. The same stage is refused; a ticket gone, or moved
+/// by another nick meanwhile, stores nothing.
+pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String, String> {
+    if ticket.stage == to.key() {
+        return Err(same_stage_message(ticket, to));
+    }
+    match db.change_ticket_stage(ticket.id, &ticket.stage, to.key()) {
+        Ok(StageChange::Changed) => Ok(format!(
+            "Etapa do ticket {}: {} → {}.",
+            ticket.key,
+            stage_label(&ticket.stage),
+            to.label()
+        )),
+        Ok(StageChange::Gone) => Err(gone_message(ticket)),
+        Ok(StageChange::Moved) => Err(format!(
+            "A etapa do ticket {} mudou em outro nick. Nada foi gravado.",
+            ticket.key
+        )),
+        Err(err) => Err(db_error_message(&err)),
+    }
+}
+
+/// Steps 1 to 5 of "Editar ID" (plan D5 of NS-36), with nothing written: the new ID trimmed
+/// (as in the creation), not empty, accepted by `jira_id_valid`, different from the current
+/// one, not in the project (visible or hidden), and no `active` agent of the ticket (of this
+/// nick or of another one: their prompt cites the docs dir). Returns the new ID.
+pub fn check_new_id(db: &Db, ticket: &Ticket, input: &str) -> Result<String, String> {
+    let new = input.trim();
+    if new.is_empty() {
+        return Err("Informe o novo ID do ticket.".into());
+    }
+    if !jira_id_valid(new) {
+        return Err(INVALID_ID_MESSAGE.into());
+    }
+    if new == ticket.key {
+        return Err("O ID não mudou.".into());
+    }
+    if let Some(message) = duplicate_message(db, ticket.project_id, new)? {
+        return Err(message);
+    }
+    match db.count_active_agents(ticket.id) {
+        Ok(0) => Ok(new.to_string()),
+        Ok(_) => Err(format!(
+            "O ticket {} tem agente ativo. Encerre os agentes dele antes de editar o ID: o \
+             prompt deles cita a pasta {}.",
+            ticket.key,
+            docs::dir_text(&ticket.key)
+        )),
+        Err(err) => Err(db_error_message(&err)),
+    }
+}
+
+/// Edits the ID of the ticket of the project at `project` (plan D5 of NS-36).
+pub fn edit_id(db: &Db, project: &Path, ticket: &Ticket, input: &str) -> Result<String, String> {
+    edit_id_with(db, project, ticket, input, &mut |old, new| {
+        db.update_ticket_key(ticket.id, old, new)
+    })
+}
+
+/// `edit_id` with the write of the database received by parameter (the tests make it fail).
+/// The checks run again (the state may have changed since the dialog), then the folder
+/// `.nick/docs/<old>/` is renamed first (`docs::rename`, never replacing anything) and the
+/// database is written after; a failing database undoes the rename. A failing undo is told
+/// with where the folder is; nothing is ever removed nor merged to "fix" it.
+pub fn edit_id_with(
+    db: &Db,
+    project: &Path,
+    ticket: &Ticket,
+    input: &str,
+    update: &mut dyn FnMut(&str, &str) -> rusqlite::Result<bool>,
+) -> Result<String, String> {
+    let new = check_new_id(db, ticket, input)?;
+    let old = ticket.key.as_str();
+    let renamed = docs::rename(project, old, &new)?;
+    let failure = match update(old, &new) {
+        Ok(true) => {
+            let mut message = format!("ID atualizado: {old} → {new}.");
+            if renamed == Renamed::Moved {
+                message = format!(
+                    "{message} A pasta {} virou {}.",
+                    docs::dir_text(old),
+                    docs::dir_text(&new)
+                );
+            }
+            return Ok(message);
+        }
+        Ok(false) => gone_message(ticket),
+        Err(err) if is_unique_violation(&err) => duplicate_message(db, ticket.project_id, &new)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| visible_duplicate(&new)),
+        Err(err) => db_error_message(&err),
+    };
+    if renamed == Renamed::NoFolder {
+        return Err(failure);
+    }
+    match docs::undo_rename(project, old, &new) {
+        Ok(()) => Err(format!(
+            "{failure} A pasta voltou para {}.",
+            docs::dir_text(old)
+        )),
+        Err(err) => Err(format!(
+            "{failure} Não consegui desfazer a renomeação: a pasta está em {} e o ticket \
+             continua com o ID {old}. {err}.",
+            docs::dir_text(&new)
+        )),
     }
 }
 
@@ -489,5 +684,377 @@ mod tests {
         assert_eq!(snapshot(&dir), before);
         assert!(!dir.join(".nick/docs/NS-1").exists());
         assert!(!dir.join(".nick/docs").join(&provisional.key).exists());
+    }
+
+    // ---- the stage of the ticket (NS-36) ----
+
+    use crate::agents::Stage;
+    use crate::db::StageChange;
+
+    #[test]
+    fn ticket_stage_has_the_five_stages_in_the_order_of_the_flow() {
+        use TicketStage::*;
+        assert_eq!(
+            TicketStage::ALL,
+            [Po, TechLeader, Development, Review, Done]
+        );
+        assert_eq!(
+            TicketStage::ALL.map(TicketStage::key),
+            ["po", "tech_leader", "development", "review", "done"]
+        );
+        assert_eq!(
+            TicketStage::ALL.map(TicketStage::label),
+            ["PO", "Tech Leader", "Dev", "Review", "Concluído"]
+        );
+        for stage in TicketStage::ALL {
+            assert_eq!(TicketStage::from_key(stage.key()), Some(stage));
+        }
+        for bad in ["", "PO", "dev", "Done", "concluido"] {
+            assert_eq!(TicketStage::from_key(bad), None, "{bad:?}");
+        }
+        // The four of the agents are the same as `Stage` (no repeated text).
+        for stage in Stage::ALL {
+            let ticket = TicketStage::from(stage);
+            assert_eq!((ticket.key(), ticket.label()), (stage.key(), stage.label()));
+            assert_eq!(ticket.agent_stage(), Some(stage));
+        }
+        assert_eq!(Done.agent_stage(), None);
+        // A key the CHECK should never let in shows raw, without a panic.
+        assert_eq!(stage_label("po"), "PO");
+        assert_eq!(stage_label("archived"), "archived");
+    }
+
+    impl Fixture {
+        fn stored(&self, id: i64) -> Ticket {
+            self.all().into_iter().find(|t| t.id == id).unwrap()
+        }
+
+        fn history(&self, id: i64) -> Vec<(String, String)> {
+            self.db
+                .list_stage_changes(id)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.from_stage, c.to_stage))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn change_stage_goes_forwards_backwards_and_to_and_from_done() {
+        let f = fixture();
+        let t = f.create("t", "NS-1").unwrap();
+        let mut steps = Vec::new();
+        for (to, message) in [
+            (TicketStage::Review, "Etapa do ticket NS-1: PO → Review."),
+            (
+                TicketStage::Development,
+                "Etapa do ticket NS-1: Review → Dev.",
+            ),
+            (TicketStage::Done, "Etapa do ticket NS-1: Dev → Concluído."),
+            (
+                TicketStage::TechLeader,
+                "Etapa do ticket NS-1: Concluído → Tech Leader.",
+            ),
+        ] {
+            let current = f.stored(t.id);
+            assert_eq!(change_stage(&f.db, &current, to), Ok(message.into()));
+            assert_eq!(f.stored(t.id).stage, to.key());
+            steps.push((current.stage, to.key().to_string()));
+        }
+        assert_eq!(f.history(t.id), steps);
+    }
+
+    #[test]
+    fn the_same_stage_is_refused_and_nothing_is_stored() {
+        let f = fixture();
+        let t = f.create("t", "NS-1").unwrap();
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Po),
+            Err("O ticket NS-1 já está em PO.".into())
+        );
+        assert_eq!(f.history(t.id), []);
+    }
+
+    #[test]
+    fn a_ticket_gone_or_moved_by_another_nick_stores_nothing() {
+        let f = fixture();
+        let t = f.create("t", "NS-1").unwrap();
+        // Another nick moved it to Review; this one still shows it in PO.
+        assert_eq!(
+            f.db.change_ticket_stage(t.id, "po", "review").unwrap(),
+            StageChange::Changed
+        );
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Done),
+            Err("A etapa do ticket NS-1 mudou em outro nick. Nada foi gravado.".into())
+        );
+        assert_eq!(f.stored(t.id).stage, "review");
+        assert_eq!(f.history(t.id).len(), 1);
+        f.db.delete_project(f.project).unwrap();
+        assert_eq!(
+            change_stage(&f.db, &f.stored_or(t.clone()), TicketStage::Done),
+            Err("O ticket NS-1 não existe mais no banco.".into())
+        );
+    }
+
+    impl Fixture {
+        /// The stored ticket, or `t` when it is gone.
+        fn stored_or(&self, t: Ticket) -> Ticket {
+            self.all().into_iter().find(|s| s.id == t.id).unwrap_or(t)
+        }
+    }
+
+    // ---- editing the ID (NS-36) ----
+
+    use crate::projects::snapshot::Entry;
+    use std::collections::BTreeMap;
+
+    impl Fixture {
+        /// The project dir (`<root>/p`) with its config and a README.
+        fn project_dir(&self) -> PathBuf {
+            let dir = self.root.join("p");
+            std::fs::create_dir_all(dir.join(".nick")).unwrap();
+            std::fs::write(dir.join(".nick/nick.conf"), "STACK_DESCRIPTION=\"\"\n").unwrap();
+            std::fs::write(dir.join("README.md"), "# p\n").unwrap();
+            dir
+        }
+
+        fn edit(&self, ticket: &Ticket, input: &str) -> Result<String, String> {
+            edit_id(&self.db, &self.root.join("p"), ticket, input)
+        }
+    }
+
+    fn with_docs(dir: &Path, key: &str) {
+        let docs = dir.join(".nick/docs").join(key);
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("plan.md"), "# plano\n").unwrap();
+    }
+
+    /// The snapshot with `.nick/docs/<old>` renamed `.nick/docs/<new>`, and without the mtime of
+    /// `.nick/docs` (its entry changed: renaming touches the parent's mtime, nothing else).
+    fn renamed(snap: BTreeMap<PathBuf, Entry>, old: &str, new: &str) -> BTreeMap<PathBuf, Entry> {
+        let from = Path::new(".nick/docs").join(old);
+        let to = Path::new(".nick/docs").join(new);
+        snap.into_iter()
+            .map(|(k, mut v)| {
+                if k == Path::new(".nick/docs") {
+                    v.modified = std::time::UNIX_EPOCH;
+                }
+                match k.strip_prefix(&from) {
+                    Ok(rest) => (to.join(rest), v),
+                    Err(_) => (k, v),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_a_folder_only_the_database_changes() {
+        for (jira, provisional) in [("", true), ("NS-1", false)] {
+            let f = fixture();
+            let dir = f.project_dir();
+            let t = f.create("t", jira).unwrap();
+            assert_eq!(t.is_provisional, provisional);
+            let before = snapshot(&dir);
+            assert_eq!(
+                f.edit(&t, "  NS-99  "),
+                Ok(format!("ID atualizado: {} → NS-99.", t.key))
+            );
+            assert_eq!(snapshot(&dir), before);
+            let stored = f.stored(t.id);
+            assert_eq!(stored.key, "NS-99");
+            assert!(!stored.is_provisional);
+            assert_eq!((stored.title, stored.stage), (t.title, t.stage));
+        }
+    }
+
+    #[test]
+    fn with_a_folder_it_is_renamed_and_the_database_updated() {
+        for jira in ["", "NS-1"] {
+            let f = fixture();
+            let dir = f.project_dir();
+            let t = f.create("t", jira).unwrap();
+            with_docs(&dir, &t.key);
+            with_docs(&dir, "NS-2");
+            let before = snapshot(&dir);
+            assert_eq!(
+                f.edit(&t, "NS-99"),
+                Ok(format!(
+                    "ID atualizado: {old} → NS-99. A pasta .nick/docs/{old}/ virou \
+                     .nick/docs/NS-99/.",
+                    old = t.key
+                ))
+            );
+            assert_eq!(
+                renamed(snapshot(&dir), "", ""),
+                renamed(before, &t.key, "NS-99")
+            );
+            let stored = f.stored(t.id);
+            assert_eq!(stored.key, "NS-99");
+            assert!(!stored.is_provisional);
+        }
+    }
+
+    #[test]
+    fn an_existing_destination_is_refused_and_nothing_changes() {
+        let f = fixture();
+        let dir = f.project_dir();
+        let t = f.create("t", "").unwrap();
+        with_docs(&dir, &t.key);
+        std::fs::create_dir_all(dir.join(".nick/docs/NS-99")).unwrap();
+        let before = snapshot(&dir);
+        assert_eq!(
+            f.edit(&t, "NS-99"),
+            Err("Já existe a pasta .nick/docs/NS-99/ no projeto. Nada foi mudado.".into())
+        );
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(f.stored(t.id), t);
+    }
+
+    #[test]
+    fn an_active_agent_is_refused_and_nothing_changes() {
+        let f = fixture();
+        let dir = f.project_dir();
+        let t = f.create("t", "NS-1").unwrap();
+        with_docs(&dir, "NS-1");
+        let agent =
+            f.db.insert_agent(t.id, "po", "s-1", "p · PO · NS-1")
+                .unwrap();
+        let before = snapshot(&dir);
+        let refusal = Err(
+            "O ticket NS-1 tem agente ativo. Encerre os agentes dele antes de editar o ID: o \
+             prompt deles cita a pasta .nick/docs/NS-1/."
+                .to_string(),
+        );
+        assert_eq!(f.edit(&t, "NS-99"), refusal);
+        assert_eq!(check_new_id(&f.db, &t, "NS-99"), refusal);
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(f.stored(t.id), t);
+        // Ended, it is no longer in the way.
+        f.db.end_agent(agent.id).unwrap();
+        assert!(f.edit(&t, "NS-99").is_ok());
+    }
+
+    #[test]
+    fn a_failing_database_undoes_the_rename() {
+        for fail in ["error", "false"] {
+            let f = fixture();
+            let dir = f.project_dir();
+            let t = f.create("t", "").unwrap();
+            with_docs(&dir, &t.key);
+            let before = snapshot(&dir);
+            let mut calls = Vec::new();
+            let mut update = |old: &str, new: &str| {
+                calls.push((old.to_string(), new.to_string()));
+                // At this point the folder is already under the new name.
+                assert!(dir.join(".nick/docs/NS-99/plan.md").is_file());
+                if fail == "error" {
+                    Err(rusqlite::Error::InvalidQuery)
+                } else {
+                    Ok(false)
+                }
+            };
+            let err = edit_id_with(&f.db, &dir, &t, "NS-99", &mut update).unwrap_err();
+            let base = if fail == "error" {
+                db_error_message(&rusqlite::Error::InvalidQuery)
+            } else {
+                format!("O ticket {} não existe mais no banco.", t.key)
+            };
+            assert_eq!(
+                err,
+                format!("{base} A pasta voltou para .nick/docs/{}/.", t.key),
+                "{fail}"
+            );
+            assert_eq!(calls, [(t.key.clone(), "NS-99".to_string())]);
+            assert_eq!(renamed(snapshot(&dir), "", ""), renamed(before, "", ""));
+            assert_eq!(f.stored(t.id), t);
+        }
+    }
+
+    /// Another nick created the same ID meanwhile: the UNIQUE of the update, its message.
+    #[test]
+    fn a_unique_violation_of_the_update_undoes_the_rename_with_the_duplicate_message() {
+        let f = fixture();
+        let dir = f.project_dir();
+        let t = f.create("t", "NS-1").unwrap();
+        with_docs(&dir, "NS-1");
+        let mut update = |old: &str, new: &str| {
+            f.create("outro", "NS-99").unwrap();
+            f.db.update_ticket_key(t.id, old, new)
+        };
+        assert_eq!(
+            edit_id_with(&f.db, &dir, &t, "NS-99", &mut update),
+            Err(
+                "Já existe um ticket com o ID NS-99 neste projeto. A pasta voltou para \
+                 .nick/docs/NS-1/."
+                    .into()
+            )
+        );
+        assert!(dir.join(".nick/docs/NS-1/plan.md").is_file());
+        assert!(!dir.join(".nick/docs/NS-99").exists());
+    }
+
+    #[test]
+    fn a_failing_undo_says_where_the_folder_is_and_removes_nothing() {
+        let f = fixture();
+        let dir = f.project_dir();
+        let t = f.create("t", "NS-1").unwrap();
+        with_docs(&dir, "NS-1");
+        let mut update = |_: &str, _: &str| {
+            // Something took the old name before the undo.
+            std::fs::create_dir(dir.join(".nick/docs/NS-1")).unwrap();
+            Err(rusqlite::Error::InvalidQuery)
+        };
+        let err = edit_id_with(&f.db, &dir, &t, "NS-99", &mut update).unwrap_err();
+        let start = format!(
+            "{} Não consegui desfazer a renomeação: a pasta está em .nick/docs/NS-99/ e o \
+             ticket continua com o ID NS-1. ",
+            db_error_message(&rusqlite::Error::InvalidQuery)
+        );
+        assert!(err.starts_with(&start), "{err}");
+        // Nothing removed nor merged: the moved folder whole, the new empty one empty.
+        assert!(dir.join(".nick/docs/NS-99/plan.md").is_file());
+        assert_eq!(
+            std::fs::read_dir(dir.join(".nick/docs/NS-1"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(f.stored(t.id), t);
+    }
+
+    #[test]
+    fn the_refusals_of_the_new_id_change_nothing() {
+        let f = fixture();
+        let dir = f.project_dir();
+        let t = f.create("t", "NS-1").unwrap();
+        f.create("outro", "NS-2").unwrap();
+        let hidden = f.create("oculto", "NS-3").unwrap();
+        hide(&f.db, &hidden).unwrap();
+        with_docs(&dir, "NS-1");
+        let before = snapshot(&dir);
+        let mut cases =
+            vec![
+            ("", "Informe o novo ID do ticket.".to_string()),
+            ("   ", "Informe o novo ID do ticket.".to_string()),
+            (" NS-1 ", "O ID não mudou.".to_string()),
+            ("NS-2", "Já existe um ticket com o ID NS-2 neste projeto.".to_string()),
+            (
+                "NS-3",
+                "Já existe um ticket com o ID NS-3 neste projeto (oculto; f mostra os ocultos)."
+                    .to_string(),
+            ),
+        ];
+        for bad in REFUSED.iter().filter(|id| !id.trim().is_empty()) {
+            cases.push((bad, INVALID_ID_MESSAGE.to_string()));
+        }
+        for (input, message) in cases {
+            assert_eq!(f.edit(&t, input), Err(message.clone()), "{input:?}");
+            assert_eq!(check_new_id(&f.db, &t, input), Err(message), "{input:?}");
+        }
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(f.stored(t.id), t);
+        // Another case of the same ID is another ID (BINARY), and passes.
+        assert_eq!(check_new_id(&f.db, &t, " ns-1 "), Ok("ns-1".to_string()));
     }
 }

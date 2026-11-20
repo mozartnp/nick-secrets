@@ -24,9 +24,13 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   o `bin/nick-init` à mão antes de cadastrar. Remover um projeto só tira o cadastro do nick: nenhum
   arquivo do projeto é apagado, mas os tickets dele saem do banco junto.
 - **Tickets:** abrem a partir de um projeto disponível (com a pasta e o `.nick/nick.conf` no
-  lugar). Cada ticket tem um título e o ID do Jira. Sem o ID, o nick gera um ID provisório. Um
-  ticket pode ser ocultado, sem sair do banco, e restaurado depois. Os tickets ficam só no banco
-  do nick: nenhuma ação sobre eles cria ou altera arquivo do projeto.
+  lugar). Cada ticket tem um título, o ID do Jira e a etapa atual (PO, Tech Leader, Dev, Review
+  ou Concluído), que só o operador muda, com o histórico das mudanças. Sem o ID, o nick gera um
+  ID provisório, que pode ser trocado depois. Um ticket pode ser ocultado, sem sair do banco, e
+  restaurado depois. A tela de cada ticket mostra a etapa, o histórico, se o plano e o review
+  existem em `.nick/docs/<ID>/` e os agentes do ticket. Os tickets ficam só no banco do nick:
+  a única ação que mexe no projeto é a troca do ID, que renomeia a pasta `.nick/docs/<ID>/`
+  (sem nunca sobrescrever outra).
 - **Agentes:** a partir de um ticket, a TUI oferece os mesmos tipos de conversa do menu do
   `auto_scrum`, faz as mesmas perguntas (a descrição longa abre no seu `$EDITOR`, ou no `nano`),
   monta o mesmo prompt do script, mostra o prompt final e pede a confirmação antes de abrir. O

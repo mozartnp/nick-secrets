@@ -131,7 +131,19 @@ pub enum StageChange {
     Moved,
 }
 
-/// An agent of a ticket, as stored (migration 3). `stage` and `state` are the raw keys of
+/// What `Db::resume_agent`, `archive_agent` and `unarchive_agent` did (NS-39, the mold of
+/// `StageChange`): `Done`, or why nothing was written — the agent is gone, or is in the state
+/// named (another nick changed it, or it was never in the expected one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentChange {
+    Done,
+    Gone,
+    Active,
+    Stopped,
+    Archived,
+}
+
+/// An agent of a ticket, as stored (migrations 3 and 6). `stage` and `state` are the raw keys of
 /// the columns (agents.rs: `Stage`, `AgentState`; the state is only written from the enum).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
@@ -144,10 +156,12 @@ pub struct Agent {
     pub name: String,
     pub opened_at: String,
     pub state: String,
+    /// The ticket key it was opened with (migration 6); None when opened before the NS-39.
+    pub opened_key: Option<String>,
 }
 
 /// The columns of an agent, in the order of `agent_from_row`.
-const AGENT_COLUMNS: &str = "id, ticket_id, stage, session_id, name, opened_at, state";
+const AGENT_COLUMNS: &str = "id, ticket_id, stage, session_id, name, opened_at, state, opened_key";
 
 fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
     Ok(Agent {
@@ -158,6 +172,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
         name: row.get(4)?,
         opened_at: row.get(5)?,
         state: row.get(6)?,
+        opened_key: row.get(7)?,
     })
 }
 
@@ -390,34 +405,116 @@ impl Db {
         )
     }
 
-    /// Stores an agent of the ticket, `active`, opened now, and returns it. A session ID
-    /// already stored fails with the UNIQUE constraint (see `is_unique_violation`).
+    /// Stores an agent of the ticket, `active`, opened now with the ticket key `opened_key`, and
+    /// returns it. A session ID already stored fails with the UNIQUE constraint (see
+    /// `is_unique_violation`).
     pub fn insert_agent(
         &self,
         ticket_id: i64,
         stage: &str,
         session_id: &str,
         name: &str,
+        opened_key: &str,
     ) -> rusqlite::Result<Agent> {
         self.conn.query_row(
             &format!(
-                "INSERT INTO agents (ticket_id, stage, session_id, name, opened_at, state) \
-                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?5) \
+                "INSERT INTO agents \
+                 (ticket_id, stage, session_id, name, opened_at, state, opened_key) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?5, ?6) \
                  RETURNING {AGENT_COLUMNS}"
             ),
-            params![ticket_id, stage, session_id, name, AgentState::Active.key()],
+            params![
+                ticket_id,
+                stage,
+                session_id,
+                name,
+                AgentState::Active.key(),
+                opened_key
+            ],
             agent_from_row,
         )
     }
 
-    /// Marks the agent as `ended` (only the state changes). `false` when the agent is no
-    /// longer in the database.
-    pub fn end_agent(&self, id: i64) -> rusqlite::Result<bool> {
+    /// Marks the agent as `stopped` (only the state changes; the `end_agent` of before the
+    /// NS-39). `false` when the agent is no longer in the database.
+    pub fn stop_agent(&self, id: i64) -> rusqlite::Result<bool> {
         let changed = self.conn.execute(
             "UPDATE agents SET state = ?2 WHERE id = ?1",
-            params![id, AgentState::Ended.key()],
+            params![id, AgentState::Stopped.key()],
         )?;
         Ok(changed > 0)
+    }
+
+    /// The agent `id`, of any state; None when it is no longer in the database.
+    pub fn get_agent(&self, id: i64) -> rusqlite::Result<Option<Agent>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"),
+                params![id],
+                agent_from_row,
+            )
+            .optional()
+    }
+
+    /// Moves the agent `id` to `to` only when it is in one of `from` (an UPDATE conditioned on
+    /// the state, the mold of `change_ticket_stage`); otherwise nothing is written, and the
+    /// state read again says why. A state this nick does not know counts as gone: nothing is
+    /// ever done on it.
+    fn change_agent_state(
+        &self,
+        id: i64,
+        from: &[AgentState],
+        to: AgentState,
+    ) -> rusqlite::Result<AgentChange> {
+        let keys: Vec<&str> = from.iter().map(|state| state.key()).collect();
+        let placeholders: Vec<String> = (3..3 + keys.len()).map(|n| format!("?{n}")).collect();
+        let to = to.key();
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&id, &to];
+        values.extend(keys.iter().map(|key| key as &dyn rusqlite::ToSql));
+        let changed = self.conn.execute(
+            &format!(
+                "UPDATE agents SET state = ?2 WHERE id = ?1 AND state IN ({})",
+                placeholders.join(", ")
+            ),
+            values.as_slice(),
+        )?;
+        if changed > 0 {
+            return Ok(AgentChange::Done);
+        }
+        let state: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match state.as_deref().and_then(AgentState::from_key) {
+            None => AgentChange::Gone,
+            Some(AgentState::Active) => AgentChange::Active,
+            Some(AgentState::Stopped) => AgentChange::Stopped,
+            Some(AgentState::Archived) => AgentChange::Archived,
+        })
+    }
+
+    /// The agent `id` becomes `active` again (a resume, NS-39): only from `stopped`, or from an
+    /// `active` row whose nick died (the caller holds its lock: agents.rs).
+    pub fn resume_agent(&self, id: i64) -> rusqlite::Result<AgentChange> {
+        self.change_agent_state(
+            id,
+            &[AgentState::Stopped, AgentState::Active],
+            AgentState::Active,
+        )
+    }
+
+    /// Archives the agent `id`: only a `stopped` one.
+    pub fn archive_agent(&self, id: i64) -> rusqlite::Result<AgentChange> {
+        self.change_agent_state(id, &[AgentState::Stopped], AgentState::Archived)
+    }
+
+    /// Takes the archived agent `id` back to `stopped`.
+    pub fn unarchive_agent(&self, id: i64) -> rusqlite::Result<AgentChange> {
+        self.change_agent_state(id, &[AgentState::Archived], AgentState::Stopped)
     }
 
     /// The value of the setting `key`, or `None` when it has no row (the default).
@@ -556,7 +653,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::migrations::{
-        MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATIONS,
+        MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATIONS,
     };
     use super::*;
 
@@ -589,12 +686,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_5_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_6_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 5);
+        assert_eq!(user_version(db.connection()), 6);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -628,7 +725,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 5);
+        assert_eq!(user_version(db.connection()), 6);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -675,7 +772,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 7, mais nova que a deste nick (5). \
+                "Erro: o banco {} está na versão 7, mais nova que a deste nick (6). \
                  Atualize o nick.",
                 path.display()
             )
@@ -750,7 +847,7 @@ mod tests {
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            5,
+            6,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -833,6 +930,14 @@ CREATE TABLE ticket_stage_changes (
 "
         );
         assert_eq!(MIGRATIONS[4], MIGRATION_5);
+        assert_eq!(
+            MIGRATION_6,
+            "\
+ALTER TABLE agents ADD COLUMN opened_key TEXT;  -- the ticket key at the opening; NULL before NS-39
+UPDATE agents SET state = 'stopped' WHERE state = 'ended';
+"
+        );
+        assert_eq!(MIGRATIONS[5], MIGRATION_6);
     }
 
     #[test]
@@ -841,13 +946,13 @@ CREATE TABLE ticket_stage_changes (
         let path = tmp.path().join("nick.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 6;")
+            .execute_batch("PRAGMA user_version = 7;")
             .unwrap();
         let err = Db::open(&path).err().expect("a newer database is refused");
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 6, mais nova que a deste nick (5). \
+                "Erro: o banco {} está na versão 7, mais nova que a deste nick (6). \
                  Atualize o nick.",
                 path.display()
             )
@@ -1273,7 +1378,7 @@ CREATE TABLE ticket_stage_changes (
         assert_eq!(db.list_projects("auto_scrum").unwrap(), projects);
         assert_eq!(old_tickets(db.connection(), projects[0].id), tickets[0]);
         assert_eq!(old_tickets(db.connection(), projects[1].id), tickets[1]);
-        assert_eq!(db.list_active_agents().unwrap(), []);
+        assert_eq!(old_active_agents(db.connection()), []);
         raw_agent(db.connection(), ns1, "po", "s-1").unwrap();
     }
 
@@ -1307,7 +1412,7 @@ CREATE TABLE ticket_stage_changes (
         let dup = raw_agent(conn, other.id, "review", "same").unwrap_err();
         assert!(is_unique_violation(&dup), "{dup:?}");
         let dup = db
-            .insert_agent(ticket, "development", "same", "n")
+            .insert_agent(ticket, "development", "same", "n", "NS-1")
             .unwrap_err();
         assert!(is_unique_violation(&dup), "{dup:?}");
         assert_eq!(agent_sessions(conn), ["same"]);
@@ -1318,7 +1423,7 @@ CREATE TABLE ticket_stage_changes (
         let tmp = tempfile::tempdir().unwrap();
         let (db, _, _) = with_ticket(&tmp);
         assert!(raw_agent(db.connection(), 99, "po", "s").is_err());
-        assert!(db.insert_agent(99, "po", "s", "n").is_err());
+        assert!(db.insert_agent(99, "po", "s", "n", "NS-1").is_err());
         assert_eq!(agent_sessions(db.connection()), Vec::<String>::new());
     }
 
@@ -1330,9 +1435,11 @@ CREATE TABLE ticket_stage_changes (
         let b = db.insert_project("auto_scrum", "b", "/b").unwrap();
         let ta = db.insert_ticket(a.id, "A-1", false, "t").unwrap();
         let tb = db.insert_ticket(b.id, "B-1", false, "t").unwrap();
-        db.insert_agent(ta.id, "po", "a-1", "n").unwrap();
-        db.insert_agent(ta.id, "review", "a-2", "n").unwrap();
-        db.insert_agent(tb.id, "development", "b-1", "n").unwrap();
+        db.insert_agent(ta.id, "po", "a-1", "n", "NS-1").unwrap();
+        db.insert_agent(ta.id, "review", "a-2", "n", "NS-1")
+            .unwrap();
+        db.insert_agent(tb.id, "development", "b-1", "n", "NS-1")
+            .unwrap();
         db.delete_project(a.id).unwrap();
         assert_eq!(ticket_keys(db.connection()), [(b.id, "B-1".to_string())]);
         assert_eq!(agent_sessions(db.connection()), ["b-1"]);
@@ -1371,24 +1478,33 @@ CREATE TABLE ticket_stage_changes (
         let tmp = tempfile::tempdir().unwrap();
         let (db, _, ticket) = with_ticket(&tmp);
         let agent = db
-            .insert_agent(ticket, "tech_leader", "s-1", "p · Tech Leader · NS-1")
+            .insert_agent(
+                ticket,
+                "tech_leader",
+                "s-1",
+                "p · Tech Leader · NS-1",
+                "NS-1",
+            )
             .unwrap();
         assert_eq!(agent.ticket_id, ticket);
         assert_eq!(agent.stage, "tech_leader");
         assert_eq!(agent.session_id, "s-1");
         assert_eq!(agent.name, "p · Tech Leader · NS-1");
         assert_eq!(agent.state, "active");
+        assert_eq!(agent.opened_key.as_deref(), Some("NS-1"));
         assert_rfc3339_utc(&agent.opened_at);
         assert_eq!(db.list_active_agents().unwrap(), [agent]);
     }
 
     #[test]
-    fn end_agent_changes_only_the_state_and_says_whether_the_row_exists() {
+    fn stop_agent_changes_only_the_state_and_says_whether_the_row_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, project, ticket) = with_ticket(&tmp);
-        let first = db.insert_agent(ticket, "po", "s-1", "n1").unwrap();
-        let second = db.insert_agent(ticket, "review", "s-2", "n2").unwrap();
-        assert!(db.end_agent(first.id).unwrap());
+        let first = db.insert_agent(ticket, "po", "s-1", "n1", "NS-1").unwrap();
+        let second = db
+            .insert_agent(ticket, "review", "s-2", "n2", "NS-1")
+            .unwrap();
+        assert!(db.stop_agent(first.id).unwrap());
         assert_eq!(
             db.list_active_agents().unwrap(),
             std::slice::from_ref(&second)
@@ -1416,13 +1532,13 @@ CREATE TABLE ticket_stage_changes (
                 first.session_id,
                 first.name,
                 first.opened_at,
-                "ended".to_string()
+                "stopped".to_string()
             )
         );
         // Ending again is harmless; a row that is gone says so.
-        assert!(db.end_agent(first.id).unwrap());
+        assert!(db.stop_agent(first.id).unwrap());
         db.delete_project(project).unwrap();
-        assert!(!db.end_agent(second.id).unwrap());
+        assert!(!db.stop_agent(second.id).unwrap());
     }
 
     #[test]
@@ -1430,10 +1546,14 @@ CREATE TABLE ticket_stage_changes (
         let tmp = tempfile::tempdir().unwrap();
         let (db, project, ticket) = with_ticket(&tmp);
         let other = db.insert_ticket(project, "NS-2", false, "t").unwrap();
-        let a = db.insert_agent(ticket, "po", "s-1", "n").unwrap();
-        let b = db.insert_agent(other.id, "review", "s-2", "n").unwrap();
-        let c = db.insert_agent(ticket, "development", "s-3", "n").unwrap();
-        db.end_agent(b.id).unwrap();
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        let b = db
+            .insert_agent(other.id, "review", "s-2", "n", "NS-1")
+            .unwrap();
+        let c = db
+            .insert_agent(ticket, "development", "s-3", "n", "NS-1")
+            .unwrap();
+        db.stop_agent(b.id).unwrap();
         assert_eq!(db.list_active_agents().unwrap(), [a, c]);
     }
 
@@ -1447,11 +1567,16 @@ CREATE TABLE ticket_stage_changes (
         db.set_ticket_hidden(hidden.id, true).unwrap();
         let other = db.insert_project("auto_scrum", "q", "/q").unwrap();
         let elsewhere = db.insert_ticket(other.id, "NS-1", false, "t").unwrap();
-        let a = db.insert_agent(ticket, "po", "s-1", "n").unwrap();
-        let b = db.insert_agent(hidden.id, "review", "s-2", "n").unwrap();
-        db.insert_agent(elsewhere.id, "po", "s-3", "n").unwrap();
-        let c = db.insert_agent(ticket, "development", "s-4", "n").unwrap();
-        db.end_agent(b.id).unwrap();
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        let b = db
+            .insert_agent(hidden.id, "review", "s-2", "n", "NS-1")
+            .unwrap();
+        db.insert_agent(elsewhere.id, "po", "s-3", "n", "NS-1")
+            .unwrap();
+        let c = db
+            .insert_agent(ticket, "development", "s-4", "n", "NS-1")
+            .unwrap();
+        db.stop_agent(b.id).unwrap();
         let b = db.list_ticket_agents(hidden.id).unwrap().remove(0);
         assert_eq!(db.list_project_agents(project).unwrap(), [a, b, c]);
         assert_eq!(db.list_project_agents(9999).unwrap(), []);
@@ -1472,14 +1597,13 @@ CREATE TABLE ticket_stage_changes (
             let t1 = old_insert_ticket(conn, a.id, "NS-1", false, "um");
             let t2 = old_insert_ticket(conn, b.id, "3f9a0c7e", true, "dois");
             old.set_ticket_hidden(t2, true).unwrap();
-            let g1 = old.insert_agent(t1, "po", "s-1", "a · PO · NS-1").unwrap();
-            old.insert_agent(t2, "review", "s-2", "b · Review · 3f9a0c7e")
-                .unwrap();
-            old.end_agent(g1.id).unwrap();
+            let g1 = old_insert_agent(conn, t1, "po", "s-1", "a · PO · NS-1");
+            old_insert_agent(conn, t2, "review", "s-2", "b · Review · 3f9a0c7e");
+            old_end_agent(conn, g1);
             (
                 old.list_projects("auto_scrum").unwrap(),
                 [old_tickets(conn, a.id), old_tickets(conn, b.id)],
-                old.list_active_agents().unwrap(),
+                old_active_agents(conn),
             )
         };
         let db =
@@ -1492,7 +1616,7 @@ CREATE TABLE ticket_stage_changes (
         assert_eq!(db.list_projects("auto_scrum").unwrap(), projects);
         assert_eq!(old_tickets(db.connection(), projects[0].id), tickets[0]);
         assert_eq!(old_tickets(db.connection(), projects[1].id), tickets[1]);
-        assert_eq!(db.list_active_agents().unwrap(), agents);
+        assert_eq!(old_active_agents(db.connection()), agents);
         assert_eq!(agent_sessions(db.connection()), ["s-1", "s-2"]);
         assert_eq!(
             db.get_setting(SETTING_RESERVED_SHORTCUT).unwrap(),
@@ -1585,24 +1709,33 @@ CREATE TABLE ticket_stage_changes (
             let t2 = old_insert_ticket(conn, a.id, "3f9a0c7e", true, "dois");
             old.set_ticket_hidden(t2, true).unwrap();
             let t3 = old_insert_ticket(conn, b.id, "NS-1", false, "três");
-            let g = old.insert_agent(t1, "po", "s-1", "a · PO · NS-1").unwrap();
-            old.insert_agent(t3, "development", "s-2", "b · Dev · NS-1")
-                .unwrap();
-            old.end_agent(g.id).unwrap();
+            let g = old_insert_agent(conn, t1, "po", "s-1", "a · PO · NS-1");
+            old_insert_agent(conn, t3, "development", "s-2", "b · Dev · NS-1");
+            old_end_agent(conn, g);
             old.set_setting(SETTING_RESERVED_SHORTCUT, "f7").unwrap();
             (
                 old.list_projects("auto_scrum").unwrap(),
                 [old_tickets(conn, a.id), old_tickets(conn, b.id)],
-                old.list_active_agents().unwrap(),
+                old_active_agents(conn),
                 [t1, t2, t3],
             )
         };
-        let db = Db::open(&path).unwrap();
+        let db = Db::open_with(
+            &path,
+            &[
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+            ],
+        )
+        .unwrap();
         assert_eq!(user_version(db.connection()), 5);
         assert_eq!(db.list_projects("auto_scrum").unwrap(), projects);
         assert_eq!(old_tickets(db.connection(), projects[0].id), tickets[0]);
         assert_eq!(old_tickets(db.connection(), projects[1].id), tickets[1]);
-        assert_eq!(db.list_active_agents().unwrap(), agents);
+        assert_eq!(old_active_agents(db.connection()), agents);
         assert_eq!(agent_sessions(db.connection()), ["s-1", "s-2"]);
         assert_eq!(
             db.get_setting(SETTING_RESERVED_SHORTCUT)
@@ -1783,10 +1916,13 @@ CREATE TABLE ticket_stage_changes (
         let tmp = tempfile::tempdir().unwrap();
         let (db, project, ticket) = with_ticket(&tmp);
         let other = db.insert_ticket(project, "NS-2", false, "t").unwrap();
-        let a = db.insert_agent(ticket, "po", "s-1", "n").unwrap();
-        db.insert_agent(other.id, "review", "s-2", "n").unwrap();
-        let c = db.insert_agent(ticket, "development", "s-3", "n").unwrap();
-        db.end_agent(a.id).unwrap();
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        db.insert_agent(other.id, "review", "s-2", "n", "NS-1")
+            .unwrap();
+        let c = db
+            .insert_agent(ticket, "development", "s-3", "n", "NS-1")
+            .unwrap();
+        db.stop_agent(a.id).unwrap();
         let listed = db.list_ticket_agents(ticket).unwrap();
         assert_eq!(
             listed
@@ -1795,7 +1931,7 @@ CREATE TABLE ticket_stage_changes (
                 .collect::<Vec<_>>(),
             ["s-1", "s-3"]
         );
-        assert_eq!(listed[0].state, "ended");
+        assert_eq!(listed[0].state, "stopped");
         assert_eq!(listed[1], c);
         assert_eq!(db.list_ticket_agents(999).unwrap(), []);
     }
@@ -1806,11 +1942,13 @@ CREATE TABLE ticket_stage_changes (
         let (db, project, ticket) = with_ticket(&tmp);
         let other = db.insert_ticket(project, "NS-2", false, "t").unwrap();
         assert_eq!(db.count_active_agents(ticket).unwrap(), 0);
-        let a = db.insert_agent(ticket, "po", "s-1", "n").unwrap();
-        db.insert_agent(ticket, "review", "s-2", "n").unwrap();
-        db.insert_agent(other.id, "review", "s-3", "n").unwrap();
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        db.insert_agent(ticket, "review", "s-2", "n", "NS-1")
+            .unwrap();
+        db.insert_agent(other.id, "review", "s-3", "n", "NS-1")
+            .unwrap();
         assert_eq!(db.count_active_agents(ticket).unwrap(), 2);
-        db.end_agent(a.id).unwrap();
+        db.stop_agent(a.id).unwrap();
         assert_eq!(db.count_active_agents(ticket).unwrap(), 1);
         assert_eq!(db.count_active_agents(other.id).unwrap(), 1);
     }
@@ -1864,5 +2002,218 @@ CREATE TABLE ticket_stage_changes (
         assert!(!db.list_tickets(a.id, true).unwrap()[2].is_provisional);
         db.delete_project(a.id).unwrap();
         assert!(!db.update_ticket_key(t.id, "NS-7", "NS-9").unwrap(), "gone");
+    }
+
+    /// An agent row of the schema before the migration 6 (NS-39): the columns of the
+    /// migration 3, without `opened_key`. `Agent` (and so `insert_agent`/`list_active_agents`)
+    /// has the key, so the tests of the older migrations write and read the agents by hand (the
+    /// mold of `old_insert_ticket`, NS-36).
+    type OldAgent = (i64, i64, String, String, String, String, String);
+
+    /// Inserts an `active` agent in a database before the migration 6; returns its id.
+    fn old_insert_agent(
+        conn: &Connection,
+        ticket: i64,
+        stage: &str,
+        session: &str,
+        name: &str,
+    ) -> i64 {
+        conn.query_row(
+            "INSERT INTO agents (ticket_id, stage, session_id, name, opened_at, state) \
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'active') \
+             RETURNING id",
+            params![ticket, stage, session, name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Ends an agent of a database before the migration 6, as the nick of then did.
+    fn old_end_agent(conn: &Connection, id: i64) {
+        conn.execute("UPDATE agents SET state = 'ended' WHERE id = ?1", [id])
+            .unwrap();
+    }
+
+    /// The `active` agents, by the columns of the migration 3, in the order they were opened.
+    fn old_active_agents(conn: &Connection) -> Vec<OldAgent> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ticket_id, stage, session_id, name, opened_at, state FROM agents \
+                 WHERE state = 'active' ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    // ---- migration 6: stopped, archived and the key at the opening (NS-39) ----
+
+    /// (session_id, state, opened_key) of every agent, by id.
+    fn agent_states(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT session_id, state, opened_key FROM agents ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_version_5_database_with_agents_migrates_to_6_ended_becoming_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let tickets = {
+            let old = Db::open_with(
+                &path,
+                &[
+                    MIGRATION_1,
+                    MIGRATION_2,
+                    MIGRATION_3,
+                    MIGRATION_4,
+                    MIGRATION_5,
+                ],
+            )
+            .unwrap();
+            assert_eq!(user_version(old.connection()), 5);
+            let conn = old.connection();
+            let p = old.insert_project("auto_scrum", "a", "/a").unwrap();
+            let t = old.insert_ticket(p.id, "NS-1", false, "um").unwrap();
+            let ended = old_insert_agent(conn, t.id, "po", "s-1", "a · PO · NS-1");
+            old_insert_agent(conn, t.id, "development", "s-2", "a · Dev · NS-1");
+            old_end_agent(conn, ended);
+            old.set_setting(SETTING_RESERVED_SHORTCUT, "f7").unwrap();
+            old.list_tickets(p.id, true).unwrap()
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(db.connection()), 6);
+        assert_eq!(
+            agent_states(db.connection()),
+            [
+                ("s-1".to_string(), "stopped".to_string(), None),
+                ("s-2".to_string(), "active".to_string(), None),
+            ],
+            "ended becomes stopped, active stays, and the key at the opening is unknown"
+        );
+        assert_eq!(
+            db.list_tickets(tickets[0].project_id, true).unwrap(),
+            tickets
+        );
+        assert_eq!(
+            db.get_setting(SETTING_RESERVED_SHORTCUT)
+                .unwrap()
+                .as_deref(),
+            Some("f7")
+        );
+        let agents = db.list_ticket_agents(tickets[0].id).unwrap();
+        assert_eq!(agents[0].opened_key, None);
+        assert_eq!(agents[0].name, "a · PO · NS-1");
+    }
+
+    #[test]
+    fn get_agent_reads_one_agent_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        assert_eq!(db.get_agent(a.id).unwrap(), Some(a.clone()));
+        assert_eq!(db.get_agent(999).unwrap(), None);
+        db.delete_project(project).unwrap();
+        assert_eq!(db.get_agent(a.id).unwrap(), None, "gone with its project");
+    }
+
+    /// The state of the agent `id`, raw.
+    fn state_of(db: &Db, id: i64) -> String {
+        db.connection()
+            .query_row("SELECT state FROM agents WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn resume_agent_makes_a_stopped_or_active_one_active_and_says_why_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        db.stop_agent(a.id).unwrap();
+        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Done);
+        assert_eq!(state_of(&db, a.id), "active");
+        // An active row with no owner (its nick died): resumed too.
+        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Done);
+        assert_eq!(state_of(&db, a.id), "active");
+        db.stop_agent(a.id).unwrap();
+        db.archive_agent(a.id).unwrap();
+        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Archived);
+        assert_eq!(
+            state_of(&db, a.id),
+            "archived",
+            "an archived one is not resumed"
+        );
+        db.delete_project(project).unwrap();
+        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Gone);
+    }
+
+    #[test]
+    fn archive_agent_archives_only_a_stopped_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        let other = db.insert_agent(ticket, "po", "s-2", "n", "NS-1").unwrap();
+        db.stop_agent(other.id).unwrap();
+        assert_eq!(db.archive_agent(a.id).unwrap(), AgentChange::Active);
+        assert_eq!(
+            state_of(&db, a.id),
+            "active",
+            "an active one is not archived"
+        );
+        db.stop_agent(a.id).unwrap();
+        assert_eq!(db.archive_agent(a.id).unwrap(), AgentChange::Done);
+        assert_eq!(state_of(&db, a.id), "archived");
+        assert_eq!(state_of(&db, other.id), "stopped", "only that agent");
+        assert_eq!(db.archive_agent(a.id).unwrap(), AgentChange::Archived);
+        db.delete_project(project).unwrap();
+        assert_eq!(db.archive_agent(a.id).unwrap(), AgentChange::Gone);
+    }
+
+    #[test]
+    fn unarchive_agent_takes_an_archived_one_back_to_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        assert_eq!(db.unarchive_agent(a.id).unwrap(), AgentChange::Active);
+        db.stop_agent(a.id).unwrap();
+        assert_eq!(db.unarchive_agent(a.id).unwrap(), AgentChange::Stopped);
+        db.archive_agent(a.id).unwrap();
+        assert_eq!(db.unarchive_agent(a.id).unwrap(), AgentChange::Done);
+        assert_eq!(state_of(&db, a.id), "stopped");
+        db.delete_project(project).unwrap();
+        assert_eq!(db.unarchive_agent(a.id).unwrap(), AgentChange::Gone);
+    }
+
+    /// A state this nick does not know (the column has no CHECK) is never acted on.
+    #[test]
+    fn an_unknown_state_is_not_resumed_archived_nor_unarchived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let a = db.insert_agent(ticket, "po", "s-1", "n", "NS-1").unwrap();
+        db.connection()
+            .execute("UPDATE agents SET state = 'future' WHERE id = ?1", [a.id])
+            .unwrap();
+        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Gone);
+        assert_eq!(db.archive_agent(a.id).unwrap(), AgentChange::Gone);
+        assert_eq!(db.unarchive_agent(a.id).unwrap(), AgentChange::Gone);
+        assert_eq!(state_of(&db, a.id), "future");
     }
 }

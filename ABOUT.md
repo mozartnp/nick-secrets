@@ -1124,8 +1124,10 @@ Hoje as três bibliotecas têm diretório: `lib/config/` (dois arquivos de códi
   (`jail_nick_hosts`). Mesmo formato do `lib/claude/`: pasta própria com o código e o dado,
   testes em `lib/tests/`. Ver seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)";
 - `lib/claude/claude.sh` + `lib/claude/permissions.json`: as regras de deny/ask do Claude
-  Code que toda sessão aberta pelo nick recebe. Ver seção "Regras de deny/ask do Claude Code
-  (`lib/claude/`)". A divisão:
+  Code que toda sessão aberta pelo nick recebe, e, desde o NS-39, onde o `claude` guarda a
+  conversa de uma sessão (`claude_conversation_file`, com a pasta de configuração por parâmetro:
+  seção "Rust no projeto: retomar e arquivar agentes (NS-39)"). Ver seção "Regras de deny/ask do
+  Claude Code (`lib/claude/`)". A divisão:
 
   | Fica em `lib/claude/` | Fica na ferramenta (`auto_scrum.sh`) |
   |---|---|
@@ -1359,7 +1361,9 @@ projeto e esconde `~/.ssh`, `~/.gnupg` etc. (ver seção "Sandbox do agente com 
 decide é o `bin/nick-agent`, pelo `--type` que o painel passa
 (`[ "$type" = "development" ] && claude_args+=(--permission-mode auto)`, a regra do `auto_scrum.sh`
 com o `$TYPE`). O
-Rust nunca passa `--permission-mode`: um teste estrutural proíbe o texto em `nick/src/`.
+Rust nunca passa `--permission-mode`: um teste estrutural proíbe o texto em `nick/src/`. Na
+retomada (NS-39), o tipo não é gravado, e quem decide é a etapa (`--stage development`), pela
+mesma linha do launcher (`exec_claude`).
 
 ## Sandbox do agente com ai-jail (`JAIL_ENABLED`)
 
@@ -2573,6 +2577,12 @@ a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
 
 ## Rust no projeto: agentes na casca `nick` (NS-33)
 
+> **Mudou no NS-39** (seção "Rust no projeto: retomar e arquivar agentes (NS-39)"): o estado
+> `ended` virou `stopped` (parado, retomável), e entrou o `archived`, pela migração 6, que também
+> acrescentou `agents.opened_key`. A coluna `state` continua sem `CHECK`, e o `AgentState`
+> continua a única fonte dos estados. O `end_agent` virou `stop_agent`, e o `bin/nick-agent`
+> ganhou os modos `--resume` e `--has-conversation`.
+
 > **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): o `g` fica no nó do
 > ticket, e o fim de um agente deixa a seleção no nó dele (agora encerrado), e não "de volta à
 > lista". A remoção de um projeto passou a levar os agentes dele: a confirmação os conta, os vivos
@@ -3218,6 +3228,11 @@ A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nic
 
 ## Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)
 
+> **Mudou no NS-39** (seção "Rust no projeto: retomar e arquivar agentes (NS-39)"): o "retomar é
+> da F5" foi feito. Um agente parado é retomado pelo `r` no nó dele, e um agente parado depois de
+> um "Editar ID" é avisado, na retomada, da pasta nova `.nick/docs/<ID novo>/` (o ID de abertura
+> fica em `agents.opened_key`). A edição do ID continua recusada só com agente `active`.
+
 > **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): a tela do ticket virou
 > o painel do nó do ticket, à direita, sem a seção "Agentes do ticket" (os agentes ficam abaixo do
 > ticket na árvore, e `Enter` num agente vivo põe o foco no terminal dele). `m`, `i` e `g` ficam no
@@ -3518,6 +3533,13 @@ do helper ele cai, conforme a sabotagem registrada em `.nick/docs/NS-37/review_s
 
 ## Rust no projeto: navegação em árvore (NS-38)
 
+> **Mudou no NS-39** (seção "Rust no projeto: retomar e arquivar agentes (NS-39)"): o agente não
+> vivo é `parado`, `[arquivado]` (só com o filtro `f`) ou `ativo em outro nick`; o painel dele
+> perdeu a frase "Retomar ... ainda não é possível" e ganhou as ações do estado (`r`, `o`); o
+> `Place::OtherAgent` virou `StoppedAgent`, `ArchivedAgent` e `ElsewhereAgent` (o `HELP_STATES`
+> tem 29 estados, e a altura do rodapé não mudou); e a confirmação da remoção de projeto diz
+> `(inclusive os parados e os arquivados)`.
+
 História filha do épico NS-28. As telas em sequência (Módulos → Projetos → Tickets → Ticket, mais a
 visão "Agentes ativos") deram lugar a **uma árvore expansível à esquerda**, como o explorador do VS
 Code, e a um **painel contextual à direita**. "Configurações" continua sendo uma tela (`c` no nó do
@@ -3723,3 +3745,211 @@ atalho com um ticket selecionado indo ao último agente e voltando (com a borda 
 `Nick::cell`), a navegação por todos os tipos de nó e filtros sem nenhum SIGWINCH novo (pelo modo
 `winsize` do `claude` falso) e o painel e o rodapé de cada tipo de nó. As telas de conferência
 estão em `.nick/docs/NS-38/telas/`.
+
+## Rust no projeto: retomar e arquivar agentes (NS-39)
+
+A fatia F5 do épico NS-28. Um agente cujo `claude` terminou, ou cujo nick fechou, deixa de ser
+uma conversa perdida: ele fica **parado** e pode ser **retomado** na mesma conversa (`claude
+--resume <session_id>`) pelo nó dele na árvore, ou **arquivado**. Fora do escopo: retomar
+sozinho ao abrir o nick, apagar agentes de vez, épicos (F7) e rodar em segundo plano.
+
+**Estados e migração 6.** Os estados são `active` (ativo), `stopped` (parado, retomável: o
+`ended` de antes) e `archived` (arquivado). A migração 6 faz `ALTER TABLE agents ADD COLUMN
+opened_key TEXT` e `UPDATE agents SET state = 'stopped' WHERE state = 'ended'`. A coluna `state`
+continua sem `CHECK` (NS-33), e o enum `AgentState` (`agents.rs`, com `key`/`from_key`) continua
+sendo a única fonte dos estados no código: os métodos do `Db` usam `AgentState::...key()`, e o
+literal da migração é a exceção (ela é fixada por teste e não muda mais). Dois estruturais cobram
+isso, com controle positivo: `no_state_literal_outside_the_enum` (`agents.rs`: nenhum literal de
+estado no código de produção do `db/mod.rs` nem do `agents.rs`, fora o `key()` do enum) e
+`no_rust_source_writes_the_state_ended` (`nick/tests/agent.rs`: nenhum `"ended"`/`'ended'` em
+`nick/src/` fora do `db/migrations.rs`). O `end_agent` virou `stop_agent`, com a mesma semântica:
+o fim do `claude`, o `x`, a saída (`q` + `s`, SIGTERM/SIGHUP) e a limpeza da abertura com a trava
+livre deixam o agente `stopped`. As mudanças de estado novas são UPDATEs condicionados ao estado
+(`Db::resume_agent` só de `stopped` ou `active`; `archive_agent` só de `stopped`;
+`unarchive_agent` só de `archived`, que volta a `stopped`), no molde do `change_ticket_stage`: com
+0 linhas, a linha é relida e o `AgentChange` diz por quê (`Gone`, `Active`, `Stopped`,
+`Archived`). Um estado que este nick não conhece conta como `Gone`: nada é feito nele.
+
+**A retomada é só manual** (`r` no nó de um agente parado). Abrir o nick não retoma nada (teste
+no `App` e no PTY). O fluxo:
+1. `r` (`App::ask_resume`) recusa na hora, sem `--check`: o arquivado (`O agente <nome> está
+   arquivado. Desarquive (o) antes de retomar.`), o `active` cuja trava outro nick vivo segura
+   (`agents::held_elsewhere`, que tenta a trava e solta na hora: `O agente <nome> está ativo em
+   outro nick e não pode ser retomado aqui.`) e o projeto indisponível (a recusa do `g`). Senão,
+   `Action::CheckResume`;
+2. o laço (`main.rs`) chama o `App::check_resume` com um `TerminalAgentLauncher` que já nasce com
+   o tamanho do painel (os helpers `pty_launcher`/`adopt_session`, extraídos do `OpenAgent`, sem
+   mudar o comportamento dele): o `--check` (falha → o alerta "Agente não aberto", pelo
+   `agent_failed`) e o `--has-conversation` (abaixo);
+3. com a conversa, `App::resume_agent`: `agents::resume` pega a trava **antes** do UPDATE (como o
+   `open` pega antes do INSERT; o `take_lock` foi extraído do `open_with`, cujos testes passaram
+   sem mudar asserção), o PTY abre com `Launch::Resume` e o agente entra nos vivos pelo
+   `start_running`, extraído do `open_agent` (os testes dele passaram sem mudar asserção): nó
+   selecionado, exibido e foco no terminal. A barra diz `O agente <nome> foi retomado.`. Se o
+   spawn falhar, o agente volta a `stopped` pelo `agents::end`, como no `open_agent`.
+
+Um `active` cuja trava está livre (o nick dono morreu: a prova do D7 do NS-33) é retomado
+normalmente. Na árvore ele continua `ativo em outro nick` até a limpeza da próxima abertura. O
+nome não muda na retomada (vale o `agents.name`, regra do NS-36), e a retomada vale para
+agentes de qualquer etapa. **Um ticket oculto não recusa o `r`** (decisão do usuário na
+execução): a retomada segue uma conversa que já existe. Já o `n` da conversa perdida, que é o
+fluxo do `g`, recusa como ele.
+
+**A configuração atual vale na retomada.** O launcher roda o mesmo `load_and_check`,
+`config_dir_prepare`, `jail_print_status` e `jail_exec` do lançamento, com o `.nick/nick.conf`
+do momento: um agente aberto fora da jail é retomado na jail se o projeto a ligou depois (teste
+no PTY). O `--permission-mode auto` sai da **etapa**, porque o tipo não é gravado (NS-35): o
+modo `--resume` recebe `--stage <po|tech_leader|development|review>` (a coluna `agents.stage`), e
+o `auto` só vale com `development`, a regra de "Modo auto só na etapa de Desenvolvimento".
+
+**O `bin/nick-agent` ganhou dois modos** (o `Uso:` cita os dois):
+- `--has-conversation <uuid>`: sem `load_and_check` (não depende da configuração), imprime
+  exatamente `conversation=true` ou `conversation=false` e sai com 0; não lança nem grava nada
+  (retrato recursivo no teste). O Rust lê a resposta com `launch::parse_has_conversation`, no
+  molde do `parse_check`: outra saída com código 0 é `O bin/nick-agent respondeu algo inesperado
+  na verificação da conversa.`, e uma falha usa o `launcher_failure`;
+- `--resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id>`, em qualquer
+  ordem, com as recusas do lançamento (valor ausente, repetido, desconhecido, a etapa fora das 4,
+  e os dois IDs pelo `jira_id_valid`). O argv é `claude --settings <regras> [--permission-mode
+  auto] [--append-system-prompt <aviso>] --resume <uuid> --name <nome>`, **sem prompt**. O main
+  despacha para ele quando `--resume` é uma das opções (`launch_kind`, que pula os valores).
+
+**Diferença do plano, aprovada pelo usuário na execução:** os dois modos de lançamento terminam
+numa função comum, `exec_claude <tipo ou etapa> <aviso> [args]`, extraída do fim do
+`launch_mode` sem mudar o argv dele. Dois estruturais de antes (`--permission-mode` numa linha
+só, condicionada a `development`, e uma única chamada de `jail_exec`) cobram exatamente isso, e
+passaram sem mudança. Um diferencial novo prova que, para a mesma configuração, a retomada chama
+o `ai-jail` com as mesmas opções até o `--` que o lançamento.
+
+**A pré-checagem da conversa e a sua limitação** (decisão 1 do plano, do usuário). O arquivo da
+conversa é `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd físico com todo caractere fora de
+A-Z, a-z e 0-9 trocado por "->/<session_id>.jsonl`, montado pela `claude_conversation_file
+<config_dir> <dir> <session_id> <var>` de `lib/claude/claude.sh`. **Diferença do plano:** a
+pasta de configuração entra por parâmetro, e não lida dentro da função, porque as regras do
+`lib/` (testes estruturais de antes) proíbem expandir variável que não seja da biblioteca e
+qualquer `CLAUDE_` sem `NICK_` no código de `lib/claude/`. Quem passa o
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}` é o `bin/nick-agent`, com o `pwd -P`. **O locale:** a troca
+é por caractere no locale de quem chama (um `é` vira um `-` só em UTF-8, como o `claude` faz, e
+dois em `LC_ALL=C`). Por decisão do usuário na execução, o `has_conversation_mode` força
+`local LC_ALL=C.UTF-8` (o escopo dinâmico do bash vale durante a chamada da lib), e o teste roda
+com `LC_ALL=C` e `POSIX` também. Numa máquina sem o locale `C.UTF-8`, o bash avisa no stderr (que
+o `parse_has_conversation` ignora num sucesso) e a troca volta a ser por byte. **O nick passa a
+depender do layout interno do `claude`** (impacto aceito no ticket): num caminho muito longo, o
+`claude` encurta o nome da pasta, e uma versão nova pode mudar a regra. Também diverge um
+caractere fora do BMP (um emoji, por exemplo) no caminho: o `claude` (JavaScript) troca por
+unidade UTF-16 e gera `--`, e o bash em UTF-8 gera um `-` só (review do NS-39, ponto 5). Nos
+três casos, o nick diria "não existe" para uma conversa que existe. Nada se perde (o `Esc` não grava nada, e arquivar
+é reversível), e a verificação manual confere o caminho longo. Se o `--resume` falhar mesmo com o
+arquivo presente, a barra mostra o `terminou com o código N` de sempre.
+
+**A conversa perdida** (`Dialog::ConversationLost`): `A conversa do agente <nome> não existe mais
+no claude (o histórico foi apagado ou o projeto mudou de pasta). Nada foi aberto.`, com o rodapé
+`a arquivar · n abrir novo agente nesta etapa · Esc cancelar`. Nenhum PTY abre (teste no PTY,
+com a árvore respondendo depois). `a` arquiva sem segundo `(s/N)` (o diálogo já é a pergunta);
+`n` abre o menu "Abrir agente" do NS-35 com os tipos da etapa do agente
+(`StageType::stage() == agent.stage`) que as flags oferecem, e com o `Precheck` da retomada (sem
+segundo `--check`); daí em diante é o fluxo do `g`. Se a etapa não tivesse tipo disponível (hoje
+não acontece), a barra diria por quê. `Esc` fecha sem gravar nada, e o atalho reservado continua
+ignorado com o diálogo aberto (NS-34).
+
+**O aviso do ID novo (Q9).** O `agents.opened_key` guarda a chave do ticket na abertura
+(`agents::open` e `Db::insert_agent` ganharam o parâmetro). Na retomada, o ID de abertura é o
+`opened_key` ou, se ele for nulo (agente de antes do NS-39), o último pedaço do `agents.name`
+depois de ` · `, só se passar no `jira_id_valid` (`agents::opened_key`, pura e testada). O
+`Launch::Resume` leva esse ID (`--opened-id`, só quando conhecido) e o `ticket.key` atual
+(`--ticket-id`). Quando são diferentes, o launcher acrescenta, no mesmo `--append-system-prompt`
+do aviso da jail (uma linha em branco entre os dois; sem nenhum aviso, nenhum
+`--append-system-prompt`), o texto da `resume_id_notice` do `auto_scrum/prompt.sh`: `O ID deste
+ticket mudou de <antigo> para <novo> depois que esta conversa começou. A pasta do ticket agora é
+.nick/docs/<novo>/ (antes era .nick/docs/<antigo>/): use o caminho novo para o plano, o review e
+os artefatos.`. O texto é prompt, então mora no bash: um estrutural
+(`the_notice_of_the_new_id_is_only_in_bash`, com controle positivo) proíbe um trecho fixo dele em
+`nick/src/`. A barra diz ` Ele foi avisado de que a pasta agora é .nick/docs/<novo>/.`. O
+"Editar ID" do NS-36 não mudou: só um agente `active` bloqueia a edição, e os parados recebem o
+aviso na retomada.
+
+**Arquivar e desarquivar** (`o` no nó do agente). Num parado, `Arquivar o agente <nome>? Ele sai
+da árvore e volta com f. (s/N)` (`Dialog::ConfirmArchive`, `is_yes`); depois do refresh, a
+seleção segue a decisão 9 do NS-38 (o irmão seguinte, o anterior ou o ancestral). Num arquivado,
+desarquiva direto (`O agente <nome> voltou para parado.`), como o restaurar do ticket. Num vivo,
+ou ativo em outro nick: `Um agente ativo não pode ser arquivado.`. Os arquivados aparecem com o
+filtro `f`, o mesmo dos tickets ocultos (`Tree::visible`): um ticket com só agentes arquivados
+vira folha sem ele, e o filtro `v` não muda.
+
+**`Enter`/`→` num agente não vivo** dizem a tecla: `O agente <nome> está parado. Pressione r para
+retomar.` e `O agente <nome> está arquivado. Pressione o para desarquivar.`. Num ativo de outro
+nick, a mensagem de antes. As mensagens de fim (`terminou`, `foi encerrado`) não mudaram.
+
+**Árvore, painel e rodapés.** O nó do agente mostra `● vivo`, `ativo em outro nick`, `parado` ou
+`[arquivado]`, os não vivos apagados (DIM). **Diferença do plano:** o plano pedia "`arquivado`
+apagado e com `[arquivado]`"; na árvore o estado do arquivado é o próprio `[arquivado]` (no molde
+do `[oculto]` do ticket), porque `arquivado  [arquivado]` repetia o texto e, na profundidade 3,
+empurrava a data para fora das 38 colunas. O painel diz `Estado: arquivado`. No painel do agente
+não vivo saiu a frase `Retomar um agente encerrado ainda não é possível neste nick.`, e entram a
+linha `ID na abertura: <id>` (quando difere do atual, ou `desconhecido`) e a ação do estado:
+`r retomar esta conversa · o arquivar`, `o desarquivar` ou `Ativo em outro nick: feche-o lá para
+retomar aqui.`. O `Place::OtherAgent` virou `StoppedAgent`, `ArchivedAgent` e `ElsewhereAgent`, e o
+`HELP_STATES` foi de 21 para 29 estados (o `every_help_state_is_in_help_states` cobra). Os rodapés
+(decisão do usuário: `← subir`, como nos outros nós de agente, e não o `← voltar` do plano):
+`↑/↓ mover · r retomar · o arquivar · ← subir · …` e `↑/↓ mover · o desarquivar · ← subir · …`;
+o do ativo em outro nick é o de antes. Nenhum é mais longo que o do ticket: os `SIZE 23 58`/`SIZE
+34 78` do `a_resize_reaches_claude_below_the_header` e o teste do tamanho em cinco larguras
+passaram sem mudar números. A confirmação da remoção de projeto diz `(inclusive os parados e os
+arquivados)`.
+
+**Lançamento no Rust.** `launch::Launch` (`New { kind, prompt_file }` ou `Resume { stage,
+opened_key, ticket_key }`) substitui o `kind`/`prompt_file` do `AgentSession::spawn` e do
+`AgentLauncher::spawn`, e `Launch::args` monta os argumentos do launcher; o `CommandBuilder`
+continua `bash <launcher>`. O `New` gera o argv de antes: os testes do `agent_session.rs` e o
+diferencial de `nick/tests/stages.rs` passaram sem mudar asserção (só a chamada). O
+`AgentLauncher` ganhou o `has_conversation`. O teste estrutural "nenhum `--permission-mode` no
+Rust" lê o fonte inteiro, testes incluídos: o teste da retomada no PTY confere o modo `auto` pelo
+`\nauto\n` do argv, sem citar a flag.
+
+**Ajustes do review do NS-39** (cada um com teste que falhou antes da correção):
+- `agents::resume_with`: se a linha virou `active` mas a releitura dela falhou, ela volta a
+  `stopped` antes de a trava sair. Senão ficaria `active` sem dono, "ativo em outro nick" até a
+  limpeza da próxima abertura (ponto 1);
+- o `r` (`App::ask_resume`) relê a linha do banco (`Db::get_agent`) em vez de confiar na árvore
+  lida antes da tecla. Um agente que outro nick retomou nesse meio-tempo é recusado sem o
+  `--check` (ponto 2);
+- o `unarchive` de um agente ativo diz `O agente <nome> já está ativo.`, e não a mensagem do
+  arquivar (ponto 3);
+- o `check_resume` roda a partir do laço, fora do `handle_key`. Por isso, uma retomada recusada
+  ali (a linha mudou depois da tecla, ou o spawn falhou) relê a árvore, e o nó mostra o estado de
+  que a barra fala (ponto 4);
+- a limitação dos caracteres fora do BMP, acima (ponto 5);
+- um estado que este nick não conhece não aparece mais como `parado`. A árvore diz `estado
+  desconhecido`, o painel diz `Estado: desconhecido (<valor>)` e `Este nick não conhece o estado
+  deste agente: nada a fazer aqui.`, o rodapé não oferece ação, e `r`/`o` respondem `O agente
+  <nome> está num estado que este nick não conhece (<valor>).` (ponto 6);
+- nits: o `ticket_of_agent` junta a leitura do ticket repetida no `check_resume` e no
+  `resume_agent`, e linhas de comentário passaram a caber em 100 colunas (ponto 7).
+
+**Testes adaptados, com o motivo** (o mapa teste a teste está em
+`.nick/docs/NS-39/mapa_testes.md`): os de banco que citavam a versão 5 (6 migrações, o texto da
+6, "mais novo" com 7); os de migração antiga, que passaram a gravar e ler os agentes por helpers
+de SQL cru (`old_insert_agent`, `old_end_agent`, `old_active_agents`, o molde do NS-36), porque
+o `AGENT_COLUMNS` tem a coluna nova, e o v4 → v5 passou a abrir só com as migrações 1 a 5; o
+`insert_agent`/`agents::open` com o `opened_key` (só sintaxe); `ended` → `stopped` nas asserções
+de estado; o `Enter` num agente parado (decisão 3); `encerrado` → `parado` e o painel/rodapé do
+agente não vivo no `ui.rs` e no PTY; a lista de funções do `prompt.sh` (`resume_id_notice`) no
+`test_auto_scrum.sh`; e o `Uso:`, o `-u CLAUDE_CONFIG_DIR` do `run_agent` e o modo `resume` do
+`jail_fail` no `test_nick_agent.sh`.
+
+**Testes novos:** `db` (v5 → v6 com dados, `get_agent`, cada `AgentChange` de retomar, arquivar e
+desarquivar, estado desconhecido), `agents` (estados, o estrutural dos literais, a trava antes do
+UPDATE, a trava de outro nick, o ativo com a trava livre, `Gone`/`Archived` soltando a trava,
+`held_elsewhere`, `archive`/`unarchive`, `opened_key`), `lib/tests/test_claude.sh`
+(`claude_conversation_file`), `bin/tests/test_nick_agent.sh` (`--has-conversation` com e sem o
+arquivo, `CLAUDE_CONFIG_DIR` e `$HOME/.claude`, `_`, `.`, espaço e acento em três locales, link
+simbólico, argumentos, nada gravado; `--resume` com a jail ligada e desligada, as 4 etapas, sem
+prompt, os avisos juntos ou nenhum, as recusas, as falhas do `jail_check` e o diferencial),
+`launch` (`parse_has_conversation`, `run_has_conversation` real), `agent_session` (a retomada no
+PTY real), `tree` (o arquivado e o filtro), `app` (cada item do 6.5 do plano, com um processo
+filho segurando o `flock`) e `ui` (estados, estilos, painéis, diálogos e rodapés), e no PTY
+(`nick/tests/agent.rs`): retomar de ponta a ponta, fechar e reabrir o nick sem retomar nada, a
+configuração atual (jail ligada depois), a conversa perdida com arquivar e desarquivar, o ativo
+em outro nick, o ID trocado e os dois estruturais. As sabotagens ficam em
+`.nick/docs/NS-39/sabotagens.md`, as telas em `.nick/docs/NS-39/telas/`, e a verificação com o
+`claude` real (que não roda dentro da jail do nick) em `.nick/docs/NS-39/verificacao_manual.md`.

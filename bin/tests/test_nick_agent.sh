@@ -38,7 +38,7 @@ BASH_BIN="$(command -v bash)"
 # Um UUID e um nome de exemplo, como a casca passa.
 SESSION_ID="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60"
 AGENT_NAME="proj · Dev · NS-1"
-USAGE="Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>"
+USAGE="Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id> | --has-conversation <uuid>"
 # Os 8 tipos do choose_type do auto_scrum.sh, na ordem do menu com tudo ligado.
 ALL_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
 # O texto que o EDITOR falso grava (po e tech_leader) e a DESCRIPTION que sai dele ($(cat), sem
@@ -92,8 +92,8 @@ new_project() {
 # em <cwd>, os logs do --render em <case_dir>/logs (NICK_PROMPT_LOGS_DIR), HOME em
 # <case_dir>/home (vazio: as toolchains que a jail monta vêm do home, e o
 # resultado não pode depender da máquina), os falsos à frente do PATH, os logs dos falsos em
-# <case_dir> (fora do projeto) e sem as variáveis FAKE_*, PLAYWRIGHT_BROWSERS_PATH e as chaves
-# da jail do ambiente de quem roda a suíte (dentro da jail, o próprio nick define a
+# <case_dir> (fora do projeto) e sem as variáveis FAKE_*, PLAYWRIGHT_BROWSERS_PATH,
+# CLAUDE_CONFIG_DIR (NS-39: --has-conversation a lê) e as chaves da jail do ambiente de quem roda a suíte (dentro da jail, o próprio nick define a
 # PLAYWRIGHT_BROWSERS_PATH; mesmo racional de jail_expected_argv). Os [VAR=valor] vêm por
 # último, então vencem (ex: um PATH sem o ai-jail falso). Grava rc, out e err em <case_dir>.
 run_agent() {
@@ -106,7 +106,7 @@ run_agent() {
   [ "$#" -gt 0 ] && shift
   mkdir -p "$case_dir/home"
   (cd "$cwd" && timeout 10 env -u PLAYWRIGHT_BROWSERS_PATH -u FAKE_JAIL_VERSION -u FAKE_CLAUDE_MODE \
-    -u JAIL_ENABLED -u JAIL_CLIPBOARD -u JAIL_ALLOW_HOSTS -u JAIL_FORWARD_PORTS \
+    -u JAIL_ENABLED -u JAIL_CLIPBOARD -u JAIL_ALLOW_HOSTS -u JAIL_FORWARD_PORTS -u CLAUDE_CONFIG_DIR \
     HOME="$case_dir/home" PATH="$FIXTURES_BIN:$PATH" FAKE_JAIL_LOG="$case_dir/jail.argv" \
     FAKE_CLAUDE_LOG="$case_dir/claude.argv" FAKE_CLAUDE_ENV="$case_dir/claude.env" \
     FAKE_ORDER_LOG="$case_dir/order" NICK_PROMPT_LOGS_DIR="$case_dir/logs" "${env_args[@]}" "$BASH_BIN" "$LAUNCHER" "$@" < /dev/null \
@@ -394,6 +394,8 @@ jail_fail() {
     run_agent "$case_dir" "$proj" "${env_args[@]}" -- --check
   elif [ "$mode" = "render" ]; then
     run_agent "$case_dir" "$proj" "${env_args[@]}" -- --render po_discussion --title "assunto"
+  elif [ "$mode" = "resume" ]; then
+    run_agent "$case_dir" "$proj" "${env_args[@]}" -- --resume "$SESSION_ID" --name "$AGENT_NAME" --stage po --ticket-id NS-1
   else
     launch "$case_dir" "$proj" "${env_args[@]}"
   fi
@@ -405,7 +407,7 @@ jail_fail() {
   assert_not_exists "$case_dir/jail.argv" "$name ($mode): nenhum lançamento pelo ai-jail"
   assert_not_exists "$case_dir/logs" "$name ($mode): nenhum log de prompt"
 }
-for mode in check launch render; do
+for mode in check launch render resume; do
   jail_fail no_jail "$mode" "ai-jail não encontrado no PATH." PATH="$min_bin" -- JAIL_ENABLED='"true"'
   jail_fail old_version "$mode" "versão do ai-jail não suportada: encontrada 2.14.0" FAKE_JAIL_VERSION=2.14.0 -- JAIL_ENABLED='"true"'
   jail_fail bad_clipboard "$mode" "JAIL_CLIPBOARD=\"xyz\" em" -- JAIL_ENABLED='"true"' JAIL_CLIPBOARD='"xyz"'
@@ -722,6 +724,222 @@ done
 # Controle positivo do without_session: só as 4 linhas certas saem.
 printf '%s\n' a --session-id "$SESSION_ID" --name "$AGENT_NAME" b > "$TEST_TMP/ws_sample"
 assert_eq "a"$'\n'"b" "$(without_session "$TEST_TMP/ws_sample")" "controle positivo: without_session tira só --session-id <uuid> --name <nome>"
+
+
+echo
+echo "== --has-conversation: diz se o claude tem a conversa, sem configuração e sem gravar nada (NS-39) =="
+# conv_file <config_dir> <dir>: o arquivo que o claude grava para a sessão SESSION_ID com o cwd
+# em <dir>, calculado aqui por outro caminho (o sed com locale UTF-8, um caractere por vez): todo
+# caractere fora de A-Z, a-z e 0-9 vira "-".
+conv_file() {
+  printf '%s/projects/%s/%s.jsonl' "$1" "$(printf '%s' "$2" | LC_ALL=C.UTF-8 sed 's/[^A-Za-z0-9]/-/g')" "$SESSION_ID"
+}
+# has_conv <case_dir> <cwd> [VAR=valor...]: run_agent com --has-conversation SESSION_ID.
+has_conv() {
+  local case_dir="$1" cwd="$2"
+  shift 2
+  run_agent "$case_dir" "$cwd" "$@" -- --has-conversation "$SESSION_ID"
+}
+# Um projeto sem .nick/nick.conf: o modo não depende da configuração.
+case_dir="$TEST_TMP/conv_cfg"
+proj="$case_dir/proj"
+mkdir -p "$proj" "$case_dir/cfg"
+before="$(tree_snapshot "$proj")"
+has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
+assert_eq "0|conversation=false" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "sem o arquivo da conversa: conversation=false, saída 0"
+assert_eq "" "$(file_of "$case_dir/err")" "sem o arquivo: nada no stderr"
+expected_conv="$(conv_file "$case_dir/cfg" "$proj")"
+mkdir -p "$(dirname "$expected_conv")"
+: > "$expected_conv"
+has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
+assert_eq "0|conversation=true" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "com <CLAUDE_CONFIG_DIR>/projects/<cwd>/<uuid>.jsonl: conversation=true"
+assert_eq "" "$(file_of "$case_dir/order")" "--has-conversation: nem o ai-jail nem o claude"
+assert_eq "$before" "$(tree_snapshot "$proj")" "--has-conversation: nada muda no projeto (retrato recursivo)"
+assert_not_exists "$proj/.nick" "--has-conversation: sem .nick/ criado"
+# Outra sessão do mesmo projeto não conta.
+run_agent "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg" -- --has-conversation "1a2b3c4d-0000-4000-8000-000000000000"
+assert_eq "conversation=false" "$(file_of "$case_dir/out")" "o arquivo de outra sessão não conta"
+# Sem CLAUDE_CONFIG_DIR: o ~/.claude do HOME.
+case_dir="$TEST_TMP/conv_home"
+proj="$case_dir/proj"
+mkdir -p "$proj"
+home_conv="$(conv_file "$case_dir/home/.claude" "$proj")"
+mkdir -p "$(dirname "$home_conv")"
+: > "$home_conv"
+has_conv "$case_dir" "$proj"
+assert_eq "0|conversation=true" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "sem CLAUDE_CONFIG_DIR: o \$HOME/.claude/projects/"
+has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/outro"
+assert_eq "conversation=false" "$(file_of "$case_dir/out")" "controle: com CLAUDE_CONFIG_DIR, o \$HOME/.claude não é olhado"
+# Um cwd com _, ., espaço e acento: cada caractere vira um "-" (o é também, como o claude faz),
+# mesmo com o locale C de quem chama (o launcher força UTF-8).
+case_dir="$TEST_TMP/conv_chars"
+proj="$case_dir/meu_proj.v2 com é"
+mkdir -p "$proj" "$case_dir/cfg"
+chars_conv="$(conv_file "$case_dir/cfg" "$proj")"
+assert_contains "$chars_conv" "-meu-proj-v2-com--/" "guarda: o caminho esperado troca _, ., espaço e o é (um - só)"
+mkdir -p "$(dirname "$chars_conv")"
+: > "$chars_conv"
+for locale_value in C.UTF-8 C POSIX; do
+  has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg" LC_ALL="$locale_value" LANG="$locale_value"
+  assert_eq "0|conversation=true" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "cwd com _, ., espaço e acento, LC_ALL=$locale_value: achada"
+done
+# O caminho físico (pwd -P), e não o do link.
+case_dir="$TEST_TMP/conv_link"
+mkdir -p "$case_dir/real/proj" "$case_dir/cfg"
+ln -s "$case_dir/real" "$case_dir/link"
+link_conv="$(conv_file "$case_dir/cfg" "$case_dir/real/proj")"
+mkdir -p "$(dirname "$link_conv")"
+: > "$link_conv"
+has_conv "$case_dir" "$case_dir/link/proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
+assert_eq "conversation=true" "$(file_of "$case_dir/out")" "cwd por um link: vale o caminho físico (pwd -P)"
+# Argumentos inválidos.
+case_dir="$TEST_TMP/conv_args"
+mkdir -p "$case_dir/proj"
+for args in "--has-conversation" "--has-conversation $SESSION_ID x" "--has-conversation $SESSION_ID --check"; do
+  # Lista de propósito: cada palavra é um argumento.
+  # shellcheck disable=SC2086
+  run_agent "$case_dir" "$case_dir/proj" -- $args
+  assert_eq "1" "$(file_of "$case_dir/rc")" "argumentos '$args': sai com 1"
+  assert_contains "$(file_of "$case_dir/err")" "$USAGE" "argumentos '$args': o uso no stderr"
+  assert_eq "" "$(file_of "$case_dir/out")" "argumentos '$args': nada no stdout"
+done
+run_agent "$case_dir" "$case_dir/proj" -- --has-conversation ""
+assert_eq "1" "$(file_of "$case_dir/rc")" "--has-conversation com UUID vazio: sai com 1"
+
+echo
+echo "== --resume: reabre a conversa pelo mesmo caminho do lançamento, sem prompt (NS-39) =="
+# O aviso do ID novo, escrito aqui à mão (o texto é do bash, auto_scrum/prompt.sh).
+id_notice() {
+  printf 'O ID deste ticket mudou de %s para %s depois que esta conversa começou. A pasta do ticket agora é .nick/docs/%s/ (antes era .nick/docs/%s/): use o caminho novo para o plano, o review e os artefatos.' "$1" "$2" "$2" "$1"
+}
+# expected_resume_argv <case_dir> <jail> <hosts> <ports> <stage> <notice do ID>: o argv do claude
+# na retomada: as regras, --permission-mode auto só com development, um --append-system-prompt só
+# (o aviso da jail e/ou o do ID, separados por uma linha em branco) e --resume/--name por último.
+expected_resume_argv() {
+  local case_dir="$1" jail="$2" hosts="$3" ports="$4" stage="$5" id_text="$6" notice="" args=()
+  args=(--settings "$(cat "$PERMISSIONS_JSON")")
+  [ "$stage" = "development" ] && args+=(--permission-mode auto)
+  if [ "$jail" = "true" ]; then
+    notice="$(lib_call "$case_dir" jail_agent_notice "$hosts" "$ports")"
+  fi
+  if [ -n "$id_text" ]; then
+    if [ -n "$notice" ]; then
+      notice="$notice"$'\n\n'"$id_text"
+    else
+      notice="$id_text"
+    fi
+  fi
+  if [ -n "$notice" ]; then
+    args+=(--append-system-prompt "$notice")
+  fi
+  args+=(--resume "$SESSION_ID" --name "$AGENT_NAME")
+  printf '%s\n' "${args[@]}"
+}
+# resume <case_dir> <cwd> <stage> <opened> <ticket> [VAR=valor...]: run_agent com --resume (sem
+# --opened-id quando <opened> é vazio).
+resume() {
+  local case_dir="$1" cwd="$2" stage="$3" opened="$4" ticket="$5" args
+  shift 5
+  args=(--resume "$SESSION_ID" --name "$AGENT_NAME" --stage "$stage")
+  [ -n "$opened" ] && args+=(--opened-id "$opened")
+  args+=(--ticket-id "$ticket")
+  run_agent "$case_dir" "$cwd" "$@" -- "${args[@]}"
+}
+# Jail ligada, o mesmo ID: o argv do ai-jail é o do lançamento, e o claude recebe só o aviso da
+# jail.
+case_dir="$TEST_TMP/resume_jail_on"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+resume "$case_dir" "$proj" po NS-1 NS-1
+hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
+assert_eq "0" "$(file_of "$case_dir/rc")" "retomada com a jail ligada: sai com 0$(file_of "$case_dir/err")"
+assert_eq "$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" po "")" "$(file_of "$case_dir/claude.argv")" \
+  "jail ligada, mesmo ID: claude --settings <regras> --append-system-prompt <aviso da jail> --resume <uuid> --name <nome>"
+assert_eq "ai-jail -- true"$'\n'"ai-jail"$'\n'"claude" "$(file_of "$case_dir/order")" "jail ligada: a checagem, depois o lançamento pelo ai-jail"
+assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): ativa" "jail ligada: o jail_print_status no terminal"
+assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "a retomada roda com o cwd no projeto"
+assert_eq "--name"$'\n'"$AGENT_NAME" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "sem prompt posicional: o último argumento é o nome"
+assert_exists "$proj/.nick/.gitignore" "a retomada roda o config_dir_prepare, como o lançamento"
+# Diferencial: as opções do ai-jail até o -- são as do lançamento normal com a mesma configuração.
+diff_launch="$TEST_TMP/resume_jail_on_launch"
+mkdir -p "$diff_launch"
+cp -a "$proj" "$diff_launch/proj"
+launch "$diff_launch" "$diff_launch/proj" HOME="$case_dir/home"
+assert_contains "$(options_until_dashes "$diff_launch/jail.argv")" "--forward-port" "guarda: o lançamento chamou o ai-jail com as opções"
+assert_eq "$(options_until_dashes "$diff_launch/jail.argv")" "$(options_until_dashes "$case_dir/jail.argv")" \
+  "diferencial: a retomada chama o ai-jail com as mesmas opções do lançamento até o --"
+# Jail ligada, o ID mudou: os dois avisos num --append-system-prompt só.
+case_dir="$TEST_TMP/resume_jail_on_id"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+resume "$case_dir" "$proj" review NS-1 NS-9
+hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
+assert_eq "$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" review "$(id_notice NS-1 NS-9)")" "$(file_of "$case_dir/claude.argv")" \
+  "jail ligada, ID mudou: o aviso da jail, uma linha em branco e o aviso do ID, num --append-system-prompt só"
+assert_eq "1" "$(grep -cx -- '--append-system-prompt' "$case_dir/claude.argv" || true)" "um único --append-system-prompt"
+assert_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/NS-9/" "o aviso cita a pasta nova"
+# Jail desligada: só o aviso do ID, ou nenhum.
+case_dir="$TEST_TMP/resume_jail_off_id"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+resume "$case_dir" "$proj" tech_leader 3f9a0c7e SC-7
+assert_eq "0" "$(file_of "$case_dir/rc")" "jail desligada: sai com 0"
+assert_eq "$(expected_resume_argv "$case_dir" false "" "" tech_leader "$(id_notice 3f9a0c7e SC-7)")" "$(file_of "$case_dir/claude.argv")" \
+  "jail desligada, ID mudou: só o aviso do ID"
+assert_not_exists "$case_dir/jail.argv" "jail desligada: o ai-jail não é chamado"
+assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): desligada" "jail desligada: o jail_print_status"
+for same_case in "NS-1|NS-1" "|NS-1"; do
+  IFS='|' read -r same_opened same_ticket <<< "$same_case"
+  case_dir="$TEST_TMP/resume_jail_off_same_${same_opened:-sem}"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+  resume "$case_dir" "$proj" po "$same_opened" "$same_ticket"
+  assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "")" "$(file_of "$case_dir/claude.argv")" \
+    "jail desligada, --opened-id '${same_opened}' e --ticket-id $same_ticket: nenhum --append-system-prompt"
+  assert_not_contains "$(file_of "$case_dir/claude.argv")" "--append-system-prompt" "sem nenhum aviso, nenhum --append-system-prompt (opened '${same_opened}')"
+done
+# A etapa decide o modo auto: só development.
+for stage in po tech_leader development review; do
+  case_dir="$TEST_TMP/resume_stage_$stage"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+  resume "$case_dir" "$proj" "$stage" NS-1 NS-1
+  assert_eq "$(expected_resume_argv "$case_dir" false "" "" "$stage" "")" "$(file_of "$case_dir/claude.argv")" "--stage $stage: o argv da retomada"
+  if [ "$stage" = "development" ]; then
+    assert_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode"$'\n'"auto" "--stage development: --permission-mode auto"
+  else
+    assert_not_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode" "--stage $stage: sem --permission-mode"
+  fi
+done
+assert_not_exists "$TEST_TMP/resume_stage_po/logs" "retomada: nenhum log de prompt"
+# Recusas dos argumentos: saída 1, o uso, nada chamado e nada criado no projeto.
+case_dir="$TEST_TMP/resume_args"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+r="--resume $SESSION_ID --name x"
+for args in "--resume" "$r" "$r --stage po" "$r --ticket-id NS-1" "$r --stage xpto --ticket-id NS-1" "$r --stage PO --ticket-id NS-1" \
+  "$r --stage po_jira --ticket-id NS-1" "$r --stage po --ticket-id a/b" "$r --stage po --ticket-id .." "$r --stage po --opened-id a/b --ticket-id NS-1" \
+  "$r --stage po --ticket-id NS-1 --stage review" "$r --stage po --ticket-id NS-1 --name y" "$r --stage po --ticket-id NS-1 --foo" \
+  "$r --stage po --ticket-id NS-1 --type po" "$r --stage po --ticket-id NS-1 --session-id $SESSION_ID" "$r --stage po --ticket-id NS-1 --check" \
+  "$r --stage po --ticket-id" "$r --stage po --ticket-id NS-1 --resume $SESSION_ID" "--session-id $SESSION_ID --name x --type po --resume $SESSION_ID"; do
+  rm -f "$case_dir/order"
+  # Lista de propósito: cada palavra é um argumento.
+  # shellcheck disable=SC2086
+  run_agent "$case_dir" "$proj" -- $args
+  assert_eq "1" "$(file_of "$case_dir/rc")" "argumentos '$args': sai com 1"
+  assert_contains "$(file_of "$case_dir/err")" "Erro: " "argumentos '$args': Erro: no stderr"
+  assert_contains "$(file_of "$case_dir/err")" "$USAGE" "argumentos '$args': o uso no stderr"
+  assert_eq "" "$(file_of "$case_dir/order")" "argumentos '$args': nada é chamado"
+done
+for empty_case in resume name ticket; do
+  rm -f "$case_dir/order"
+  case "$empty_case" in
+    resume) run_agent "$case_dir" "$proj" -- --resume "" --name x --stage po --ticket-id NS-1 ;;
+    name) run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name "" --stage po --ticket-id NS-1 ;;
+    ticket) run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name x --stage po --ticket-id "" ;;
+  esac
+  assert_eq "1" "$(file_of "$case_dir/rc")" "valor vazio ($empty_case): sai com 1"
+  assert_eq "" "$(file_of "$case_dir/order")" "valor vazio ($empty_case): nada é chamado"
+done
+assert_not_exists "$proj/.nick/.gitignore" "argumentos inválidos da retomada: nada criado no projeto"
+rm -f "$case_dir/order"
+run_agent "$case_dir" "$proj" -- --ticket-id NS-2 --stage review --opened-id NS-1 --name "$AGENT_NAME" --resume "$SESSION_ID"
+assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: os argumentos da retomada em qualquer ordem também valem"
+assert_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/NS-2/" "controle positivo: em qualquer ordem, o aviso do ID novo"
 
 echo
 echo "== estrutura do launcher =="

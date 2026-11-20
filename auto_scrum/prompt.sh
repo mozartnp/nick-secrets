@@ -5,7 +5,8 @@
 # build the same prompt byte for byte: the answers and the blocks the templates use, the blocks
 # built from the project flags (build_*_blocks, run by build_prompt_blocks), the templates
 # expanded by envsubst and the exchange block at the end (render_prompt), plus jira_id_valid
-# and warn_legacy_plan, which the answers go through. The functions were moved from
+# and warn_legacy_plan, which the answers go through, and the notice of a resumed agent whose
+# ticket changed its ID (resume_id_notice, NS-39). The functions were moved from
 # auto_scrum.sh without changing a line of their bodies.
 #
 # Not a library of lib/, on purpose (ABOUT.md, "Rust no projeto: etapas do auto_scrum na casca
@@ -315,6 +316,14 @@ render_prompt() {
   envsubst '$TITLE $DESCRIPTION $JIRA_ID $JIRA_LINK $SENTRY_LINK $PLAN_PATH $REVIEW_PATH $STACK_BLOCK_DEV $STACK_BLOCK_TL $STACK_BLOCK_REVIEW $SENTRY_BLOCK_TL $PO_VALIDATION_BLOCK $PO_TICKET_FORMAT_BLOCK $TECH_LEADER_PLAN_RULES_BLOCK $TDD_BLOCK_DEV $TDD_BLOCK_REVIEW' \
     < "$templates_dir/$type.md" > "$log_file"
   { echo; exchange_block; } >> "$log_file"
+}
+
+# resume_id_notice <old> <new>: prints the notice a resumed agent gets (NS-39, through
+# --append-system-prompt of bin/nick-agent --resume) when the ID of its ticket changed after its
+# conversation started ("Editar ID", NS-36): the folder of the ticket is now $NICK_DOCS_DIR/<new>/.
+# Here, and not in the nick shell, because the text is prompt, and no Rust builds a prompt.
+resume_id_notice() {
+  echo "O ID deste ticket mudou de $1 para $2 depois que esta conversa começou. A pasta do ticket agora é $NICK_DOCS_DIR/$2/ (antes era $NICK_DOCS_DIR/$1/): use o caminho novo para o plano, o review e os artefatos."
 }
 
 # warn_legacy_plan: before this ticket, plans lived in docs/plans/<ID>_<summary>.md. When

@@ -3,13 +3,14 @@
 # claude.sh: the Claude Code permission rules (deny/ask) that every session opened by a nick
 # tool gets — today only auto_scrum uses it. The rules live in permissions.json, next to this
 # file, the single source of them ({"permissions": {"deny": [...], "ask": [...]}}, nothing
-# else); this library only finds that file and reads it (claude_settings_load), and prints the
-# error when it can't (claude_print_settings_error). The tool passes the content inline to the
-# agent, as 'claude --settings "<content>" ...': never as a path (inside the jail a path out of
-# the project may not exist) and never written to a .claude/settings*.json of the user or of
-# the project. Always on: there is no flag to turn the rules off and no fallback without them.
-# The rules match the command text, so they are a guard rail, not a sandbox (see ABOUT.md,
-# "Regras de deny/ask do Claude Code (lib/claude/)").
+# else); this library only finds that file and reads it (claude_settings_load), and prints the error
+# when it can't (claude_print_settings_error); since the NS-39 it also says where claude keeps the
+# conversation of a session (claude_conversation_file). The tool passes the content inline to the
+# agent, as 'claude --settings "<content>" ...': never as a path (inside the jail a path out of the
+# project may not exist) and never written to a .claude/settings*.json of the user or of the
+# project. Always on: there is no flag to turn the rules off and no fallback without them. The rules
+# match the command text, so they are a guard rail, not a sandbox (see ABOUT.md, "Regras de deny/ask
+# do Claude Code (lib/claude/)").
 #
 # Rules (see ABOUT.md, "Código compartilhado entre ferramentas (lib/)"):
 #   - loading it only assigns NICK_CLAUDE_PERMISSIONS_FILE and defines functions: it prints
@@ -53,4 +54,22 @@ claude_settings_load() {
     return 1
   fi
   printf -v "$__claude_var" '%s' "$__claude_content"
+}
+
+# claude_conversation_file <config_dir> <dir> <session_id> <variable>: stores in <variable>, with
+# printf -v, the file where claude keeps the conversation <session_id> of a session run with the
+# cwd at <dir> (NS-39, the check before a resume): <config_dir>/projects/<dir with every character
+# but A-Z, a-z and 0-9 replaced by "-">/<session_id>.jsonl. <config_dir> is the
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude} of the caller (by parameter: this library reads no global of
+# the caller, and never names a CLAUDE_* variable), and <dir> its physical path (pwd -P). The
+# replacement is by character in the locale of the caller: under a UTF-8 locale an accented letter
+# becomes a single "-", as claude does; under LC_ALL=C it would be one per byte, so the caller
+# forces a UTF-8 locale. A character out of the BMP (an emoji) is one "-" here but two for claude,
+# which replaces by UTF-16 unit: not covered. This is the layout of a claude internal detail
+# (accepted in the NS-39): a new claude may change it, and for a very long path claude shortens
+# the folder name, so the file is not found there (ABOUT.md, "Rust no projeto: retomar e arquivar
+# agentes").
+claude_conversation_file() {
+  local __claude_dir="$2"
+  printf -v "$4" '%s/projects/%s/%s.jsonl' "$1" "${__claude_dir//[!A-Za-z0-9]/-}" "$3"
 }

@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use nick::agent_session::{AgentEvent, AgentSession};
-use nick::launch::{self, RenderRequest};
+use nick::launch::{self, Launch, RenderRequest};
 use nick::stages::{self, Input, Rule, StageType};
 
 const SESSION_ID: &str = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60";
@@ -209,8 +209,10 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
             1,
             SESSION_ID,
             NAME,
-            kind,
-            &rendered.log,
+            Launch::New {
+                kind,
+                prompt_file: &rendered.log,
+            },
             (24, 80),
             tx,
         )

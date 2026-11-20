@@ -18,6 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
 use crate::agent_session::{AgentEvent, AgentSession};
+use crate::agents::Stage;
 use crate::paths::normalize;
 use crate::stages::StageType;
 
@@ -32,6 +33,62 @@ pub const UNEXPECTED_CHECK_MESSAGE: &str =
 /// When `--render` exits with 0 but its stdout does not start with `log=<absolute path>`.
 pub const UNEXPECTED_RENDER_MESSAGE: &str =
     "O bin/nick-agent respondeu algo inesperado na montagem do prompt.";
+
+/// When `--has-conversation` exits with 0 but its stdout is not exactly the line
+/// `conversation=true` or `conversation=false` (NS-39).
+pub const UNEXPECTED_CONVERSATION_MESSAGE: &str =
+    "O bin/nick-agent respondeu algo inesperado na verificação da conversa.";
+
+/// How the PTY of an agent starts (NS-39): a new agent, with the prompt `--render` built, or the
+/// resume of a stopped one in its own conversation, with no prompt. The launcher decides the
+/// rest of the argv of claude (the auto mode by the type or the stage, the notices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch<'a> {
+    /// `--type <kind> --prompt-file <prompt_file>` (NS-35).
+    New {
+        kind: StageType,
+        prompt_file: &'a Path,
+    },
+    /// `--stage <stage> [--opened-id <opened_key>] --ticket-id <ticket_key>`: the stage of the
+    /// agent (its type is not stored), the ticket key it was opened with, when known
+    /// (`agents::opened_key`), and the key of its ticket now; when they differ, the launcher
+    /// tells the agent the new folder of the ticket.
+    Resume {
+        stage: Stage,
+        opened_key: Option<&'a str>,
+        ticket_key: &'a str,
+    },
+}
+
+impl Launch<'_> {
+    /// The arguments of the launcher for the agent `session_id` named `name`.
+    pub fn args(&self, session_id: &str, name: &str) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        let mut push = |values: &[&OsStr]| args.extend(values.iter().map(|v| v.to_os_string()));
+        match *self {
+            Launch::New { kind, prompt_file } => {
+                push(&["--session-id".as_ref(), session_id.as_ref()]);
+                push(&["--name".as_ref(), name.as_ref()]);
+                push(&["--type".as_ref(), kind.key().as_ref()]);
+                push(&["--prompt-file".as_ref(), prompt_file.as_os_str()]);
+            }
+            Launch::Resume {
+                stage,
+                opened_key,
+                ticket_key,
+            } => {
+                push(&["--resume".as_ref(), session_id.as_ref()]);
+                push(&["--name".as_ref(), name.as_ref()]);
+                push(&["--stage".as_ref(), stage.key().as_ref()]);
+                if let Some(key) = opened_key {
+                    push(&["--opened-id".as_ref(), key.as_ref()]);
+                }
+                push(&["--ticket-id".as_ref(), ticket_key.as_ref()]);
+            }
+        }
+        args
+    }
+}
 
 /// The launcher: bin/nick-agent of the checkout, normalized (without `..`).
 pub fn launcher_path() -> PathBuf {
@@ -120,6 +177,58 @@ pub fn run_check(launcher: &Path, project: &Path) -> Result<Precheck, String> {
         .output()
         .map_err(|err| format!("Não consegui rodar o bin/nick-agent: {err}."))?;
     parse_check(output.status.code(), &output.stdout, &output.stderr)
+}
+
+/// Reads the result of `--has-conversation` (NS-39), like `parse_check`: exit 0 with exactly
+/// the line `conversation=true` or `conversation=false` (with or without the final line break)
+/// is the answer, whatever the stderr; anything else on stdout is an error, so a conversation is
+/// never presumed; a failure is the stderr of the launcher, or a message with the code.
+pub fn parse_has_conversation(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<bool, String> {
+    let stderr = String::from_utf8_lossy(stderr).trim_end().to_string();
+    if code != Some(0) {
+        return Err(launcher_failure(code, stderr, "verificação da conversa"));
+    }
+    let line = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+    flag_line(line, "conversation").ok_or_else(|| UNEXPECTED_CONVERSATION_MESSAGE.to_string())
+}
+
+/// Runs `bash <launcher> --has-conversation <session_id>` with the cwd at `project`, the stdin
+/// closed and the output captured (outside the PTY), and reads it with `parse_has_conversation`:
+/// whether claude still keeps the conversation of the agent, before a resume (NS-39).
+pub fn run_has_conversation(
+    launcher: &Path,
+    project: &Path,
+    session_id: &str,
+) -> Result<bool, String> {
+    run_has_conversation_with_env(launcher, project, session_id, &[])
+}
+
+/// `run_has_conversation` with `env` added to the environment of the launcher (the tests point
+/// CLAUDE_CONFIG_DIR at a temporary dir).
+pub(crate) fn run_has_conversation_with_env(
+    launcher: &Path,
+    project: &Path,
+    session_id: &str,
+    env: &[(&str, &str)],
+) -> Result<bool, String> {
+    let mut command = Command::new("bash");
+    command
+        .arg(launcher)
+        .arg("--has-conversation")
+        .arg(session_id)
+        .current_dir(project)
+        .stdin(Stdio::null());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("Não consegui rodar o bin/nick-agent: {err}."))?;
+    parse_has_conversation(output.status.code(), &output.stdout, &output.stderr)
 }
 
 /// The answers of a form, for `--render`.
@@ -244,10 +353,17 @@ pub trait AgentLauncher {
         project: &Path,
         request: &RenderRequest,
     ) -> Result<Rendered, String>;
-    /// Starts `bash <launcher> --session-id <session_id> --name <name> --type <kind>
-    /// --prompt-file <prompt_file>` in a PTY with the cwd at `project`, for the agent whose row
-    /// has the id `agent_id` (its events carry it). The error is the system's.
-    #[allow(clippy::too_many_arguments)]
+    /// `bash <launcher> --has-conversation <session_id>` with the cwd at `project` (NS-39).
+    fn has_conversation(
+        &mut self,
+        launcher: &Path,
+        project: &Path,
+        session_id: &str,
+    ) -> Result<bool, String>;
+    /// Starts `bash <launcher> <arguments of launch>` in a PTY with the cwd at `project`, for
+    /// the agent whose row has the id `agent_id` (its events carry it): a new one (`--session-id
+    /// <session_id> --name <name> --type <kind> --prompt-file <prompt_file>`) or a resume
+    /// (NS-39, `Launch::args`). The error is the system's.
     fn spawn(
         &mut self,
         launcher: &Path,
@@ -255,8 +371,7 @@ pub trait AgentLauncher {
         agent_id: i64,
         session_id: &str,
         name: &str,
-        kind: StageType,
-        prompt_file: &Path,
+        launch: Launch,
     ) -> Result<(), String>;
 }
 
@@ -309,6 +424,15 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
         run_render(launcher, project, request)
     }
 
+    fn has_conversation(
+        &mut self,
+        launcher: &Path,
+        project: &Path,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        run_has_conversation(launcher, project, session_id)
+    }
+
     fn spawn(
         &mut self,
         launcher: &Path,
@@ -316,8 +440,7 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
         agent_id: i64,
         session_id: &str,
         name: &str,
-        kind: StageType,
-        prompt_file: &Path,
+        launch: Launch,
     ) -> Result<(), String> {
         let session = AgentSession::spawn(
             launcher,
@@ -325,8 +448,7 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
             agent_id,
             session_id,
             name,
-            kind,
-            prompt_file,
+            launch,
             (self.size_of)(name, self.jail),
             self.tx.clone(),
         )
@@ -668,5 +790,96 @@ mod tests {
         fs::write(&fake, format!("echo log={}\n", log.display())).unwrap();
         let err = run_render(&fake, tmp.path(), &request).unwrap_err();
         assert!(err.contains(&log.display().to_string()), "{err}");
+    }
+
+    // ---- NS-39: the check of the conversation before a resume ----
+
+    #[test]
+    fn the_conversation_check_is_exactly_one_line() {
+        assert_eq!(
+            parse_has_conversation(Some(0), b"conversation=true\n", b""),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_has_conversation(Some(0), b"conversation=false", b""),
+            Ok(false)
+        );
+        // A warning on stderr does not change a success (the locale, say).
+        assert_eq!(
+            parse_has_conversation(Some(0), b"conversation=true\n", b"aviso"),
+            Ok(true)
+        );
+        for stdout in [
+            &b""[..],
+            b"conversation=TRUE\n",
+            b"conversation=true\nconversation=true\n",
+            b"jail=true\n",
+            b" conversation=true\n",
+            b"conversation=",
+        ] {
+            assert_eq!(
+                parse_has_conversation(Some(0), stdout, b""),
+                Err(UNEXPECTED_CONVERSATION_MESSAGE.to_string()),
+                "{}",
+                String::from_utf8_lossy(stdout)
+            );
+        }
+        assert_eq!(
+            UNEXPECTED_CONVERSATION_MESSAGE,
+            "O bin/nick-agent respondeu algo inesperado na verificação da conversa."
+        );
+    }
+
+    #[test]
+    fn a_failing_conversation_check_is_the_stderr_or_the_code() {
+        assert_eq!(
+            parse_has_conversation(Some(1), b"", b"Erro: x\nUso: y\n"),
+            Err("Erro: x\nUso: y".to_string())
+        );
+        assert_eq!(
+            parse_has_conversation(Some(2), b"conversation=true\n", b""),
+            Err("O bin/nick-agent falhou na verificação da conversa (código 2).".to_string())
+        );
+        assert_eq!(
+            parse_has_conversation(None, b"", b""),
+            Err("O bin/nick-agent foi interrompido na verificação da conversa.".to_string())
+        );
+    }
+
+    #[test]
+    fn run_has_conversation_runs_the_real_launcher_in_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let proj = root.join("meu proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config = root.join("cfg");
+        let config_env = config.display().to_string();
+        let env = [("CLAUDE_CONFIG_DIR", config_env.as_str())];
+        let session = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60";
+        assert_eq!(
+            run_has_conversation_with_env(&launcher_path(), &proj, session, &env),
+            Ok(false),
+            "no config is needed"
+        );
+        let dir = config.join("projects").join(
+            proj.display()
+                .to_string()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>(),
+        );
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{session}.jsonl")), "{}\n").unwrap();
+        assert_eq!(
+            run_has_conversation_with_env(&launcher_path(), &proj, session, &env),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_dir(&proj).unwrap().count(),
+            0,
+            "nothing written in the project"
+        );
+        let err = run_has_conversation_with_env(&launcher_path(), &proj, "", &env).unwrap_err();
+        assert!(err.starts_with("Erro: "), "{err}");
     }
 }

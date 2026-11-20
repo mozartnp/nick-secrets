@@ -1755,7 +1755,7 @@ mkdir -p "$prompt_clean_dir/tty"
 prompt_clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
 prompt_config_sh="$SCRIPT_DIR/../../lib/config/config.sh"
 prompt_expected_vars="$(printf '%s\n' DESCRIPTION EXCHANGE_DIR JIRA_ID JIRA_LINK NICK_DIR NICK_DOCS_DIR PERMISSION_BLOCK_PO PLAN_PATH PO_TICKET_FORMAT_BLOCK PO_VALIDATION_BLOCK PRODUCTION_BLOCK_PO PROMPT_LOGS_DIR PROMPT_TEMPLATES_DIR REVIEW_PATH SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINK STACK_BLOCK_DEV STACK_BLOCK_REVIEW STACK_BLOCK_TL TDD_BLOCK_DEV TDD_BLOCK_REVIEW TDD_BLOCK_TL TDD_CRITERIA_BLOCK_TL TECH_LEADER_PLAN_RULES_BLOCK TITLE | LC_ALL=C sort)"
-prompt_expected_funcs="$(printf '%s\n' build_permission_blocks build_po_blocks build_production_blocks build_prompt_blocks build_sentry_blocks build_stack_blocks build_tdd_blocks build_tech_leader_blocks exchange_block jira_id_valid render_prompt warn_legacy_plan | LC_ALL=C sort)"
+prompt_expected_funcs="$(printf '%s\n' build_permission_blocks build_po_blocks build_production_blocks build_prompt_blocks build_sentry_blocks build_stack_blocks build_tdd_blocks build_tech_leader_blocks exchange_block jira_id_valid render_prompt resume_id_notice warn_legacy_plan | LC_ALL=C sort)"
 prompt_clean_rc=0
 timeout 2 bash --norc --noprofile -c "source '$prompt_config_sh'; compgen -v | LC_ALL=C sort > '$prompt_clean_dir/vars_before'; declare -F | sed 's/^declare -f //' | LC_ALL=C sort > '$prompt_clean_dir/funcs_before'; source '$PROMPT_SH' > '$prompt_clean_dir/out' 2>&1; compgen -v | LC_ALL=C sort > '$prompt_clean_dir/vars_after'; declare -F | sed 's/^declare -f //' | LC_ALL=C sort > '$prompt_clean_dir/funcs_after'" < /dev/null || prompt_clean_rc=$?
 assert_eq "0" "$prompt_clean_rc" "prompt.sh carrega sem erro (com lib/config/config.sh antes)"

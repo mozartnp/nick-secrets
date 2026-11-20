@@ -918,7 +918,7 @@ mod tests {
         let t = f.create("t", "NS-1").unwrap();
         with_docs(&dir, "NS-1");
         let agent =
-            f.db.insert_agent(t.id, "po", "s-1", "p · PO · NS-1")
+            f.db.insert_agent(t.id, "po", "s-1", "p · PO · NS-1", "NS-1")
                 .unwrap();
         let before = snapshot(&dir);
         let refusal = Err(
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(snapshot(&dir), before);
         assert_eq!(f.stored(t.id), t);
         // Ended, it is no longer in the way.
-        f.db.end_agent(agent.id).unwrap();
+        f.db.stop_agent(agent.id).unwrap();
         assert!(f.edit(&t, "NS-99").is_ok());
     }
 

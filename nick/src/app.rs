@@ -12,8 +12,10 @@
 //! real `AgentLauncher` (launch.rs). Several agents run at once (NS-34): the tree stays on the
 //! left, and the agent selected on it is shown on the right (NS-38); the reserved shortcut
 //! (`keys::Shortcut`, kept in the database) toggles the focus between them; with the focus on the
-//! terminal every other key goes to the program (`Action::Send`). The screen texts are in PT-BR,
-//! and drawing is ui.rs's job.
+//! terminal every other key goes to the program (`Action::Send`). A stopped agent (NS-39) is
+//! resumed in its own conversation by `r` on its node (`Action::CheckResume`: the check, whether
+//! claude still keeps the conversation, then `resume_agent`), and archived or unarchived by `o`.
+//! The screen texts are in PT-BR, and drawing is ui.rs's job.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,13 +24,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-use crate::agents::{self, Agent, OpenAgent};
+use crate::agents::{self, Agent, AgentState, OpenAgent};
 use crate::db::{Db, SETTING_RESERVED_SHORTCUT, StageChangeRow};
 use crate::docs::{self, Artifacts};
 use crate::editor::{EditorOutcome, EditorRunner};
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
-use crate::launch::{self, AgentLauncher, Precheck, RenderRequest, Rendered};
+use crate::launch::{self, AgentLauncher, Launch, Precheck, RenderRequest, Rendered};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
@@ -138,6 +140,17 @@ pub enum Dialog {
     AgentError { message: String },
     /// The `(s/N)` confirmation of ending the agent `id` (`x` on its node, NS-38).
     ConfirmEndAgent { id: i64, name: String },
+    /// The conversation of `agent` is no longer in claude (NS-39): nothing was opened. `a`
+    /// archives it (the dialog is the question), `n` opens the menu of a new agent of its stage
+    /// for `ticket` with the `precheck` of the resume, Esc closes it.
+    ConversationLost {
+        project: PathBuf,
+        agent: Agent,
+        ticket: Ticket,
+        precheck: Precheck,
+    },
+    /// The `(s/N)` confirmation of archiving a stopped agent (`o` on its node, NS-39).
+    ConfirmArchive { agent: Agent },
     /// The `(s/N)` confirmation of quitting with agents running (they are all ended).
     ConfirmQuit,
     /// The capture of a new reserved shortcut: `first` is the key pressed once, which must be
@@ -205,6 +218,12 @@ pub enum Action {
     RemoveProject {
         project: Project,
         agents: Vec<i64>,
+    },
+    /// Resume the stopped `agent`, with the cwd at `project` (`r` on its node, NS-39): the loop
+    /// calls `check_resume`.
+    CheckResume {
+        project: PathBuf,
+        agent: Agent,
     },
 }
 
@@ -470,7 +489,8 @@ impl App {
             | Action::ScrollPageDown
             | Action::ScrollLines(_)
             | Action::EndAgent(_)
-            | Action::RemoveProject { .. } => false,
+            | Action::RemoveProject { .. }
+            | Action::CheckResume { .. } => false,
         }
     }
 
@@ -542,6 +562,21 @@ impl App {
             }) => self.key_confirm_prompt(key, project, ticket, precheck, kind, rendered, scroll),
             Some(Dialog::AgentError { message }) => self.key_agent_error(key, message),
             Some(Dialog::ConfirmEndAgent { id, .. }) => confirmed(key, Action::EndAgent(id)),
+            Some(Dialog::ConversationLost {
+                project,
+                agent,
+                ticket,
+                precheck,
+            }) => self.key_conversation_lost(key, project, agent, ticket, precheck),
+            Some(Dialog::ConfirmArchive { agent }) => {
+                // Only s/S confirm; any other key cancels.
+                if is_yes(key) {
+                    self.status = Some(match agents::archive(&self.db, &agent) {
+                        Ok(message) | Err(message) => message,
+                    });
+                }
+                Action::None
+            }
             Some(Dialog::ConfirmQuit) => confirmed(key, Action::QuitEndingAgents),
             // Taken before the dialogs (above).
             Some(Dialog::CaptureShortcut { .. }) => Action::None,
@@ -884,10 +919,18 @@ impl App {
                     self.focus = Focus::Terminal;
                     self.status = None;
                 } else if let Some(agent) = self.agent_record(id) {
-                    self.status = Some(format!(
-                        "O agente {} não está rodando neste nick.",
-                        agent.name
-                    ));
+                    // Which key, by the state (NS-39); an active one of another nick: as before.
+                    self.status = Some(match AgentState::from_key(&agent.state) {
+                        Some(AgentState::Stopped) => format!(
+                            "O agente {} está parado. Pressione r para retomar.",
+                            agent.name
+                        ),
+                        Some(AgentState::Archived) => format!(
+                            "O agente {} está arquivado. Pressione o para desarquivar.",
+                            agent.name
+                        ),
+                        _ => format!("O agente {} não está rodando neste nick.", agent.name),
+                    });
                 }
                 return;
             }
@@ -987,9 +1030,101 @@ impl App {
                     });
                 }
             }
+            (NodeId::Agent(id), KeyCode::Char('r')) if self.agent(id).is_none() => {
+                return self.ask_resume(id);
+            }
+            (NodeId::Agent(id), KeyCode::Char('o')) => self.archive_key(id),
             _ => {}
         }
         Action::None
+    }
+
+    /// `r` on the node of an agent not live (NS-39): refused when archived, when another live
+    /// nick holds its lock (early, before the `--check`: the guarantee is `agents::resume`'s), or
+    /// when its project is unavailable now (the refusal of `g`); otherwise the loop runs the
+    /// check of the resume (`Action::CheckResume`). A hidden ticket does not refuse it: the
+    /// resume goes on a conversation that already exists (decision of the user in the NS-39).
+    fn ask_resume(&mut self, id: i64) -> Action {
+        let Some(cached) = self.agent_record(id).cloned() else {
+            return Action::None;
+        };
+        // The row of now, and not the one the tree read (another nick may have resumed it
+        // meanwhile: review of the NS-39, point 2).
+        let agent = match self.db.get_agent(id) {
+            Ok(Some(agent)) => agent,
+            Ok(None) => {
+                self.status = Some(format!(
+                    "O agente {} não existe mais no banco.",
+                    cached.name
+                ));
+                return Action::None;
+            }
+            Err(err) => {
+                self.status = Some(projects::db_error_message(&err));
+                return Action::None;
+            }
+        };
+        let Some(state) = AgentState::from_key(&agent.state) else {
+            self.status = Some(unknown_state_message(&agent));
+            return Action::None;
+        };
+        if state == AgentState::Archived {
+            self.status = Some(format!(
+                "O agente {} está arquivado. Desarquive (o) antes de retomar.",
+                agent.name
+            ));
+            return Action::None;
+        }
+        if state == AgentState::Active
+            && self
+                .agents_dir
+                .as_deref()
+                .is_some_and(|dir| agents::held_elsewhere(dir, &agent.session_id))
+        {
+            self.status = Some(agents::elsewhere_message(&agent));
+            return Action::None;
+        }
+        let Some(project) = self
+            .ticket(agent.ticket_id)
+            .and_then(|ticket| self.project_of(ticket))
+            .cloned()
+        else {
+            return Action::None;
+        };
+        if let Some(mark) = projects::unavailable_text(projects::availability(&project.path)) {
+            self.status = Some(format!(
+                "Projeto indisponível: {mark}. O agente só abre com a pasta e o \
+                 .nick/nick.conf no lugar."
+            ));
+            return Action::None;
+        }
+        self.status = None;
+        Action::CheckResume {
+            project: project.path,
+            agent,
+        }
+    }
+
+    /// `o` on the node of an agent (NS-39): a stopped one asks `(s/N)` and is archived; an
+    /// archived one goes back to stopped at once (as restoring a ticket); a live one, or an
+    /// active one of another nick, is refused.
+    fn archive_key(&mut self, id: i64) {
+        let Some(agent) = self.agent_record(id).cloned() else {
+            return;
+        };
+        match AgentState::from_key(&agent.state) {
+            Some(AgentState::Stopped) if self.agent(id).is_none() => {
+                self.status = None;
+                self.dialog = Some(Dialog::ConfirmArchive { agent });
+            }
+            Some(AgentState::Archived) => {
+                self.status = Some(match agents::unarchive(&self.db, &agent) {
+                    Ok(message) | Err(message) => message,
+                });
+            }
+            None => self.status = Some(unknown_state_message(&agent)),
+            Some(_) => self.status = Some("Um agente ativo não pode ser arquivado.".into()),
+        }
     }
 
     /// The keys of a ticket node: `e` the title, `o` hide (asking) or restore, `g` an agent,
@@ -1282,13 +1417,7 @@ impl App {
         ticket: &Ticket,
         launcher: &mut dyn AgentLauncher,
     ) {
-        if !self.launcher.is_file() {
-            self.dialog = Some(Dialog::AgentError {
-                message: format!(
-                    "Não encontrei o bin/nick-agent em {}. Nada foi aberto.",
-                    self.launcher.display()
-                ),
-            });
+        if !self.launcher_found() {
             return;
         }
         match launcher.check(&self.launcher, project) {
@@ -1303,6 +1432,199 @@ impl App {
             }
             Err(message) => self.agent_failed(&message),
         }
+    }
+
+    /// Whether the launcher is a file; when not, the alert with its path (the check of `g` and of
+    /// the resume, NS-39).
+    fn launcher_found(&mut self) -> bool {
+        if self.launcher.is_file() {
+            return true;
+        }
+        self.dialog = Some(Dialog::AgentError {
+            message: format!(
+                "Não encontrei o bin/nick-agent em {}. Nada foi aberto.",
+                self.launcher.display()
+            ),
+        });
+        false
+    }
+
+    /// `Action::CheckResume` (NS-39): the `--check` (a failure is the alert "Agente não aberto",
+    /// as for `g`), then whether claude still keeps the conversation (`--has-conversation`, out of
+    /// the PTY): a missing one opens the warning of the lost conversation and nothing is opened;
+    /// a found one is resumed (`resume_agent`), with the jail and the warning of this check.
+    pub fn check_resume(
+        &mut self,
+        project: &Path,
+        agent: &Agent,
+        launcher: &mut dyn AgentLauncher,
+    ) {
+        if !self.launcher_found() {
+            return;
+        }
+        let precheck = match launcher.check(&self.launcher, project) {
+            Ok(precheck) => precheck,
+            Err(message) => return self.agent_failed(&message),
+        };
+        match launcher.has_conversation(&self.launcher, project, &agent.session_id) {
+            Err(message) => self.agent_failed(&message),
+            Ok(true) => self.resume_agent(project, agent, precheck, launcher),
+            Ok(false) => {
+                if let Some(ticket) = self.ticket_of_agent(agent) {
+                    self.dialog = Some(Dialog::ConversationLost {
+                        project: project.to_path_buf(),
+                        agent: agent.clone(),
+                        ticket,
+                        precheck,
+                    });
+                }
+            }
+        }
+        // This runs from the loop, not from `handle_key`: a resume refused (the row changed
+        // after the key) reads the tree again, so the node shows the state the bar talks about
+        // (review of the NS-39, point 4). A resumed one was read by `start_running`.
+        if self.agent(agent.id).is_none() && self.dialog.is_none() {
+            self.refresh_tree();
+        }
+    }
+
+    /// The ticket of `agent`, read from the database now; when it is gone (or the database
+    /// fails), the status bar says why and there is none.
+    fn ticket_of_agent(&mut self, agent: &Agent) -> Option<Ticket> {
+        match self.db.get_ticket(agent.ticket_id) {
+            Ok(Some(ticket)) => Some(ticket),
+            Ok(None) => {
+                self.status = Some(format!("O agente {} não existe mais no banco.", agent.name));
+                None
+            }
+            Err(err) => {
+                self.status = Some(projects::db_error_message(&err));
+                None
+            }
+        }
+    }
+
+    /// Resumes `agent` in its own conversation (NS-39), with the cwd at `project` and the jail
+    /// and the warning of `check` (not run again: the launch repeats the checks in bash, with the
+    /// config of now). Its lock is taken and its row goes back to `active` (`agents::resume`),
+    /// then the PTY starts with `Launch::Resume`: its stage, the ticket key it was opened with
+    /// (`agents::opened_key`) and the key of its ticket now, so the launcher tells it when the
+    /// folder of the ticket changed. Its name is the one stored. A failing start stops it again
+    /// and releases the lock, as `open_agent`; a started one runs as an opened one
+    /// (`start_running`).
+    pub fn resume_agent(
+        &mut self,
+        project: &Path,
+        agent: &Agent,
+        check: Precheck,
+        launcher: &mut dyn AgentLauncher,
+    ) {
+        let Some(stage) = agents::Stage::from_key(&agent.stage) else {
+            self.status = Some(format!(
+                "O agente {} tem uma etapa que este nick não conhece ({}).",
+                agent.name,
+                printable(&agent.stage)
+            ));
+            return;
+        };
+        let Some(ticket) = self.ticket_of_agent(agent) else {
+            return;
+        };
+        let Some(agents_dir) = self.agents_dir.as_deref() else {
+            self.status = Some("Não consegui abrir o agente: sem a pasta das travas.".into());
+            return;
+        };
+        let record = match agents::resume(&self.db, agents_dir, agent) {
+            Ok(record) => record,
+            Err(message) => {
+                self.status = Some(message);
+                return;
+            }
+        };
+        let opened = agents::opened_key(&record.agent);
+        let launch = Launch::Resume {
+            stage,
+            opened_key: opened.as_deref(),
+            ticket_key: &ticket.key,
+        };
+        let id = record.agent.id;
+        let name = record.agent.name.clone();
+        let session_id = record.agent.session_id.clone();
+        if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name, launch) {
+            let mut message = format!("Não consegui abrir o agente: {err}.");
+            if let Err(db) = agents::end(&self.db, record) {
+                message = format!("{message} {db}");
+            }
+            self.status = Some(message);
+            return;
+        }
+        self.start_running(record, name.clone(), &ticket, check);
+        let mut message = format!("O agente {name} foi retomado.");
+        if opened.as_deref().is_some_and(|key| key != ticket.key) {
+            message.push_str(&format!(
+                " Ele foi avisado de que a pasta agora é {}.",
+                docs::dir_text(&ticket.key)
+            ));
+        }
+        self.status = Some(message);
+    }
+
+    /// The keys of the warning of a lost conversation (NS-39): `a` archives (no second
+    /// question), `n` opens the menu "Abrir agente" of the types of the stage of the agent that
+    /// the flags offer, with the precheck of the resume (no second `--check`; a hidden ticket is
+    /// refused as by `g`), Esc closes writing nothing; any other key keeps it.
+    fn key_conversation_lost(
+        &mut self,
+        key: KeyEvent,
+        project: PathBuf,
+        agent: Agent,
+        ticket: Ticket,
+        precheck: Precheck,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Char('a') => {
+                self.status = Some(match agents::archive(&self.db, &agent) {
+                    Ok(message) | Err(message) => message,
+                });
+            }
+            KeyCode::Char('n') if ticket.hidden_at.is_some() => {
+                self.status = Some(format!(
+                    "O ticket {} está oculto. Restaure-o (o) para abrir um agente.",
+                    ticket.key
+                ));
+            }
+            KeyCode::Char('n') => {
+                let types: Vec<StageType> = StageType::menu(precheck.jira, precheck.sentry)
+                    .into_iter()
+                    .filter(|kind| kind.stage().key() == agent.stage)
+                    .collect();
+                if types.is_empty() {
+                    self.status = Some(format!(
+                        "Nenhum tipo de agente da etapa {} está disponível neste projeto.",
+                        printable(&tickets::stage_label(&agent.stage))
+                    ));
+                } else {
+                    self.status = None;
+                    self.dialog = Some(Dialog::ChooseType {
+                        project,
+                        ticket,
+                        precheck,
+                        types,
+                        index: 0,
+                    });
+                }
+            }
+            _ => {
+                self.dialog = Some(Dialog::ConversationLost {
+                    project,
+                    agent,
+                    ticket,
+                    precheck,
+                });
+            }
+        }
+        Action::None
     }
 
     /// The alert of an agent not opened (a failing `--check` or `--render`), with `Nada foi
@@ -1574,8 +1896,15 @@ impl App {
             self.status = Some("Não consegui abrir o agente: sem a pasta das travas.".into());
             return;
         };
-        let record = match agents::open(&self.db, agents_dir, ticket.id, stage, &session_id, &name)
-        {
+        let record = match agents::open(
+            &self.db,
+            agents_dir,
+            ticket.id,
+            stage,
+            &session_id,
+            &name,
+            &ticket.key,
+        ) {
             Ok(record) => record,
             Err(message) => {
                 self.status = Some(message);
@@ -1583,8 +1912,11 @@ impl App {
             }
         };
         let id = record.agent.id;
-        if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name, kind, log)
-        {
+        let launch = Launch::New {
+            kind,
+            prompt_file: log,
+        };
+        if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name, launch) {
             let mut message = format!("Não consegui abrir o agente: {err}.");
             if let Err(db) = agents::end(&self.db, record) {
                 message = format!("{message} {db}");
@@ -1592,7 +1924,17 @@ impl App {
             self.status = Some(message);
             return;
         }
-        let project = project_name.to_string();
+        self.start_running(record, name, ticket, check);
+    }
+
+    /// An agent whose PTY started (opened, or resumed: NS-39) joins the running ones, with the
+    /// jail and the warning of its `check`; its node is selected (its branches open: reading
+    /// only, the stage does not change), and it is shown with the focus on its terminal.
+    fn start_running(&mut self, record: OpenAgent, name: String, ticket: &Ticket, check: Precheck) {
+        let id = record.agent.id;
+        let project = self
+            .project_of(ticket)
+            .map_or(String::new(), |p| p.name.clone());
         self.agents.push(RunningAgent {
             record,
             id,
@@ -1606,8 +1948,6 @@ impl App {
             unseen: false,
         });
         self.status = None;
-        // The node of the new agent is selected, its branches open (reading only: the stage
-        // does not change).
         self.reveal_and_select(NodeId::Agent(id));
         self.refresh_tree();
         self.show(id);
@@ -1636,7 +1976,7 @@ impl App {
         Some(agent)
     }
 
-    /// The program of the agent `id` ended with `code`: the row becomes `ended` and the lock
+    /// The program of the agent `id` ended with `code`: the row becomes `stopped` and the lock
     /// goes (agents.rs), it leaves the running ones (`take_agent`), and the status says so
     /// (plus the warning of the check, when there was one). The screen on the left stays, with
     /// the tickets read again.
@@ -1675,7 +2015,7 @@ impl App {
     }
 
     /// Ends the records of every running agent (the nick is leaving, its sessions already
-    /// terminated): each row becomes `ended` and each lock goes, one by one, even after an
+    /// terminated): each row becomes `stopped` and each lock goes, one by one, even after an
     /// error, so no lock is left held. Returns the first error of the database, if any.
     pub fn end_all_records(&mut self) -> Result<(), String> {
         self.shown = None;
@@ -2116,6 +2456,16 @@ fn edit_text(text: &mut String, key: KeyEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// The refusal of acting on an agent in a state this nick does not know (the column has no
+/// CHECK; review of the NS-39, point 6): nothing is done on it.
+fn unknown_state_message(agent: &Agent) -> String {
+    format!(
+        "O agente {} está num estado que este nick não conhece ({}).",
+        agent.name,
+        printable(&agent.state)
+    )
 }
 
 /// `s` or `S`: the "sim" of the `(s/N)` confirmations (of auto_scrum too); any other key is no.
@@ -3241,8 +3591,13 @@ mod tests {
         spawns: Vec<(PathBuf, PathBuf, String, String)>,
         ids: Vec<i64>,
         kinds: Vec<(StageType, PathBuf)>,
+        /// The resumes (NS-39): the stage, the key at the opening and the key of now.
+        resumes: Vec<(Stage, Option<String>, String)>,
+        /// The sessions whose conversation was asked for (NS-39).
+        conversations: Vec<String>,
         check: Result<Precheck, String>,
         render: Result<Rendered, String>,
+        conversation: Result<bool, String>,
         spawn: Result<(), String>,
     }
 
@@ -3267,6 +3622,8 @@ mod tests {
                 spawns: Vec::new(),
                 ids: Vec::new(),
                 kinds: Vec::new(),
+                resumes: Vec::new(),
+                conversations: Vec::new(),
                 check: Ok(Precheck {
                     jail,
                     jira: false,
@@ -3274,6 +3631,7 @@ mod tests {
                     warning: None,
                 }),
                 render: Ok(rendered(3)),
+                conversation: Ok(true),
                 spawn: Ok(()),
             }
         }
@@ -3300,6 +3658,16 @@ mod tests {
             self.render.clone()
         }
 
+        fn has_conversation(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            session_id: &str,
+        ) -> Result<bool, String> {
+            self.conversations.push(session_id.to_string());
+            self.conversation.clone()
+        }
+
         fn spawn(
             &mut self,
             launcher: &Path,
@@ -3307,11 +3675,23 @@ mod tests {
             agent_id: i64,
             session_id: &str,
             name: &str,
-            kind: StageType,
-            prompt_file: &Path,
+            launch: Launch,
         ) -> Result<(), String> {
             self.ids.push(agent_id);
-            self.kinds.push((kind, prompt_file.to_path_buf()));
+            match launch {
+                Launch::New { kind, prompt_file } => {
+                    self.kinds.push((kind, prompt_file.to_path_buf()));
+                }
+                Launch::Resume {
+                    stage,
+                    opened_key,
+                    ticket_key,
+                } => self.resumes.push((
+                    stage,
+                    opened_key.map(str::to_string),
+                    ticket_key.to_string(),
+                )),
+            }
             self.spawns.push((
                 launcher.to_path_buf(),
                 project.to_path_buf(),
@@ -4126,7 +4506,7 @@ mod tests {
         assert_eq!(f.app.focus, Focus::List);
         let rows = f.agent_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].3, "ended");
+        assert_eq!(rows[0].3, "stopped");
         assert!(!agents::lock_path(&f.agents_dir(), &rows[0].0).exists());
     }
 
@@ -4241,7 +4621,7 @@ mod tests {
             assert_eq!(f.status(), Some(message));
             assert!(f.app.agents.is_empty());
             assert_eq!(f.app.focus, Focus::List);
-            assert_eq!(f.agent_rows()[0].3, "ended");
+            assert_eq!(f.agent_rows()[0].3, "stopped");
             assert!(!agents::lock_path(&f.agents_dir(), &session_id).exists());
             // Back on the list, q quits again.
             assert_eq!(f.ch('q'), Action::Quit);
@@ -4587,7 +4967,7 @@ mod tests {
         let rows = f.agent_rows();
         assert_eq!(
             (rows[0].3.as_str(), rows[1].3.as_str()),
-            ("active", "ended")
+            ("active", "stopped")
         );
         assert!(!agents::lock_path(&f.agents_dir(), &rows[1].0).exists());
         assert!(f.locked(&rows[0].0), "the other one goes on");
@@ -4645,7 +5025,7 @@ mod tests {
         let rows = f.agent_rows();
         assert_eq!(
             (rows[0].3.as_str(), rows[1].3.as_str()),
-            ("active", "ended")
+            ("active", "stopped")
         );
         for row in &rows {
             assert!(
@@ -4984,7 +5364,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("proj · PO · NS-1", "active"),
-                ("proj · Dev · NS-1", "ended")
+                ("proj · Dev · NS-1", "stopped")
             ]
         );
         assert!(f.rows().contains(&NodeId::Agent(launcher.ids[1])));
@@ -5047,9 +5427,10 @@ mod tests {
         assert_eq!(f.app.selected, NodeId::Agent(launcher.ids[1]));
         assert_eq!(f.key(KeyCode::Right), Action::None);
         assert_eq!(f.app.focus, Focus::List);
+        // NS-39 (decision 3): a stopped one says which key resumes it.
         assert_eq!(
             f.status(),
-            Some("O agente proj · Tech Leader · NS-1 não está rodando neste nick.")
+            Some("O agente proj · Tech Leader · NS-1 está parado. Pressione r para retomar.")
         );
         // An active one of another nick does not open either.
         f.app
@@ -5059,6 +5440,7 @@ mod tests {
                 "review",
                 "outro",
                 "proj · Review · NS-1",
+                "NS-1",
             )
             .unwrap();
         // A first key reads it (the refresh comes after the key), the next one reaches it.
@@ -5265,7 +5647,7 @@ mod tests {
         // An active agent (of this nick or not) is refused at Enter too.
         f.app
             .db
-            .insert_agent(ticket.id, "po", "outro", "proj · PO · NS-1")
+            .insert_agent(ticket.id, "po", "outro", "proj · PO · NS-1", "NS-1")
             .unwrap();
         f.ch('i');
         f.ch('9');
@@ -5729,9 +6111,10 @@ mod tests {
         assert_eq!(f.app.selected, Fixture::anode(id));
         f.key(KeyCode::Enter);
         assert_eq!(f.app.focus, Focus::List);
+        // NS-39 (decision 3): a stopped one says which key resumes it.
         assert_eq!(
             f.status(),
-            Some("O agente proj · Tech Leader · NS-2 não está rodando neste nick.")
+            Some("O agente proj · Tech Leader · NS-2 está parado. Pressione r para retomar.")
         );
     }
 
@@ -5806,7 +6189,7 @@ mod tests {
             Some(first),
             "the live one opened most recently"
         );
-        assert_eq!(f.agent_rows()[1].3, "ended");
+        assert_eq!(f.agent_rows()[1].3, "stopped");
         assert!(!agents::lock_path(&f.agents_dir(), &launcher.spawns[1].2).exists());
         assert_eq!(f.agent_rows()[0].3, "active");
         // The last one: nothing to go to.
@@ -6046,7 +6429,7 @@ mod tests {
         let ticket = f.tnode_id("NS-1");
         f.app
             .db
-            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1")
+            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1", "NS-1")
             .unwrap();
         f.app.select(NodeId::Project(f.pid("proj")));
         assert_eq!(f.ch('r'), Action::None);
@@ -6058,7 +6441,7 @@ mod tests {
         let ticket = f.tnode_id("NS-1");
         f.app
             .db
-            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1")
+            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1", "NS-1")
             .unwrap();
         assert_eq!(f.ch('s'), Action::None);
         assert_eq!(f.status(), Some(refusal));
@@ -6100,5 +6483,665 @@ mod tests {
             matches!(f.app.dialog, Some(Dialog::NewTicket { .. })),
             "it stays open"
         );
+    }
+
+    // ---- NS-39: resuming and archiving the agents ----
+
+    /// The Tech Leader agent of NS-2 (`running`), ended: stopped, its node selected.
+    fn stopped_agent() -> (Fixture, FakeLauncher, i64) {
+        let (mut f, launcher) = running();
+        let id = launcher.ids[0];
+        f.app.agent_ended(id, 0);
+        assert_eq!(f.app.selected, Fixture::anode(id));
+        f.app.status = None;
+        (f, launcher, id)
+    }
+
+    const TL_NAME: &str = "proj · Tech Leader · NS-2";
+
+    impl Fixture {
+        /// `r` on the selected node and, when it asks for it (`Action::CheckResume`), the check
+        /// of the resume carried out with `launcher`, as the loop does.
+        fn r(&mut self, launcher: &mut FakeLauncher) -> bool {
+            match self.ch('r') {
+                Action::CheckResume { project, agent } => {
+                    self.app.check_resume(&project, &agent, launcher);
+                    true
+                }
+                Action::None => false,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        /// The state of the agent `id` in the database.
+        fn state_of(&self, id: i64) -> String {
+            self.app
+                .db
+                .get_agent(id)
+                .unwrap()
+                .expect("in the database")
+                .state
+        }
+
+        fn session_of(&self, id: i64) -> String {
+            self.app.db.get_agent(id).unwrap().unwrap().session_id
+        }
+
+        /// An agent row of the ticket `key`, inserted as another nick would (active), its node
+        /// selected (the ticket opened).
+        fn foreign_agent(&mut self, key: &str, session: &str) -> i64 {
+            let ticket = self.tnode_id(key);
+            let agent = self
+                .app
+                .db
+                .insert_agent(ticket, "review", session, "proj · Review · NS-1", key)
+                .unwrap();
+            self.app.tree.open(NodeId::Ticket(ticket));
+            self.app.refresh_tree();
+            self.select(Fixture::anode(agent.id));
+            agent.id
+        }
+    }
+
+    #[test]
+    fn r_on_a_stopped_agent_checks_finds_the_conversation_and_resumes_it() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let p = f.app.selected_project().unwrap().path.clone();
+        let agent = f.app.agent_record(id).unwrap().clone();
+        assert_eq!(
+            f.ch('r'),
+            Action::CheckResume {
+                project: p.clone(),
+                agent: agent.clone()
+            }
+        );
+        assert_eq!(
+            launcher.checks.len(),
+            1,
+            "no check before the loop carries it out"
+        );
+        f.app.check_resume(&p, &agent, &mut launcher);
+        assert_eq!(launcher.checks.len(), 2, "the check of the resume");
+        assert_eq!(
+            launcher.conversations,
+            std::slice::from_ref(&agent.session_id)
+        );
+        assert_eq!(
+            launcher.resumes,
+            [(
+                Stage::TechLeader,
+                Some("NS-2".to_string()),
+                "NS-2".to_string()
+            )]
+        );
+        assert_eq!(launcher.ids, [id, id], "the same row, the same session");
+        assert_eq!(launcher.spawns[1].2, agent.session_id);
+        assert_eq!(launcher.spawns[1].3, TL_NAME, "the name stored");
+        assert_eq!(f.state_of(id), "active");
+        assert!(f.app.agent(id).is_some(), "running again");
+        assert_eq!(f.app.selected, Fixture::anode(id));
+        assert_eq!(f.app.shown(), Some(id));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado.")
+        );
+        assert!(
+            f.agents_dir()
+                .join(format!("{}.lock", agent.session_id))
+                .exists()
+        );
+        // Its end stops it again, as any agent.
+        f.app.agent_ended(id, 0);
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    #[test]
+    fn a_failing_check_or_conversation_check_shows_the_alert_and_changes_nothing() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        launcher.check = Err("Erro: a jail falhou.".into());
+        assert!(f.r(&mut launcher));
+        assert_eq!(f.alert(), "Nada foi aberto.\n\nErro: a jail falhou.");
+        assert!(
+            launcher.conversations.is_empty(),
+            "no conversation check after a failure"
+        );
+        assert_eq!(launcher.resumes, []);
+        assert_eq!(f.state_of(id), "stopped");
+        f.key(KeyCode::Esc);
+        launcher.check = FakeLauncher::new(true).check;
+        launcher.conversation = Err("Erro: x".into());
+        assert!(f.r(&mut launcher));
+        assert_eq!(f.alert(), "Nada foi aberto.\n\nErro: x");
+        assert_eq!(launcher.resumes, []);
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    #[test]
+    fn a_missing_launcher_on_resume_shows_its_path() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        fs::remove_file(f.root.join("bin/nick-agent")).unwrap();
+        assert!(f.r(&mut launcher));
+        assert!(
+            f.alert().starts_with("Não encontrei o bin/nick-agent em "),
+            "{}",
+            f.alert()
+        );
+        assert_eq!(launcher.checks.len(), 1);
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    fn lost(f: &Fixture) -> (Agent, Precheck) {
+        match &f.app.dialog {
+            Some(Dialog::ConversationLost {
+                agent, precheck, ..
+            }) => (agent.clone(), precheck.clone()),
+            other => panic!("not in the lost conversation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lost_conversation_opens_the_warning_and_esc_writes_nothing() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        launcher.conversation = Ok(false);
+        assert!(f.r(&mut launcher));
+        assert_eq!(lost(&f).0.id, id);
+        assert_eq!(launcher.resumes, [], "no PTY");
+        assert_eq!(launcher.ids, [id], "only the first opening");
+        assert_eq!(f.state_of(id), "stopped");
+        // The reserved shortcut is ignored with the dialog open (NS-34).
+        f.shortcut();
+        assert_eq!(f.app.focus, Focus::List);
+        assert!(f.app.dialog.is_some());
+        // Another key keeps it; Esc closes it writing nothing.
+        f.ch('x');
+        assert!(f.app.dialog.is_some());
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.state_of(id), "stopped");
+        assert_eq!(f.app.selected, Fixture::anode(id));
+    }
+
+    #[test]
+    fn a_on_the_lost_conversation_archives_without_asking_again() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        launcher.conversation = Ok(false);
+        f.r(&mut launcher);
+        assert_eq!(f.ch('a'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.state_of(id), "archived");
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi arquivado.")
+        );
+        assert!(!f.rows().contains(&Fixture::anode(id)), "out of the tree");
+        assert_eq!(
+            f.app.selected,
+            NodeId::Ticket(ticket),
+            "the selection goes up"
+        );
+    }
+
+    #[test]
+    fn n_on_the_lost_conversation_opens_the_menu_of_its_stage_without_a_second_check() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        launcher.conversation = Ok(false);
+        launcher.check = Ok(Precheck {
+            jail: true,
+            jira: true,
+            sentry: true,
+            warning: None,
+        });
+        f.r(&mut launcher);
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(
+            f.menu(),
+            (vec![StageType::TechLeader, StageType::TechLeaderJira], 0)
+        );
+        assert_eq!(launcher.checks.len(), 2, "the check of the resume only");
+        // From there, the flow of `g`: the form, the preview and a new agent.
+        f.pick(StageType::TechLeader);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        let Action::OpenAgent {
+            project,
+            ticket,
+            kind,
+            log,
+            precheck,
+        } = f.ch('s')
+        else {
+            panic!("no OpenAgent");
+        };
+        assert_eq!(ticket.key, "NS-2");
+        f.app
+            .open_agent(&project, &ticket, kind, &log, precheck, &mut launcher);
+        assert_eq!(launcher.checks.len(), 2, "no other check");
+        assert_eq!(f.app.agents().len(), 1);
+        assert_ne!(f.app.agents()[0].id, id, "a new agent");
+        assert_eq!(f.state_of(id), "stopped", "the old one stays");
+    }
+
+    #[test]
+    fn the_menu_of_the_lost_conversation_follows_the_stage_and_the_flags() {
+        let cases = [
+            (
+                0,
+                true,
+                true,
+                vec![
+                    StageType::Po,
+                    StageType::PoDiscussion,
+                    StageType::PoJira,
+                    StageType::PoSentry,
+                ],
+            ),
+            (
+                0,
+                false,
+                false,
+                vec![StageType::Po, StageType::PoDiscussion],
+            ),
+            (
+                0,
+                false,
+                true,
+                vec![StageType::Po, StageType::PoDiscussion, StageType::PoSentry],
+            ),
+            (2, true, true, vec![StageType::Development]),
+            (3, true, true, vec![StageType::Review]),
+        ];
+        for (downs, jira, sentry, expected) in cases {
+            let (mut f, _) = with_agents();
+            let mut launcher = FakeLauncher::new(false);
+            f.open_agent(downs, &mut launcher);
+            let id = launcher.ids[0];
+            f.app.agent_ended(id, 0);
+            launcher.conversation = Ok(false);
+            launcher.check = Ok(Precheck {
+                jail: false,
+                jira,
+                sentry,
+                warning: None,
+            });
+            f.r(&mut launcher);
+            f.ch('n');
+            assert_eq!(
+                f.menu().0,
+                expected,
+                "stage {downs}, jira {jira}, sentry {sentry}"
+            );
+        }
+    }
+
+    #[test]
+    fn n_on_the_lost_conversation_of_a_hidden_ticket_says_to_restore_it() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
+        tickets::hide(&f.app.db, &t).unwrap();
+        f.ch('f');
+        f.select(Fixture::anode(id));
+        launcher.conversation = Ok(false);
+        assert!(
+            f.r(&mut launcher),
+            "r works on the agent of a hidden ticket"
+        );
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some("O ticket NS-2 está oculto. Restaure-o (o) para abrir um agente.")
+        );
+    }
+
+    #[test]
+    fn the_agent_of_a_hidden_ticket_is_resumed() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
+        tickets::hide(&f.app.db, &t).unwrap();
+        f.ch('f');
+        f.select(Fixture::anode(id));
+        assert!(f.r(&mut launcher));
+        assert_eq!(f.state_of(id), "active");
+        assert_eq!(f.app.focus, Focus::Terminal);
+    }
+
+    /// A child process holding the flock of `path` (another nick), until it is killed.
+    fn hold_lock(path: &Path) -> std::process::Child {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Through bash, the only program the nick runs with Command (structural of the NS-33).
+        let child = std::process::Command::new("bash")
+            .args(["-c", "exec flock \"$0\" sleep 30"])
+            .arg(path)
+            .spawn()
+            .expect("flock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !agents::held_elsewhere(
+            path.parent().unwrap(),
+            path.file_stem().unwrap().to_str().unwrap(),
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never took the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child
+    }
+
+    #[test]
+    fn an_agent_active_in_another_nick_is_refused_without_the_check() {
+        let (mut f, _) = with_agents();
+        let id = f.foreign_agent("NS-1", "outro-1");
+        let lock = f.agents_dir().join("outro-1.lock");
+        let mut child = hold_lock(&lock);
+        let mut launcher = FakeLauncher::new(false);
+        assert!(!f.r(&mut launcher), "refused at the key");
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Review · NS-1 está ativo em outro nick e não pode ser retomado aqui."
+            )
+        );
+        assert!(launcher.checks.is_empty(), "no check");
+        assert_eq!(f.state_of(id), "active");
+        // `o` refuses it too.
+        f.ch('o');
+        assert_eq!(f.status(), Some("Um agente ativo não pode ser arquivado."));
+        assert_eq!(f.state_of(id), "active");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_active_agent_whose_lock_is_free_is_resumed() {
+        let (mut f, _) = with_agents();
+        let id = f.foreign_agent("NS-1", "outro-1");
+        let mut launcher = FakeLauncher::new(false);
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            launcher.resumes,
+            [(Stage::Review, Some("NS-1".to_string()), "NS-1".to_string())]
+        );
+        assert_eq!(f.state_of(id), "active");
+        assert!(f.app.agent(id).is_some());
+        assert_eq!(f.app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn a_resume_after_the_id_changed_tells_the_agent_the_new_folder() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
+        let p = f.app.selected_project().unwrap().path.clone();
+        tickets::edit_id(&f.app.db, &p, &t, "NS-9").unwrap();
+        f.app.refresh_tree();
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            launcher.resumes,
+            [(
+                Stage::TechLeader,
+                Some("NS-2".to_string()),
+                "NS-9".to_string()
+            )]
+        );
+        assert_eq!(launcher.spawns[1].3, TL_NAME, "the name does not change");
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · NS-2 foi retomado. Ele foi avisado de que a \
+                 pasta agora é .nick/docs/NS-9/."
+            )
+        );
+    }
+
+    #[test]
+    fn an_agent_of_before_the_ns39_takes_its_key_from_the_name() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        f.app
+            .db
+            .connection()
+            .execute("UPDATE agents SET opened_key = NULL WHERE id = ?1", [id])
+            .unwrap();
+        f.app.refresh_tree();
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            launcher.resumes,
+            [(
+                Stage::TechLeader,
+                Some("NS-2".to_string()),
+                "NS-2".to_string()
+            )]
+        );
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado.")
+        );
+    }
+
+    #[test]
+    fn a_failing_spawn_on_resume_stops_the_agent_again_and_releases_the_lock() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        launcher.spawn = Err("sem pty".into());
+        assert!(f.r(&mut launcher));
+        assert_eq!(f.status(), Some("Não consegui abrir o agente: sem pty."));
+        assert_eq!(f.state_of(id), "stopped");
+        assert!(f.app.agent(id).is_none());
+        let session = f.session_of(id);
+        assert!(!f.agents_dir().join(format!("{session}.lock")).exists());
+    }
+
+    #[test]
+    fn r_on_an_archived_agent_and_on_an_unavailable_project_says_why() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.state_of(id), "archived");
+        f.ch('f');
+        f.select(Fixture::anode(id));
+        assert!(!f.r(&mut launcher));
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · NS-2 está arquivado. Desarquive (o) antes de retomar."
+            )
+        );
+        f.ch('o');
+        assert_eq!(f.state_of(id), "stopped");
+        let p = f.app.selected_project().unwrap().path.clone();
+        fs::remove_file(projects::config_file(&p)).unwrap();
+        assert!(!f.r(&mut launcher));
+        assert_eq!(
+            f.status(),
+            Some(
+                "Projeto indisponível: [indisponível: sem .nick/nick.conf]. O agente só abre com \
+                 a pasta e o .nick/nick.conf no lugar."
+            )
+        );
+        assert_eq!(launcher.checks.len(), 1, "no check");
+    }
+
+    #[test]
+    fn o_archives_a_stopped_agent_asking_and_the_selection_goes_to_the_sibling() {
+        let (mut f, mut launcher, first) = stopped_agent();
+        // A second agent of the same ticket, ended too.
+        f.on_ticket();
+        f.open_kind(StageType::TechLeader, &mut launcher);
+        let second = launcher.ids[1];
+        f.app.agent_ended(second, 0);
+        f.select(Fixture::anode(first));
+        assert_eq!(f.ch('o'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmArchive {
+                agent: f.app.agent_record(first).unwrap().clone()
+            })
+        );
+        f.ch('n');
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.state_of(first), "stopped", "any other key cancels");
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.state_of(first), "archived");
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi arquivado.")
+        );
+        assert_eq!(f.app.selected, Fixture::anode(second), "the next sibling");
+        assert!(!f.rows().contains(&Fixture::anode(first)));
+        // With `f`, the archived one is back on the tree; `o` unarchives it without asking.
+        f.ch('f');
+        assert!(f.rows().contains(&Fixture::anode(first)));
+        f.select(Fixture::anode(first));
+        assert_eq!(f.ch('o'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.state_of(first), "stopped");
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 voltou para parado.")
+        );
+    }
+
+    #[test]
+    fn o_on_a_live_agent_is_refused() {
+        let (mut f, _launcher) = running();
+        let id = f.app.agents()[0].id;
+        f.shortcut();
+        assert_eq!(f.app.selected, Fixture::anode(id));
+        assert_eq!(f.ch('o'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some("Um agente ativo não pode ser arquivado."));
+        assert_eq!(f.state_of(id), "active");
+    }
+
+    #[test]
+    fn enter_on_a_stopped_or_an_archived_agent_says_which_key() {
+        let (mut f, _launcher, id) = stopped_agent();
+        for open in [KeyCode::Enter, KeyCode::Right] {
+            f.key(open);
+            assert_eq!(
+                f.status(),
+                Some("O agente proj · Tech Leader · NS-2 está parado. Pressione r para retomar.")
+            );
+        }
+        f.ch('o');
+        f.ch('s');
+        f.ch('f');
+        f.select(Fixture::anode(id));
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · NS-2 está arquivado. Pressione o para desarquivar."
+            )
+        );
+        assert_eq!(f.app.focus, Focus::List);
+    }
+
+    /// Opening the nick resumes nothing: the stopped agents stay stopped, and nothing reaches a
+    /// launcher (the App runs none by itself: only `Action::CheckResume` does, from `r`).
+    #[test]
+    fn opening_the_app_with_stopped_agents_resumes_none() {
+        let (f, _launcher, id) = stopped_agent();
+        let agents_dir = f.agents_dir();
+        // The nick closes (its App goes) and opens again on the same database.
+        let Fixture { _tmp, root, app } = f;
+        drop(app);
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        assert_eq!(agents::cleanup(&db, &agents_dir), Ok(0));
+        let mut app = App::new(db, None, None, root.join("bin/nick-init"))
+            .with_agents(root.join("bin/nick-agent"), agents_dir);
+        assert!(app.agents().is_empty());
+        // Every node of the tree, opened and walked: no action asks for a launch.
+        for _ in 0..12 {
+            for code in [KeyCode::Enter, KeyCode::Down] {
+                let action = app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                assert_eq!(action, Action::None);
+            }
+        }
+        assert!(app.agents().is_empty());
+        assert_eq!(app.db.get_agent(id).unwrap().unwrap().state, "stopped");
+    }
+
+    /// Review of the NS-39, point 2: the node still says stopped (the tree was read before),
+    /// but another nick resumed it meanwhile: `r` reads the row again and refuses before the
+    /// check.
+    #[test]
+    fn r_reads_the_row_again_and_refuses_one_another_nick_resumed_meanwhile() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        assert_eq!(
+            f.app.agent_record(id).unwrap().state,
+            "stopped",
+            "the tree of before"
+        );
+        f.app
+            .db
+            .connection()
+            .execute("UPDATE agents SET state = 'active' WHERE id = ?1", [id])
+            .unwrap();
+        let session = f.session_of(id);
+        let mut child = hold_lock(&f.agents_dir().join(format!("{session}.lock")));
+        assert!(!f.r(&mut launcher), "refused at the key");
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · NS-2 está ativo em outro nick e não pode ser \
+                 retomado aqui."
+            )
+        );
+        assert_eq!(launcher.checks.len(), 1, "no check of the resume");
+        assert_eq!(f.state_of(id), "active");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Review of the NS-39, point 4: a resume refused in the loop (the row changed after the
+    /// key) reads the tree again, so the node shows the state the bar talks about.
+    #[test]
+    fn a_resume_refused_in_the_loop_reads_the_tree_again() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let p = f.app.selected_project().unwrap().path.clone();
+        let agent = f.app.agent_record(id).unwrap().clone();
+        f.app.db.archive_agent(id).unwrap();
+        f.app.check_resume(&p, &agent, &mut launcher);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · NS-2 está arquivado. Desarquive (o) antes de retomar."
+            )
+        );
+        assert_eq!(
+            f.app.agent_record(id).unwrap().state,
+            "archived",
+            "read again"
+        );
+        assert!(
+            !f.rows().contains(&Fixture::anode(id)),
+            "out of the tree without f"
+        );
+    }
+
+    /// Review of the NS-39, point 6: a state this nick does not know is not offered as
+    /// stopped: `r` and `o` say so, and nothing is run.
+    #[test]
+    fn an_agent_in_an_unknown_state_is_neither_resumed_nor_archived() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        f.app
+            .db
+            .connection()
+            .execute("UPDATE agents SET state = 'futuro' WHERE id = ?1", [id])
+            .unwrap();
+        f.app.refresh_tree();
+        let message = "O agente proj · Tech Leader · NS-2 está num estado que este nick não conhece (futuro).";
+        assert!(!f.r(&mut launcher));
+        assert_eq!(f.status(), Some(message));
+        assert_eq!(launcher.checks.len(), 1, "no check");
+        assert_eq!(f.ch('o'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some(message));
+        assert_eq!(f.state_of(id), "futuro");
     }
 }

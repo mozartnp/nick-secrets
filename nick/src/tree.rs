@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agents::Agent;
+use crate::agents::{Agent, AgentState};
 use crate::app::Row;
 use crate::modules::ModuleKind;
 use crate::projects::Availability;
@@ -51,7 +51,7 @@ pub struct TreeData<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     open: HashSet<NodeId>,
-    /// The hidden tickets are listed too (`f`).
+    /// The hidden tickets are listed too, and the archived agents (`f`; NS-39).
     pub show_hidden: bool,
     /// Only the branches with a live agent of this nick, all open (`v`).
     pub only_active: bool,
@@ -72,9 +72,10 @@ impl Tree {
     /// The rows on the screen, in order: each module (the root, even alone); its projects (an
     /// unavailable one does not open, but for one with a live agent); the tickets of an open
     /// project, without the hidden ones unless `show_hidden` or one of its agents is live (decision
-    /// 7); the agents of an open ticket, in the order they were opened. With `only_active`, only
-    /// the branches with a live agent and only the live agents, every branch open, whatever the
-    /// state kept.
+    /// 7); the agents of an open ticket, in the order they were opened, without the archived ones
+    /// unless `show_hidden` (NS-39; a ticket with only archived agents is then a leaf). With
+    /// `only_active`, only the branches with a live agent and only the live agents, every branch
+    /// open, whatever the state kept.
     pub fn visible(&self, data: &TreeData) -> Vec<Visible> {
         let live_in = |test: &dyn Fn(&LiveAgent) -> bool| data.live.iter().any(test);
         let unseen_in = |test: &dyn Fn(&LiveAgent) -> bool| {
@@ -138,6 +139,10 @@ impl Tree {
                         .map_or(&[][..], Vec::as_slice)
                         .iter()
                         .filter(|agent| !self.only_active || live_in(&|a| a.id == agent.id))
+                        // An archived agent only with the hidden ones (`f`, NS-39).
+                        .filter(|agent| {
+                            self.show_hidden || agent.state != AgentState::Archived.key()
+                        })
                         .collect();
                     let expandable = !agents.is_empty();
                     let open =
@@ -305,7 +310,8 @@ mod tests {
             session_id: format!("s{id}"),
             name: format!("a{id}"),
             opened_at: String::new(),
-            state: "ended".into(),
+            state: "stopped".into(),
+            opened_key: None,
         }
     }
 
@@ -609,5 +615,64 @@ mod tests {
         assert_eq!(Tree::reselect(&deep, &after, t10), t12);
         // Unknown before: the first row.
         assert_eq!(Tree::reselect(&[], &closed, t11), M);
+    }
+
+    /// NS-39: an archived agent only shows with the filter `f` (as a hidden ticket), and a ticket
+    /// whose agents are all archived is a leaf without it; the filter `v` does not change.
+    #[test]
+    fn an_archived_agent_shows_only_with_the_filter_of_the_hidden_ones() {
+        let mut data = Data::new();
+        data.agents.get_mut(&10).unwrap()[0].state = "archived".into();
+        data.agents.insert(12, vec![agent(120, 12)]);
+        data.agents.get_mut(&12).unwrap()[0].state = "archived".into();
+        let mut tree = Tree::default();
+        tree.open(M);
+        tree.open(NodeId::Project(1));
+        tree.open(NodeId::Ticket(10));
+        tree.open(NodeId::Ticket(12));
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (NodeId::Project(1), 1),
+                (NodeId::Ticket(10), 2),
+                (NodeId::Agent(101), 3),
+                (NodeId::Ticket(12), 2),
+                (NodeId::Project(2), 1),
+            ]
+        );
+        let leaf = find(&tree, &data, NodeId::Ticket(12));
+        assert!(
+            !leaf.expandable && !leaf.open,
+            "only archived agents: a leaf"
+        );
+        tree.show_hidden = true;
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (NodeId::Project(1), 1),
+                (NodeId::Ticket(10), 2),
+                (NodeId::Agent(100), 3),
+                (NodeId::Agent(101), 3),
+                (NodeId::Ticket(11), 2),
+                (NodeId::Ticket(12), 2),
+                (NodeId::Agent(120), 3),
+                (NodeId::Project(2), 1),
+            ]
+        );
+        assert!(find(&tree, &data, NodeId::Ticket(12)).expandable);
+        // The filter `v` shows only the live agents, as before: an archived one never is.
+        tree.only_active = true;
+        let data = data.live(101, 10, 1, false);
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (NodeId::Project(1), 1),
+                (NodeId::Ticket(10), 2),
+                (NodeId::Agent(101), 3),
+            ]
+        );
     }
 }

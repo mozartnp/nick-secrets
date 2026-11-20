@@ -253,12 +253,9 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
     nick.wait_for("O agente proj · Dev · NS-1 terminou.");
     // Decision 10 of NS-38: the selection stays on the node of the agent, now ended, with the
     // focus on the tree.
-    nick.wait_for_flat("↑/↓ mover · ← subir");
+    nick.wait_for_flat("↑/↓ mover · r retomar · o arquivar · ← subir");
     let (_, row) = nick.selected_row().expect("a selection");
-    assert!(
-        row.contains("Dev  encerrado"),
-        "the same node selected: {row}"
-    );
+    assert!(row.contains("Dev  parado"), "the same node selected: {row}");
     // The argv: the session id of the database and the name, then the prompt (NS-35); the Dev
     // stage in auto mode (NS-35); the cwd is the project.
     let argv = read(&logs(&world).claude);
@@ -280,7 +277,7 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
         "{env}"
     );
     assert!(!logs(&world).jail.exists(), "no ai-jail out of the jail");
-    assert_eq!(world.agents()[0].3, "ended");
+    assert_eq!(world.agents()[0].3, "stopped");
     assert!(!lock.exists(), "the lock is gone");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
@@ -310,7 +307,7 @@ fn an_agent_in_the_jail_goes_through_ai_jail() {
         let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
     }
     nick.wait_for("O agente proj · Tech Leader · NS-1 terminou com o código");
-    assert_eq!(world.agents()[0].3, "ended");
+    assert_eq!(world.agents()[0].3, "stopped");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
@@ -737,7 +734,7 @@ fn assert_signal_ends_the_agent(signal: Signal, code: u32) {
         wait_dead(&nick, pid);
     }
     let agents = world.agents();
-    assert_eq!(agents[0].3, "ended", "{signal}");
+    assert_eq!(agents[0].3, "stopped", "{signal}");
     assert!(
         !world
             .agents_dir()
@@ -788,7 +785,7 @@ fn a_panic_with_an_agent_open_ends_its_group_and_exits_with_101() {
     assert_eq!(world.agents()[0].3, "active");
     let mut again = world.spawn(&world.root, &[]);
     again.wait_for(" Navegação ");
-    assert_eq!(world.agents()[0].3, "ended");
+    assert_eq!(world.agents()[0].3, "stopped");
     again.send("q");
     assert_eq!(again.wait_exit(), Some(0));
 }
@@ -801,7 +798,7 @@ fn an_active_agent_without_its_lock_is_ended_when_the_nick_opens() {
     world.active_agent(&proj, "NS-1", "morto");
     let mut nick = world.spawn(&world.root, &[]);
     nick.wait_for(" Navegação ");
-    assert_eq!(world.agents()[0].3, "ended");
+    assert_eq!(world.agents()[0].3, "stopped");
     assert!(!world.agents_dir().join("morto.lock").exists());
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
@@ -823,7 +820,7 @@ fn an_agent_whose_lock_another_nick_holds_stays_active() {
     // Control: with the lock free, the next opening ends it.
     let mut again = world.spawn(&world.root, &[]);
     again.wait_for(" Navegação ");
-    assert_eq!(world.agents()[0].3, "ended");
+    assert_eq!(world.agents()[0].3, "stopped");
     again.send("q");
     assert_eq!(again.wait_exit(), Some(0));
 }
@@ -1297,12 +1294,12 @@ fn an_agent_ended_from_the_view_dies_alone() {
     let agents = world.agents();
     assert_eq!(
         (agents[0].3.as_str(), agents[1].3.as_str()),
-        ("ended", "active")
+        ("stopped", "active")
     );
     assert!(!lock_of(&world, &agents[0].0).exists());
     assert!(lock_of(&world, &agents[1].0).exists());
     // The ended one stays on its node (decision 10 of NS-38); beta is shown when selected.
-    nick.wait_for("Tech Leader  encerrado");
+    nick.wait_for("Tech Leader  parado");
     nick.select("Dev  ● vivo");
     nick.wait_for_panel("beta · Dev · NS-1");
     nick.send("q");
@@ -1339,7 +1336,7 @@ fn quitting_with_two_agents_asks_and_ends_both() {
         wait_dead(&nick, pid);
     }
     let agents = world.agents();
-    assert!(agents.iter().all(|a| a.3 == "ended"), "{agents:?}");
+    assert!(agents.iter().all(|a| a.3 == "stopped"), "{agents:?}");
     assert!(agents.iter().all(|a| !lock_of(&world, &a.0).exists()));
 }
 
@@ -1386,7 +1383,7 @@ fn sigterm_with_two_agents_ends_both_and_exits_with_143() {
         wait_dead(&nick, pid);
     }
     let agents = world.agents();
-    assert!(agents.iter().all(|a| a.3 == "ended"), "{agents:?}");
+    assert!(agents.iter().all(|a| a.3 == "stopped"), "{agents:?}");
     assert!(agents.iter().all(|a| !lock_of(&world, &a.0).exists()));
 }
 
@@ -1861,13 +1858,13 @@ fn a_live_agent_opens_from_the_ticket_screen_whatever_the_stage() {
     nick.send("x");
     nick.wait_for("GOT 78");
     wait_flat(&nick, "O agente proj · PO · NS-1 terminou.");
-    nick.wait_for("PO  encerrado");
+    nick.wait_for("PO  parado");
     assert_eq!(
         stage_of(&world, "NS-1"),
         "development",
         "the end changes no stage"
     );
-    assert_eq!(world.agents()[0].3, "ended");
+    assert_eq!(world.agents()[0].3, "stopped");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
@@ -2107,10 +2104,10 @@ fn each_kind_of_node_has_its_panel_and_its_help() {
     nick.keep_screen("agente vivo com o foco na árvore");
     for (label, title, help, screen) in [
         (
-            "PO  encerrado",
+            "PO  parado",
             " Agente ",
-            "↑/↓ mover · ← subir",
-            "agente encerrado",
+            "↑/↓ mover · r retomar · o arquivar · ← subir",
+            "agente parado",
         ),
         (
             "NS-1",
@@ -2146,7 +2143,7 @@ fn each_kind_of_node_has_its_panel_and_its_help() {
     nick.wait_for(" Navegação (só ativos) ");
     assert!(!nick.screen().contains("NS-2"), "{}", nick.screen());
     assert!(
-        !nick.screen().contains("PO  encerrado"),
+        !nick.screen().contains("PO  parado"),
         "only the live agents"
     );
     nick.keep_screen("filtro de agentes ativos");
@@ -2200,4 +2197,290 @@ fn removing_a_project_ends_its_live_agent() {
     );
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0), "no agent left: q quits at once");
+}
+
+// ---- resuming and archiving the agents (NS-39) ----
+
+/// The file where claude keeps the conversation `session` of a session run at `proj`: under the
+/// HOME of the world (no CLAUDE_CONFIG_DIR: the environment is clean), the physical path of the
+/// project with every character but A-Z, a-z and 0-9 as "-".
+fn conversation_file(world: &World, proj: &Path, session: &str) -> PathBuf {
+    let dir: String = fs::canonicalize(proj)
+        .unwrap()
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    world
+        .home()
+        .join(".claude/projects")
+        .join(dir)
+        .join(format!("{session}.jsonl"))
+}
+
+/// Writes the conversation of `session` (as claude would).
+fn keep_conversation(world: &World, proj: &Path, session: &str) {
+    let file = conversation_file(world, proj, session);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(file, "{}\n").unwrap();
+}
+
+/// Opens the PO agent (`po_discussion`) on NS-1 of `proj`, whose fake claude (mode `echo`, one
+/// byte) is ended by a key: its node is left selected, stopped. Returns its session id.
+fn open_and_stop(nick: &mut Nick, world: &World) -> String {
+    open_tickets(nick, "proj");
+    open_agent(nick, 0);
+    nick.wait_for("READY");
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.wait_for_flat("r retomar");
+    let (_, row) = nick.selected_row().expect("a selection");
+    assert!(row.contains("PO  parado"), "{row}");
+    world.agents()[0].0.clone()
+}
+
+/// The argv of a resume of `session` named `name`: no prompt after the name.
+fn assert_resumed(world: &World, session: &str, name: &str) {
+    let argv = read(&logs(world).claude);
+    assert!(
+        argv.ends_with(&format!("--resume\n{session}\n--name\n{name}\n")),
+        "{argv}"
+    );
+    assert!(!argv.contains("--session-id"), "{argv}");
+}
+
+#[test]
+fn a_stopped_agent_is_resumed_in_its_conversation() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    let session = open_and_stop(&mut nick, &world);
+    nick.keep_screen("nó parado selecionado, com o painel");
+    assert_eq!(world.agents()[0].3, "stopped");
+    keep_conversation(&world, &proj, &session);
+    fs::remove_file(logs(&world).claude).unwrap();
+    nick.send("r");
+    nick.wait_for("READY");
+    nick.wait_for_flat("O agente proj · PO · NS-1 foi retomado.");
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    assert_eq!(world.agents().len(), 1, "the same agent, no new row");
+    assert_eq!(world.agents()[0].3, "active");
+    assert!(world.agents_dir().join(format!("{session}.lock")).is_file());
+    nick.keep_screen("agente retomado, com o foco no terminal");
+    nick.send(SHORTCUT);
+    nick.wait_for_flat("Enter ir ao terminal");
+    let (_, row) = nick.selected_row().expect("a selection");
+    assert!(row.contains("PO  ● vivo"), "{row}");
+    // It ends as any agent.
+    nick.send(ENTER);
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    assert_eq!(world.agents()[0].3, "stopped");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn closing_and_opening_the_nick_resumes_nothing_until_r() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    let session = world.agents()[0].0.clone();
+    nick.send(SHORTCUT);
+    nick.send("q");
+    nick.wait_for("Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_eq!(world.agents()[0].3, "stopped");
+    fs::remove_file(logs(&world).claude).unwrap();
+    // Opening again: the node is stopped, and no claude was launched.
+    let mut again = spawn(&world, "sleep", &[]);
+    open_tickets(&mut again, "proj");
+    again.open_node("NS-1");
+    again.select("PO  parado");
+    assert!(!logs(&world).claude.exists(), "opening resumes nothing");
+    assert_eq!(world.agents()[0].3, "stopped");
+    keep_conversation(&world, &proj, &session);
+    again.send("r");
+    again.wait_for("READY");
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    again.send(SHORTCUT);
+    again.send("q");
+    again.wait_for("Encerrar e sair? (s/N)");
+    again.send("s");
+    assert_eq!(again.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_resume_uses_the_config_of_now() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    let session = open_and_stop(&mut nick, &world);
+    assert!(!logs(&world).jail.exists(), "opened out of the jail");
+    fs::write(proj.join(".nick/nick.conf"), "JAIL_ENABLED=\"true\"\n").unwrap();
+    keep_conversation(&world, &proj, &session);
+    nick.send("r");
+    nick.wait_for_panel("proj · PO · NS-1 · na jail");
+    nick.wait_for("READY");
+    let jail = read(&logs(&world).jail);
+    assert!(jail.contains(&format!("--resume\n{session}\n")), "{jail}");
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn a_lost_conversation_opens_nothing_and_the_agent_can_be_archived_and_back() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    let session = open_and_stop(&mut nick, &world);
+    fs::remove_file(logs(&world).claude).unwrap();
+    nick.send("r");
+    nick.wait_for(" Conversa não encontrada ");
+    nick.wait_for_flat("não existe mais no claude");
+    nick.wait_for_flat("a arquivar · n abrir novo agente nesta etapa · Esc cancelar");
+    nick.keep_screen("diálogo da conversa perdida");
+    assert!(!logs(&world).claude.exists(), "no PTY opened");
+    nick.send("a");
+    nick.wait_for_flat("O agente proj · PO · NS-1 foi arquivado.");
+    assert_eq!(world.agents()[0].3, "archived");
+    assert!(
+        !nick.tree_rows().iter().any(|row| row.contains("PO  ")),
+        "out of the tree: {}",
+        nick.screen()
+    );
+    // The tree still answers, and the archived one shows with `f`.
+    nick.send("f");
+    nick.wait_for("PO  [arquivado]");
+    nick.select("PO  [arquivado]");
+    nick.wait_for_flat("o desarquivar");
+    nick.keep_screen("agente arquivado com o filtro f, com o painel");
+    nick.send("r");
+    nick.wait_for_flat("está arquivado. Desarquive (o) antes de retomar.");
+    nick.send("o");
+    nick.wait_for_flat("O agente proj · PO · NS-1 voltou para parado.");
+    assert_eq!(world.agents()[0].3, "stopped");
+    keep_conversation(&world, &proj, &session);
+    nick.send("r");
+    nick.wait_for("READY");
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn an_agent_active_in_another_nick_is_not_resumed_here() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    world.active_agent(&proj, "NS-1", "vivo");
+    // Another nick holds its lock (the mold of
+    // an_agent_whose_lock_another_nick_holds_stays_active).
+    nick::paths::create_state_dir(&world.agents_dir()).unwrap();
+    let lock = fs::File::create(world.agents_dir().join("vivo.lock")).unwrap();
+    lock.lock().unwrap();
+    keep_conversation(&world, &proj, "vivo");
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    nick.open_node("NS-1");
+    nick.select("PO  ativo em outro nick");
+    nick.wait_for_flat("Ativo em outro nick: feche-o lá para retomar aqui.");
+    nick.keep_screen("agente ativo em outro nick, com o painel");
+    nick.send("r");
+    nick.wait_for_flat("O agente x está ativo em outro nick e não pode ser retomado aqui.");
+    assert!(!logs(&world).claude.exists(), "nothing launched");
+    assert_eq!(world.agents()[0].3, "active");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    drop(lock);
+}
+
+#[test]
+fn a_resume_after_the_id_changed_tells_the_new_folder() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    let session = open_and_stop(&mut nick, &world);
+    nick.select("NS-1");
+    nick.send("i");
+    nick.wait_for(" Editar ID ");
+    nick.send("\x7f\x7f\x7f\x7f");
+    nick.send("NS-9");
+    nick.send(ENTER);
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    nick.wait_for_flat("ID atualizado: NS-1 → NS-9.");
+    nick.select("PO  parado");
+    nick.wait_for_flat("ID na abertura: NS-1");
+    nick.keep_screen("agente parado depois de editar o ID do ticket");
+    keep_conversation(&world, &proj, &session);
+    nick.send("r");
+    nick.wait_for("READY");
+    nick.wait_for_flat("Ele foi avisado de que a pasta agora é .nick/docs/NS-9/.");
+    let argv = read(&logs(&world).claude);
+    assert!(argv.contains("--append-system-prompt\n"), "{argv}");
+    assert!(argv.contains(".nick/docs/NS-9/"), "{argv}");
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// The production code of the sources of src/ (without the `mod tests` and the comments), with
+/// the name of each file.
+fn production_sources() -> Vec<(String, String)> {
+    sources()
+        .into_iter()
+        .map(|(name, source)| {
+            let code = source.split("#[cfg(test)]").next().unwrap_or("");
+            let code: Vec<&str> = code
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            (name, code.join("\n"))
+        })
+        .collect()
+}
+
+/// A fixed piece of the notice of the new ID (NS-39): the text is prompt, only in bash.
+const ID_NOTICE_PIECE: &str = "depois que esta conversa começou";
+
+#[test]
+fn the_notice_of_the_new_id_is_only_in_bash() {
+    for (name, code) in production_sources() {
+        assert!(!code.contains(ID_NOTICE_PIECE), "{name}");
+    }
+    // Positive control: the piece is the text of the notice, in auto_scrum/prompt.sh.
+    let prompt =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../auto_scrum/prompt.sh"))
+            .unwrap();
+    assert!(prompt.contains(ID_NOTICE_PIECE));
+}
+
+/// `"ended"`/`'ended'` in `code`.
+fn ended_literals(code: &str) -> usize {
+    code.matches("\"ended\"").count() + code.matches("'ended'").count()
+}
+
+#[test]
+fn no_rust_source_writes_the_state_ended() {
+    for (name, code) in production_sources() {
+        if name.ends_with("db/migrations.rs") {
+            continue;
+        }
+        assert_eq!(ended_literals(&code), 0, "{name}");
+    }
+    // Positive controls: the migrations name it (the comment of the 3 and the UPDATE of the 6),
+    // and the filter finds both quotes.
+    let migrations = sources()
+        .into_iter()
+        .find(|(name, _)| name.ends_with("db/migrations.rs"))
+        .expect("db/migrations.rs is read")
+        .1;
+    assert_eq!(ended_literals(&migrations), 2);
+    assert_eq!(ended_literals("state = 'ended' or \"ended\""), 2);
 }

@@ -19,7 +19,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::stages::StageType;
+use crate::launch::Launch;
 
 /// Lines of scrollback kept by the parser.
 pub const SCROLLBACK_LINES: usize = 10_000;
@@ -114,12 +114,14 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    /// Opens a PTY of `rows`x`cols` (at least 2x2) and runs `bash <launcher> --session-id
-    /// <session_id> --name <name> --type <kind> --prompt-file <prompt_file>` in it, with the cwd
-    /// at `project`, the environment of the nick plus TERM=xterm-256color and
-    /// COLORTERM=truecolor. Events go to `tx`, as `AgentEvent`s of `agent_id` (the `id` of the
-    /// row of the agent, stored before the spawn). The launcher decides the rest of the argv of
-    /// claude by the type (the auto mode of the Dev stage): the shell never passes it.
+    /// Opens a PTY of `rows`x`cols` (at least 2x2) and runs `bash <launcher> <arguments of
+    /// launch>` in it (`Launch::args`: a new agent, `--session-id <session_id> --name <name>
+    /// --type <kind> --prompt-file <prompt_file>`, or a resume, NS-39, `--resume <session_id>
+    /// --name <name> --stage <stage> [--opened-id <key>] --ticket-id <key>`), with the cwd at
+    /// `project`, the environment of the nick plus TERM=xterm-256color and COLORTERM=truecolor.
+    /// Events go to `tx`, as `AgentEvent`s of `agent_id` (the `id` of the row of the agent,
+    /// stored before the spawn). The launcher decides the rest of the argv of claude by the type
+    /// or the stage (the auto mode of the Dev stage): the shell never passes it.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn<E: From<AgentEvent> + Send + 'static>(
         launcher: &Path,
@@ -127,8 +129,7 @@ impl AgentSession {
         agent_id: i64,
         session_id: &str,
         name: &str,
-        kind: StageType,
-        prompt_file: &Path,
+        launch: Launch,
         (rows, cols): (u16, u16),
         tx: Sender<E>,
     ) -> Result<AgentSession, Error> {
@@ -138,8 +139,7 @@ impl AgentSession {
             agent_id,
             session_id,
             name,
-            kind,
-            prompt_file,
+            launch,
             (rows, cols),
             &[],
             tx,
@@ -153,8 +153,7 @@ impl AgentSession {
         agent_id: i64,
         session_id: &str,
         name: &str,
-        kind: StageType,
-        prompt_file: &Path,
+        launch: Launch,
         (rows, cols): (u16, u16),
         env: &[(&str, &str)],
         tx: Sender<E>,
@@ -163,10 +162,7 @@ impl AgentSession {
         let pair = native_pty_system().openpty(pty_size(rows, cols))?;
         let mut command = CommandBuilder::new("bash");
         command.arg(launcher);
-        command.args(["--session-id", session_id, "--name", name]);
-        command.args(["--type", kind.key()]);
-        command.arg("--prompt-file");
-        command.arg(prompt_file);
+        command.args(launch.args(session_id, name));
         command.cwd(project);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -355,6 +351,8 @@ pub fn terminate_registered() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::Stage;
+    use crate::stages::StageType;
     use std::fs;
     use std::path::PathBuf;
 
@@ -493,6 +491,24 @@ mod tests {
             size: (u16, u16),
             tx: Sender<AgentEvent>,
         ) -> AgentSession {
+            let prompt = self.path("prompt.md");
+            let launch = Launch::New {
+                kind: StageType::PoDiscussion,
+                prompt_file: &prompt,
+            };
+            self.spawn_launch(agent_id, mode, extra, size, tx, launch)
+        }
+
+        /// `spawn_on` with the launch of the agent (NS-39: a new one or a resume).
+        fn spawn_launch(
+            &self,
+            agent_id: i64,
+            mode: &str,
+            extra: &[(&str, &str)],
+            size: (u16, u16),
+            tx: Sender<AgentEvent>,
+            launch: Launch,
+        ) -> AgentSession {
             let path = format!(
                 "{}:{}",
                 repo("bin/tests/fixtures/bin").display(),
@@ -517,8 +533,7 @@ mod tests {
                 agent_id,
                 "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60",
                 "proj · Dev · NS-1",
-                StageType::PoDiscussion,
-                &self.path("prompt.md"),
+                launch,
                 size,
                 &env,
                 tx,
@@ -865,5 +880,61 @@ mod tests {
         let (session, _rx) = case.spawn("exit", &[("FAKE_CLAUDE_MODE_alfa", "osc52")], (24, 80));
         assert_eq!(wait_exit(&session), 0);
         wait_for_text(&session, "COPIADO");
+    }
+
+    /// A resume (NS-39): the real launcher gets `--resume <id> --name <name> --stage <stage>
+    /// [--opened-id <key>] --ticket-id <key>`, and claude gets `--resume` with no prompt.
+    #[test]
+    fn a_resume_runs_claude_with_resume_and_no_prompt() {
+        let case = Case::new();
+        let (tx, rx) = mpsc::channel();
+        let launch = Launch::Resume {
+            stage: Stage::Development,
+            opened_key: Some("NS-1"),
+            ticket_key: "NS-9",
+        };
+        let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
+        assert_eq!(wait_exit(&session), 0);
+        session.wait();
+        let argv = fs::read_to_string(case.path("claude.argv")).expect("the fake claude ran");
+        assert!(argv.starts_with("--settings\n{"), "{argv}");
+        assert!(
+            argv.ends_with(
+                "--resume\n0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60\n--name\nproj · Dev · NS-1\n"
+            ),
+            "no prompt after the name: {argv}"
+        );
+        // The auto mode of the Dev stage (the launcher's; no Rust names its flag).
+        assert!(argv.contains("\nauto\n"), "the Dev stage: {argv}");
+        assert!(
+            argv.contains(".nick/docs/NS-9/"),
+            "the notice of the new ID: {argv}"
+        );
+        assert!(!argv.contains("--session-id"), "{argv}");
+        let env = fs::read_to_string(case.path("claude.env")).unwrap();
+        let pwd = format!("PWD={}", case.path("proj").display());
+        assert!(env.lines().any(|l| l == pwd), "{env}");
+        assert_eq!(session_events(&rx).last(), Some(&SessionEvent::Exited(0)));
+    }
+
+    /// Without the key at the opening, no `--opened-id` and no notice of the ID.
+    #[test]
+    fn a_resume_without_the_key_at_the_opening_has_no_notice() {
+        let case = Case::new();
+        let (tx, _rx) = mpsc::channel();
+        let launch = Launch::Resume {
+            stage: Stage::Po,
+            opened_key: None,
+            ticket_key: "NS-9",
+        };
+        let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
+        assert_eq!(wait_exit(&session), 0);
+        session.wait();
+        let argv = fs::read_to_string(case.path("claude.argv")).unwrap();
+        assert!(!argv.contains("--append-system-prompt"), "{argv}");
+        assert!(
+            !argv.contains("\nauto\n"),
+            "no auto mode out of the Dev stage: {argv}"
+        );
     }
 }

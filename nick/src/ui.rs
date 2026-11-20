@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::agents::{Agent, AgentState};
+use crate::agents::{self, Agent, AgentState};
 use crate::app::{App, Button, Dialog, Row, RunningAgent, Screen, TicketDetail, TicketField};
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
@@ -262,8 +262,10 @@ pub(crate) enum Place {
     Project,
     Ticket,
     LiveAgent,
-    /// An agent ended, or active in another nick.
-    OtherAgent,
+    /// An agent not live (NS-39): stopped (resumable), archived, or active in another nick.
+    StoppedAgent,
+    ArchivedAgent,
+    ElsewhereAgent,
     Settings,
 }
 
@@ -281,7 +283,16 @@ fn help_state(app: &App) -> HelpState {
             NodeId::Project(_) => Place::Project,
             NodeId::Ticket(_) => Place::Ticket,
             NodeId::Agent(id) if app.agent(id).is_some() => Place::LiveAgent,
-            NodeId::Agent(_) => Place::OtherAgent,
+            NodeId::Agent(id) => {
+                match app
+                    .agent_record(id)
+                    .and_then(|agent| AgentState::from_key(&agent.state))
+                {
+                    Some(AgentState::Stopped) => Place::StoppedAgent,
+                    Some(AgentState::Archived) => Place::ArchivedAgent,
+                    _ => Place::ElsewhereAgent,
+                }
+            }
         }
     };
     let (show_hidden, only_active) = app.filters();
@@ -319,6 +330,10 @@ fn dialog_keys(dialog: &Dialog) -> &'static str {
         Dialog::ConfirmPrompt { .. } => PROMPT_KEYS,
         Dialog::AgentError { .. } => "Enter/Esc fechar",
         Dialog::ConfirmEndAgent { .. } => "s encerrar · qualquer outra tecla cancela",
+        Dialog::ConversationLost { .. } => {
+            "a arquivar · n abrir novo agente nesta etapa · Esc cancelar"
+        }
+        Dialog::ConfirmArchive { .. } => "s arquivar · qualquer outra tecla cancela",
         Dialog::ConfirmQuit => "s encerrar e sair · qualquer outra tecla cancela",
         Dialog::CaptureShortcut { .. } => "Esc cancelar",
         Dialog::ChooseTicketStage { .. } => "↑/↓ escolher · Enter escolher · Esc cancelar",
@@ -360,7 +375,9 @@ fn help_text_for(
         Place::LiveAgent => {
             format!("↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · {shortcut} alternar")
         }
-        Place::OtherAgent => "↑/↓ mover · ← subir".to_string(),
+        Place::StoppedAgent => "↑/↓ mover · r retomar · o arquivar · ← subir".to_string(),
+        Place::ArchivedAgent => "↑/↓ mover · o desarquivar · ← subir".to_string(),
+        Place::ElsewhereAgent => "↑/↓ mover · ← subir".to_string(),
     };
     let hidden = if show_hidden {
         "f esconder ocultos"
@@ -378,7 +395,7 @@ fn help_text_for(
 
 /// Every state of the help without a dialog: each kind of node with both filters, and the
 /// settings. `help_rows` reserves rows for the longest of them.
-const HELP_STATES: [HelpState; 21] = [
+const HELP_STATES: [HelpState; 29] = [
     (Place::Module, false, false),
     (Place::Module, true, false),
     (Place::Module, false, true),
@@ -395,10 +412,18 @@ const HELP_STATES: [HelpState; 21] = [
     (Place::LiveAgent, true, false),
     (Place::LiveAgent, false, true),
     (Place::LiveAgent, true, true),
-    (Place::OtherAgent, false, false),
-    (Place::OtherAgent, true, false),
-    (Place::OtherAgent, false, true),
-    (Place::OtherAgent, true, true),
+    (Place::StoppedAgent, false, false),
+    (Place::StoppedAgent, true, false),
+    (Place::StoppedAgent, false, true),
+    (Place::StoppedAgent, true, true),
+    (Place::ArchivedAgent, false, false),
+    (Place::ArchivedAgent, true, false),
+    (Place::ArchivedAgent, false, true),
+    (Place::ArchivedAgent, true, true),
+    (Place::ElsewhereAgent, false, false),
+    (Place::ElsewhereAgent, true, false),
+    (Place::ElsewhereAgent, false, true),
+    (Place::ElsewhereAgent, true, true),
     (Place::Settings, false, false),
 ];
 
@@ -597,14 +622,17 @@ fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
 }
 
 /// The state of an agent record: `● vivo` (this nick runs it), `ativo em outro nick` (an active
-/// row without a session here) or `encerrado`.
+/// row without a session here), `arquivado`, `parado` (NS-39, the `encerrado` of before), or
+/// `estado desconhecido` (a state this nick does not know: review of the NS-39, point 6).
 fn agent_state(app: &App, agent: &Agent) -> &'static str {
     if app.agent(agent.id).is_some() {
-        "● vivo"
-    } else if agent.state == AgentState::Active.key() {
-        "ativo em outro nick"
-    } else {
-        "encerrado"
+        return "● vivo";
+    }
+    match AgentState::from_key(&agent.state) {
+        Some(AgentState::Active) => "ativo em outro nick",
+        Some(AgentState::Archived) => "arquivado",
+        Some(AgentState::Stopped) => "parado",
+        None => "estado desconhecido",
     }
 }
 
@@ -618,6 +646,8 @@ fn agent_spans(app: &App, agent: &Agent) -> (Vec<Span<'static>>, Style) {
     let live = app.agent(agent.id);
     let state = match live {
         Some(live) if live.unseen => "● saída nova",
+        // Marked as a hidden ticket is (`[oculto]`), and shown only with the filter `f` (NS-39).
+        None if agent.state == AgentState::Archived.key() => "[arquivado]",
         _ => agent_state(app, agent),
     };
     let mut spans = vec![
@@ -785,22 +815,41 @@ fn draw_node_panel(frame: &mut Frame, app: &App, area: Rect) {
                 return;
             };
             let state = agent_state(app, agent);
-            paragraph(
-                frame,
-                " Agente ".to_string(),
-                vec![
-                    Line::from(format!("Nome: {}", printable(&agent.name))),
-                    Line::from(format!(
-                        "Etapa: {}",
-                        printable(&tickets::stage_label(&agent.stage))
-                    )),
-                    Line::from(format!("Estado: {state}")),
-                    Line::from(format!("Aberto em: {}", short_date(&agent.opened_at))),
-                    Line::from(format!("Sessão: {}", printable(&agent.session_id))),
-                    Line::from(""),
-                    Line::from("Retomar um agente encerrado ainda não é possível neste nick."),
-                ],
-            );
+            let mut lines = vec![
+                Line::from(format!("Nome: {}", printable(&agent.name))),
+                Line::from(format!(
+                    "Etapa: {}",
+                    printable(&tickets::stage_label(&agent.stage))
+                )),
+                Line::from(match AgentState::from_key(&agent.state) {
+                    None if app.agent(agent.id).is_none() => {
+                        format!("Estado: desconhecido ({})", printable(&agent.state))
+                    }
+                    _ => format!("Estado: {state}"),
+                }),
+                Line::from(format!("Aberto em: {}", short_date(&agent.opened_at))),
+                Line::from(format!("Sessão: {}", printable(&agent.session_id))),
+            ];
+            // The ID it was opened with, when it is not the one of its ticket now (NS-39: the
+            // resume tells it the new folder), or unknown (before the NS-39, a name without it).
+            let now = app
+                .ticket(agent.ticket_id)
+                .map(|ticket| ticket.key.as_str());
+            match agents::opened_key(agent) {
+                None => lines.push(Line::from("ID na abertura: desconhecido")),
+                Some(key) if Some(key.as_str()) != now => {
+                    lines.push(Line::from(format!("ID na abertura: {}", printable(&key))));
+                }
+                Some(_) => {}
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(match AgentState::from_key(&agent.state) {
+                Some(AgentState::Active) => "Ativo em outro nick: feche-o lá para retomar aqui.",
+                Some(AgentState::Archived) => "o desarquivar",
+                Some(AgentState::Stopped) => "r retomar esta conversa · o arquivar",
+                None => "Este nick não conhece o estado deste agente: nada a fazer aqui.",
+            }));
+            paragraph(frame, " Agente ".to_string(), lines);
         }
     }
 }
@@ -953,7 +1002,8 @@ fn removal_question(name: &str, path: &str, tickets: i64, agents: i64, live: i64
         0 => String::new(),
         1 => "O agente registrado dele será apagado do banco. ".to_string(),
         n => format!(
-            "Os {n} agentes registrados dele (inclusive os encerrados) serão apagados do banco. "
+            "Os {n} agentes registrados dele (inclusive os parados e os arquivados) serão apagados \
+             do banco. "
         ),
     };
     let goes = format!("{ended}{tickets}{records}");
@@ -1179,6 +1229,23 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             vec![Line::from(format!(
                 "Encerrar o agente {}? (s/N)",
                 printable(name)
+            ))],
+            None,
+        ),
+        Dialog::ConversationLost { agent, .. } => (
+            " Conversa não encontrada ",
+            vec![Line::from(format!(
+                "A conversa do agente {} não existe mais no claude (o histórico foi apagado ou \
+                 o projeto mudou de pasta). Nada foi aberto.",
+                printable(&agent.name)
+            ))],
+            None,
+        ),
+        Dialog::ConfirmArchive { agent } => (
+            " Arquivar agente ",
+            vec![Line::from(format!(
+                "Arquivar o agente {}? Ele sai da árvore e volta com f. (s/N)",
+                printable(&agent.name)
             ))],
             None,
         ),
@@ -1951,14 +2018,14 @@ mod tests {
                 2,
                 "Os 2 agentes vivos dele neste nick serão encerrados. Os 3 tickets dele \
                  (inclusive os ocultos) serão apagados do banco. Os 4 agentes registrados dele \
-                 (inclusive os encerrados) serão apagados do banco.",
+                 (inclusive os parados e os arquivados) serão apagados do banco.",
             ),
             (
                 2,
                 3,
                 0,
                 "Os 2 tickets dele (inclusive os ocultos) serão apagados do banco. Os 3 agentes \
-                 registrados dele (inclusive os encerrados) serão apagados do banco.",
+                 registrados dele (inclusive os parados e os arquivados) serão apagados do banco.",
             ),
         ] {
             f.app.dialog = Some(Dialog::ConfirmRemove {
@@ -2382,6 +2449,10 @@ mod tests {
             unreachable!("open_agent does not render")
         }
 
+        fn has_conversation(&mut self, _: &Path, _: &Path, _: &str) -> Result<bool, String> {
+            unreachable!("open_agent does not check the conversation")
+        }
+
         fn spawn(
             &mut self,
             _: &Path,
@@ -2389,8 +2460,7 @@ mod tests {
             _: i64,
             _: &str,
             _: &str,
-            _: StageType,
-            _: &Path,
+            _: crate::launch::Launch,
         ) -> Result<(), String> {
             Ok(())
         }
@@ -3083,15 +3153,15 @@ mod tests {
         );
         db.insert_ticket(a.id, "abcd1234", true, "Quatro").unwrap();
         let ended = db
-            .insert_agent(t1.id, "development", "s-1", "alfa · Dev · NS-1")
+            .insert_agent(t1.id, "development", "s-1", "alfa · Dev · NS-1", "NS-1")
             .unwrap();
-        db.end_agent(ended.id).unwrap();
+        db.stop_agent(ended.id).unwrap();
         sql(
             "UPDATE agents SET opened_at = '2026-11-19T21:46:05Z' WHERE id = ?1",
             ended.id,
         );
         let other = db
-            .insert_agent(t1.id, "po", "s-2", "alfa · PO · NS-1")
+            .insert_agent(t1.id, "po", "s-2", "alfa · PO · NS-1", "NS-1")
             .unwrap();
         sql(
             "UPDATE agents SET opened_at = '2026-11-20T00:00:00Z' WHERE id = ?1",
@@ -3164,7 +3234,7 @@ mod tests {
                 "> ▾ auto_scrum",
                 "    ▾ alfa",
                 "      ▾ NS-1  [Tech Leader]  Um",
-                "          Dev  encerrado  2026-11-19 21:46",
+                "          Dev  parado  2026-11-19 21:46",
                 "          PO  ativo em outro nick  2026-11-20 00:00",
                 "        NS-2  [✓ Concluído]  Dois",
                 "        abcd1234  [PO]  Quatro  [provisório]",
@@ -3196,7 +3266,7 @@ mod tests {
         assert!(dim(at("beta  [indisponível")), "unavailable: dimmed");
         assert!(dim(at("NS-3  [PO]  Três  [oculto]")), "hidden: dimmed");
         assert!(!dim(at("NS-2")));
-        assert!(dim(at("Dev  encerrado")), "not live: dimmed");
+        assert!(dim(at("Dev  parado")), "not live: dimmed");
         assert!(dim(at("PO  ativo em outro nick")));
         let (y, x) = at("[✓ Concluído]");
         assert_eq!(buffer[(x + 1, y)].fg, Color::Green);
@@ -3256,7 +3326,7 @@ mod tests {
             &buffer,
             "Nenhum ticket neste projeto. Pressione a para criar.",
         );
-        // An ended agent and one active in another nick.
+        // A stopped agent and one active in another nick (NS-39: the actions of each state).
         let agents = f
             .app
             .ticket_agents
@@ -3269,21 +3339,34 @@ mod tests {
         assert_has(&buffer, " Agente ");
         assert_has(&buffer, "Nome: alfa · Dev · NS-1");
         assert_has(&buffer, "Etapa: Dev");
-        assert_has(&buffer, "Estado: encerrado");
+        assert_has(&buffer, "Estado: parado");
         assert_has(&buffer, "Aberto em: 2026-11-19 21:46 UTC");
         assert_has(&buffer, "Sessão: s-1");
+        assert_has(&buffer, "r retomar esta conversa · o arquivar");
+        assert!(
+            !text(&buffer).contains("Retomar um agente"),
+            "{}",
+            text(&buffer)
+        );
+        assert!(
+            !text(&buffer).contains("ID na abertura"),
+            "the same ID: no line"
+        );
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · r retomar · o arquivar · ← subir · f mostrar ocultos · v agentes \
+             ativos · q sair"
+        );
+        f.app.select(NodeId::Agent(agents[1].id));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Estado: ativo em outro nick");
         assert_has(
             &buffer,
-            "Retomar um agente encerrado ainda não é possível neste nick.",
+            "Ativo em outro nick: feche-o lá para retomar aqui.",
         );
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · ← subir · f mostrar ocultos · v agentes ativos · q sair"
-        );
-        f.app.select(NodeId::Agent(agents[1].id));
-        assert_has(
-            &render_at(&f.app, 140, 30, None),
-            "Estado: ativo em outro nick",
         );
     }
 
@@ -3461,7 +3544,9 @@ mod tests {
             Place::Project,
             Place::Ticket,
             Place::LiveAgent,
-            Place::OtherAgent,
+            Place::StoppedAgent,
+            Place::ArchivedAgent,
+            Place::ElsewhereAgent,
             Place::Settings,
         ] {
             // Exhaustive: a new place does not compile here until it is listed above.
@@ -3470,7 +3555,9 @@ mod tests {
                 | Place::Project
                 | Place::Ticket
                 | Place::LiveAgent
-                | Place::OtherAgent
+                | Place::StoppedAgent
+                | Place::ArchivedAgent
+                | Place::ElsewhereAgent
                 | Place::Settings => {}
             }
             let filters: &[(bool, bool)] = if place == Place::Settings {
@@ -3496,9 +3583,9 @@ mod tests {
         let db = Db::open(&root.join("nick.db")).unwrap();
         let ticket = f.app.agents[0].ticket_id;
         let ended = db
-            .insert_agent(ticket, "po", "s-x", "proj · PO · NS-1")
+            .insert_agent(ticket, "po", "s-x", "proj · PO · NS-1", "NS-1")
             .unwrap();
-        db.end_agent(ended.id).unwrap();
+        db.stop_agent(ended.id).unwrap();
         f.app.refresh_tree();
         let nodes = [
             MODULE,
@@ -3597,5 +3684,161 @@ mod tests {
         f.app.agents[0].unseen = false;
         let row = list_row(&render(&f.app), y);
         assert!(row.contains("Tech Leader  ● vivo  [FORA"), "{row:?}");
+    }
+
+    // ---- NS-39: the stopped and the archived agents ----
+
+    /// The agents of NS-1 of `with_tree`: the stopped Dev and the PO active in another nick.
+    fn ns1_agents(f: &Fixture) -> Vec<Agent> {
+        let mut agents: Vec<Agent> = f.app.ticket_agents.values().flatten().cloned().collect();
+        agents.sort_by_key(|a| a.id);
+        agents
+    }
+
+    #[test]
+    fn an_archived_agent_is_dimmed_marked_and_only_with_the_filter() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let dev = ns1_agents(&f)[0].id;
+        db.archive_agent(dev).unwrap();
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert!(
+            find(&buffer, "Dev  arquivado").is_none(),
+            "out of the tree without f"
+        );
+        f.app.tree.show_hidden = true;
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let (y, x) =
+            find(&buffer, "Dev  [arquivado]  2026").unwrap_or_else(|| panic!("{}", text(&buffer)));
+        assert!(buffer[(x, y)].modifier.contains(Modifier::DIM), "dimmed");
+        // Its panel and its help: only the way back.
+        f.app.select(NodeId::Agent(dev));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Estado: arquivado");
+        assert_has(&buffer, "o desarquivar");
+        assert!(!text(&buffer).contains("r retomar"), "{}", text(&buffer));
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · o desarquivar · ← subir · f esconder ocultos · v agentes ativos · q sair"
+        );
+    }
+
+    #[test]
+    fn a_live_agent_and_a_stopped_one_are_told_apart() {
+        let (mut f, root) = with_running(&["proj"]);
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let ticket = f.app.agents[0].ticket_id;
+        let stopped = db
+            .insert_agent(ticket, "po", "s-x", "proj · PO · NS-1", "NS-1")
+            .unwrap();
+        db.stop_agent(stopped.id).unwrap();
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let at = |needle| find(&buffer, needle).unwrap_or_else(|| panic!("{needle}"));
+        let dim = |(y, x): (u16, u16)| buffer[(x, y)].modifier.contains(Modifier::DIM);
+        assert!(!dim(at("● vivo")), "live: not dimmed");
+        assert!(dim(at("PO  parado")), "stopped: dimmed");
+    }
+
+    #[test]
+    fn the_panel_says_the_id_at_the_opening_when_it_is_not_the_id_of_now() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let dev = ns1_agents(&f)[0].id;
+        db.connection()
+            .execute("UPDATE agents SET opened_key = 'NS-0' WHERE id = ?1", [dev])
+            .unwrap();
+        f.app.refresh_tree();
+        f.app.select(NodeId::Agent(dev));
+        assert_has(&render_at(&f.app, 140, 30, None), "ID na abertura: NS-0");
+        // Before the NS-39 (NULL): from the name, the same ID, no line.
+        db.connection()
+            .execute("UPDATE agents SET opened_key = NULL WHERE id = ?1", [dev])
+            .unwrap();
+        f.app.refresh_tree();
+        assert!(!text(&render_at(&f.app, 140, 30, None)).contains("ID na abertura"));
+        // A name that does not give it: unknown.
+        db.connection()
+            .execute("UPDATE agents SET name = 'sem id' WHERE id = ?1", [dev])
+            .unwrap();
+        f.app.refresh_tree();
+        assert_has(
+            &render_at(&f.app, 140, 30, None),
+            "ID na abertura: desconhecido",
+        );
+    }
+
+    #[test]
+    fn the_dialogs_of_the_lost_conversation_and_of_archiving() {
+        let (mut f, _) = with_tree();
+        let agent = ns1_agents(&f)[0].clone();
+        let ticket = f.app.ticket(agent.ticket_id).unwrap().clone();
+        f.app.dialog = Some(Dialog::ConversationLost {
+            project: PathBuf::from("/alfa"),
+            agent: agent.clone(),
+            ticket,
+            precheck: Precheck {
+                jail: true,
+                jira: false,
+                sentry: false,
+                warning: None,
+            },
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Conversa não encontrada ");
+        assert!(
+            flat(&buffer).contains(
+                "A conversa do agente alfa · Dev · NS-1 não existe mais no claude (o histórico \
+                 foi apagado ou o projeto mudou de pasta). Nada foi aberto."
+            ),
+            "{}",
+            text(&buffer)
+        );
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "a arquivar · n abrir novo agente nesta etapa · Esc cancelar"
+        );
+        f.app.dialog = Some(Dialog::ConfirmArchive { agent });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Arquivar agente ");
+        assert!(
+            flat(&buffer).contains(
+                "Arquivar o agente alfa · Dev · NS-1? Ele sai da árvore e volta com f. (s/N)"
+            ),
+            "{}",
+            text(&buffer)
+        );
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "s arquivar · qualquer outra tecla cancela"
+        );
+    }
+
+    /// Review of the NS-39, point 6: a state this nick does not know is not shown as stopped,
+    /// and its panel and its help offer no action.
+    #[test]
+    fn an_unknown_state_is_shown_as_unknown_with_no_action() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let dev = ns1_agents(&f)[0].id;
+        db.connection()
+            .execute("UPDATE agents SET state = 'futuro' WHERE id = ?1", [dev])
+            .unwrap();
+        f.app.refresh_tree();
+        f.app.select(NodeId::Agent(dev));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Dev  estado desconhecido");
+        assert_has(&buffer, "Estado: desconhecido (futuro)");
+        assert_has(
+            &buffer,
+            "Este nick não conhece o estado deste agente: nada a fazer aqui.",
+        );
+        assert!(!text(&buffer).contains("r retomar"), "{}", text(&buffer));
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · ← subir · f mostrar ocultos · v agentes ativos · q sair"
+        );
     }
 }

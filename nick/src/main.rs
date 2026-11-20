@@ -436,6 +436,34 @@ impl Shell {
         }
     }
 
+    /// The launcher of a PTY that is born with its size: the panel the new agent will have (the
+    /// same count as `ui::layout`), less its header, known at the spawn (review NS-34, P2).
+    fn pty_launcher(
+        &self,
+        guard: &mut TerminalGuard,
+    ) -> io::Result<TerminalAgentLauncher<LoopEvent>> {
+        let panel = ui::new_agent_panel(&self.app, self.frame_area(guard)?);
+        let size_of = move |name: &str, jail: bool| {
+            let area = ui::terminal_in_panel(panel, name, jail);
+            (area.height, area.width)
+        };
+        Ok(TerminalAgentLauncher::new(
+            self.tx.clone(),
+            Box::new(size_of),
+        ))
+    }
+
+    /// The session `launcher` started (an agent opened or resumed, now the shown one) joins the
+    /// sessions of the loop.
+    fn adopt_session(&mut self, launcher: &mut TerminalAgentLauncher<LoopEvent>) {
+        if let (Some(session), Some(id)) = (launcher.session.take(), self.app.shown()) {
+            let size = session.with_screen(|screen| screen.size());
+            self.sizes.insert(id, size);
+            self.sessions.push((id, session));
+            agent_test_hook(self.sessions.len());
+        }
+    }
+
     /// Carries out an action. Returns true to quit.
     fn carry_out(
         &mut self,
@@ -484,23 +512,17 @@ impl Shell {
                 log,
                 precheck,
             } => {
-                // The PTY is born with its size: the panel the new agent will have (the same
-                // count as `ui::layout`), less its header, known at the spawn.
-                let panel = ui::new_agent_panel(&self.app, self.frame_area(guard)?);
-                let size_of = move |name: &str, jail: bool| {
-                    let area = ui::terminal_in_panel(panel, name, jail);
-                    (area.height, area.width)
-                };
-                let mut launcher = TerminalAgentLauncher::new(self.tx.clone(), Box::new(size_of))
-                    .with_jail(precheck.jail);
+                let mut launcher = self.pty_launcher(guard)?.with_jail(precheck.jail);
                 self.app
                     .open_agent(&project, &ticket, kind, &log, precheck, &mut launcher);
-                if let (Some(session), Some(id)) = (launcher.session.take(), self.app.shown()) {
-                    let size = session.with_screen(|screen| screen.size());
-                    self.sizes.insert(id, size);
-                    self.sessions.push((id, session));
-                    agent_test_hook(self.sessions.len());
-                }
+                self.adopt_session(&mut launcher);
+            }
+            Action::CheckResume { project, agent } => {
+                // The check and the conversation out of the PTY, then the PTY of the resume
+                // (NS-39); the jail of the size comes from that check.
+                let mut launcher = self.pty_launcher(guard)?;
+                self.app.check_resume(&project, &agent, &mut launcher);
+                self.adopt_session(&mut launcher);
             }
             Action::Send(bytes) => {
                 if let Some(session) = self.shown_session() {
@@ -586,7 +608,7 @@ impl Shell {
     }
 
     /// Ends every agent: all the process groups at once (SIGTERM, SIGKILL after a single
-    /// grace of 2 s, wait), then every record (`ended`, the locks released).
+    /// grace of 2 s, wait), then every record (`stopped`, the locks released).
     fn end_all(&mut self) {
         let mut sessions: Vec<AgentSession> = self
             .sessions

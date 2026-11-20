@@ -175,7 +175,8 @@ impl World {
             .into_iter()
             .find(|t| t.key == key)
             .unwrap();
-        db.insert_agent(ticket.id, "po", session_id, "x").unwrap();
+        db.insert_agent(ticket.id, "po", session_id, "x", "NS-1")
+            .unwrap();
     }
 
     /// Registers `dir` in the database the binary will use, through the library.

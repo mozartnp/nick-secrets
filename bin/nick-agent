@@ -29,6 +29,20 @@
 #       and --name: the deny/ask rules, --permission-mode auto only with --type development, the
 #       jail notice (only with the jail on), --session-id, --name and the content of <file> (the
 #       log of --render) as the last argument.
+#   nick-agent --resume <uuid> --name <name> --stage <stage> [--opened-id <id>] --ticket-id <id>
+#       (NS-39) resumes the conversation <uuid> of a stopped agent, by the same path as the launch
+#       (the same checks, config_dir_prepare, jail_print_status and jail_exec, with the config of
+#       now): claude --settings <rules> [--permission-mode auto only with --stage development]
+#       [--append-system-prompt <notice>] --resume <uuid> --name <name>, with no prompt. The
+#       notice is the jail one (only with the jail on) and, when --opened-id (the ticket key the
+#       agent was opened with) differs from --ticket-id (the key of now), a blank line and
+#       resume_id_notice (auto_scrum/prompt.sh): the folder of the ticket changed. The stage, and
+#       not the type, because the type of an agent is not stored.
+#   nick-agent --has-conversation <uuid>
+#       (NS-39) prints exactly conversation=true or conversation=false and exits with 0: whether
+#       claude keeps the conversation <uuid> of a session run with the cwd at this project
+#       (claude_conversation_file of lib/claude/, under ${CLAUDE_CONFIG_DIR:-$HOME/.claude}). It
+#       needs no config, launches nothing and writes nothing.
 # The UUID format is not checked here (claude checks it; the nick always generates a valid one).
 # There is no variable that swaps this script nor any part of the launch: the shell finds it by a
 # path fixed at build time, and this is the path that guarantees the jail and the rules.
@@ -77,11 +91,13 @@ AGENT_JAIL_HOSTS=""
 # The types of the stages: the $TYPE values of choose_type (auto_scrum.sh), in its order
 # (bin/tests/test_nick_agent.sh compares both).
 AGENT_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
+# The stages of an agent (the agents.stage column of the nick shell, NS-39: --resume).
+AGENT_STAGES=(po tech_leader development review)
 
 # usage_error <message>: the error and the usage on stderr, exit 1 (the pattern of bin/nick-init).
 usage_error() {
   echo "Erro: $1" >&2
-  echo "Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>" >&2
+  echo "Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id> | --has-conversation <uuid>" >&2
   exit 1
 }
 
@@ -216,7 +232,7 @@ render_mode() {
 
 # launch_mode <args...>: the launch (see the header).
 launch_mode() {
-  local session_id="" name="" type="" prompt_file="" claude_args
+  local session_id="" name="" type="" prompt_file=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --session-id | --name | --type | --prompt-file)
@@ -246,22 +262,119 @@ launch_mode() {
   config_dir_prepare || exit 1
   jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
   # The argv of auto_scrum.sh plus --session-id and --name (bin/tests/test_nick_agent.sh compares
-  # both): the rules inline, auto mode only in the Development stage (ABOUT.md, "Modo auto só na
-  # etapa de Desenvolvimento"), the jail notice only with the jail on, the session id and the name
-  # the nick chose, and the prompt last, read as the script reads it ($(cat), without the final
-  # line breaks).
+  # both): the session id and the name the nick chose, and the prompt last, read as the script
+  # reads it ($(cat), without the final line breaks).
+  exec_claude "$type" "" --session-id "$session_id" --name "$name" "$(cat "$prompt_file")"
+}
+
+# exec_claude <type or stage> <notice> [args...]: the end of every launch (the launch and the
+# resume, NS-39), after load_and_check: claude by jail_exec with the rules inline, auto mode only
+# in the Development stage (ABOUT.md, "Modo auto só na etapa de Desenvolvimento"; the key of the
+# type and of the stage is the same, development), one --append-system-prompt with the jail
+# notice (only with the jail on) and <notice> after a blank line (when not empty), and [args].
+# Never returns (jail_exec ends with exec).
+exec_claude() {
+  local type="$1" extra_notice="$2" notice="" claude_args
+  shift 2
   claude_args=(--settings "$NICK_CLAUDE_SETTINGS")
   [ "$type" = "development" ] && claude_args+=(--permission-mode auto)
   if [ "$JAIL_ENABLED" = "true" ]; then
-    claude_args+=(--append-system-prompt "$(jail_agent_notice "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS")")
+    notice="$(jail_agent_notice "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS")"
   fi
-  claude_args+=(--session-id "$session_id" --name "$name")
-  jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$(cat "$prompt_file")"
+  if [ -n "$extra_notice" ]; then
+    notice="${notice:+$notice$'\n\n'}$extra_notice"
+  fi
+  if [ -n "$notice" ]; then
+    claude_args+=(--append-system-prompt "$notice")
+  fi
+  jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$@"
+}
+
+# stage_known <stage>: whether <stage> is one of AGENT_STAGES.
+stage_known() {
+  local known
+  for known in "${AGENT_STAGES[@]}"; do
+    [ "$known" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# resume_mode <args...>: the resume (see the header), its options in any order.
+resume_mode() {
+  local session_id="" name="" stage="" opened_id="" ticket_id="" seen=" " notice=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --resume | --name | --stage | --opened-id | --ticket-id)
+        [ "$#" -ge 2 ] || usage_error "falta o valor de $1."
+        case "$seen" in
+          *" $1 "*) usage_error "o $1 foi repetido." ;;
+        esac
+        seen="$seen$1 "
+        case "$1" in
+          --resume) session_id="$2" ;;
+          --name) name="$2" ;;
+          --stage) stage="$2" ;;
+          --opened-id) opened_id="$2" ;;
+          --ticket-id) ticket_id="$2" ;;
+        esac
+        shift 2
+        ;;
+      --check | --render | --has-conversation) usage_error "o $1 não aceita outros argumentos." ;;
+      *) usage_error "argumento desconhecido: '$1'" ;;
+    esac
+  done
+  [ -n "$session_id" ] || usage_error "informe o --resume <uuid> (não vazio)."
+  [ -n "$name" ] || usage_error "informe o --name <nome> (não vazio)."
+  [ -n "$stage" ] || usage_error "informe o --stage <etapa>."
+  stage_known "$stage" || usage_error "a etapa '$stage' não existe."
+  [ -n "$ticket_id" ] || usage_error "informe o --ticket-id <id>."
+  # The message of read_jira_id (auto_scrum.sh), without its "Tente de novo."; an --opened-id
+  # given goes through it too (empty included).
+  jira_id_valid "$ticket_id" || usage_error "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/)."
+  case "$seen" in
+    *" --opened-id "*)
+      jira_id_valid "$opened_id" || usage_error "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/)."
+      ;;
+  esac
+
+  load_and_check
+  config_dir_prepare || exit 1
+  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
+  if [ -n "$opened_id" ] && [ "$opened_id" != "$ticket_id" ]; then
+    notice="$(resume_id_notice "$opened_id" "$ticket_id")"
+  fi
+  # No prompt: the conversation goes on where it stopped.
+  exec_claude "$stage" "$notice" --resume "$session_id" --name "$name"
+}
+
+# has_conversation_mode <uuid>: the --has-conversation mode (see the header). The locale is UTF-8
+# here (C.UTF-8, whatever the one of the nick), so an accented letter of the cwd is one "-", as
+# claude does (lib/claude/claude.sh: claude_conversation_file).
+has_conversation_mode() {
+  local LC_ALL=C.UTF-8 file=""
+  if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    usage_error "informe o --has-conversation <uuid> (não vazio), sem outros argumentos."
+  fi
+  claude_conversation_file "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$(pwd -P)" "$1" file
+  if [ -f "$file" ]; then echo "conversation=true"; else echo "conversation=false"; fi
+}
+
+# launch_kind <args...>: "resume" when --resume is one of the options (the values of the options
+# that take one are skipped, so a name "--resume" is a value), "launch" otherwise.
+launch_kind() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --resume) echo "resume" && return 0 ;;
+      --session-id | --name | --type | --prompt-file | --stage | --opened-id | --ticket-id) shift ;;
+    esac
+    [ "$#" -gt 0 ] && shift
+  done
+  echo "launch"
 }
 
 main() {
   if [ "$#" -eq 0 ]; then
-    usage_error "informe --check, --render <tipo> ou --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>."
+    usage_error "informe --check, --render <tipo>, --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>, --resume <uuid> --name <nome> --stage <etapa> --ticket-id <id> ou --has-conversation <uuid>."
   fi
   case "$1" in
     --check)
@@ -277,7 +390,17 @@ main() {
       shift
       render_mode "$@"
       ;;
-    *) launch_mode "$@" ;;
+    --has-conversation)
+      shift
+      has_conversation_mode "$@"
+      ;;
+    *)
+      if [ "$(launch_kind "$@")" = "resume" ]; then
+        resume_mode "$@"
+      else
+        launch_mode "$@"
+      fi
+      ;;
   esac
 }
 

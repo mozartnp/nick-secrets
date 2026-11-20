@@ -252,6 +252,22 @@ run_claude "$ctl_dir" "claude_print_settings_error '/proj/não.json'" "export LC
 assert_contains "$(file_of "$ctl_dir/err")" "ilegíveis: /proj/não.json" "com LC_ALL=C, o 'não' do caminho sai intacto"
 
 echo
+echo "== claude_conversation_file: o arquivo da conversa do claude (NS-39) =="
+conv_dir="$(new_case conversation)"
+# Um caminho com cada tipo de caractere: só A-Z, a-z e 0-9 ficam; o resto vira "-" (com locale
+# UTF-8, um caractere acentuado vira um "-" só, como o claude faz).
+run_claude "$conv_dir" "claude_conversation_file /cfg '/home/u/meu_proj.v2/a b é' 0f8e-11 file; printf '%s' \"\$file\"" "export LC_ALL=C.UTF-8"
+assert_eq "0" "$(file_of "$conv_dir/rc")" "sai com 0"
+assert_eq "/cfg/projects/-home-u-meu-proj-v2-a-b--/0f8e-11.jsonl" "$(file_of "$conv_dir/out")" \
+  "<config>/projects/<dir com todo caractere não alfanumérico trocado por ->/<sessão>.jsonl"
+assert_eq "" "$(file_of "$conv_dir/err")" "nada no stderr"
+run_claude "$conv_dir" "claude_conversation_file /cfg '/x/é' s file; printf '%s' \"\$file\"" "export LC_ALL=C"
+assert_eq "/cfg/projects/-x---/s.jsonl" "$(file_of "$conv_dir/out")" \
+  "controle: com LC_ALL=C o é são dois bytes e vira \"--\" (por isso quem chama força UTF-8)"
+run_claude "$conv_dir" "file=intacto; other=x; claude_conversation_file /c /d s file; printf '%s|%s' \"\$file\" \"\$other\""
+assert_eq "/c/projects/-d/s.jsonl|x" "$(file_of "$conv_dir/out")" "grava só na variável pedida (printf -v)"
+
+echo
 echo "== carga limpa: source só define nomes claude_/NICK_CLAUDE_, sem imprimir nada =="
 clean_dir="$TEST_TMP/clean"
 mkdir -p "$clean_dir"

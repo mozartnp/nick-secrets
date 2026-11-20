@@ -94,6 +94,19 @@ CREATE TABLE ticket_stage_changes (
 );
 ";
 
+/// Migration 6 (NS-39): the agents can be resumed and archived. The states become `active`,
+/// `stopped` (the `ended` of before: the claude ended or the nick closed, and the conversation can
+/// be resumed) and `archived`; the column still has no CHECK (see the migration 3), and the
+/// `AgentState` enum stays the only source of the states in the code (this literal is the
+/// exception: a published migration is pinned by a test and never changes). `opened_key` is the
+/// ticket key the agent was opened with, so a resume can tell the agent the folder of a ticket
+/// whose ID changed; NULL for the agents opened before the NS-39, whose key comes from the end of
+/// their name (`agents::opened_key`).
+pub const MIGRATION_6: &str = "\
+ALTER TABLE agents ADD COLUMN opened_key TEXT;  -- the ticket key at the opening; NULL before NS-39
+UPDATE agents SET state = 'stopped' WHERE state = 'ended';
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
 pub const MIGRATIONS: &[&str] = &[
     MIGRATION_1,
@@ -101,4 +114,5 @@ pub const MIGRATIONS: &[&str] = &[
     MIGRATION_3,
     MIGRATION_4,
     MIGRATION_5,
+    MIGRATION_6,
 ];

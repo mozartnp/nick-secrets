@@ -14,15 +14,17 @@ const ALT_ON: &str = "\x1b[?1049h";
 const ALT_OFF: &str = "\x1b[?1049l";
 const CURSOR_ON: &str = "\x1b[?25h";
 
-/// Opens the Projects screen of auto_scrum.
+/// Opens the module on the tree (NS-38; before, the Projects screen), the module selected.
 fn open_projects(nick: &mut common::Nick) {
-    nick.wait_for("Módulos");
-    nick.send(ENTER);
-    nick.wait_for("auto_scrum > Projetos");
+    nick.wait_for(" Navegação ");
+    nick.open_node("auto_scrum");
+    nick.wait_for_flat("a adicionar projeto");
 }
 
-/// Types `path` in the add field and confirms.
+/// On the module (where `a` adds a project), types `path` in the add field and confirms.
 fn add(nick: &mut common::Nick, path: &Path) {
+    nick.select("auto_scrum");
+    nick.wait_for_flat("a adicionar projeto");
     nick.send("a");
     nick.wait_for("Caminho da pasta do projeto:");
     nick.send(path.to_str().unwrap());
@@ -60,8 +62,10 @@ fn it_shows_the_same_list_from_any_cwd() {
         nick.send("q");
         assert_eq!(nick.wait_exit(), Some(0), "cwd {}", cwd.display());
     }
-    assert!(screens[0].contains(&format!("alfa  {}", alfa.display())));
-    assert!(screens[0].contains(&format!("beta  {}", beta.display())));
+    // The tree shows the names (NS-38); the path is in the panel of the project.
+    assert!(screens[0].contains("▸ alfa"), "{}", screens[0]);
+    assert!(screens[0].contains("▸ beta"));
+    let _ = (&alfa, &beta);
     assert_eq!(screens[0], screens[1]);
     assert_eq!(screens[0], screens[2]);
 }
@@ -70,7 +74,7 @@ fn it_shows_the_same_list_from_any_cwd() {
 fn the_database_is_born_in_xdg_state_home() {
     let world = World::new();
     let mut nick = world.spawn(&world.root, &[]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
     assert!(world.db_path().is_file());
@@ -86,7 +90,7 @@ fn without_xdg_state_home_the_database_is_born_in_home() {
         .filter(|(k, _)| k != "XDG_STATE_HOME")
         .collect();
     let mut nick = common::Nick::spawn(&world.root, &env);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
     let dir = world.home().join(".local/state/nick");
@@ -123,7 +127,7 @@ fn without_home_it_does_not_open_and_exits_with_1() {
 fn q_exits_with_0_and_restores_the_terminal() {
     let world = World::new();
     let mut nick = world.spawn(&world.root, &[]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
     let raw = nick.raw();
@@ -276,9 +280,9 @@ fn assert_init_failure(mode: &str, message: &str) {
     assert_eq!(world.stored(), Vec::<std::path::PathBuf>::new(), "{mode}");
     assert!(!bare.join(".nick/nick.conf").exists());
     nick.send(ESC);
-    // The footer of the list, and not a text of the list (visible behind the alert): an ESC
+    // The help of the module, and not a text of the tree (visible behind the alert): an ESC
     // sent together with the next key would be read as Alt+key (NS-32).
-    nick.wait_for("r remover");
+    nick.wait_for_flat("a adicionar projeto");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0), "{mode}");
 }
@@ -345,9 +349,9 @@ fn the_init_only_runs_from_the_button() {
     add(&mut nick, &bare);
     nick.wait_for("Esta pasta não tem a configuração do nick.");
     nick.send(ESC);
-    // The footer of the list, and not a text of the list (visible behind the alert): an ESC
+    // The help of the module, and not a text of the tree (visible behind the alert): an ESC
     // sent together with the next key would be read as Alt+key (NS-32).
-    nick.wait_for("r remover");
+    nick.wait_for_flat("a adicionar projeto");
     // Again, now leaving through the focused "Cancelar".
     add(&mut nick, &bare);
     nick.wait_for("Esta pasta não tem a configuração do nick.");
@@ -386,12 +390,9 @@ fn a_missing_init_shows_the_path_and_the_tui_goes_on() {
         nick.screen()
     );
     nick.send(ESC);
-    // The footer of the list, and not a text of the list (visible behind the alert): an ESC
+    // The help of the module, and not a text of the tree (visible behind the alert): an ESC
     // sent together with the next key would be read as Alt+key (NS-32).
-    nick.wait_for("r remover");
-    nick.send(LEFT);
-    nick.wait_for("Módulos");
-    nick.send(DOWN);
+    nick.wait_for_flat("a adicionar projeto");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
     assert!(!world.marker().exists());
@@ -408,11 +409,11 @@ fn removing_keeps_every_file_of_the_project() {
     let before = common::snapshot(&proj);
     let mut nick = world.spawn(&world.root, &[]);
     open_projects(&mut nick);
-    nick.wait_for("proj");
+    nick.select("proj");
     nick.send("r");
     nick.wait_for("(s/N)");
     nick.send("n");
-    nick.wait_for("r remover");
+    nick.wait_for_flat("r remover");
     assert_eq!(world.stored(), std::slice::from_ref(&proj));
     nick.send("r");
     nick.wait_for("(s/N)");
@@ -435,24 +436,44 @@ fn a_project_whose_directory_is_gone_is_marked_unavailable() {
     fs::remove_file(noconf.join(".nick/nick.conf")).unwrap();
     let mut nick = world.spawn(&world.root, &[]);
     open_projects(&mut nick);
-    nick.wait_for("[indisponível: pasta não encontrada]");
-    nick.wait_for("[indisponível: sem .nick/nick.conf]");
+    // On the tree, the end of the row is cut at 40 columns (NS-34); the panel says it whole.
+    nick.wait_for("gone  [indisponível: pasta não");
+    nick.wait_for("noconf  [indisponível: sem .nick");
+    nick.select("gone");
+    nick.wait_for("Situação: [indisponível: pasta não encontrada]");
+    nick.select("noconf");
+    nick.wait_for("Situação: [indisponível: sem .nick/nick.conf]");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
 
 // ---- tickets (NS-32) ----
 
-/// Opens the Projects screen, then the tickets of the selected project.
+/// Opens the project `name` on the tree (NS-38; before, its Tickets screen), selected.
 fn open_tickets(nick: &mut common::Nick, name: &str) {
-    open_projects(nick);
-    nick.wait_for(name);
-    nick.send(ENTER);
-    nick.wait_for(&format!("auto_scrum > {name} > Tickets"));
+    nick.open_project(name);
+    nick.wait_for_flat("a novo ticket");
 }
 
-/// Creates a ticket through the dialog (empty `jira` generates a provisional ID).
+/// Goes up the tree (`←` on a leaf) until the project is selected (its help: `a novo ticket`).
+fn on_project(nick: &mut common::Nick) {
+    for _ in 0..3 {
+        if nick.flat_screen().contains("a novo ticket") {
+            return;
+        }
+        let (_, row) = nick.selected_row().expect("a selection");
+        nick.send(LEFT);
+        nick.wait_until("the selection to go up", || {
+            nick.selected_row().is_some_and(|(_, now)| now != row)
+        });
+    }
+    nick.wait_for_flat("a novo ticket");
+}
+
+/// Creates a ticket through the dialog, on the project of the selection (empty `jira`
+/// generates a provisional ID).
 fn new_ticket(nick: &mut common::Nick, title: &str, jira: &str) {
+    on_project(nick);
     nick.send("a");
     nick.wait_for("ID do Jira (opcional; vazio gera um ID provisório):");
     nick.send(title);
@@ -490,12 +511,18 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     assert_eq!(stored.len(), 2);
     let provisional = stored[1].0.clone();
     assert_eq!(provisional.len(), 8);
+    // On the tree the end of the row is cut at 40 columns (NS-34); the panel of the selected
+    // ticket has the marks.
     assert!(
         nick.screen()
-            .contains(&format!("{provisional}  [PO]  Sem ID ainda  [provisório]"))
+            .contains(&format!("{provisional}  [PO]  Sem ID ainda")),
+        "{}",
+        nick.screen()
     );
+    nick.wait_for(&format!("{provisional}  Sem ID ainda  [provisório]"));
 
     // A blank title is refused and the dialog keeps what was typed.
+    on_project(&mut nick);
     nick.send("a");
     nick.wait_for("Novo ticket");
     nick.send("   ");
@@ -505,10 +532,10 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     nick.wait_for("Informe o título do ticket.");
     assert!(nick.screen().contains("NS-9"));
     nick.send(ESC);
-    nick.wait_for("f mostrar ocultos");
+    nick.wait_for_flat("a novo ticket");
 
     // Edit the title of NS-7 (the first one).
-    nick.send("\x1b[A");
+    nick.select("NS-7");
     nick.send("e");
     nick.wait_for("Editar título");
     nick.wait_for("ID: NS-7");
@@ -522,7 +549,7 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("n");
-    nick.wait_for("f mostrar ocultos");
+    nick.wait_for_flat("f mostrar ocultos");
     assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
     nick.send("o");
     nick.wait_for("(s/N)");
@@ -537,19 +564,20 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     // The filter shows it as [oculto], and `o` restores it.
     nick.send("f");
     nick.wait_for("(com ocultos)");
-    nick.wait_for("NS-7  [PO]  Corrigir o senha  [oculto]");
-    nick.wait_for("f esconder ocultos");
+    nick.wait_for("NS-7  [PO]  Corrigir o senha");
+    nick.wait_for_flat("f esconder ocultos");
     nick.send("\x1b[A");
     nick.send("o");
     nick.wait_for("Ticket restaurado: NS-7.");
     nick.send("f");
-    nick.wait_for("f mostrar ocultos");
+    nick.wait_for_flat("f mostrar ocultos");
     assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
     assert!(!nick.screen().contains("[oculto]"));
 
-    // Back to the projects, with it still there.
+    // Up to the project, with it still there.
     nick.send(ESC);
-    nick.wait_for("auto_scrum > Projetos");
+    nick.wait_for_flat("a novo ticket");
+    assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 
@@ -578,21 +606,27 @@ fn an_unavailable_project_does_not_open_its_tickets() {
     fs::remove_file(noconf.join(".nick/nick.conf")).unwrap();
     let mut nick = world.spawn(&world.root, &[]);
     open_projects(&mut nick);
-    nick.wait_for("[indisponível: sem .nick/nick.conf]");
+    nick.select("noconf");
     nick.send(ENTER);
     // The message is longer than the screen: it wraps in the status bar, nothing is cut.
     nick.wait_for("Projeto indisponível: [indisponível: sem .nick/nick.conf].");
     let screen = nick.screen();
     let lines: Vec<&str> = screen.lines().map(str::trim).collect();
-    let n = lines.len();
+    let n = lines
+        .iter()
+        .position(|line| line.starts_with("Projeto indisponível:"))
+        .unwrap();
     assert_eq!(
-        format!("{} {}", lines[n - 3], lines[n - 2]),
+        format!("{} {}", lines[n], lines[n + 1]),
         "Projeto indisponível: [indisponível: sem .nick/nick.conf]. Os tickets só abrem com a \
          pasta e o .nick/nick.conf no lugar.",
         "{screen}"
     );
-    assert!(nick.screen().contains("auto_scrum > Projetos"));
-    assert!(!nick.screen().contains("Escondido"));
+    assert!(nick.screen().contains("▸ noconf") || nick.screen().contains("  noconf"));
+    assert!(
+        !nick.screen().contains("Escondido"),
+        "closed: its tickets are not listed"
+    );
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
@@ -608,11 +642,10 @@ fn the_tickets_of_a_project_do_not_show_in_another() {
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "alfa");
     nick.wait_for("NS-1  [PO]  Só do alfa");
-    nick.send(ESC);
-    nick.wait_for("auto_scrum > Projetos");
-    nick.send(DOWN);
-    nick.send(ENTER);
-    nick.wait_for("auto_scrum > beta > Tickets");
+    // alfa closed (←), beta open: its tickets are the only ones on the tree.
+    nick.send(LEFT);
+    nick.wait_until("alfa closed", || !nick.screen().contains("Só do alfa"));
+    open_tickets(&mut nick, "beta");
     nick.wait_for("Nenhum ticket neste projeto.");
     assert!(!nick.screen().contains("Só do alfa"));
     // The same ID in another project is accepted.
@@ -645,7 +678,7 @@ fn removing_a_project_with_tickets_deletes_them_and_no_other() {
     let before = common::snapshot(&alfa);
     let mut nick = world.spawn(&world.root, &[]);
     open_projects(&mut nick);
-    nick.wait_for("alfa");
+    nick.select("alfa");
     nick.send("r");
     nick.wait_for("(s/N)");
     let flat = nick.flat_screen();
@@ -677,7 +710,7 @@ fn stage_of(world: &World, key: &str) -> String {
         .unwrap()
 }
 
-/// On the ticket screen: `m`, ↓ from the current stage until `label` (each ↓ waits), Enter,
+/// On the node of a ticket: `m`, ↓ from the current stage until `label` (each ↓ waits), Enter,
 /// the confirmation and `s`.
 fn change_stage(nick: &mut common::Nick, label: &str) {
     nick.send("m");
@@ -704,30 +737,27 @@ fn the_operator_changes_the_stage_and_done_stays_on_the_list() {
     open_tickets(&mut nick, "proj");
     new_ticket(&mut nick, "Corrigir o login", "NS-7");
     nick.wait_for("NS-7  [PO]  Corrigir o login");
-    nick.keep_screen("lista de tickets com a etapa");
-    nick.send(ENTER);
-    nick.wait_for("m mudar etapa");
+    nick.keep_screen("árvore com a etapa do ticket");
+    // The new ticket is selected: its panel on the right (NS-38; before, Enter opened it).
+    nick.wait_for_flat("m mudar etapa");
     nick.wait_for("Etapa atual: PO");
     nick.wait_for("Nenhuma mudança: o ticket começou em PO.");
-    nick.keep_screen("tela do ticket sem histórico");
+    nick.keep_screen("painel do ticket sem histórico");
     change_stage(&mut nick, "Review");
     nick.wait_for("Etapa do ticket NS-7: PO → Review.");
     nick.wait_for("Etapa atual: Review");
     nick.wait_for("UTC  PO → Review");
     assert_eq!(stage_of(&world, "NS-7"), "review");
-    nick.send(ESC);
-    nick.wait_for("Enter detalhes");
-    nick.wait_for("NS-7  [Review]  Corrigir o login");
-    nick.send(ENTER);
-    nick.wait_for("m mudar etapa");
+    nick.wait_for("NS-7  [Review]  Corrigir o");
     change_stage(&mut nick, "Concluído");
     nick.wait_for("Etapa do ticket NS-7: Review → Concluído.");
     nick.wait_for("UTC  Review → Concluído");
-    nick.keep_screen("tela do ticket com histórico");
+    nick.keep_screen("painel do ticket com histórico");
+    // ← up to the project: the done ticket stays on the tree.
     nick.send(ESC);
-    nick.wait_for("Enter detalhes");
-    nick.wait_for("NS-7  [✓ Concluído]  Corrigir o login");
-    nick.keep_screen("lista com um ticket concluído");
+    nick.wait_for_flat("a novo ticket");
+    nick.wait_for("NS-7  [✓ Concluído]  Corrigir");
+    nick.keep_screen("árvore com um ticket concluído");
     assert_eq!(stage_of(&world, "NS-7"), "done");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
@@ -744,10 +774,10 @@ fn the_ticket_screen_reads_the_plan_from_the_disk() {
     fs::write(docs.join("plan.md"), "# plano\n").unwrap();
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "proj");
-    nick.send(ENTER);
+    nick.select("NS-7");
     nick.wait_for("Plano (existe):  .nick/docs/NS-7/plan.md");
     nick.wait_for("Review (não existe):  .nick/docs/NS-7/review.md");
-    nick.keep_screen("tela do ticket com o plano");
+    nick.keep_screen("painel do ticket com o plano");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
@@ -774,7 +804,7 @@ fn renamed(
         .collect()
 }
 
-/// On the ticket screen: `i`, the current ID erased, `new` typed, Enter.
+/// On the node of a ticket: `i`, the current ID erased, `new` typed, Enter.
 fn type_new_id(nick: &mut common::Nick, current: &str, new: &str) {
     nick.send("i");
     nick.wait_for("Novo ID do ticket (ex: SC-123):");
@@ -799,13 +829,13 @@ fn editing_the_id_renames_only_the_docs_folder() {
     let before = common::snapshot(&proj);
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "proj");
-    nick.send(ENTER);
-    nick.wait_for("m mudar etapa");
+    nick.select(&uuid);
+    nick.wait_for_flat("m mudar etapa");
     nick.send("i");
     nick.wait_for("Novo ID do ticket (ex: SC-123):");
     nick.keep_screen("diálogo de editar ID");
     nick.send(ESC);
-    nick.wait_for("m mudar etapa");
+    nick.wait_for_flat("m mudar etapa");
     type_new_id(&mut nick, &uuid, "NS-99");
     let flat = nick.flat_screen();
     assert!(
@@ -819,8 +849,8 @@ fn editing_the_id_renames_only_the_docs_folder() {
     nick.keep_screen("confirmação de editar ID com a pasta");
     nick.send("s");
     nick.wait_for(&format!("ID atualizado: {uuid} → NS-99."));
-    nick.wait_for("auto_scrum > proj > NS-99");
-    nick.keep_screen("tela do ticket depois de editar o ID");
+    nick.wait_for(" Ticket NS-99 ");
+    nick.keep_screen("painel do ticket depois de editar o ID");
     assert_eq!(
         renamed(common::snapshot(&proj), "", ""),
         renamed(before, &uuid, "NS-99"),
@@ -831,7 +861,7 @@ fn editing_the_id_renames_only_the_docs_folder() {
         [("NS-99".into(), "Sem ID".into(), false)]
     );
     nick.send(ESC);
-    nick.wait_for("Enter detalhes");
+    nick.wait_for_flat("a novo ticket");
     assert!(!nick.screen().contains("[provisório]"));
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
@@ -849,8 +879,8 @@ fn editing_the_id_onto_an_existing_folder_is_refused_and_changes_nothing() {
     let before = common::snapshot(&proj);
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "proj");
-    nick.send(ENTER);
-    nick.wait_for("m mudar etapa");
+    nick.select("NS-1");
+    nick.wait_for_flat("m mudar etapa");
     type_new_id(&mut nick, "NS-1", "NS-99");
     nick.send("s");
     nick.wait_for("Já existe a pasta .nick/docs/NS-99/ no projeto. Nada foi mudado.");

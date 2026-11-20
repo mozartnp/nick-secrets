@@ -13,7 +13,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{DOWN, ENTER, ESC, Nick, PANEL_COL, TAB, World};
+use common::{DOWN, ENTER, ESC, LEFT, Nick, PANEL_COL, RIGHT, TAB, World};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -88,13 +88,12 @@ fn world_with(lines: &[&str]) -> (World, PathBuf) {
     (world, proj)
 }
 
-/// From the Modules screen, opens the tickets of the project `name`.
+/// On the tree (NS-38; before, the Tickets screen): the project `name` open and its first
+/// ticket selected.
 fn open_tickets(nick: &mut Nick, name: &str) {
-    nick.wait_for("Módulos");
-    nick.send(ENTER);
-    nick.wait_for(&format!("> {name}"));
-    nick.send(ENTER);
-    nick.wait_for("g abrir agente");
+    nick.open_project(name);
+    nick.send(DOWN);
+    nick.wait_for_flat("g abrir agente");
 }
 
 /// The type each stage of the NS-33/NS-34 tests (`downs` in PO, Tech Leader, Dev, Review)
@@ -252,8 +251,14 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
     nick.send("\x03");
     nick.wait_for("GOT c3 a1 03");
     nick.wait_for("O agente proj · Dev · NS-1 terminou.");
-    assert!(nick.screen().contains("g abrir agente"), "back on the list");
-    assert!(nick.screen().contains("> NS-1"), "the same ticket selected");
+    // Decision 10 of NS-38: the selection stays on the node of the agent, now ended, with the
+    // focus on the tree.
+    nick.wait_for_flat("↑/↓ mover · ← subir");
+    let (_, row) = nick.selected_row().expect("a selection");
+    assert!(
+        row.contains("Dev  encerrado"),
+        "the same node selected: {row}"
+    );
     // The argv: the session id of the database and the name, then the prompt (NS-35); the Dev
     // stage in auto mode (NS-35); the cwd is the project.
     let argv = read(&logs(&world).claude);
@@ -320,13 +325,7 @@ fn each_project_runs_with_its_own_cwd_and_config() {
         world.ticket(dir, "NS-1", "t");
     }
     let mut nick = spawn(&world, "", &[]);
-    nick.wait_for("Módulos");
-    nick.send(ENTER);
-    nick.wait_for("> alfa");
-    nick.send(DOWN);
-    nick.wait_for("> beta");
-    nick.send(ENTER);
-    nick.wait_for("g abrir agente");
+    open_tickets(&mut nick, "beta");
     open_agent(&mut nick, 3);
     nick.wait_for("O agente beta · Review · NS-1 terminou.");
     let env = read(&logs(&world).env);
@@ -761,7 +760,7 @@ fn sighup_ends_the_agent_group_and_exits_with_129() {
 fn sigterm_without_an_agent_restores_and_exits_with_143() {
     let world = World::new();
     let mut nick = world.spawn(&world.root, &[]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     kill(Pid::from_raw(nick.pid()), Signal::SIGTERM).unwrap();
     assert_eq!(nick.wait_exit(), Some(143));
     assert_restored_at_the_end(&nick.raw());
@@ -788,7 +787,7 @@ fn a_panic_with_an_agent_open_ends_its_group_and_exits_with_101() {
     // The database is not touched: the next opening ends the agent.
     assert_eq!(world.agents()[0].3, "active");
     let mut again = world.spawn(&world.root, &[]);
-    again.wait_for("Módulos");
+    again.wait_for(" Navegação ");
     assert_eq!(world.agents()[0].3, "ended");
     again.send("q");
     assert_eq!(again.wait_exit(), Some(0));
@@ -801,7 +800,7 @@ fn an_active_agent_without_its_lock_is_ended_when_the_nick_opens() {
     let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
     world.active_agent(&proj, "NS-1", "morto");
     let mut nick = world.spawn(&world.root, &[]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     assert_eq!(world.agents()[0].3, "ended");
     assert!(!world.agents_dir().join("morto.lock").exists());
     nick.send("q");
@@ -816,14 +815,14 @@ fn an_agent_whose_lock_another_nick_holds_stays_active() {
     let lock = fs::File::create(world.agents_dir().join("vivo.lock")).unwrap();
     lock.lock().unwrap();
     let mut nick = world.spawn(&world.root, &[]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
     assert_eq!(world.agents()[0].3, "active");
     drop(lock);
     // Control: with the lock free, the next opening ends it.
     let mut again = world.spawn(&world.root, &[]);
-    again.wait_for("Módulos");
+    again.wait_for(" Navegação ");
     assert_eq!(world.agents()[0].3, "ended");
     again.send("q");
     assert_eq!(again.wait_exit(), Some(0));
@@ -833,7 +832,6 @@ fn an_agent_whose_lock_another_nick_holds_stays_active() {
 
 /// The reserved shortcut by default, Ctrl+\ (0x1c in the PTY).
 const SHORTCUT: &str = "\x1c";
-const UP: &str = "\x1b[A";
 
 /// A world with the projects `alfa` (in the jail) and `beta` (out of it), each with the
 /// ticket NS-1, and a directory for the logs of each fake claude by project.
@@ -881,12 +879,7 @@ fn open_both(nick: &mut Nick) {
 fn open_beta(nick: &mut Nick, running: usize) {
     nick.send(SHORTCUT);
     wait_flat(nick, &format!("v agentes ativos ({running})"));
-    nick.send(ESC);
-    nick.wait_for("r remover");
-    nick.send(DOWN);
-    nick.wait_for("> beta");
-    nick.send(ENTER);
-    nick.wait_for("auto_scrum > beta > Tickets");
+    open_tickets(nick, "beta");
     open_agent(nick, 2);
     nick.wait_for_panel(&format!("beta · Dev · NS-1 · {OFF_JAIL}"));
 }
@@ -921,23 +914,21 @@ fn two_agents_of_two_projects_run_at_once_each_with_its_cwd_and_config() {
     assert_eq!(agents.len(), 2);
     assert!(agents.iter().all(|a| a.3 == "active"));
     assert!(agents.iter().all(|a| lock_of(&world, &a.0).exists()));
-    // The view lists both, [FORA DA JAIL] only on beta.
+    // The filter of the active agents (NS-38; before, the view) lists both, [FORA DA JAIL]
+    // only on beta.
     nick.send(SHORTCUT);
     wait_flat(&nick, "v agentes ativos (2)");
     nick.send("v");
-    nick.wait_for("Agentes ativos");
-    nick.wait_for("beta · Dev · NS-1  [FORA DA JAIL]");
-    // Only the list: on the same row, inside its border (NS-37), the panel shows the header
-    // of beta, out of the jail.
-    let screen = nick.screen();
-    let alfa: String = screen
-        .lines()
-        .find(|l| l.contains("alfa · Tech Leader · NS-1"))
-        .unwrap_or_else(|| panic!("alfa on the view:\n{screen}"))
-        .chars()
-        .take(usize::from(PANEL_COL))
-        .collect();
+    nick.wait_for("(só ativos)");
+    nick.wait_for("Dev  ● vivo  [FORA DA JAIL]");
+    // Only the tree: on the rows of the left, inside its border (NS-37).
+    let rows = nick.tree_rows();
+    let alfa = rows
+        .iter()
+        .find(|row| row.contains("Tech Leader  ● vivo"))
+        .unwrap_or_else(|| panic!("alfa on the tree:\n{}", nick.screen()));
     assert!(!alfa.contains("FORA DA JAIL"), "{alfa}");
+    let _ = PANEL_COL;
     nick.send("q");
     nick.wait_for("Há 2 agentes ativos (alfa, beta). Encerrar todos e sair? (s/N)");
     nick.send("s");
@@ -1002,19 +993,24 @@ fn a_hidden_agent_whose_text_changed_is_marked_until_it_is_shown() {
         "{}",
         nick.screen()
     );
-    nick.send("v");
-    nick.wait_for("Agentes ativos");
+    // The branch of alfa closed (the selection goes over its agent on the way: being shown,
+    // it is seen, and it is hidden again once the selection leaves it).
+    nick.select("alfa");
+    nick.send(LEFT);
+    nick.wait_for("▸ alfa");
     assert!(!nick.screen().contains("saída nova"), "{}", nick.screen());
-    // New text marks it, on the view (the list of 40 columns cuts the end of this line) and on
-    // the help of the lists.
+    // New text marks it: on its closed project (NS-38: the mark goes up) and on the help.
     fs::write(world.root.join("trigger.2"), "").unwrap();
-    nick.wait_for("alfa · Tech Leader · NS-1  ● saída");
-    nick.send(ESC);
+    nick.wait_for("▸ alfa  ● saída nova");
     wait_flat(&nick, "v agentes ativos (2, 1 com saída nova)");
+    // With the filter of the active agents, on its node, whole: in the place of `● vivo` (review
+    // of the NS-38, P1).
     nick.send("v");
-    nick.wait_for("● saída");
+    nick.wait_for("(só ativos)");
+    nick.wait_for("Tech Leader  ● saída nova");
+    wait_flat(&nick, "v mostrar tudo (2, 1 com saída nova)");
     // Shown, it is seen: the mark goes.
-    nick.send(UP);
+    nick.select("Tech Leader");
     nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
     nick.wait_for_panel("NOVO");
     nick.wait_until("the mark gone", || !nick.screen().contains("saída nova"));
@@ -1049,9 +1045,8 @@ fn toggling_the_focus_neither_resizes_nor_marks_a_hidden_agent() {
         "{}",
         nick.screen()
     );
-    nick.send("v");
-    nick.wait_for("Agentes ativos");
-    nick.send(UP);
+    // Shown by selecting its node on the tree (NS-38).
+    nick.select("Tech Leader");
     nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
     let panel = nick.panel();
     assert_eq!(
@@ -1092,8 +1087,10 @@ fn toggling_the_focus_moves_the_thick_border_at_once() {
     let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
     let mut nick = spawn(&world, "sleep", &[]);
     open_tickets(&mut nick, "proj");
-    // Without an agent, the list keeps its plain border.
-    assert_eq!(border_at(&nick, 0, 0), ("┌".into(), false));
+    // Without an agent too, the tree has the focus and the thick border (NS-38, decision 1;
+    // before, the plain border of the NS-37).
+    assert_eq!(border_at(&nick, 0, 0), ("┏".into(), true));
+    assert_eq!(border_at(&nick, 0, PANEL_COL), ("┌".into(), false));
     open_agent(&mut nick, 0);
     nick.wait_for_panel("READY");
     wait_for_focus_border(&nick, true);
@@ -1172,9 +1169,7 @@ fn only_the_copy_of_the_shown_agent_reaches_the_outer_terminal() {
     nick.send(SHORTCUT);
     // The text of alfa changed (COPIADO 1): it is marked.
     wait_flat(&nick, "v agentes ativos (2, 1 com saída nova)");
-    nick.send("v");
-    nick.wait_for("Agentes ativos");
-    nick.send(UP);
+    nick.select("Tech Leader");
     nick.wait_for_panel("COPIADO 1");
     assert!(
         !nick.raw().contains(COPY),
@@ -1194,9 +1189,9 @@ fn only_the_copy_of_the_shown_agent_reaches_the_outer_terminal() {
 fn a_shortcut_saved_in_the_settings_works_right_away_and_at_the_next_opening() {
     let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
     let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     nick.send("c");
-    nick.wait_for("Atalho para alternar entre a lista e o terminal: Ctrl+\\ (padrão)");
+    nick.wait_for_tree("Atalho para alternar entre a lista e o terminal: Ctrl+\\ (padrão)");
     nick.send("t");
     nick.wait_for("Aperte a tecla do novo atalho. Esc cancela.");
     nick.send("\x1d");
@@ -1212,7 +1207,7 @@ fn a_shortcut_saved_in_the_settings_works_right_away_and_at_the_next_opening() {
         world.setting("reserved_shortcut").as_deref(),
         Some("ctrl+]")
     );
-    nick.wait_for("Atalho para alternar entre a lista e o terminal: Ctrl+]");
+    nick.wait_for_tree("Atalho para alternar entre a lista e o terminal: Ctrl+]");
     assert!(!nick.screen().contains("(padrão)"));
     // Right away: Ctrl+] toggles, and Ctrl+\ goes to claude.
     nick.send(ESC);
@@ -1232,9 +1227,9 @@ fn a_shortcut_saved_in_the_settings_works_right_away_and_at_the_next_opening() {
     assert_eq!(nick.wait_exit(), Some(0));
     // At the next opening, from the database; p goes back to the default.
     let mut again = world.spawn(&world.root, &[]);
-    again.wait_for("Módulos");
+    again.wait_for(" Navegação ");
     again.send("c");
-    again.wait_for("Atalho para alternar entre a lista e o terminal: Ctrl+]");
+    again.wait_for_tree("Atalho para alternar entre a lista e o terminal: Ctrl+]");
     assert!(!again.screen().contains("(padrão)"));
     again.send("p");
     again.wait_for("Atalho de volta ao padrão: Ctrl+\\.");
@@ -1248,7 +1243,7 @@ fn a_shortcut_saved_in_the_settings_works_right_away_and_at_the_next_opening() {
 fn the_capture_refuses_enter_and_ctrl_c_without_saving_nor_quitting() {
     let world = World::new();
     let mut nick = world.spawn(&world.root, &[]);
-    nick.wait_for("Módulos");
+    nick.wait_for(" Navegação ");
     nick.send("c");
     nick.wait_for("(padrão)");
     nick.send("t");
@@ -1278,9 +1273,8 @@ fn an_agent_ended_from_the_view_dies_alone() {
     let (alfa, beta) = (&pids[..2], &pids[2..]);
     nick.send(SHORTCUT);
     wait_flat(&nick, "v agentes ativos (2)");
-    nick.send("v");
-    nick.wait_for("Agentes ativos");
-    nick.send(UP);
+    // `x` on the node of the agent (NS-38; before, on the view).
+    nick.select("Tech Leader");
     nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
     // n: nothing changes.
     nick.send("x");
@@ -1307,6 +1301,9 @@ fn an_agent_ended_from_the_view_dies_alone() {
     );
     assert!(!lock_of(&world, &agents[0].0).exists());
     assert!(lock_of(&world, &agents[1].0).exists());
+    // The ended one stays on its node (decision 10 of NS-38); beta is shown when selected.
+    nick.wait_for("Tech Leader  encerrado");
+    nick.select("Dev  ● vivo");
     nick.wait_for_panel("beta · Dev · NS-1");
     nick.send("q");
     nick.wait_for("Há 1 agente ativo (beta). Encerrar e sair? (s/N)");
@@ -1402,12 +1399,7 @@ fn a_panic_with_two_agents_ends_both_groups_and_exits_with_101() {
     nick.wait_for_panel("READY");
     nick.send(SHORTCUT);
     wait_flat(&nick, "v agentes ativos (1)");
-    nick.send(ESC);
-    nick.wait_for("r remover");
-    nick.send(DOWN);
-    nick.wait_for("> beta");
-    nick.send(ENTER);
-    nick.wait_for("auto_scrum > beta > Tickets");
+    open_tickets(&mut nick, "beta");
     open_agent(&mut nick, 2);
     nick.wait_until("both fakes started", || pids(&world).len() == 4);
     let pids = pids(&world);
@@ -1831,9 +1823,10 @@ fn stage_of(world: &World, key: &str) -> String {
         .unwrap()
 }
 
-/// From the list beside a live agent: Enter on the ticket, its screen.
+/// From the node of a live agent: `←` up to its ticket, its panel on the right (NS-38; before,
+/// Enter opened the ticket screen).
 fn open_ticket_screen(nick: &mut Nick) {
-    nick.send(ENTER);
+    nick.send(LEFT);
     wait_flat(nick, "m mudar etapa");
 }
 
@@ -1847,8 +1840,8 @@ fn a_live_agent_opens_from_the_ticket_screen_whatever_the_stage() {
     nick.send(SHORTCUT);
     wait_flat(&nick, "v agentes ativos (1)");
     open_ticket_screen(&mut nick);
-    nick.wait_for("proj · PO · NS-1  ● vivo");
-    nick.keep_screen("tela do ticket ao lado de um agente vivo");
+    nick.wait_for("PO  ● vivo");
+    nick.keep_screen("painel do ticket com o agente vivo na árvore");
     // The ticket goes to Dev.
     nick.send("m");
     nick.wait_for("Para qual etapa?");
@@ -1861,13 +1854,14 @@ fn a_live_agent_opens_from_the_ticket_screen_whatever_the_stage() {
     nick.send("s");
     wait_flat(&nick, "Etapa do ticket NS-1: PO → Dev.");
     assert_eq!(stage_of(&world, "NS-1"), "development");
-    // Its PO agent opens from there, with the focus on its terminal.
+    // Its PO agent opens from its node, with the focus on its terminal.
+    nick.select("PO  ● vivo");
     nick.send(ENTER);
     nick.wait_for("Ctrl+\\ voltar à lista");
     nick.send("x");
     nick.wait_for("GOT 78");
     wait_flat(&nick, "O agente proj · PO · NS-1 terminou.");
-    nick.wait_for("proj · PO · NS-1  encerrado");
+    nick.wait_for("PO  encerrado");
     assert_eq!(
         stage_of(&world, "NS-1"),
         "development",
@@ -1938,4 +1932,272 @@ fn the_dev_form_without_a_plan_warns_and_opens_anyway() {
     );
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- the tree (NS-38) ----
+
+/// Criterion 3 of NS-38: from the module down to the terminal of a live agent only with the
+/// arrows and Enter, through no other screen.
+#[test]
+fn from_the_module_to_the_terminal_of_a_live_agent_only_with_the_arrows_and_enter() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    // Back on the tree, every branch closed: up to the module (← on a leaf goes up; on an open
+    // node it closes it).
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "v agentes ativos (1)");
+    for row in [
+        "▾ NS-1",
+        "▸ NS-1",
+        "▾ proj",
+        "▸ proj",
+        "▾ auto_scrum",
+        "▸ auto_scrum",
+    ] {
+        nick.send(LEFT);
+        nick.wait_until(&format!("{row} selected"), || {
+            nick.selected_row()
+                .is_some_and(|(_, sel)| sel.contains(row))
+        });
+    }
+    nick.keep_screen("árvore fechada no módulo");
+    assert_eq!(nick.tree_rows()[1], "", "only the module on the tree");
+    // → opens, ↓ goes down, → opens, ↓, →, ↓ and Enter: the terminal of the agent.
+    let steps = [
+        (RIGHT, "▾ auto_scrum"),
+        (DOWN, "▸ proj"),
+        (RIGHT, "▾ proj"),
+        (DOWN, "▸ NS-1"),
+        (RIGHT, "▾ NS-1"),
+        (DOWN, "PO  ● vivo"),
+    ];
+    for (key, row) in steps {
+        nick.send(key);
+        nick.wait_until(&format!("{row:?} selected"), || {
+            nick.selected_row()
+                .is_some_and(|(_, sel)| sel.contains(row))
+        });
+    }
+    nick.keep_screen("agente vivo selecionado na árvore");
+    nick.wait_for_panel("proj · PO · NS-1 · FORA DA JAIL");
+    nick.send(ENTER);
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    wait_for_focus_border(&nick, true);
+    nick.keep_screen("terminal do agente com o foco");
+    nick.send(SHORTCUT);
+    nick.send("q");
+    nick.wait_for("Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Decision 2 of NS-38: the shortcut from a node that is not a live agent goes to the last
+/// agent shown (its node selected, the thick border on its panel), and again back to the tree
+/// on the same agent.
+#[test]
+fn the_shortcut_from_a_ticket_goes_to_the_last_agent_and_back() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, false);
+    // The ticket selected: no agent shown, its panel on the right.
+    nick.send(LEFT);
+    wait_flat(&nick, "m mudar etapa");
+    nick.wait_for(" Ticket NS-1 ");
+    nick.keep_screen("ticket selecionado com um agente vivo escondido");
+    nick.send(SHORTCUT);
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    nick.wait_for_panel("READY");
+    wait_for_focus_border(&nick, true);
+    let (_, row) = nick.selected_row().expect("a selection");
+    assert!(row.contains("PO  ● vivo"), "the node of the agent: {row}");
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, false);
+    wait_flat(&nick, "Enter ir ao terminal");
+    let (_, row) = nick.selected_row().expect("a selection");
+    assert!(row.contains("PO  ● vivo"), "the same agent: {row}");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Moving the selection between the module, a project, a ticket and an agent, and the two
+/// filters, resize no terminal: the claude gets no SIGWINCH (each one redraws it and marks a
+/// hidden one). The fake prints a SIZE at the start and at each SIGWINCH.
+#[test]
+fn moving_on_the_tree_sends_no_sigwinch_to_claude() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    world.ticket(&world.root.join("proj"), "NS-2", "Segundo");
+    let mut nick = spawn(&world, "winsize", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("SIZE 23 58");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    // The ticket, the project, the module, down again to the other ticket, the filters.
+    // ← goes up from a leaf and closes an open node; → opens.
+    for (key, help) in [
+        (LEFT, "m mudar etapa"),
+        (LEFT, "m mudar etapa"),
+        (LEFT, "a novo ticket"),
+        (LEFT, "a novo ticket"),
+        (LEFT, "a adicionar projeto"),
+        (LEFT, "a adicionar projeto"),
+        (RIGHT, "a adicionar projeto"),
+        (DOWN, "a novo ticket"),
+        (RIGHT, "a novo ticket"),
+        (DOWN, "m mudar etapa"),
+        (RIGHT, "m mudar etapa"),
+        (DOWN, "Enter ir ao terminal"),
+        (DOWN, "m mudar etapa"),
+        ("f", "f esconder ocultos"),
+        ("v", "v mostrar tudo"),
+        ("v", "v agentes ativos"),
+        ("f", "f mostrar ocultos"),
+        (DOWN, "Enter ir ao terminal"),
+    ] {
+        nick.send(key);
+        wait_flat(&nick, help);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    nick.wait_for_panel("SIZE 23 58");
+    let panel = nick.panel();
+    assert_eq!(panel.matches("SIZE").count(), 1, "never resized: {panel}");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// The panel on the right of each kind of node, beside a live agent and an ended one (the
+/// screens of the validation of NS-38 come from here, with `NICK_TEST_SCREENS`).
+#[test]
+fn each_kind_of_node_has_its_panel_and_its_help() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    world.ticket(&proj, "NS-2", "Segundo");
+    world.hide_ticket(&proj, "NS-2");
+    let mut nick = spawn(&world, "sleep", &[]);
+    nick.wait_for(" Navegação ");
+    nick.wait_for("Projetos: 1");
+    nick.keep_screen("módulo fechado, sem agente (sempre lado a lado)");
+    // An ended agent (the first) and a live one (the second), both of NS-1.
+    open_tickets(&mut nick, "proj");
+    nick.keep_screen("ticket selecionado, sem agente");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "x encerrar");
+    nick.send("x");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    wait_flat(&nick, "O agente proj · PO · NS-1 foi encerrado.");
+    nick.select("NS-1");
+    open_agent(&mut nick, 1);
+    nick.wait_for_panel("READY");
+    nick.keep_screen("agente vivo com o foco no terminal");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    nick.keep_screen("agente vivo com o foco na árvore");
+    for (label, title, help, screen) in [
+        (
+            "PO  encerrado",
+            " Agente ",
+            "↑/↓ mover · ← subir",
+            "agente encerrado",
+        ),
+        (
+            "NS-1",
+            " Ticket NS-1 ",
+            "m mudar etapa",
+            "ticket com agentes",
+        ),
+        ("proj", " Projeto proj ", "a novo ticket", "projeto"),
+        (
+            "auto_scrum",
+            " auto_scrum ",
+            "a adicionar projeto",
+            "módulo",
+        ),
+    ] {
+        nick.select(label);
+        nick.wait_for(title);
+        wait_flat(&nick, help);
+        nick.keep_screen(&format!(
+            "{screen} selecionado, com um agente vivo escondido"
+        ));
+    }
+    nick.wait_for("Agentes vivos neste nick: 1");
+    // The filters: the hidden ticket shows; only the live branches.
+    nick.send("f");
+    nick.wait_for(" Navegação (com ocultos) ");
+    nick.wait_for("NS-2  [PO]  Segundo  [oculto]");
+    nick.keep_screen("filtro de ocultos");
+    nick.send("v");
+    nick.wait_for(" Navegação (com ocultos) (só ativos) ");
+    nick.keep_screen("filtro de ocultos e de agentes ativos");
+    nick.send("f");
+    nick.wait_for(" Navegação (só ativos) ");
+    assert!(!nick.screen().contains("NS-2"), "{}", nick.screen());
+    assert!(
+        !nick.screen().contains("PO  encerrado"),
+        "only the live agents"
+    );
+    nick.keep_screen("filtro de agentes ativos");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair? (s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Removing a project ends its agents (decision of the user after the NS-38): the live one of
+/// this nick dies with its group, its record and its lock go, the project and its files stay
+/// out of it (no file of the project is touched).
+#[test]
+fn removing_a_project_ends_its_live_agent() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    let group = pids(&world);
+    assert!(group.iter().all(|p| alive(*p)));
+    let session = world.agents()[0].0.clone();
+    let before = common::snapshot(&proj);
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    nick.select("proj");
+    wait_flat(&nick, "r remover");
+    nick.send("r");
+    wait_flat(
+        &nick,
+        "O agente vivo dele neste nick será encerrado. O ticket dele será apagado do banco. O \
+         agente registrado dele será apagado do banco. (s/N)",
+    );
+    nick.keep_screen("remover projeto com um agente vivo");
+    nick.send("s");
+    wait_flat(
+        &nick,
+        "Projeto removido do nick: proj. Nenhum arquivo foi apagado. O agente proj · PO · NS-1 \
+         foi encerrado.",
+    );
+    for pid in group {
+        wait_dead(&nick, pid);
+    }
+    assert_eq!(world.stored(), Vec::<PathBuf>::new());
+    assert_eq!(world.agents(), []);
+    assert!(!lock_of(&world, &session).exists(), "the lock is gone");
+    assert_eq!(
+        common::snapshot(&proj),
+        before,
+        "no file of the project touched"
+    );
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0), "no agent left: q quits at once");
 }

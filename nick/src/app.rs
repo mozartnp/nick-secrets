@@ -1,19 +1,21 @@
-//! The state of the TUI and its transitions by key, with no terminal I/O: `handle_key` takes a
-//! key and returns an `Action`, which the loop (main.rs) carries out. The only action that runs
+//! The state of the TUI and its transitions by key, with no terminal I/O: `handle_key` takes a key
+//! and returns an `Action`, which the loop (main.rs) carries out. The only action that runs
 //! bin/nick-init is `Action::RunInit`, and only the "Criar configuração" button of the
-//! missing-config alert produces it (plan D7 of NS-31). The navigation is Modules > Projects >
-//! Tickets; the rules of the tickets are in tickets.rs, and none of them touches a file of the
-//! project. From a ticket, `g` opens an agent (NS-33) by the flow of auto_scrum.sh (NS-35): the
-//! check of the launcher (`Action::CheckAgent`), the menu of the stage types its flags offer, the
-//! form of the type (stages.rs; the long text in `$EDITOR`, `Action::EditDescription`), the
-//! prompt built by bash (`Action::RenderPrompt`), its preview with the `(s/N)` confirmation, and
-//! `Action::OpenAgent`, which the loop hands to `open_agent` with the real `AgentLauncher`
-//! (launch.rs). Several agents
-//! run at once (NS-34): the list stays on the left and the shown agent on the right, and the
-//! reserved shortcut (`keys::Shortcut`, kept in the database) toggles the focus between them;
-//! with the focus on the terminal every other key goes to the program (`Action::Send`). The
-//! screen texts are in PT-BR, and drawing is ui.rs's job.
+//! missing-config alert produces it (plan D7 of NS-31). The navigation is a tree (NS-38, the model
+//! in tree.rs): Module > Project > Ticket > Agent, the keys of the selected node and its panel on
+//! the right; "Configurações" is the only other screen. The rules of the tickets are in tickets.rs,
+//! and none of them touches a file of the project. From a ticket, `g` opens an agent (NS-33) by the
+//! flow of auto_scrum.sh (NS-35): the check of the launcher (`Action::CheckAgent`), the menu of the
+//! stage types its flags offer, the form of the type (stages.rs; the long text in `$EDITOR`,
+//! `Action::EditDescription`), the prompt built by bash (`Action::RenderPrompt`), its preview with
+//! the `(s/N)` confirmation, and `Action::OpenAgent`, which the loop hands to `open_agent` with the
+//! real `AgentLauncher` (launch.rs). Several agents run at once (NS-34): the tree stays on the
+//! left, and the agent selected on it is shown on the right (NS-38); the reserved shortcut
+//! (`keys::Shortcut`, kept in the database) toggles the focus between them; with the focus on the
+//! terminal every other key goes to the program (`Action::Send`). The screen texts are in PT-BR,
+//! and drawing is ui.rs's job.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -32,21 +34,17 @@ use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
 use crate::stages::{self, Input, Rule, StageType};
 use crate::tickets::{self, Ticket, TicketStage};
+use crate::tree::{LiveAgent, NodeId, Tree, TreeData, Visible};
 
-/// The list on the screen.
+/// What the column on the left shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    Modules,
-    Projects,
-    /// The tickets of the open project (`App::project`).
-    Tickets,
-    /// One ticket of the open project (`App::ticket_detail`, NS-36): its stage, its history,
-    /// its artifacts and its agents.
-    Ticket,
-    /// "Agentes ativos": every agent this nick runs, of every project (NS-34).
-    ActiveAgents,
-    /// "Configurações": the reserved shortcut (NS-34).
+    /// "Configurações": the reserved shortcut (NS-34), opened by `c` on the module node; the
+    /// right panel keeps showing the selected node.
     Settings,
+    /// The tree Module > Project > Ticket > Agent (NS-38), with the panel of the selected node
+    /// on the right.
+    Tree,
 }
 
 /// Where the keys go while an agent runs (NS-34): the list on the left or the terminal of the
@@ -83,11 +81,19 @@ pub enum Dialog {
         focus: Button,
         note: Option<String>,
     },
-    /// The `(s/N)` confirmation of a removal, with how many tickets go with the project.
-    ConfirmRemove { project: Project, tickets: i64 },
-    /// A new ticket: the title (required) and the Jira ID (optional; empty generates a
+    /// The `(s/N)` confirmation of a removal, with how many tickets and agent records go with
+    /// the project, and how many of its agents this nick runs (they are ended first, NS-38).
+    ConfirmRemove {
+        project: Project,
+        tickets: i64,
+        agents: i64,
+        live: i64,
+    },
+    /// A new ticket of the project `project_id` (the node where `a` opened it, review of the
+    /// NS-38, P5): the title (required) and the Jira ID (optional; empty generates a
     /// provisional one).
     NewTicket {
+        project_id: i64,
         title: String,
         jira_id: String,
         focus: TicketField,
@@ -130,7 +136,7 @@ pub enum Dialog {
     },
     /// Why no agent was opened (the launcher is missing, or its check failed).
     AgentError { message: String },
-    /// The `(s/N)` confirmation of ending the agent `id` from "Agentes ativos".
+    /// The `(s/N)` confirmation of ending the agent `id` (`x` on its node, NS-38).
     ConfirmEndAgent { id: i64, name: String },
     /// The `(s/N)` confirmation of quitting with agents running (they are all ended).
     ConfirmQuit,
@@ -188,12 +194,18 @@ pub enum Action {
     ScrollPageDown,
     /// Scroll the agent's history by lines (positive: up, into the history).
     ScrollLines(i32),
-    /// End the agent with this id (confirmed from "Agentes ativos"): the loop terminates its
+    /// End the agent with this id (confirmed on its node): the loop terminates its
     /// session and calls `agent_ended_by_operator`.
     EndAgent(i64),
     /// Quit, ending every agent (confirmed): the loop terminates every session and calls
     /// `end_all_records`.
     QuitEndingAgents,
+    /// Remove `project`, whose live `agents` this nick runs (confirmed, NS-38): the loop
+    /// terminates their sessions and calls `remove_project_ending_agents`.
+    RemoveProject {
+        project: Project,
+        agents: Vec<i64>,
+    },
 }
 
 /// Lines scrolled by one step of the mouse wheel, when the wheel scrolls the history.
@@ -219,8 +231,11 @@ pub struct RunningAgent {
     pub name: String,
     /// The name of its project.
     pub project: String,
-    /// Whether it runs in the jail (the `jail=` of the check). Only in memory: every agent of
-    /// the view is of this process (NS-34, not a column).
+    /// Where it is in the tree (NS-38): its ticket and the project of the ticket.
+    pub ticket_id: i64,
+    pub project_id: i64,
+    /// Whether it runs in the jail (the `jail=` of the check). Only in memory: every running
+    /// agent is of this process (NS-34, not a column).
     pub jail: bool,
     /// What the check wrote on stderr, shown when the agent ends.
     warning: Option<String>,
@@ -230,15 +245,14 @@ pub struct RunningAgent {
     pub unseen: bool,
 }
 
-/// The ticket of the ticket screen (NS-36), read when the screen opens and again after every
-/// action, like the lists: the artifacts come from the disk each time, with no cache.
+/// The selected ticket (NS-36; the panel on the right since the NS-38), read again after every
+/// action: the artifacts come from the disk each time, with no cache. Its agents are on the
+/// tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketDetail {
     pub ticket: Ticket,
     /// The history of its stage, oldest first.
     pub changes: Vec<StageChangeRow>,
-    /// Its agents, of every stage and state, in the order they were opened.
-    pub agents: Vec<Agent>,
     pub artifacts: Artifacts,
 }
 
@@ -256,17 +270,10 @@ pub struct App {
     cwd: Option<PathBuf>,
     init: PathBuf,
     pub(crate) screen: Screen,
-    pub(crate) module_index: usize,
-    pub(crate) project_index: usize,
     pub(crate) dialog: Option<Dialog>,
     pub(crate) status: Option<String>,
+    /// The projects of the module, with their availability.
     pub(crate) rows: Vec<Row>,
-    /// The project whose tickets are on the Tickets screen.
-    pub(crate) project: Option<Project>,
-    pub(crate) ticket_index: usize,
-    pub(crate) ticket_rows: Vec<Ticket>,
-    /// The filter of the Tickets screen: the hidden ones are listed too.
-    pub(crate) show_hidden: bool,
     /// bin/nick-agent (launch.rs).
     pub(crate) launcher: PathBuf,
     /// Where the locks of the agents live (agents.rs); None until `with_agents`.
@@ -278,10 +285,6 @@ pub struct App {
     pub(crate) focus: Focus,
     /// What the shown agent's program asked of its terminal.
     pub(crate) agent_term: AgentTerm,
-    /// The selection of "Agentes ativos".
-    pub(crate) agent_index: usize,
-    /// The screen "Agentes ativos" goes back to.
-    pub(crate) back: Screen,
     /// The reserved shortcut in use, and whether the database has a row for it (no row: the
     /// default).
     pub(crate) shortcut: Shortcut,
@@ -290,45 +293,56 @@ pub struct App {
     /// largest scroll (its end). The loop computes it from the screen (`ui::prompt_window`) and
     /// sets it before each key, so the App does not know the drawing.
     pub(crate) prompt_window: (usize, usize),
-    /// The ticket of the ticket screen (NS-36).
+    /// The detail of the selected ticket (NS-36; the panel on the right since the NS-38).
     pub(crate) ticket_detail: Option<TicketDetail>,
-    /// The selection of the agents of the ticket screen.
-    pub(crate) ticket_agent_index: usize,
+    /// The tree (NS-38): the open branches and the filters.
+    pub(crate) tree: Tree,
+    /// The selected node.
+    pub(crate) selected: NodeId,
+    /// The tickets of every project of the module (the hidden ones too), by project id.
+    pub(crate) tickets: HashMap<i64, Vec<Ticket>>,
+    /// The agents (of every stage and state) of the tickets of the open projects and of the
+    /// projects with a live agent, by ticket id.
+    pub(crate) ticket_agents: HashMap<i64, Vec<Agent>>,
+    /// The visible rows of the tree, computed after every change of the tree.
+    pub(crate) visible: Vec<Visible>,
+    /// The last agent shown (decision 2 of NS-38): where the shortcut goes from another node.
+    pub(crate) last_shown: Option<i64>,
 }
 
 impl App {
-    /// A new TUI on the Modules screen. `home` expands `~` and `cwd` resolves a relative path
-    /// typed by the operator; `init` is the bin/nick-init to run from the button.
+    /// A new TUI on the tree, with the module selected and every branch closed. `home` expands `~`
+    /// and `cwd` resolves a relative path typed by the operator; `init` is the bin/nick-init to run
+    /// from the button.
     pub fn new(db: Db, home: Option<PathBuf>, cwd: Option<PathBuf>, init: PathBuf) -> App {
-        App {
+        let mut app = App {
             db,
             home,
             cwd,
             init,
-            screen: Screen::Modules,
-            module_index: 0,
-            project_index: 0,
+            screen: Screen::Tree,
             dialog: None,
             status: None,
             rows: Vec::new(),
-            project: None,
-            ticket_index: 0,
-            ticket_rows: Vec::new(),
-            show_hidden: false,
             launcher: launch::launcher_path(),
             agents_dir: None,
             agents: Vec::new(),
             shown: None,
             focus: Focus::List,
             agent_term: AgentTerm::default(),
-            agent_index: 0,
-            back: Screen::Modules,
             shortcut: Shortcut::DEFAULT,
             shortcut_stored: false,
             prompt_window: (0, 0),
             ticket_detail: None,
-            ticket_agent_index: 0,
-        }
+            tree: Tree::default(),
+            selected: NodeId::Module(ModuleKind::ALL[0]),
+            tickets: HashMap::new(),
+            ticket_agents: HashMap::new(),
+            visible: Vec::new(),
+            last_shown: None,
+        };
+        app.refresh_tree();
+        app
     }
 
     /// The window of the preview of the prompt (rows shown, largest scroll), set by the loop
@@ -426,9 +440,9 @@ impl App {
         self.status = Some(message);
     }
 
-    /// The module of the Projects screen (the one selected on the Modules screen).
+    /// The module whose projects are on the tree (the only one today: `ModuleKind::ALL`).
     pub fn module(&self) -> ModuleKind {
-        ModuleKind::ALL[self.module_index]
+        ModuleKind::ALL[0]
     }
 
     /// The init the button runs.
@@ -455,7 +469,8 @@ impl App {
             | Action::ScrollPageUp
             | Action::ScrollPageDown
             | Action::ScrollLines(_)
-            | Action::EndAgent(_) => false,
+            | Action::EndAgent(_)
+            | Action::RemoveProject { .. } => false,
         }
     }
 
@@ -494,10 +509,11 @@ impl App {
             }
             Some(Dialog::ConfirmRemove { project, .. }) => self.key_confirm_remove(key, project),
             Some(Dialog::NewTicket {
+                project_id,
                 title,
                 jira_id,
                 focus,
-            }) => self.key_new_ticket(key, title, jira_id, focus),
+            }) => self.key_new_ticket(key, project_id, title, jira_id, focus),
             Some(Dialog::EditTitle { ticket, input }) => self.key_edit_title(key, ticket, input),
             Some(Dialog::ConfirmHide { ticket }) => self.key_confirm_hide(key, ticket),
             Some(Dialog::ChooseType {
@@ -547,24 +563,15 @@ impl App {
                 self.key_confirm_edit_id(key, ticket, new)
             }
             None => match self.screen {
-                Screen::Modules => self.key_modules(key),
-                Screen::Projects => self.key_projects(key),
-                Screen::Tickets => self.key_tickets(key),
-                Screen::Ticket => self.key_ticket(key),
-                Screen::ActiveAgents => self.key_active_agents(key),
                 Screen::Settings => self.key_settings(key),
+                Screen::Tree => self.key_tree(key),
             },
         };
-        // The availability is computed again after every action on the list (plan D9): not
-        // while a dialog stays open (typing a path is not an action, and each refresh reads
-        // the disk), but when it closes, whatever closed it. The tickets are read again the
-        // same way.
-        if self.dialog.is_none() {
-            match self.screen {
-                Screen::Projects => self.refresh(),
-                Screen::Tickets | Screen::Ticket => self.refresh_tickets(),
-                Screen::Modules | Screen::ActiveAgents | Screen::Settings => {}
-            }
+        // The tree is read again after every action on it (plan D9 of NS-31): not while a
+        // dialog stays open (typing a path is not an action, and each refresh reads the disk),
+        // but when it closes, whatever closed it.
+        if self.dialog.is_none() && self.screen == Screen::Tree {
+            self.refresh_tree();
         }
         action
     }
@@ -572,13 +579,27 @@ impl App {
     /// The reserved shortcut: from the terminal back to the list; from the list to the terminal
     /// of the shown agent, but not with a dialog open (it is a pending question) nor without
     /// an agent shown.
+    /// On the tree (decision 2 of NS-38): a live agent selected gets the focus; from another
+    /// node, the last agent shown, when still live, is selected (its branches opened), shown and
+    /// focused; without a live agent, nothing.
     fn toggle_focus(&mut self) {
         match self.focus {
             Focus::Terminal => self.focus = Focus::List,
-            Focus::List if self.dialog.is_none() && self.shown.is_some() => {
-                self.focus = Focus::Terminal;
+            Focus::List if self.dialog.is_some() => {}
+            Focus::List => {
+                let target = match self.selected {
+                    NodeId::Agent(id) if self.agent(id).is_some() => Some(id),
+                    _ => self.last_shown.filter(|id| self.agent(*id).is_some()),
+                };
+                if let Some(id) = target {
+                    if self.selected != NodeId::Agent(id) {
+                        self.reveal_and_select(NodeId::Agent(id));
+                        self.refresh_tree();
+                    }
+                    self.show(id);
+                    self.focus = Focus::Terminal;
+                }
             }
-            Focus::List => {}
         }
     }
 
@@ -592,57 +613,434 @@ impl App {
         Action::None
     }
 
-    /// `v` on a list: the view "Agentes ativos", with the shown agent selected; `Esc` goes back
-    /// to `screen`.
-    fn open_active_agents(&mut self) {
-        self.back = self.screen;
-        self.screen = Screen::ActiveAgents;
-        self.agent_index = self
-            .shown
-            .and_then(|id| self.agents.iter().position(|agent| agent.id == id))
-            .unwrap_or(0);
-        self.status = None;
+    /// The live agents, as the tree sees them.
+    fn live(&self) -> Vec<LiveAgent> {
+        self.agents
+            .iter()
+            .map(|agent| LiveAgent {
+                id: agent.id,
+                ticket_id: agent.ticket_id,
+                project_id: agent.project_id,
+                unseen: agent.unseen,
+            })
+            .collect()
     }
 
-    fn key_active_agents(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.agent_index = self.agent_index.saturating_sub(1);
-                self.show_selected();
+    fn tree_data<'a>(&'a self, live: &'a [LiveAgent]) -> TreeData<'a> {
+        TreeData {
+            module: self.module(),
+            projects: &self.rows,
+            tickets: &self.tickets,
+            agents: &self.ticket_agents,
+            live,
+        }
+    }
+
+    /// The visible rows of the tree, in order.
+    pub fn visible(&self) -> &[Visible] {
+        &self.visible
+    }
+
+    /// The selected node of the tree.
+    pub fn selected(&self) -> NodeId {
+        self.selected
+    }
+
+    /// The project `id` of the module, with its availability.
+    pub fn project_row(&self, id: i64) -> Option<&Row> {
+        self.rows.iter().find(|row| row.project.id == id)
+    }
+
+    /// The projects of the module, with their availability.
+    pub fn project_rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    /// The tickets of the project `id` (the hidden ones too).
+    pub fn project_tickets(&self, id: i64) -> &[Ticket] {
+        self.tickets.get(&id).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The ticket `id`, of any project.
+    pub fn ticket(&self, id: i64) -> Option<&Ticket> {
+        self.tickets
+            .values()
+            .flatten()
+            .find(|ticket| ticket.id == id)
+    }
+
+    /// The record of the agent `id` (of every state), when its ticket's agents were read.
+    pub fn agent_record(&self, id: i64) -> Option<&Agent> {
+        self.ticket_agents
+            .values()
+            .flatten()
+            .find(|agent| agent.id == id)
+    }
+
+    /// The filters of the tree: the hidden tickets (`f`) and only the active agents (`v`).
+    pub fn filters(&self) -> (bool, bool) {
+        (self.tree.show_hidden, self.tree.only_active)
+    }
+
+    /// The project of the selected node (a project, or the project of a ticket or an agent).
+    pub fn selected_project(&self) -> Option<&Project> {
+        let project = match self.selected {
+            NodeId::Module(_) => return None,
+            NodeId::Project(id) => id,
+            NodeId::Ticket(id) => self.ticket(id)?.project_id,
+            NodeId::Agent(id) => {
+                let ticket = match self.agent(id) {
+                    Some(agent) => agent.ticket_id,
+                    None => self.agent_record(id)?.ticket_id,
+                };
+                self.ticket(ticket)?.project_id
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.agent_index = (self.agent_index + 1).min(self.agents.len().saturating_sub(1));
-                self.show_selected();
-            }
-            KeyCode::Enter | KeyCode::Right => {
-                if self.agents.get(self.agent_index).is_some() {
-                    self.show_selected();
-                    self.focus = Focus::Terminal;
+        };
+        self.project_row(project).map(|row| &row.project)
+    }
+
+    /// The project of `ticket`, from the list of the module.
+    fn project_of(&self, ticket: &Ticket) -> Option<&Project> {
+        self.project_row(ticket.project_id).map(|row| &row.project)
+    }
+
+    /// Computes the visible rows again (after the tree or its data changed).
+    pub(crate) fn relayout(&mut self) {
+        let live = self.live();
+        self.visible = self.tree.visible(&self.tree_data(&live));
+    }
+
+    /// Opens every ancestor of `id` and selects it (a new node, or the agent of the shortcut).
+    pub(crate) fn reveal_and_select(&mut self, id: NodeId) {
+        let live = self.live();
+        let mut tree = std::mem::take(&mut self.tree);
+        tree.reveal(id, &self.tree_data(&live));
+        self.tree = tree;
+        self.select(id);
+    }
+
+    /// Selects `id`. "Shown" follows the selection (decision 5 of NS-38): a live agent of this
+    /// nick is shown on the right; any other node leaves every agent hidden.
+    pub(crate) fn select(&mut self, id: NodeId) {
+        self.selected = id;
+        match id {
+            NodeId::Agent(agent) if self.agent(agent).is_some() => self.show(agent),
+            _ => {
+                if self.shown.take().is_some() {
+                    self.agent_term = AgentTerm::default();
+                }
+                if self.focus == Focus::Terminal {
+                    self.focus = Focus::List;
                 }
             }
-            KeyCode::Char('x') => {
-                if let Some(agent) = self.agents.get(self.agent_index) {
+        }
+    }
+
+    /// Reads the tree again: the projects with their availability (from the disk, as the
+    /// Projects screen did), the tickets of every project and the agents of the tickets of the
+    /// open projects and of the projects with a live agent (from the database), and the detail
+    /// of the selected ticket. An open project that became unavailable is closed (decision 11),
+    /// unless a live agent of this nick is below it (decision 7: it stays reachable).
+    /// The selection stays on its node, or goes to the next sibling, the previous one or the
+    /// parent when its node is gone (decision 9).
+    pub(crate) fn refresh_tree(&mut self) {
+        self.refresh();
+        let live_projects: HashSet<i64> = self.agents.iter().map(|a| a.project_id).collect();
+        // One with a live agent stays open: the agent stays reachable (decision 7).
+        let unavailable: Vec<i64> = self
+            .rows
+            .iter()
+            .filter(|row| row.availability != Availability::Available)
+            .map(|row| row.project.id)
+            .filter(|id| !live_projects.contains(id))
+            .collect();
+        for id in unavailable {
+            self.tree.close(NodeId::Project(id));
+        }
+        let mut tickets = HashMap::new();
+        let mut agents = HashMap::new();
+        let mut error = None;
+        for row in &self.rows {
+            let id = row.project.id;
+            match self.db.list_tickets(id, true) {
+                Ok(list) => {
+                    // One query per open project (or with a live agent), not one per ticket:
+                    // this runs after every key (review of the NS-38, P2). Ordered by id, so
+                    // each ticket keeps its agents in the order they were opened.
+                    if self.tree.is_open(NodeId::Project(id)) || live_projects.contains(&id) {
+                        match self.db.list_project_agents(id) {
+                            Ok(found) => {
+                                for ticket in &list {
+                                    agents.insert(ticket.id, Vec::new());
+                                }
+                                for agent in found {
+                                    agents
+                                        .entry(agent.ticket_id)
+                                        .or_insert_with(Vec::new)
+                                        .push(agent);
+                                }
+                            }
+                            Err(err) => error = Some(err),
+                        }
+                    }
+                    tickets.insert(id, list);
+                }
+                Err(err) => error = Some(err),
+            }
+        }
+        if let Some(err) = error {
+            self.status = Some(projects::db_error_message(&err));
+        }
+        // The selected ticket gone from the database (another nick removed it): say so.
+        if let NodeId::Ticket(id) = self.selected
+            && let Some(old) = self.ticket(id)
+            && !tickets.values().flatten().any(|t: &Ticket| t.id == id)
+        {
+            self.status = Some(tickets::gone_message(old));
+        }
+        self.tickets = tickets;
+        self.ticket_agents = agents;
+        let before = std::mem::take(&mut self.visible);
+        self.relayout();
+        let selected = Tree::reselect(&before, &self.visible, self.selected);
+        if selected != self.selected {
+            self.select(selected);
+        }
+        self.read_ticket_detail();
+    }
+
+    /// The detail of the selected ticket (its history from the database, its artifacts from
+    /// the disk); None on another node. Only reads: nothing here writes the stage.
+    fn read_ticket_detail(&mut self) {
+        let NodeId::Ticket(id) = self.selected else {
+            self.ticket_detail = None;
+            return;
+        };
+        let Some(path) = self
+            .ticket(id)
+            .and_then(|ticket| self.project_of(ticket))
+            .map(|project| project.path.clone())
+        else {
+            self.ticket_detail = None;
+            return;
+        };
+        let read = || -> rusqlite::Result<Option<TicketDetail>> {
+            let Some(ticket) = self.db.get_ticket(id)? else {
+                return Ok(None);
+            };
+            Ok(Some(TicketDetail {
+                changes: self.db.list_stage_changes(id)?,
+                artifacts: docs::artifacts(&path, &ticket.key),
+                ticket,
+            }))
+        };
+        match read() {
+            Ok(detail) => self.ticket_detail = detail,
+            Err(err) => self.status = Some(projects::db_error_message(&err)),
+        }
+    }
+
+    /// The index of the selected row.
+    fn selected_row(&self) -> Option<usize> {
+        self.visible.iter().position(|row| row.id == self.selected)
+    }
+
+    fn key_tree(&mut self, key: KeyEvent) -> Action {
+        let at = self.selected_row();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(at) = at.filter(|at| *at > 0) {
+                    self.select(self.visible[at - 1].id);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(row) = at.and_then(|at| self.visible.get(at + 1)) {
+                    self.select(row.id);
+                }
+            }
+            KeyCode::Enter | KeyCode::Right => self.tree_enter(),
+            KeyCode::Esc | KeyCode::Left => self.tree_back(),
+            KeyCode::Char('f') => self.tree.show_hidden = !self.tree.show_hidden,
+            KeyCode::Char('v') => {
+                self.tree.only_active = !self.tree.only_active;
+                self.status = None;
+            }
+            _ if is_quit(key) => return self.quit(),
+            _ => return self.key_node(key),
+        }
+        // No relayout here: the refresh after the key computes the rows, and `reselect` needs
+        // the ones of before the key (a filter may take the selected node away).
+        Action::None
+    }
+
+    /// `→`/`Enter`: a live agent gets the focus on its terminal; another agent says why not; an
+    /// unavailable project says why it does not open (read from the disk now); a closed node
+    /// opens, and an open one goes down to its first child.
+    fn tree_enter(&mut self) {
+        match self.selected {
+            NodeId::Agent(id) => {
+                if self.agent(id).is_some() {
+                    self.show(id);
+                    self.focus = Focus::Terminal;
+                    self.status = None;
+                } else if let Some(agent) = self.agent_record(id) {
+                    self.status = Some(format!(
+                        "O agente {} não está rodando neste nick.",
+                        agent.name
+                    ));
+                }
+                return;
+            }
+            NodeId::Project(id)
+                if !self.tree.only_active && !self.agents.iter().any(|a| a.project_id == id) =>
+            {
+                let Some(row) = self.project_row(id) else {
+                    return;
+                };
+                if let Some(mark) =
+                    projects::unavailable_text(projects::availability(&row.project.path))
+                {
+                    self.status = Some(format!(
+                        "Projeto indisponível: {mark}. Os tickets só abrem com a pasta e o \
+                         .nick/nick.conf no lugar."
+                    ));
+                    return;
+                }
+                if !self.tree.is_open(self.selected) {
+                    // Available now, maybe not at the last refresh.
+                    self.tree.open(self.selected);
+                    self.status = None;
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let Some(at) = self.selected_row() else {
+            return;
+        };
+        let row = self.visible[at];
+        if !row.expandable {
+            return;
+        }
+        if !row.open {
+            self.tree.open(row.id);
+            self.status = None;
+        } else if let Some(child) = self.visible.get(at + 1).filter(|c| c.depth > row.depth) {
+            self.select(child.id);
+        }
+    }
+
+    /// `←`/`Esc`: an open node closes (not under the filter `v`, which shows every branch
+    /// open); a closed one or a leaf goes up to its parent.
+    fn tree_back(&mut self) {
+        self.status = None;
+        if let Some(row) = self.selected_row().map(|at| self.visible[at])
+            && row.open
+            && !self.tree.only_active
+        {
+            self.tree.close(row.id);
+            return;
+        }
+        let live = self.live();
+        if let Some(parent) = self.tree.parent(self.selected, &self.tree_data(&live)) {
+            self.select(parent);
+        }
+    }
+
+    /// The keys of the selected node (NS-38, the table of the plan): the same dialogs and
+    /// messages as the screens of before.
+    fn key_node(&mut self, key: KeyEvent) -> Action {
+        match (self.selected, key.code) {
+            (NodeId::Module(_), KeyCode::Char('a')) => {
+                self.dialog = Some(Dialog::AddPath {
+                    input: String::new(),
+                });
+            }
+            (NodeId::Module(_), KeyCode::Char('c')) => {
+                self.screen = Screen::Settings;
+                self.status = None;
+            }
+            (NodeId::Project(project_id), KeyCode::Char('a')) => {
+                self.dialog = Some(Dialog::NewTicket {
+                    project_id,
+                    title: String::new(),
+                    jira_id: String::new(),
+                    focus: TicketField::Title,
+                });
+            }
+            (NodeId::Project(id), KeyCode::Char('r')) => {
+                if let Some(project) = self.project_row(id).map(|row| row.project.clone()) {
+                    self.ask_removal(project);
+                }
+            }
+            (NodeId::Ticket(id), code) => {
+                let Some(ticket) = self.ticket(id).cloned() else {
+                    return Action::None;
+                };
+                return self.key_ticket_node(code, ticket);
+            }
+            (NodeId::Agent(id), KeyCode::Char('x')) => {
+                if let Some(agent) = self.agent(id) {
                     self.dialog = Some(Dialog::ConfirmEndAgent {
-                        id: agent.id,
+                        id,
                         name: agent.name.clone(),
                     });
                 }
             }
-            KeyCode::Esc | KeyCode::Left => {
-                self.screen = self.back;
-                self.status = None;
-            }
-            _ if is_quit(key) => return self.quit(),
             _ => {}
         }
         Action::None
     }
 
-    /// Shows the agent selected on "Agentes ativos".
-    fn show_selected(&mut self) {
-        if let Some(id) = self.agents.get(self.agent_index).map(|agent| agent.id) {
-            self.show(id);
+    /// The keys of a ticket node: `e` the title, `o` hide (asking) or restore, `g` an agent,
+    /// `m` the stage, `i` the ID.
+    fn key_ticket_node(&mut self, code: KeyCode, ticket: Ticket) -> Action {
+        match code {
+            KeyCode::Char('e') => {
+                self.dialog = Some(Dialog::EditTitle {
+                    input: ticket.title.clone(),
+                    ticket,
+                });
+            }
+            KeyCode::Char('o') => {
+                if ticket.hidden_at.is_some() {
+                    // Restoring hides nothing and is undone with `o`: no confirmation.
+                    self.status = Some(match tickets::restore(&self.db, &ticket) {
+                        Ok(message) | Err(message) => message,
+                    });
+                } else {
+                    self.dialog = Some(Dialog::ConfirmHide { ticket });
+                }
+            }
+            KeyCode::Char('g') => return self.choose_stage(Some(ticket)),
+            KeyCode::Char('m') => {
+                let index = TicketStage::ALL
+                    .iter()
+                    .position(|stage| stage.key() == ticket.stage)
+                    .unwrap_or(0);
+                self.status = None;
+                self.dialog = Some(Dialog::ChooseTicketStage { ticket, index });
+            }
+            KeyCode::Char('i') => {
+                let mark = self.project_of(&ticket).and_then(|project| {
+                    projects::unavailable_text(projects::availability(&project.path))
+                });
+                if let Some(mark) = mark {
+                    self.status = Some(format!(
+                        "Projeto indisponível: {mark}. O ID só é editado com a pasta e o \
+                         .nick/nick.conf no lugar."
+                    ));
+                } else {
+                    self.status = None;
+                    self.dialog = Some(Dialog::EditId {
+                        input: ticket.key.clone(),
+                        ticket,
+                    });
+                }
+            }
+            _ => {}
         }
+        Action::None
     }
 
     /// Shows the agent `id` on the right: being shown counts as seen, so its mark goes. The
@@ -652,8 +1050,12 @@ impl App {
             self.agent_term = AgentTerm::default();
         }
         self.shown = Some(id);
-        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+        self.last_shown = Some(id);
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id)
+            && agent.unseen
+        {
             agent.unseen = false;
+            self.relayout();
         }
     }
 
@@ -684,6 +1086,8 @@ impl App {
             return false;
         }
         agent.unseen = true;
+        // The mark goes up to the closed ancestors on the tree right away (NS-38).
+        self.relayout();
         true
     }
 
@@ -705,7 +1109,7 @@ impl App {
                 Err(err) => self.status = Some(projects::db_error_message(&err)),
             },
             KeyCode::Esc | KeyCode::Left => {
-                self.screen = Screen::Modules;
+                self.screen = Screen::Tree;
                 self.status = None;
             }
             _ if is_quit(key) => return self.quit(),
@@ -754,148 +1158,10 @@ impl App {
         Action::None
     }
 
-    fn key_modules(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.module_index = self.module_index.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.module_index = (self.module_index + 1).min(ModuleKind::ALL.len() - 1);
-            }
-            KeyCode::Enter | KeyCode::Right => {
-                self.screen = Screen::Projects;
-                self.project_index = 0;
-                self.status = None;
-            }
-            KeyCode::Char('c') => {
-                self.screen = Screen::Settings;
-                self.status = None;
-            }
-            KeyCode::Char('v') => self.open_active_agents(),
-            _ if is_quit(key) => return self.quit(),
-            _ => {}
-        }
-        Action::None
-    }
-
-    fn key_projects(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.project_index = self.project_index.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.project_index =
-                    (self.project_index + 1).min(self.rows.len().saturating_sub(1));
-            }
-            KeyCode::Char('a') => {
-                self.dialog = Some(Dialog::AddPath {
-                    input: String::new(),
-                });
-            }
-            KeyCode::Char('r') => {
-                if let Some(row) = self.rows.get(self.project_index) {
-                    match self.db.count_tickets(row.project.id) {
-                        Ok(tickets) => {
-                            self.dialog = Some(Dialog::ConfirmRemove {
-                                project: row.project.clone(),
-                                tickets,
-                            });
-                        }
-                        Err(err) => self.status = Some(projects::db_error_message(&err)),
-                    }
-                }
-            }
-            KeyCode::Enter | KeyCode::Right => self.open_tickets(),
-            KeyCode::Char('v') => self.open_active_agents(),
-            KeyCode::Esc | KeyCode::Left => {
-                self.screen = Screen::Modules;
-                self.status = None;
-            }
-            _ if is_quit(key) => return self.quit(),
-            _ => {}
-        }
-        Action::None
-    }
-
-    /// Opens the Tickets screen of the selected project, only if it is available now.
-    fn open_tickets(&mut self) {
-        let Some(row) = self.rows.get(self.project_index) else {
-            return;
-        };
-        let availability = projects::availability(&row.project.path);
-        if let Some(mark) = projects::unavailable_text(availability) {
-            self.status = Some(format!(
-                "Projeto indisponível: {mark}. Os tickets só abrem com a pasta e o \
-                 .nick/nick.conf no lugar."
-            ));
-            return;
-        }
-        self.project = Some(row.project.clone());
-        self.screen = Screen::Tickets;
-        self.ticket_index = 0;
-        self.ticket_rows.clear();
-        self.show_hidden = false;
-        self.status = None;
-    }
-
-    fn key_tickets(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.ticket_index = self.ticket_index.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.ticket_index =
-                    (self.ticket_index + 1).min(self.ticket_rows.len().saturating_sub(1));
-            }
-            KeyCode::Char('a') => {
-                self.dialog = Some(Dialog::NewTicket {
-                    title: String::new(),
-                    jira_id: String::new(),
-                    focus: TicketField::Title,
-                });
-            }
-            KeyCode::Char('e') => {
-                if let Some(ticket) = self.ticket_rows.get(self.ticket_index) {
-                    self.dialog = Some(Dialog::EditTitle {
-                        input: ticket.title.clone(),
-                        ticket: ticket.clone(),
-                    });
-                }
-            }
-            KeyCode::Char('o') => {
-                if let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() {
-                    if ticket.hidden_at.is_some() {
-                        // Restoring hides nothing and is undone with `o`: no confirmation.
-                        self.status = Some(match tickets::restore(&self.db, &ticket) {
-                            Ok(message) | Err(message) => message,
-                        });
-                    } else {
-                        self.dialog = Some(Dialog::ConfirmHide { ticket });
-                    }
-                }
-            }
-            KeyCode::Char('f') => self.show_hidden = !self.show_hidden,
-            KeyCode::Char('g') => {
-                return self.choose_stage(self.ticket_rows.get(self.ticket_index).cloned());
-            }
-            KeyCode::Enter | KeyCode::Right => self.open_ticket(),
-            KeyCode::Char('v') => self.open_active_agents(),
-            KeyCode::Esc | KeyCode::Left => {
-                self.screen = Screen::Projects;
-                self.project = None;
-                self.ticket_rows.clear();
-                self.show_hidden = false;
-                self.status = None;
-            }
-            _ if is_quit(key) => return self.quit(),
-            _ => {}
-        }
-        Action::None
-    }
-
     fn key_new_ticket(
         &mut self,
         key: KeyEvent,
+        project_id: i64,
         mut title: String,
         mut jira_id: String,
         mut focus: TicketField,
@@ -906,16 +1172,17 @@ impl App {
                 return Action::None;
             }
             KeyCode::Enter => {
-                let Some(project_id) = self.project.as_ref().map(|p| p.id) else {
-                    return Action::None;
-                };
+                // The project where `a` opened the dialog, not the selection now (a refresh by
+                // the end of an agent may have moved it). One gone from the database fails in
+                // `create`, which says why, with the dialog open.
                 match tickets::create(&self.db, project_id, &title, &jira_id) {
                     Ok(ticket) => {
                         self.status = Some(tickets::created_message(&ticket));
-                        // Select the new ticket: the refresh after the dialog closes reads the
-                        // list again and keeps the selection by id.
-                        self.ticket_rows.push(ticket);
-                        self.ticket_index = self.ticket_rows.len() - 1;
+                        // Select the new ticket, its branch open: the refresh after the dialog
+                        // closes reads it.
+                        self.tree.open(NodeId::Module(self.module()));
+                        self.tree.open(NodeId::Project(project_id));
+                        self.selected = NodeId::Ticket(ticket.id);
                         return Action::None;
                     }
                     Err(message) => self.status = Some(message),
@@ -936,6 +1203,7 @@ impl App {
             }
         }
         self.dialog = Some(Dialog::NewTicket {
+            project_id,
             title,
             jira_id,
             focus,
@@ -974,9 +1242,9 @@ impl App {
         Action::None
     }
 
-    /// `g` on a ticket (of the list, or of the ticket screen since the NS-36): the check of the
-    /// launcher (`Action::CheckAgent`), then the menu, only for a visible ticket of a project
-    /// available now (read from the disk at the key, like the Enter on a project).
+    /// `g` on the node of a ticket (NS-38; before, on the lists and the ticket screen): the check
+    /// of the launcher (`Action::CheckAgent`), then the menu, only for a visible ticket of a
+    /// project available now (read from the disk at the key, like the Enter on a project).
     fn choose_stage(&mut self, ticket: Option<Ticket>) -> Action {
         let Some(ticket) = ticket else {
             return Action::None;
@@ -988,7 +1256,7 @@ impl App {
             ));
             return Action::None;
         }
-        let Some(project) = self.project.as_ref() else {
+        let Some(project) = self.project_of(&ticket) else {
             return Action::None;
         };
         if let Some(mark) = projects::unavailable_text(projects::availability(&project.path)) {
@@ -1281,8 +1549,8 @@ impl App {
     /// D7 of NS-35): the check is not run again (the launch repeats the checks in bash). It
     /// generates the session ID and the name (the stage of the type and the ID of the ticket),
     /// takes the lock and stores the `active` row (agents.rs), and only then starts the PTY. A
-    /// failing start ends the row and releases the lock. The agent joins the running ones, is
-    /// shown and gets the focus; the list stays on the same ticket.
+    /// failing start ends the row and releases the lock. The agent joins the running ones, its
+    /// node is selected (its branches open), and it is shown with the focus on its terminal.
     pub fn open_agent(
         &mut self,
         project: &Path,
@@ -1293,7 +1561,7 @@ impl App {
         launcher: &mut dyn AgentLauncher,
     ) {
         let stage = kind.stage();
-        let project_name = self.project.as_ref().map_or("", |p| p.name.as_str());
+        let project_name = self.project_of(ticket).map_or("", |p| p.name.as_str());
         let name = agents::agent_name(project_name, stage, &ticket.key);
         let session_id = match self.db.random_session_id() {
             Ok(id) => id,
@@ -1330,16 +1598,20 @@ impl App {
             id,
             name,
             project,
+            ticket_id: ticket.id,
+            project_id: ticket.project_id,
             jail: check.jail,
             warning: check.warning,
             seen_text: String::new(),
             unseen: false,
         });
+        self.status = None;
+        // The node of the new agent is selected, its branches open (reading only: the stage
+        // does not change).
+        self.reveal_and_select(NodeId::Agent(id));
+        self.refresh_tree();
         self.show(id);
         self.focus = Focus::Terminal;
-        self.status = None;
-        // The ticket screen lists the new agent (reading only: the stage does not change).
-        self.refresh_ticket();
     }
 
     /// Takes the agent `id` out of the running ones. When it was the shown one, the agent
@@ -1352,17 +1624,15 @@ impl App {
             self.shown = None;
             self.focus = Focus::List;
             self.agent_term = AgentTerm::default();
-            if let Some(last) = self.agents.last().map(|agent| agent.id) {
-                self.show(last);
-            }
+        }
+        // The selection stays on its node, now an ended agent (decision 10 of NS-38); the
+        // shortcut goes to the live agent opened most recently.
+        if self.last_shown == Some(id) {
+            self.last_shown = self.agents.last().map(|agent| agent.id);
         }
         if self.agents.is_empty() {
             self.focus = Focus::List;
         }
-        self.agent_index = self
-            .shown
-            .and_then(|shown| self.agents.iter().position(|agent| agent.id == shown))
-            .unwrap_or(0);
         Some(agent)
     }
 
@@ -1387,7 +1657,7 @@ impl App {
             message = format!("{message} {err}");
         }
         self.status = Some(message);
-        self.refresh_tickets();
+        self.refresh_tree();
     }
 
     /// The operator ended the agent `id` (`Action::EndAgent`, its session already terminated
@@ -1401,7 +1671,7 @@ impl App {
             message = format!("{message} {err}");
         }
         self.status = Some(message);
-        self.refresh_tickets();
+        self.refresh_tree();
     }
 
     /// Ends the records of every running agent (the nick is leaving, its sessions already
@@ -1472,157 +1742,6 @@ impl App {
         }
     }
 
-    /// Reads the tickets of the open project again (with the hidden ones when the filter is
-    /// on), keeping the selected ticket selected when it is still listed.
-    fn refresh_tickets(&mut self) {
-        let Some(project_id) = self.project.as_ref().map(|p| p.id) else {
-            return;
-        };
-        let selected = self.ticket_rows.get(self.ticket_index).map(|t| t.id);
-        match self.db.list_tickets(project_id, self.show_hidden) {
-            Ok(list) => self.ticket_rows = list,
-            Err(err) => {
-                self.ticket_rows.clear();
-                self.status = Some(projects::db_error_message(&err));
-            }
-        }
-        if let Some(index) =
-            selected.and_then(|id| self.ticket_rows.iter().position(|t| t.id == id))
-        {
-            self.ticket_index = index;
-        }
-        self.ticket_index = self
-            .ticket_index
-            .min(self.ticket_rows.len().saturating_sub(1));
-        self.refresh_ticket();
-    }
-
-    /// `Enter`/`→` on the list of the tickets: the ticket screen of the selected ticket.
-    fn open_ticket(&mut self) {
-        let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() else {
-            return;
-        };
-        self.ticket_detail = Some(TicketDetail {
-            ticket,
-            changes: Vec::new(),
-            agents: Vec::new(),
-            artifacts: Artifacts::default(),
-        });
-        self.screen = Screen::Ticket;
-        self.ticket_agent_index = 0;
-        self.status = None;
-        self.refresh_ticket();
-    }
-
-    /// Reads the ticket of the ticket screen again (its row, history and agents from the
-    /// database, its artifacts from the disk). Only reads: nothing here writes the stage. A
-    /// ticket gone from the database goes back to the list, saying so.
-    fn refresh_ticket(&mut self) {
-        if self.screen != Screen::Ticket {
-            return;
-        }
-        let (Some(detail), Some(project)) = (self.ticket_detail.as_ref(), self.project.as_ref())
-        else {
-            return;
-        };
-        let id = detail.ticket.id;
-        let read = || -> rusqlite::Result<Option<TicketDetail>> {
-            let Some(ticket) = self.db.get_ticket(id)? else {
-                return Ok(None);
-            };
-            Ok(Some(TicketDetail {
-                changes: self.db.list_stage_changes(id)?,
-                agents: self.db.list_ticket_agents(id)?,
-                artifacts: docs::artifacts(&project.path, &ticket.key),
-                ticket,
-            }))
-        };
-        match read() {
-            Ok(Some(fresh)) => {
-                self.ticket_agent_index = self
-                    .ticket_agent_index
-                    .min(fresh.agents.len().saturating_sub(1));
-                self.ticket_detail = Some(fresh);
-            }
-            Ok(None) => {
-                let gone = tickets::gone_message(&detail.ticket);
-                self.ticket_detail = None;
-                self.screen = Screen::Tickets;
-                self.status = Some(gone);
-                self.refresh_tickets();
-            }
-            Err(err) => self.status = Some(projects::db_error_message(&err)),
-        }
-    }
-
-    fn key_ticket(&mut self, key: KeyEvent) -> Action {
-        let Some(detail) = self.ticket_detail.as_ref() else {
-            return Action::None;
-        };
-        let ticket = detail.ticket.clone();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.ticket_agent_index = self.ticket_agent_index.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.ticket_agent_index =
-                    (self.ticket_agent_index + 1).min(detail.agents.len().saturating_sub(1));
-            }
-            KeyCode::Enter | KeyCode::Right => {
-                // A live agent of this nick opens, whatever the stage of the ticket; the
-                // others only show (resuming them is the F5's).
-                if let Some(agent) = detail.agents.get(self.ticket_agent_index) {
-                    if self.agent(agent.id).is_some() {
-                        let id = agent.id;
-                        self.show(id);
-                        self.focus = Focus::Terminal;
-                        self.status = None;
-                    } else {
-                        self.status = Some(format!(
-                            "O agente {} não está rodando neste nick.",
-                            agent.name
-                        ));
-                    }
-                }
-            }
-            KeyCode::Char('m') => {
-                let index = TicketStage::ALL
-                    .iter()
-                    .position(|stage| stage.key() == ticket.stage)
-                    .unwrap_or(0);
-                self.status = None;
-                self.dialog = Some(Dialog::ChooseTicketStage { ticket, index });
-            }
-            KeyCode::Char('i') => {
-                let path = self.project.as_ref().map(|p| p.path.clone());
-                let mark =
-                    path.and_then(|path| projects::unavailable_text(projects::availability(&path)));
-                if let Some(mark) = mark {
-                    self.status = Some(format!(
-                        "Projeto indisponível: {mark}. O ID só é editado com a pasta e o \
-                         .nick/nick.conf no lugar."
-                    ));
-                } else {
-                    self.status = None;
-                    self.dialog = Some(Dialog::EditId {
-                        input: ticket.key.clone(),
-                        ticket,
-                    });
-                }
-            }
-            KeyCode::Char('g') => return self.choose_stage(Some(ticket)),
-            KeyCode::Char('v') => self.open_active_agents(),
-            KeyCode::Esc | KeyCode::Left => {
-                self.screen = Screen::Tickets;
-                self.ticket_detail = None;
-                self.status = None;
-            }
-            _ if is_quit(key) => return self.quit(),
-            _ => {}
-        }
-        Action::None
-    }
-
     fn key_choose_ticket_stage(
         &mut self,
         key: KeyEvent,
@@ -1666,8 +1785,7 @@ impl App {
             KeyCode::Enter => match tickets::check_new_id(&self.db, &ticket, &input) {
                 Ok(new) => {
                     let moves = self
-                        .project
-                        .as_ref()
+                        .project_of(&ticket)
                         .is_some_and(|p| docs::has_dir(&p.path, &ticket.key));
                     self.status = None;
                     self.dialog = Some(Dialog::ConfirmEditId { ticket, new, moves });
@@ -1687,7 +1805,7 @@ impl App {
     /// changed); any other key cancels, renaming nothing.
     fn key_confirm_edit_id(&mut self, key: KeyEvent, ticket: Ticket, new: String) -> Action {
         if is_yes(key)
-            && let Some(project) = self.project.as_ref()
+            && let Some(project) = self.project_of(&ticket)
         {
             self.status = Some(
                 match tickets::edit_id(&self.db, &project.path, &ticket, &new) {
@@ -1790,23 +1908,124 @@ impl App {
         Action::None
     }
 
+    /// `r` on a project: the confirmation with what goes with it (its tickets, its agent
+    /// records and its agents live in this nick), or the refusal when an agent of it is active
+    /// in another nick, which this one can't end (the safe side, as "Editar ID" of NS-36).
+    fn ask_removal(&mut self, project: Project) {
+        let counted = self
+            .db
+            .count_tickets(project.id)
+            .and_then(|tickets| Ok((tickets, self.db.list_project_agents(project.id)?)));
+        let (tickets, agents) = match counted {
+            Ok(counted) => counted,
+            Err(err) => {
+                self.status = Some(projects::db_error_message(&err));
+                return;
+            }
+        };
+        if let Some(refusal) = self.removal_refusal(&project, &agents) {
+            self.status = Some(refusal);
+            return;
+        }
+        let live = agents.iter().filter(|a| self.agent(a.id).is_some()).count();
+        self.dialog = Some(Dialog::ConfirmRemove {
+            project,
+            tickets,
+            agents: i64::try_from(agents.len()).unwrap_or(i64::MAX),
+            live: i64::try_from(live).unwrap_or(i64::MAX),
+        });
+    }
+
+    /// The refusal of removing `project` when one of its `agents` is active in another nick.
+    fn removal_refusal(&self, project: &Project, agents: &[Agent]) -> Option<String> {
+        agents
+            .iter()
+            .any(|a| a.state == agents::AgentState::Active.key() && self.agent(a.id).is_none())
+            .then(|| {
+                format!(
+                    "O projeto {} tem agente ativo em outro nick. Encerre os agentes dele lá antes \
+                     de remover o projeto.",
+                    project.name
+                )
+            })
+    }
+
     fn key_confirm_remove(&mut self, key: KeyEvent, project: Project) -> Action {
         // Only s/S confirm (the "sim" of the auto_scrum confirmations); any other key cancels.
-        if is_yes(key) {
-            self.status = Some(match projects::remove(&self.db, &project) {
-                Ok(message) | Err(message) => message,
-            });
+        if !is_yes(key) {
+            return Action::None;
         }
+        // Checked again: another nick may have opened an agent of it meanwhile.
+        match self.db.list_project_agents(project.id) {
+            Ok(agents) => {
+                if let Some(refusal) = self.removal_refusal(&project, &agents) {
+                    self.status = Some(refusal);
+                    return Action::None;
+                }
+            }
+            Err(err) => {
+                self.status = Some(projects::db_error_message(&err));
+                return Action::None;
+            }
+        }
+        let live: Vec<i64> = self
+            .agents
+            .iter()
+            .filter(|agent| agent.project_id == project.id)
+            .map(|agent| agent.id)
+            .collect();
+        if !live.is_empty() {
+            return Action::RemoveProject {
+                project,
+                agents: live,
+            };
+        }
+        self.status = Some(match projects::remove(&self.db, &project) {
+            Ok(message) | Err(message) => message,
+        });
         Action::None
+    }
+
+    /// `Action::RemoveProject` (the sessions of `ended` already terminated by the loop): their
+    /// records end and their locks go, as when the operator ends one (`x`), then the project is
+    /// removed (its tickets and agents leave the database with it, by the cascade).
+    pub fn remove_project_ending_agents(&mut self, project: &Project, ended: &[i64]) {
+        let mut names = Vec::new();
+        let mut error = None;
+        for id in ended {
+            if let Some(agent) = self.take_agent(*id) {
+                names.push(agent.name.clone());
+                if let Err(err) = agents::end(&self.db, agent.record) {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        let mut message = match projects::remove(&self.db, project) {
+            Ok(message) | Err(message) => message,
+        };
+        match names.as_slice() {
+            [] => {}
+            [name] => message = format!("{message} O agente {name} foi encerrado."),
+            _ => {
+                message = format!(
+                    "{message} Os {} agentes vivos dele foram encerrados.",
+                    names.len()
+                );
+            }
+        }
+        if let Some(err) = error {
+            message = format!("{message} {err}");
+        }
+        self.status = Some(message);
+        self.refresh_tree();
     }
 
     /// After a registration: the status message and the new project selected.
     fn registered(&mut self, project: &Project) {
         self.status = Some(projects::registered_message(project));
-        self.refresh();
-        if let Some(index) = self.rows.iter().position(|r| r.project.id == project.id) {
-            self.project_index = index;
-        }
+        self.tree.open(NodeId::Module(self.module()));
+        self.selected = NodeId::Project(project.id);
+        self.refresh_tree();
     }
 
     /// Reads the projects of the module again and computes their availability.
@@ -1826,7 +2045,6 @@ impl App {
                 self.status = Some(projects::db_error_message(&err));
             }
         }
-        self.project_index = self.project_index.min(self.rows.len().saturating_sub(1));
     }
 
     /// Back from the init (plan D6): checks the config again and registers the project only if
@@ -2002,11 +2220,11 @@ mod tests {
                 .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         }
 
-        /// Opens the Projects screen and types `path` in the add field, then Enter.
+        /// Selects the module on the tree and types `path` in the add field, then Enter.
         fn add(&mut self, path: &str) -> Action {
-            if self.app.screen == Screen::Modules {
-                self.key(KeyCode::Enter);
-            }
+            self.app
+                .select(crate::tree::NodeId::Module(ModuleKind::AutoScrum));
+            self.app.relayout();
             self.ch('a');
             self.type_text(path);
             self.key(KeyCode::Enter)
@@ -2043,53 +2261,6 @@ mod tests {
     }
 
     // ---- navigation and quitting ----
-
-    #[test]
-    fn it_starts_on_the_modules_screen_with_auto_scrum() {
-        let f = fixture();
-        assert_eq!(f.app.screen, Screen::Modules);
-        assert_eq!(f.app.module(), ModuleKind::AutoScrum);
-        assert_eq!(f.app.dialog, None);
-    }
-
-    #[test]
-    fn enter_and_right_open_the_projects_and_esc_and_left_go_back() {
-        let mut f = fixture();
-        for open in [KeyCode::Enter, KeyCode::Right] {
-            for back in [KeyCode::Esc, KeyCode::Left] {
-                assert_eq!(f.key(open), Action::None);
-                assert_eq!(f.app.screen, Screen::Projects);
-                assert_eq!(f.key(back), Action::None);
-                assert_eq!(f.app.screen, Screen::Modules);
-            }
-        }
-    }
-
-    #[test]
-    fn up_down_k_j_move_within_the_list() {
-        let mut f = fixture();
-        f.dir("a", true);
-        f.dir("b", true);
-        f.dir("c", true);
-        f.add(f.root.join("a").to_str().unwrap());
-        f.add(f.root.join("b").to_str().unwrap());
-        f.add(f.root.join("c").to_str().unwrap());
-        f.app.project_index = 0;
-        f.key(KeyCode::Down);
-        f.ch('j');
-        assert_eq!(f.app.project_index, 2);
-        f.key(KeyCode::Down);
-        assert_eq!(f.app.project_index, 2, "stops at the last");
-        f.key(KeyCode::Up);
-        f.ch('k');
-        f.ch('k');
-        assert_eq!(f.app.project_index, 0, "stops at the first");
-        // One module: moving on Modules stays on it.
-        f.key(KeyCode::Esc);
-        f.key(KeyCode::Down);
-        f.ch('j');
-        assert_eq!(f.app.module_index, 0);
-    }
 
     #[test]
     fn q_and_capital_q_quit_on_both_lists() {
@@ -2172,7 +2343,11 @@ mod tests {
         assert_eq!(f.app.dialog, None);
         assert_eq!(f.add("alfa"), Action::None, "relative to the cwd");
         assert_eq!(f.names(), ["alfa", "beta"]);
-        assert_eq!(f.app.project_index, 0, "the new one is selected");
+        assert_eq!(
+            f.app.selected,
+            crate::tree::NodeId::Project(f.pid("cwd/alfa")),
+            "the new one is selected"
+        );
         assert_eq!(f.stored(), [a, b]);
     }
 
@@ -2188,7 +2363,7 @@ mod tests {
         assert_eq!(f.app.dialog, Some(Dialog::AddPath { input: "ab".into() }));
         assert_eq!(f.key(KeyCode::Esc), Action::None);
         assert_eq!(f.app.dialog, None);
-        assert_eq!(f.app.screen, Screen::Projects);
+        assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(f.stored(), Vec::<PathBuf>::new());
         assert_eq!(f.status(), None, "the refusal goes away with the field");
     }
@@ -2518,10 +2693,11 @@ mod tests {
         let b = f.dir("b", true);
         f.add(a.to_str().unwrap());
         f.add(b.to_str().unwrap());
-        assert_eq!(f.app.project_index, 1);
+        let node = |f: &Fixture, rel| crate::tree::NodeId::Project(f.pid(rel));
+        assert_eq!(f.app.selected, node(&f, "b"));
         f.ch('r');
         f.ch('s');
-        assert_eq!(f.app.project_index, 0);
+        assert_eq!(f.app.selected, node(&f, "a"));
         assert_eq!(f.names(), ["a"]);
     }
 
@@ -2566,28 +2742,90 @@ mod tests {
 
     // ---- tickets (NS-32) ----
 
-    /// Registers `rel` (with config) and opens its tickets.
+    /// Registers `rel` (with config) and opens its node on the tree (selected).
     fn with_tickets(rel: &str) -> (Fixture, PathBuf) {
         let mut f = fixture();
         let p = f.dir(rel, true);
         f.add(p.to_str().unwrap());
         assert_eq!(f.key(KeyCode::Enter), Action::None);
-        assert_eq!(f.app.screen, Screen::Tickets, "{:?}", f.status());
+        let id = f.app.selected_project().expect("the project selected").id;
+        assert!(
+            f.app.tree.is_open(crate::tree::NodeId::Project(id)),
+            "{:?}",
+            f.status()
+        );
         (f, p)
     }
 
     impl Fixture {
+        /// The tickets of the project of the selected node on the tree, in order.
+        fn visible_tickets(&self) -> Vec<&crate::tickets::Ticket> {
+            let project = self.app.selected_project().map(|p| p.id);
+            self.app
+                .visible()
+                .iter()
+                .filter_map(|row| match row.id {
+                    crate::tree::NodeId::Ticket(id) => self.app.ticket(id),
+                    _ => None,
+                })
+                .filter(|t| Some(t.project_id) == project)
+                .collect()
+        }
+
+        /// The keys of the tickets of the project of the selected node, as the tree lists them.
         fn keys(&self) -> Vec<String> {
-            self.app.ticket_rows.iter().map(|t| t.key.clone()).collect()
+            self.visible_tickets()
+                .iter()
+                .map(|t| t.key.clone())
+                .collect()
+        }
+
+        /// The key of the selected ticket.
+        fn selected_key(&self) -> Option<String> {
+            match self.app.selected {
+                crate::tree::NodeId::Ticket(id) => self.app.ticket(id).map(|t| t.key.clone()),
+                _ => None,
+            }
+        }
+
+        /// Selects the project of the selected node (where `a` creates a ticket).
+        fn on_project(&mut self) {
+            if let Some(id) = self.app.selected_project().map(|p| p.id) {
+                self.app.select(crate::tree::NodeId::Project(id));
+            }
+        }
+
+        /// From an agent node, selects its ticket (where `g`, `m`, `i` act).
+        fn on_ticket(&mut self) {
+            if let crate::tree::NodeId::Agent(id) = self.app.selected {
+                let ticket = match self.app.agent(id) {
+                    Some(agent) => agent.ticket_id,
+                    None => self.app.agent_record(id).expect("read").ticket_id,
+                };
+                self.app.select(crate::tree::NodeId::Ticket(ticket));
+            }
+        }
+
+        /// Selects the ticket `key` of the project of the selected node.
+        fn select_key(&mut self, key: &str) {
+            let id = self
+                .visible_tickets()
+                .iter()
+                .find(|t| t.key == key)
+                .unwrap_or_else(|| panic!("{key} not listed"))
+                .id;
+            self.app.select(crate::tree::NodeId::Ticket(id));
         }
 
         fn all_tickets(&self) -> Vec<crate::tickets::Ticket> {
-            let id = self.app.project.as_ref().expect("a project is open").id;
+            let id = self.app.selected_project().expect("a project selected").id;
             self.app.db.list_tickets(id, true).unwrap()
         }
 
-        /// Creates a ticket through the dialog: `a`, the title, Tab, the ID, Enter.
+        /// Creates a ticket through the dialog, on the node of the project of the selected
+        /// node: `a`, the title, Tab, the ID, Enter.
         fn new_ticket(&mut self, title: &str, jira: &str) -> Action {
+            self.on_project();
             self.ch('a');
             self.type_text(title);
             self.key(KeyCode::Tab);
@@ -2604,40 +2842,12 @@ mod tests {
             f.add(p.to_str().unwrap());
             f.app.status = Some("x".into());
             assert_eq!(f.key(open), Action::None);
-            assert_eq!(f.app.screen, Screen::Tickets);
-            assert_eq!(f.app.project.as_ref().unwrap().path, p);
-            assert_eq!(f.app.ticket_rows, []);
-            assert!(!f.app.show_hidden);
+            let id = f.pid("proj");
+            assert!(f.app.tree.is_open(crate::tree::NodeId::Project(id)));
+            assert_eq!(f.app.selected_project().unwrap().path, p);
+            assert_eq!(f.keys(), Vec::<String>::new());
+            assert!(!f.app.tree.show_hidden);
             assert_eq!(f.status(), None);
-        }
-    }
-
-    #[test]
-    fn an_unavailable_project_does_not_open_and_says_why() {
-        for dir_missing in [true, false] {
-            let (mut f, p) = with_one_project();
-            let mark = if dir_missing {
-                fs::remove_dir_all(&p).unwrap();
-                "[indisponível: pasta não encontrada]"
-            } else {
-                fs::remove_file(projects::config_file(&p)).unwrap();
-                "[indisponível: sem .nick/nick.conf]"
-            };
-            for open in [KeyCode::Enter, KeyCode::Right] {
-                assert_eq!(f.key(open), Action::None);
-                assert_eq!(f.app.screen, Screen::Projects, "{mark}");
-                assert_eq!(f.app.project, None);
-                assert_eq!(
-                    f.status(),
-                    Some(
-                        format!(
-                            "Projeto indisponível: {mark}. Os tickets só abrem com a pasta \
-                             e o .nick/nick.conf no lugar."
-                        )
-                        .as_str()
-                    )
-                );
-            }
         }
     }
 
@@ -2646,7 +2856,8 @@ mod tests {
         let mut f = fixture();
         f.key(KeyCode::Enter);
         assert_eq!(f.key(KeyCode::Enter), Action::None);
-        assert_eq!(f.app.screen, Screen::Projects);
+        assert_eq!(f.app.screen, Screen::Tree);
+        assert_eq!(f.rows(), [MODULE], "a module without projects is a leaf");
     }
 
     #[test]
@@ -2657,15 +2868,16 @@ mod tests {
             let b = f.dir("b", true);
             f.add(a.to_str().unwrap());
             f.add(b.to_str().unwrap());
-            assert_eq!(f.app.project_index, 1);
+            let node = crate::tree::NodeId::Project(f.pid("b"));
+            assert_eq!(f.app.selected, node);
             f.key(KeyCode::Enter);
             f.ch('f');
-            assert!(f.app.show_hidden);
+            assert!(f.app.tree.show_hidden);
             assert_eq!(f.key(back), Action::None);
-            assert_eq!(f.app.screen, Screen::Projects);
-            assert_eq!(f.app.project_index, 1, "b is still selected");
-            assert!(!f.app.show_hidden, "the filter is off again");
-            assert_eq!(f.app.project, None);
+            assert_eq!(f.app.selected, node, "b is still selected");
+            assert!(!f.app.tree.is_open(node), "and closed");
+            // Decision 8 of NS-38: the filters are global, they stay on.
+            assert!(f.app.tree.show_hidden, "the filter stays on");
         }
     }
 
@@ -2676,6 +2888,7 @@ mod tests {
         assert_eq!(
             f.app.dialog,
             Some(Dialog::NewTicket {
+                project_id: f.pid("proj"),
                 title: String::new(),
                 jira_id: String::new(),
                 focus: TicketField::Title,
@@ -2700,6 +2913,7 @@ mod tests {
         assert_eq!(
             f.app.dialog,
             Some(Dialog::NewTicket {
+                project_id: f.pid("proj"),
                 title: "Tqx".into(),
                 jira_id: "NS-".into(),
                 focus: TicketField::Title,
@@ -2714,13 +2928,18 @@ mod tests {
         assert_eq!(f.app.dialog, None);
         assert_eq!(f.status(), Some("Ticket criado: NS-1 — Primeiro."));
         // Enter on the title field also confirms.
+        f.on_project();
         f.ch('a');
         f.type_text("Segundo");
         f.key(KeyCode::Enter);
         assert_eq!(f.app.dialog, None);
         assert_eq!(f.keys().len(), 2);
-        assert_eq!(f.app.ticket_index, 1, "the new one is selected");
-        let second = &f.app.ticket_rows[1];
+        let second = f.visible_tickets()[1].clone();
+        assert_eq!(
+            f.selected_key().as_deref(),
+            Some(second.key.as_str()),
+            "the new one is selected"
+        );
         assert!(second.is_provisional);
         assert_eq!(
             f.status(),
@@ -2762,6 +2981,7 @@ mod tests {
             assert_eq!(
                 f.app.dialog,
                 Some(Dialog::NewTicket {
+                    project_id: f.pid("proj"),
                     title: title.into(),
                     jira_id: jira.into(),
                     focus: TicketField::JiraId,
@@ -2776,7 +2996,7 @@ mod tests {
     fn e_edits_the_title_prefilled_and_validates_it() {
         let (mut f, _) = with_tickets("proj");
         f.new_ticket("Velho", "NS-1");
-        let ticket = f.app.ticket_rows[0].clone();
+        let ticket = f.visible_tickets()[0].clone();
         assert_eq!(f.ch('e'), Action::None);
         assert_eq!(
             f.app.dialog,
@@ -2802,13 +3022,13 @@ mod tests {
         f.key(KeyCode::Enter);
         assert_eq!(f.app.dialog, None);
         assert_eq!(f.status(), Some("Título atualizado: NS-1."));
-        assert_eq!(f.app.ticket_rows[0].title, "Novo q");
-        assert_eq!(f.app.ticket_rows[0].key, "NS-1");
+        assert_eq!(f.visible_tickets()[0].title, "Novo q");
+        assert_eq!(f.visible_tickets()[0].key, "NS-1");
         // Esc cancels without saving.
         f.ch('e');
         f.type_text("zzz");
         f.key(KeyCode::Esc);
-        assert_eq!(f.app.ticket_rows[0].title, "Novo q");
+        assert_eq!(f.visible_tickets()[0].title, "Novo q");
     }
 
     #[test]
@@ -2832,7 +3052,7 @@ mod tests {
         ] {
             let (mut f, _) = with_tickets("proj");
             f.new_ticket("t", "NS-1");
-            let ticket = f.app.ticket_rows[0].clone();
+            let ticket = f.visible_tickets()[0].clone();
             assert_eq!(f.ch('o'), Action::None);
             assert_eq!(f.app.dialog, Some(Dialog::ConfirmHide { ticket }));
             assert_eq!(f.key(key), Action::None, "{key:?}");
@@ -2856,20 +3076,20 @@ mod tests {
         let (mut f, _) = with_tickets("proj");
         f.new_ticket("a", "NS-1");
         f.new_ticket("b", "NS-2");
-        f.app.ticket_index = 0;
+        f.select_key("NS-1");
         f.ch('o');
         f.ch('s');
         assert_eq!(f.keys(), ["NS-2"]);
         assert_eq!(f.ch('f'), Action::None);
-        assert!(f.app.show_hidden);
+        assert!(f.app.tree.show_hidden);
         assert_eq!(f.keys(), ["NS-1", "NS-2"]);
-        f.app.ticket_index = 0;
+        f.select_key("NS-1");
         assert_eq!(f.ch('o'), Action::None);
         assert_eq!(f.app.dialog, None, "no confirmation to restore");
         assert_eq!(f.status(), Some("Ticket restaurado: NS-1."));
         assert!(f.all_tickets().iter().all(|t| t.hidden_at.is_none()));
         assert_eq!(f.ch('f'), Action::None);
-        assert!(!f.app.show_hidden);
+        assert!(!f.app.tree.show_hidden);
         assert_eq!(f.keys(), ["NS-1", "NS-2"]);
     }
 
@@ -2878,14 +3098,18 @@ mod tests {
         let (mut f, _) = with_tickets("proj");
         f.new_ticket("a", "A");
         f.new_ticket("b", "B");
-        assert_eq!(f.app.ticket_index, 1);
+        let key = |f: &Fixture| f.selected_key();
+        assert_eq!(key(&f).as_deref(), Some("B"));
         f.key(KeyCode::Down);
-        assert_eq!(f.app.ticket_index, 1, "stops at the last");
+        assert_eq!(key(&f).as_deref(), Some("B"), "stops at the last row");
         f.key(KeyCode::Up);
+        assert_eq!(key(&f).as_deref(), Some("A"));
+        // On the tree, up from the first ticket is its project (NS-38).
         f.ch('k');
-        assert_eq!(f.app.ticket_index, 0, "stops at the first");
+        assert_eq!(f.app.selected, crate::tree::NodeId::Project(f.pid("proj")));
         f.ch('j');
-        assert_eq!(f.app.ticket_index, 1);
+        f.ch('j');
+        assert_eq!(key(&f).as_deref(), Some("B"));
     }
 
     #[test]
@@ -2895,7 +3119,7 @@ mod tests {
         f.new_ticket("b", "B");
         f.ch('o');
         f.ch('s');
-        assert_eq!(f.app.ticket_index, 0);
+        assert_eq!(f.selected_key().as_deref(), Some("A"));
         assert_eq!(f.keys(), ["A"]);
     }
 
@@ -2913,6 +3137,7 @@ mod tests {
         assert_eq!(
             f.app.dialog,
             Some(Dialog::NewTicket {
+                project_id: f.pid("proj"),
                 title: "q".into(),
                 jira_id: "Q".into(),
                 focus: TicketField::JiraId,
@@ -2950,13 +3175,12 @@ mod tests {
         let b = f.dir("b", true);
         f.add(a.to_str().unwrap());
         f.add(b.to_str().unwrap());
-        f.app.project_index = 0;
+        f.app.select(crate::tree::NodeId::Project(f.pid("a")));
         f.key(KeyCode::Enter);
         f.new_ticket("de a", "NS-1");
-        f.key(KeyCode::Esc);
-        f.key(KeyCode::Down);
+        f.app.select(crate::tree::NodeId::Project(f.pid("b")));
         f.key(KeyCode::Enter);
-        assert_eq!(f.app.project.as_ref().unwrap().path, b);
+        assert_eq!(f.app.selected_project().unwrap().path, b);
         assert_eq!(f.keys(), Vec::<String>::new());
         f.new_ticket("de b", "NS-1");
         assert_eq!(
@@ -2964,7 +3188,7 @@ mod tests {
             Some("Ticket criado: NS-1 — de b."),
             "same ID is fine"
         );
-        assert_eq!(f.app.ticket_rows[0].title, "de b");
+        assert_eq!(f.visible_tickets()[0].title, "de b");
     }
 
     #[test]
@@ -2974,8 +3198,8 @@ mod tests {
         f.new_ticket("b", "NS-2");
         f.ch('o');
         f.ch('s');
-        let id = f.app.project.as_ref().unwrap().id;
-        f.key(KeyCode::Esc);
+        let id = f.app.selected_project().unwrap().id;
+        f.app.select(crate::tree::NodeId::Project(id));
         f.ch('r');
         match &f.app.dialog {
             Some(Dialog::ConfirmRemove { tickets, .. }) => assert_eq!(*tickets, 2),
@@ -3168,7 +3392,9 @@ mod tests {
         }
 
         /// `g` and the check it asks for (`Action::CheckAgent`), carried out with `launcher`.
+        /// On the tree, from an agent node: `g` on its ticket.
         fn g(&mut self, launcher: &mut FakeLauncher) {
+            self.on_ticket();
             match self.ch('g') {
                 Action::CheckAgent { project, ticket } => {
                     self.app.check_agent(&project, &ticket, launcher);
@@ -3287,7 +3513,7 @@ mod tests {
     #[test]
     fn g_runs_the_check_before_the_menu() {
         let (mut f, p) = with_agents();
-        let ticket = f.app.ticket_rows[0].clone();
+        let ticket = f.visible_tickets()[0].clone();
         assert_eq!(
             f.ch('g'),
             Action::CheckAgent {
@@ -3347,7 +3573,7 @@ mod tests {
         assert_eq!(f.menu().1, 0, "q stays in the menu");
         assert_eq!(f.key(KeyCode::Esc), Action::None);
         assert_eq!(f.app.dialog, None);
-        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.app.screen, Screen::Tree);
         f.g(&mut FakeLauncher::new(false));
         assert_eq!(f.ctrl_c(), Action::Quit, "Ctrl+C quits, as in every dialog");
         assert_eq!(f.agent_rows(), []);
@@ -3763,8 +3989,8 @@ mod tests {
         f.ch('o');
         f.ch('s');
         f.ch('f');
-        assert_eq!(f.app.ticket_rows[0].key, "NS-1");
-        assert!(f.app.ticket_rows[0].hidden_at.is_some());
+        assert_eq!(f.visible_tickets()[0].key, "NS-1");
+        assert!(f.visible_tickets()[0].hidden_at.is_some());
         f.key(KeyCode::Up);
         assert_eq!(f.ch('g'), Action::None);
         assert_eq!(f.app.dialog, None);
@@ -3820,11 +4046,13 @@ mod tests {
                 "active".to_string()
             )]
         );
-        // The agent is shown with the focus on its terminal, and the list stays on the ticket.
+        // The agent is shown with the focus on its terminal, its node selected on the tree
+        // (NS-38; before, the list stayed on the ticket).
         assert_eq!(f.app.focus, Focus::Terminal);
-        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(f.app.dialog, None);
         let agent = f.app.shown_agent().expect("the running agent");
+        assert_eq!(f.app.selected, crate::tree::NodeId::Agent(agent.id));
         assert_eq!(agent.name, name);
         assert!(!agent.jail);
         assert_eq!(
@@ -3851,7 +4079,7 @@ mod tests {
         assert_eq!(launcher.renders, []);
         assert_eq!(launcher.spawns, []);
         assert_eq!(f.agent_rows(), []);
-        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.app.screen, Screen::Tree);
         // q does not quit the alert; Esc and Enter close it.
         assert_eq!(f.ch('q'), Action::None);
         assert!(matches!(f.app.dialog, Some(Dialog::AgentError { .. })));
@@ -3887,7 +4115,12 @@ mod tests {
         launcher.spawn = Err("sem PTY".into());
         f.open_agent(1, &mut launcher);
         assert_eq!(f.status(), Some("Não consegui abrir o agente: sem PTY."));
-        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.app.screen, Screen::Tree);
+        assert_eq!(
+            f.selected_key().as_deref(),
+            Some("NS-1"),
+            "still on the ticket"
+        );
         assert!(f.app.agents.is_empty());
         assert_eq!(f.app.shown, None);
         assert_eq!(f.app.focus, Focus::List);
@@ -4000,8 +4233,11 @@ mod tests {
             let (mut f, launcher) = running();
             let session_id = launcher.spawns[0].2.clone();
             f.app.agent_ended(launcher.ids[0], code);
-            assert_eq!(f.app.screen, Screen::Tickets);
-            assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-2");
+            // Decision 10 of NS-38: the selection stays on the node of the agent, now ended.
+            assert_eq!(f.app.screen, Screen::Tree);
+            assert_eq!(f.app.selected, crate::tree::NodeId::Agent(launcher.ids[0]));
+            f.on_ticket();
+            assert_eq!(f.selected_key().as_deref(), Some("NS-2"));
             assert_eq!(f.status(), Some(message));
             assert!(f.app.agents.is_empty());
             assert_eq!(f.app.focus, Focus::List);
@@ -4065,12 +4301,9 @@ mod tests {
         f.open_agent(0, &mut launcher);
         assert_eq!(f.shortcut(), Action::None);
         assert_eq!(f.app.focus, Focus::List);
-        f.key(KeyCode::Esc);
-        assert_eq!(f.app.screen, Screen::Projects);
         let beta = f.dir("beta", true);
         f.add(beta.to_str().unwrap());
         f.key(KeyCode::Enter);
-        assert_eq!(f.app.screen, Screen::Tickets);
         f.new_ticket("Beta", "B-1");
         launcher.check = Ok(Precheck {
             jail: false,
@@ -4089,12 +4322,13 @@ mod tests {
         assert_eq!(f.app.agents.len(), 2);
         assert_eq!(f.app.shown, Some(launcher.ids[1]));
         assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(
-            f.app.screen,
-            Screen::Tickets,
-            "the list stays on the tickets"
+            f.app.selected,
+            crate::tree::NodeId::Agent(launcher.ids[1]),
+            "the node of the last one is selected (NS-38)"
         );
-        assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "B-1");
+        assert_eq!(f.app.agents[1].ticket_id, f.tnode_id("B-1"));
         assert_eq!(launcher.spawns[0].1, f.root.join("proj"));
         assert_eq!(launcher.spawns[1].1, f.root.join("beta"));
         let rows = f.agent_rows();
@@ -4158,9 +4392,13 @@ mod tests {
     fn with_the_focus_on_the_list_the_keys_are_the_list_s() {
         let (mut f, _) = running();
         f.shortcut();
-        assert_eq!(f.app.ticket_index, 1);
         assert_eq!(f.key(KeyCode::Up), Action::None);
-        assert_eq!(f.app.ticket_index, 0, "the arrows move the tickets");
+        assert_eq!(
+            f.selected_key().as_deref(),
+            Some("NS-2"),
+            "the arrows move on the tree"
+        );
+        f.on_project();
         assert_eq!(f.ch('a'), Action::None);
         assert!(matches!(f.app.dialog, Some(Dialog::NewTicket { .. })));
         f.key(KeyCode::Esc);
@@ -4176,7 +4414,7 @@ mod tests {
             f.app.handle_mouse(&wheel, Rect::new(40, 1, 60, 20)),
             Action::None
         );
-        // The shortcut takes the focus back to the terminal of the shown agent.
+        // The shortcut takes the focus back to the terminal of the last shown agent.
         assert_eq!(f.shortcut(), Action::None);
         assert_eq!(f.app.focus, Focus::Terminal);
         assert_eq!(f.app.handle_paste("x"), Action::Send(b"x".to_vec()));
@@ -4187,7 +4425,7 @@ mod tests {
         let (mut f, _) = with_agents();
         assert_eq!(f.shortcut(), Action::None);
         assert_eq!(f.app.focus, Focus::List);
-        assert_eq!(f.app.screen, Screen::Tickets);
+        assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(f.ch('q'), Action::Quit, "q still quits the list");
     }
 
@@ -4238,29 +4476,6 @@ mod tests {
     }
 
     #[test]
-    fn the_end_of_the_shown_agent_shows_the_most_recent_one_on_the_list() {
-        let (mut f, launcher) = two_running();
-        let (first, second) = (launcher.ids[0], launcher.ids[1]);
-        f.app.agent_ended(second, 0);
-        assert_eq!(f.status(), Some("O agente beta · Dev · B-1 terminou."));
-        assert_eq!(f.app.shown, Some(first));
-        assert_eq!(f.app.focus, Focus::List);
-        assert_eq!(f.app.screen, Screen::Tickets);
-        assert_eq!(f.agent_rows()[1].3, "ended");
-        assert!(!agents::lock_path(&f.agents_dir(), &launcher.spawns[1].2).exists());
-        assert_eq!(f.agent_rows()[0].3, "active");
-        // The last one: nothing shown.
-        f.app.agent_ended(first, 0);
-        assert_eq!(f.app.shown, None);
-        assert_eq!(f.app.focus, Focus::List);
-        assert!(f.app.agents.is_empty());
-        // An end that is not of a running agent changes nothing.
-        f.app.status = None;
-        f.app.agent_ended(first, 0);
-        assert_eq!(f.status(), None);
-    }
-
-    #[test]
     fn the_end_of_a_hidden_agent_keeps_the_focus_and_the_shown_one() {
         let (mut f, launcher) = two_running();
         let (first, second) = (launcher.ids[0], launcher.ids[1]);
@@ -4297,10 +4512,10 @@ mod tests {
         assert!(!f.app.wants_hidden_text(second));
         assert!(!f.app.hidden_output(second, "qualquer coisa"));
         assert!(!f.app.agents[1].unseen);
-        // Being shown clears it.
+        // Being shown clears it (selected on the tree, NS-38).
         f.shortcut();
         f.ch('v');
-        f.key(KeyCode::Up);
+        f.select(crate::tree::NodeId::Agent(first));
         assert_eq!(f.app.shown, Some(first));
         assert!(!f.app.agents[0].unseen);
     }
@@ -4308,76 +4523,18 @@ mod tests {
     // ---- "Agentes ativos", ending and quitting (NS-34) ----
 
     #[test]
-    fn v_opens_the_active_agents_from_every_list_and_esc_goes_back() {
-        let (mut f, _) = two_running();
-        f.shortcut();
-        for back in [KeyCode::Esc, KeyCode::Left] {
-            // From the tickets, with the same ticket selected.
-            assert_eq!(f.app.screen, Screen::Tickets);
-            let ticket = f.app.ticket_index;
-            assert_eq!(f.ch('v'), Action::None);
-            assert_eq!(f.app.screen, Screen::ActiveAgents);
-            assert_eq!(f.key(back), Action::None);
-            assert_eq!(f.app.screen, Screen::Tickets);
-            assert_eq!(f.app.ticket_index, ticket);
-        }
-        f.key(KeyCode::Esc);
-        assert_eq!(f.app.screen, Screen::Projects);
-        let project = f.app.project_index;
-        f.ch('v');
-        assert_eq!(f.app.screen, Screen::ActiveAgents);
-        f.key(KeyCode::Esc);
-        assert_eq!(
-            (f.app.screen, f.app.project_index),
-            (Screen::Projects, project)
-        );
-        f.key(KeyCode::Esc);
-        f.ch('v');
-        assert_eq!(f.app.screen, Screen::ActiveAgents);
-        f.key(KeyCode::Left);
-        assert_eq!(f.app.screen, Screen::Modules);
-    }
-
-    #[test]
     fn v_works_without_agents_and_is_typed_in_a_text_field() {
         let mut f = fixture();
         assert_eq!(f.ch('v'), Action::None);
-        assert_eq!(f.app.screen, Screen::ActiveAgents);
+        assert!(f.app.tree.only_active, "the filter of the tree (NS-38)");
+        assert_eq!(f.rows(), [MODULE]);
         assert!(f.app.agents.is_empty());
-        f.key(KeyCode::Esc);
-        f.key(KeyCode::Enter);
+        f.ch('v');
+        assert!(!f.app.tree.only_active);
         f.ch('a');
         f.ch('v');
         assert_eq!(f.app.dialog, Some(Dialog::AddPath { input: "v".into() }));
-        assert_eq!(f.app.screen, Screen::Projects);
-    }
-
-    #[test]
-    fn moving_on_the_view_shows_the_selected_agent_and_enter_focuses_it() {
-        let (mut f, launcher) = two_running();
-        let (first, second) = (launcher.ids[0], launcher.ids[1]);
-        f.shortcut();
-        f.ch('v');
-        assert_eq!(f.app.agent_index, 1, "it starts on the shown one");
-        f.key(KeyCode::Up);
-        assert_eq!(f.app.shown, Some(first));
-        assert_eq!(f.app.focus, Focus::List);
-        f.ch('k');
-        assert_eq!(f.app.shown, Some(first), "stops at the first");
-        f.ch('j');
-        assert_eq!(f.app.shown, Some(second));
-        f.key(KeyCode::Down);
-        assert_eq!(f.app.shown, Some(second), "stops at the last");
-        f.key(KeyCode::Up);
-        assert_eq!(f.key(KeyCode::Enter), Action::None);
-        assert_eq!((f.app.shown, f.app.focus), (Some(first), Focus::Terminal));
-        f.shortcut();
-        f.key(KeyCode::Esc);
-        f.ch('v');
-        assert_eq!(f.app.agent_index, 0, "the shown one again");
-        f.key(KeyCode::Down);
-        assert_eq!(f.key(KeyCode::Right), Action::None);
-        assert_eq!((f.app.shown, f.app.focus), (Some(second), Focus::Terminal));
+        assert!(!f.app.tree.only_active);
     }
 
     #[test]
@@ -4394,7 +4551,7 @@ mod tests {
             let first = launcher.ids[0];
             f.shortcut();
             f.ch('v');
-            f.key(KeyCode::Up);
+            f.select(crate::tree::NodeId::Agent(first));
             assert_eq!(f.ch('x'), Action::None);
             assert_eq!(
                 f.app.dialog,
@@ -4419,12 +4576,13 @@ mod tests {
         let (mut f, launcher) = two_running();
         let (first, second) = (launcher.ids[0], launcher.ids[1]);
         f.shortcut();
-        f.ch('v');
         f.app.agent_ended_by_operator(second);
         assert_eq!(f.status(), Some("O agente beta · Dev · B-1 foi encerrado."));
         assert_eq!(f.names_running(), ["proj · PO · NS-1"]);
-        assert_eq!(f.app.shown, Some(first));
-        assert_eq!(f.app.agent_index, 0);
+        // Decision 10 of NS-38: the selection stays on the node; the shortcut goes to the other.
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.app.selected, crate::tree::NodeId::Agent(second));
+        assert_eq!(f.app.last_shown, Some(first));
         assert_eq!(f.app.focus, Focus::List);
         let rows = f.agent_rows();
         assert_eq!(
@@ -4462,7 +4620,7 @@ mod tests {
             assert_eq!(f.app.agents.len(), 2);
             assert!(f.agent_rows().iter().all(|r| r.3 == "active"));
         }
-        // From the view too.
+        // With the filter of the active agents too.
         let (mut f, _) = two_running();
         f.shortcut();
         f.ch('v');
@@ -4520,13 +4678,14 @@ mod tests {
         assert_eq!(f.ch('c'), Action::None);
         assert_eq!(f.app.screen, Screen::Settings);
         assert_eq!(f.key(KeyCode::Esc), Action::None);
-        assert_eq!(f.app.screen, Screen::Modules);
+        assert_eq!(f.app.screen, Screen::Tree, "back to the tree (NS-38)");
+        assert_eq!(f.app.selected, MODULE);
         f.ch('c');
         f.key(KeyCode::Left);
-        assert_eq!(f.app.screen, Screen::Modules);
-        f.key(KeyCode::Enter);
+        assert_eq!(f.app.screen, Screen::Tree);
+        let (mut f, _) = with_one_project();
         f.ch('c');
-        assert_eq!(f.app.screen, Screen::Projects, "not on the projects");
+        assert_eq!(f.app.screen, Screen::Tree, "not on a project");
         let mut f = fixture();
         f.ch('c');
         assert_eq!(f.ch('q'), Action::Quit, "q quits the settings");
@@ -4622,9 +4781,7 @@ mod tests {
     fn the_current_shortcut_can_be_chosen_again_in_the_capture() {
         let (mut f, _) = running();
         f.shortcut();
-        f.key(KeyCode::Esc);
-        f.key(KeyCode::Esc);
-        assert_eq!(f.app.screen, Screen::Modules);
+        f.select(MODULE);
         f.ch('c');
         f.ch('t');
         // The shortcut is captured, not taken as the toggle.
@@ -4639,8 +4796,7 @@ mod tests {
     fn a_saved_shortcut_works_right_away_and_p_goes_back_to_the_default() {
         let (mut f, _) = running();
         f.shortcut();
-        f.key(KeyCode::Esc);
-        f.key(KeyCode::Esc);
+        f.select(MODULE);
         f.ch('c');
         f.ch('t');
         f.mods(KeyCode::F(7), KeyModifiers::NONE);
@@ -4784,40 +4940,25 @@ mod tests {
         }
     }
 
+    /// Replaces `enter_and_right_open_the_ticket_and_esc_and_left_go_back_with_the_same_selection`
+    /// (NS-38: no ticket screen; the selected ticket shows on the right).
     #[test]
-    fn enter_and_right_open_the_ticket_and_esc_and_left_go_back_with_the_same_selection() {
-        for open in [KeyCode::Enter, KeyCode::Right] {
-            for back in [KeyCode::Esc, KeyCode::Left] {
-                let (mut f, _) = with_agents();
-                f.key(KeyCode::Down);
-                f.app.status = Some("x".into());
-                assert_eq!(f.key(open), Action::None);
-                assert_eq!(f.app.screen, Screen::Ticket);
-                assert_eq!(f.detail().ticket.key, "NS-2");
-                assert_eq!(f.status(), None);
-                assert_eq!(f.key(back), Action::None);
-                assert_eq!(f.app.screen, Screen::Tickets);
-                assert_eq!(f.app.ticket_detail, None);
-                assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-2");
-            }
-        }
-        // A hidden one, with the filter on, opens too.
+    fn selecting_a_ticket_reads_its_detail_and_another_node_drops_it() {
         let (mut f, _) = with_agents();
+        assert_eq!(f.detail().ticket.key, "NS-1");
+        f.key(KeyCode::Down);
+        assert_eq!(f.detail().ticket.key, "NS-2");
+        f.key(KeyCode::Left);
+        assert_eq!(f.app.ticket_detail, None, "the project selected");
+        // A hidden one, with the filter on, too.
+        f.select_key("NS-1");
         f.ch('o');
         f.ch('s');
         f.ch('f');
-        f.key(KeyCode::Up);
-        assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-1");
-        f.key(KeyCode::Enter);
+        f.select_key("NS-1");
+        f.key(KeyCode::Char('z'));
         assert_eq!(f.detail().ticket.key, "NS-1");
         assert!(f.detail().ticket.hidden_at.is_some());
-        f.key(KeyCode::Esc);
-        assert_eq!(f.app.ticket_rows[f.app.ticket_index].key, "NS-1");
-        assert!(f.app.show_hidden, "the filter stays");
-        // An empty list opens nothing.
-        let (mut f, _) = with_tickets("vazio");
-        f.key(KeyCode::Enter);
-        assert_eq!(f.app.screen, Screen::Tickets);
     }
 
     #[test]
@@ -4829,13 +4970,15 @@ mod tests {
         f.open_agent(2, &mut launcher);
         f.shortcut();
         f.app.agent_ended(launcher.ids[1], 0);
-        f.key(KeyCode::Enter);
+        f.on_ticket();
+        f.key(KeyCode::Char('z'));
         let detail = f.detail();
         assert_eq!(detail.ticket.key, "NS-1");
         assert_eq!(detail.changes, []);
+        // The agents of the ticket are on the tree now (NS-38), every stage and state.
+        let id = detail.ticket.id;
         assert_eq!(
-            detail
-                .agents
+            f.app.ticket_agents[&id]
                 .iter()
                 .map(|a| (a.name.as_str(), a.state.as_str()))
                 .collect::<Vec<_>>(),
@@ -4844,12 +4987,13 @@ mod tests {
                 ("proj · Dev · NS-1", "ended")
             ]
         );
-        assert_eq!(detail.artifacts, Artifacts::default());
-        // Created with the screen open: the next refresh reads it.
+        assert!(f.rows().contains(&NodeId::Agent(launcher.ids[1])));
+        assert_eq!(f.detail().artifacts, Artifacts::default());
+        // Created with the ticket selected: the next refresh reads it.
         let docs = p.join(".nick/docs/NS-1");
         fs::create_dir_all(&docs).unwrap();
         fs::write(docs.join("plan.md"), "# plano\n").unwrap();
-        f.key(KeyCode::Down);
+        f.key(KeyCode::Char('z'));
         assert_eq!(
             f.detail().artifacts,
             Artifacts {
@@ -4857,7 +5001,6 @@ mod tests {
                 review: false
             }
         );
-        assert_eq!(f.app.ticket_agent_index, 1);
         f.choose_ticket_stage(TicketStage::Review);
         f.ch('s');
         assert_eq!(f.detail().changes.len(), 1);
@@ -4867,18 +5010,17 @@ mod tests {
     #[test]
     fn a_ticket_gone_from_the_database_goes_back_to_the_list() {
         let (mut f, _) = with_agents();
-        f.key(KeyCode::Enter);
         let id = f.detail().ticket.id;
         f.app
             .db
             .connection()
             .execute("DELETE FROM tickets WHERE id = ?1", [id])
             .unwrap();
-        f.key(KeyCode::Down);
-        assert_eq!(f.app.screen, Screen::Tickets);
-        assert_eq!(f.app.ticket_detail, None);
+        f.key(KeyCode::Char('z'));
+        assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(f.status(), Some("O ticket NS-1 não existe mais no banco."));
         assert_eq!(f.keys(), ["NS-2"]);
+        assert_eq!(f.detail().ticket.key, "NS-2", "the next one selected");
     }
 
     #[test]
@@ -4890,18 +5032,19 @@ mod tests {
         f.open_agent(1, &mut launcher);
         f.shortcut();
         f.app.agent_ended(launcher.ids[1], 0);
-        f.key(KeyCode::Enter);
+        f.on_ticket();
         // The ticket goes to Dev; its live PO agent still opens.
         f.choose_ticket_stage(TicketStage::Development);
         f.ch('s');
         assert_eq!(f.stage_of("NS-1"), "development");
-        f.app.shown = None;
+        f.select(NodeId::Agent(launcher.ids[0]));
         assert_eq!(f.key(KeyCode::Enter), Action::None);
         assert_eq!(f.app.shown, Some(launcher.ids[0]));
         assert_eq!(f.app.focus, Focus::Terminal);
-        assert_eq!(f.app.screen, Screen::Ticket, "the list stays on the ticket");
+        assert_eq!(f.app.selected, NodeId::Agent(launcher.ids[0]));
         f.shortcut();
         f.key(KeyCode::Down);
+        assert_eq!(f.app.selected, NodeId::Agent(launcher.ids[1]));
         assert_eq!(f.key(KeyCode::Right), Action::None);
         assert_eq!(f.app.focus, Focus::List);
         assert_eq!(
@@ -4912,16 +5055,17 @@ mod tests {
         f.app
             .db
             .insert_agent(
-                f.detail().ticket.id,
+                f.tnode_id("NS-1"),
                 "review",
                 "outro",
                 "proj · Review · NS-1",
             )
             .unwrap();
-        // The first key reads it (the refresh comes after the key), the second reaches it.
+        // A first key reads it (the refresh comes after the key), the next one reaches it.
+        f.key(KeyCode::Char('z'));
         f.key(KeyCode::Down);
-        f.key(KeyCode::Down);
-        assert_eq!(f.app.ticket_agent_index, 2);
+        let other = f.app.ticket_agents[&f.tnode_id("NS-1")][2].id;
+        assert_eq!(f.app.selected, NodeId::Agent(other));
         f.key(KeyCode::Enter);
         assert_eq!(f.app.focus, Focus::List);
         assert_eq!(
@@ -4994,7 +5138,7 @@ mod tests {
         ));
         f.key(KeyCode::Esc);
         assert_eq!(f.app.dialog, None);
-        assert_eq!(f.app.screen, Screen::Ticket);
+        assert_eq!(f.app.screen, Screen::Tree);
         // Done stays on the list.
         f.choose_ticket_stage(TicketStage::Done);
         f.ch('s');
@@ -5020,19 +5164,20 @@ mod tests {
         // Done does not end nor hide the live agent of the ticket.
         f.open_kind(StageType::Development, &mut launcher);
         f.shortcut();
-        let before = (f.names_running(), f.app.shown);
-        f.key(KeyCode::Enter);
+        let before = f.names_running();
+        f.on_ticket();
         f.choose_ticket_stage(TicketStage::Done);
         f.ch('s');
         assert_eq!(f.stage_of("NS-1"), "done");
-        assert_eq!((f.names_running(), f.app.shown), before);
+        assert_eq!(f.names_running(), before);
         assert_eq!(f.agent_rows().last().unwrap().3, "active");
     }
 
+    /// Adapted from `g_and_v_work_from_the_ticket_screen` (NS-38: `v` is the filter of the
+    /// tree, `the_filter_v_shows_the_branches_of_the_live_agents_and_the_mark_goes_up`).
     #[test]
-    fn g_and_v_work_from_the_ticket_screen() {
+    fn g_works_from_the_ticket_node_with_its_refusals() {
         let (mut f, p) = with_agents();
-        f.key(KeyCode::Enter);
         let ticket = f.detail().ticket.clone();
         assert_eq!(
             f.ch('g'),
@@ -5043,21 +5188,19 @@ mod tests {
         );
         let mut launcher = FakeLauncher::new(true);
         f.open_kind(StageType::PoDiscussion, &mut launcher);
-        assert_eq!(f.app.screen, Screen::Ticket);
-        assert_eq!(f.detail().agents.len(), 1, "the new agent is listed");
+        assert_eq!(f.app.screen, Screen::Tree);
+        assert_eq!(
+            f.app.ticket_agents[&f.tnode_id("NS-1")].len(),
+            1,
+            "the new agent is on the tree"
+        );
         f.shortcut();
-        f.ch('v');
-        assert_eq!(f.app.screen, Screen::ActiveAgents);
-        f.key(KeyCode::Esc);
-        assert_eq!(f.app.screen, Screen::Ticket);
         // The refusals of the g of the list: a hidden ticket.
-        f.key(KeyCode::Esc);
-        f.key(KeyCode::Down);
+        f.select(f.tnode("NS-2"));
         f.ch('o');
         f.ch('s');
         f.ch('f');
-        f.key(KeyCode::Down);
-        f.key(KeyCode::Enter);
+        f.select(f.tnode("NS-2"));
         assert_eq!(f.detail().ticket.key, "NS-2");
         assert_eq!(f.ch('g'), Action::None);
         assert_eq!(
@@ -5146,7 +5289,8 @@ mod tests {
                  com a pasta e o .nick/nick.conf no lugar."
             )
         );
-        assert_eq!(f.keys(), ["NS-1", "NS-2"]);
+        let keys: Vec<String> = f.all_tickets().into_iter().map(|t| t.key).collect();
+        assert_eq!(keys, ["NS-1", "NS-2"]);
     }
 
     #[test]
@@ -5195,7 +5339,7 @@ mod tests {
         );
         assert!(!docs.exists());
         assert!(p.join(".nick/docs/NS-10/plan.md").is_file());
-        assert_eq!(f.app.screen, Screen::Ticket);
+        assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(f.detail().ticket.key, "NS-10");
         assert!(f.detail().artifacts.plan);
         assert_eq!(f.keys(), ["NS-10", "NS-2"]);
@@ -5250,5 +5394,711 @@ mod tests {
         f.g(&mut launcher);
         f.pick(StageType::TechLeader);
         assert!(!f.plan_missing());
+    }
+
+    // ---- the tree (NS-38) ----
+
+    use crate::tree::NodeId;
+
+    const MODULE: NodeId = NodeId::Module(ModuleKind::AutoScrum);
+
+    impl Fixture {
+        /// The visible nodes of the tree, in order.
+        fn rows(&self) -> Vec<NodeId> {
+            self.app.visible().iter().map(|row| row.id).collect()
+        }
+
+        /// Selects `id` with its branches open, as the helpers of navigation of the tests do.
+        fn select(&mut self, id: NodeId) {
+            self.app.reveal_and_select(id);
+            self.app.refresh_tree();
+            assert_eq!(self.app.selected, id, "{id:?} not on the tree");
+        }
+
+        /// The id of the project at `rel`.
+        fn pid(&self, rel: &str) -> i64 {
+            let path = self.root.join(rel);
+            self.app
+                .rows
+                .iter()
+                .find(|row| row.project.path == path)
+                .expect("registered")
+                .project
+                .id
+        }
+
+        /// The node of the ticket `key` (of any project; the first one).
+        fn tnode(&self, key: &str) -> NodeId {
+            let ticket = self
+                .app
+                .tickets
+                .values()
+                .flatten()
+                .find(|t| t.key == key)
+                .unwrap_or_else(|| panic!("no ticket {key}"));
+            NodeId::Ticket(ticket.id)
+        }
+    }
+
+    #[test]
+    fn the_tree_starts_on_the_module_closed() {
+        let mut f = fixture();
+        assert_eq!(f.app.screen, Screen::Tree);
+        assert_eq!(f.app.selected, MODULE);
+        assert_eq!(f.rows(), [MODULE]);
+        assert_eq!(f.app.dialog, None);
+        // Registered before the nick opened: still closed, the module selected.
+        let p = f.dir("p", true);
+        f.add(p.to_str().unwrap());
+        let db = Db::open(&f.root.join("nick.db")).unwrap();
+        let app = App::new(db, None, None, f.root.join("bin/nick-init"));
+        assert_eq!(app.selected, MODULE);
+        assert_eq!(app.visible().len(), 1);
+        assert!(app.visible()[0].expandable && !app.visible()[0].open);
+    }
+
+    /// The tree of a module with the projects `a` (tickets A-1, A-2) and `b` (B-1), every
+    /// branch closed and the module selected.
+    fn two_projects() -> Fixture {
+        let (mut f, _) = with_tickets("a");
+        f.new_ticket("um", "A-1");
+        f.new_ticket("dois", "A-2");
+        let b = f.dir("b", true);
+        f.add(b.to_str().unwrap());
+        f.key(KeyCode::Enter);
+        f.new_ticket("três", "B-1");
+        f.app.tree = Tree::default();
+        f.app.selected = MODULE;
+        f.app.refresh_tree();
+        assert_eq!(f.rows(), [MODULE]);
+        f
+    }
+
+    #[test]
+    fn right_and_enter_open_a_closed_node_and_go_down_on_an_open_one() {
+        for open in [KeyCode::Right, KeyCode::Enter] {
+            let mut f = two_projects();
+            let (a, b) = (NodeId::Project(f.pid("a")), NodeId::Project(f.pid("b")));
+            f.app.status = Some("x".into());
+            assert_eq!(f.key(open), Action::None);
+            assert_eq!(f.rows(), [MODULE, a, b], "{open:?}");
+            assert_eq!(f.app.selected, MODULE, "opening does not move");
+            assert_eq!(f.status(), None);
+            f.key(open);
+            assert_eq!(f.app.selected, a, "down to the first child");
+            f.key(open);
+            let (a1, a2) = (f.tnode("A-1"), f.tnode("A-2"));
+            assert_eq!(f.rows(), [MODULE, a, a1, a2, b]);
+            f.key(open);
+            assert_eq!(f.app.selected, a1);
+            // A ticket without agents is a leaf: nothing happens.
+            f.key(open);
+            assert_eq!(f.app.selected, a1);
+            assert_eq!(f.rows(), [MODULE, a, a1, a2, b]);
+        }
+    }
+
+    #[test]
+    fn up_down_k_j_move_on_the_visible_rows_and_stop_at_the_ends() {
+        let mut f = two_projects();
+        f.key(KeyCode::Enter);
+        let (a, b) = (NodeId::Project(f.pid("a")), NodeId::Project(f.pid("b")));
+        f.key(KeyCode::Down);
+        assert_eq!(f.app.selected, a);
+        f.ch('j');
+        assert_eq!(f.app.selected, b);
+        f.key(KeyCode::Down);
+        assert_eq!(f.app.selected, b, "stops at the last");
+        f.ch('k');
+        f.key(KeyCode::Up);
+        assert_eq!(f.app.selected, MODULE);
+        f.key(KeyCode::Up);
+        assert_eq!(f.app.selected, MODULE, "stops at the first");
+    }
+
+    #[test]
+    fn left_and_esc_close_an_open_node_and_go_up_from_a_closed_one() {
+        for back in [KeyCode::Left, KeyCode::Esc] {
+            let mut f = two_projects();
+            let a = NodeId::Project(f.pid("a"));
+            let a1 = f.tnode("A-1");
+            f.select(a1);
+            f.app.status = Some("x".into());
+            assert_eq!(f.key(back), Action::None);
+            assert_eq!(f.app.selected, a, "a leaf goes up");
+            assert_eq!(f.status(), None);
+            f.key(back);
+            assert_eq!(f.app.selected, a, "an open node closes");
+            assert!(!f.rows().contains(&a1));
+            f.key(back);
+            assert_eq!(f.app.selected, MODULE);
+            f.key(back);
+            assert_eq!(f.rows(), [MODULE]);
+            assert_eq!(f.key(back), Action::None, "the root stays");
+            assert_eq!(f.app.selected, MODULE);
+        }
+    }
+
+    #[test]
+    fn an_unavailable_project_does_not_open_and_says_why_on_the_tree() {
+        for dir_missing in [true, false] {
+            let (mut f, p) = with_one_project();
+            let node = NodeId::Project(f.pid("proj"));
+            assert_eq!(f.app.selected, node);
+            let mark = if dir_missing {
+                fs::remove_dir_all(&p).unwrap();
+                "[indisponível: pasta não encontrada]"
+            } else {
+                fs::remove_file(projects::config_file(&p)).unwrap();
+                "[indisponível: sem .nick/nick.conf]"
+            };
+            for open in [KeyCode::Enter, KeyCode::Right] {
+                assert_eq!(f.key(open), Action::None);
+                assert_eq!(f.rows(), [MODULE, node], "{mark}");
+                assert_eq!(
+                    f.status(),
+                    Some(
+                        format!(
+                            "Projeto indisponível: {mark}. Os tickets só abrem com a pasta \
+                             e o .nick/nick.conf no lugar."
+                        )
+                        .as_str()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_project_that_becomes_unavailable_is_closed() {
+        let (mut f, p) = with_tickets("proj");
+        f.new_ticket("t", "NS-1");
+        let node = NodeId::Project(f.pid("proj"));
+        assert!(f.rows().contains(&f.tnode("NS-1")));
+        fs::remove_file(projects::config_file(&p)).unwrap();
+        f.key(KeyCode::Down);
+        assert_eq!(f.rows(), [MODULE, node]);
+        assert_eq!(f.app.selected, node, "the selection goes up to the project");
+        fs::write(projects::config_file(&p), "").unwrap();
+        f.key(KeyCode::Down);
+        assert_eq!(f.rows(), [MODULE, node], "it stays closed");
+    }
+
+    #[test]
+    fn the_selection_survives_a_refresh_by_identity() {
+        let mut f = two_projects();
+        let b1 = f.tnode("B-1");
+        f.select(b1);
+        // Another nick creates a ticket in `a` (above B-1): B-1 stays selected.
+        f.select(f.tnode("A-1"));
+        f.select(b1);
+        let a = f.pid("a");
+        crate::tickets::create(&f.app.db, a, "de fora", "A-0").unwrap();
+        f.key(KeyCode::Char('z'));
+        assert_eq!(f.app.selected, b1);
+        // The selected ticket hidden: the next sibling, else the previous, else the parent.
+        // The list of `a` is A-1, A-2, A-0 (in the order they were created).
+        f.select(f.tnode("A-1"));
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.app.selected, f.tnode("A-2"), "the next one");
+        f.select(f.tnode("A-0"));
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.app.selected, f.tnode("A-2"), "the last: the previous one");
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.app.selected, NodeId::Project(a), "none left: the parent");
+    }
+
+    impl Fixture {
+        fn tnode_id(&self, key: &str) -> i64 {
+            match self.tnode(key) {
+                NodeId::Ticket(id) => id,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn typing_in_a_dialog_does_not_refresh_the_tree() {
+        let (mut f, p) = with_one_project();
+        f.select(MODULE);
+        fs::remove_file(projects::config_file(&p)).unwrap();
+        f.ch('a');
+        f.type_text("abc");
+        f.key(KeyCode::Backspace);
+        assert_eq!(
+            f.app.rows[0].availability,
+            Availability::Available,
+            "not recomputed while typing"
+        );
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.rows[0].availability, Availability::ConfigMissing);
+        // The same in the removal confirmation: the answer closes it and refreshes.
+        fs::remove_dir_all(&p).unwrap();
+        f.app.select(NodeId::Project(f.pid("proj")));
+        f.ch('r');
+        assert_eq!(f.app.rows[0].availability, Availability::ConfigMissing);
+        f.ch('n');
+        assert_eq!(f.app.rows[0].availability, Availability::DirMissing);
+    }
+
+    #[test]
+    fn the_keys_of_a_node_do_nothing_on_another() {
+        let mut f = two_projects();
+        // On the module: no ticket key, no removal; `x` only on a live agent.
+        for c in ['e', 'o', 'g', 'm', 'i', 'r', 'x'] {
+            assert_eq!(f.ch(c), Action::None, "{c}");
+            assert_eq!(f.app.dialog, None, "{c}");
+        }
+        // On a project: no `c`, no ticket key.
+        f.select(NodeId::Project(f.pid("a")));
+        for c in ['c', 'e', 'o', 'g', 'm', 'i', 'x'] {
+            assert_eq!(f.ch(c), Action::None, "{c}");
+            assert_eq!(f.app.dialog, None, "{c}");
+            assert_eq!(f.app.screen, Screen::Tree);
+        }
+        // On a ticket: no `a`, `r` nor `c`.
+        f.select(f.tnode("A-1"));
+        for c in ['a', 'r', 'c', 'x'] {
+            assert_eq!(f.ch(c), Action::None, "{c}");
+            assert_eq!(f.app.dialog, None, "{c}");
+            assert_eq!(f.app.screen, Screen::Tree);
+        }
+    }
+
+    // ---- focus and the shown agent on the tree (NS-38) ----
+
+    impl Fixture {
+        /// The node of the running agent `id`.
+        fn anode(id: i64) -> NodeId {
+            NodeId::Agent(id)
+        }
+    }
+
+    #[test]
+    fn open_agent_selects_the_new_agent_with_the_focus_on_the_terminal() {
+        let (f, launcher) = running();
+        let id = launcher.ids[0];
+        assert_eq!(f.app.selected, Fixture::anode(id));
+        assert_eq!(f.app.shown, Some(id));
+        assert_eq!(f.app.last_shown, Some(id));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert!(f.rows().contains(&Fixture::anode(id)), "its branch is open");
+        assert_eq!(f.app.agents[0].ticket_id, f.tnode_id("NS-2"));
+        assert_eq!(f.app.agents[0].project_id, f.pid("proj"));
+    }
+
+    #[test]
+    fn moving_to_a_live_agent_shows_it_and_to_another_node_hides_it() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.shortcut();
+        assert_eq!(f.app.focus, Focus::List);
+        // Up from the second agent: its ticket; every agent hidden.
+        f.key(KeyCode::Up);
+        assert_eq!(f.app.selected, f.tnode("B-1"));
+        assert_eq!(f.app.shown, None);
+        assert!(f.app.wants_hidden_text(second), "it can be marked now");
+        assert_eq!(f.app.last_shown, Some(second));
+        assert!(f.app.hidden_output(first, "algo novo"));
+        // To the first agent: shown, its mark gone, the focus still on the tree.
+        f.select(Fixture::anode(first));
+        assert_eq!(f.app.shown, Some(first));
+        assert!(!f.app.agents[0].unseen);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.last_shown, Some(first));
+    }
+
+    #[test]
+    fn enter_on_a_live_agent_focuses_it_and_on_another_says_why() {
+        let (mut f, launcher) = running();
+        let id = launcher.ids[0];
+        f.shortcut();
+        assert_eq!(f.app.focus, Focus::List);
+        f.app.status = Some("x".into());
+        for open in [KeyCode::Enter, KeyCode::Right] {
+            assert_eq!(f.key(open), Action::None);
+            assert_eq!(f.app.focus, Focus::Terminal);
+            assert_eq!(f.status(), None);
+            f.shortcut();
+        }
+        f.app.agent_ended(id, 0);
+        f.app.status = None;
+        assert_eq!(f.app.selected, Fixture::anode(id));
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 não está rodando neste nick.")
+        );
+    }
+
+    #[test]
+    fn the_shortcut_from_another_node_goes_to_the_last_shown_and_back() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.shortcut();
+        // The first agent shown last, then the module selected and every branch closed.
+        f.select(Fixture::anode(first));
+        f.select(MODULE);
+        f.key(KeyCode::Esc);
+        assert_eq!(f.rows(), [MODULE]);
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.selected, Fixture::anode(first), "the last shown");
+        assert!(
+            f.rows().contains(&Fixture::anode(first)),
+            "its branches open"
+        );
+        assert_eq!(f.app.shown, Some(first));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.selected, Fixture::anode(first), "the same agent");
+        // On a live agent the shortcut takes that one.
+        f.select(Fixture::anode(second));
+        f.shortcut();
+        assert_eq!(f.app.shown, Some(second));
+        assert_eq!(f.app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn the_shortcut_does_nothing_without_a_live_agent_nor_with_a_dialog() {
+        let (mut f, launcher) = running();
+        let id = launcher.ids[0];
+        f.shortcut();
+        f.select(f.tnode("NS-1"));
+        f.ch('m');
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { .. })
+        ));
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.selected, f.tnode("NS-1"));
+        f.key(KeyCode::Esc);
+        f.app.agent_ended(id, 0);
+        assert_eq!(f.app.last_shown, None);
+        assert_eq!(f.shortcut(), Action::None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.selected, f.tnode("NS-1"));
+    }
+
+    /// Replaces `the_end_of_the_shown_agent_shows_the_most_recent_one_on_the_list` (decision
+    /// 10 of NS-38): the selection stays on the node, now an ended agent.
+    #[test]
+    fn the_end_of_the_shown_agent_keeps_the_selection_on_its_node() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        f.app.agent_ended(second, 0);
+        assert_eq!(f.status(), Some("O agente beta · Dev · B-1 terminou."));
+        assert_eq!(f.app.selected, Fixture::anode(second));
+        assert!(
+            f.rows().contains(&Fixture::anode(second)),
+            "an ended agent now"
+        );
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(
+            f.app.last_shown,
+            Some(first),
+            "the live one opened most recently"
+        );
+        assert_eq!(f.agent_rows()[1].3, "ended");
+        assert!(!agents::lock_path(&f.agents_dir(), &launcher.spawns[1].2).exists());
+        assert_eq!(f.agent_rows()[0].3, "active");
+        // The last one: nothing to go to.
+        f.app.agent_ended(first, 0);
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.app.last_shown, None);
+        assert!(f.app.agents.is_empty());
+        // An end that is not of a running agent changes nothing.
+        f.app.status = None;
+        f.app.agent_ended(first, 0);
+        assert_eq!(f.status(), None);
+    }
+
+    #[test]
+    fn x_on_a_live_agent_asks_and_only_s_ends_it() {
+        let (mut f, launcher) = running();
+        let id = launcher.ids[0];
+        f.shortcut();
+        assert_eq!(f.ch('x'), Action::None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmEndAgent {
+                id,
+                name: "proj · Tech Leader · NS-2".into()
+            })
+        );
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        f.ch('x');
+        assert_eq!(f.ch('s'), Action::EndAgent(id));
+        f.app.agent_ended_by_operator(id);
+        assert_eq!(f.app.selected, Fixture::anode(id));
+        f.app.status = None;
+        assert_eq!(f.ch('x'), Action::None, "an ended agent is not asked");
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn the_filter_v_shows_the_branches_of_the_live_agents_and_the_mark_goes_up() {
+        let (mut f, launcher) = two_running();
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        let (proj, beta) = (
+            NodeId::Project(f.pid("proj")),
+            NodeId::Project(f.pid("beta")),
+        );
+        f.shortcut();
+        f.select(MODULE);
+        f.key(KeyCode::Right);
+        // Every branch closed, but the module open: the projects.
+        f.app.tree.close(proj);
+        f.app.tree.close(beta);
+        f.app.refresh_tree();
+        // The mark goes up at once: no key, no refresh (the loop only redraws).
+        assert!(f.app.hidden_output(first, "algo novo"));
+        let row = |f: &Fixture, id| *f.app.visible().iter().find(|r| r.id == id).unwrap();
+        assert!(
+            row(&f, proj).unseen_below,
+            "the mark goes up to the closed project"
+        );
+        assert!(!row(&f, beta).unseen_below);
+        assert!(!row(&f, MODULE).unseen_below, "the module is open");
+        f.app.status = Some("x".into());
+        assert_eq!(f.ch('v'), Action::None);
+        assert_eq!(f.status(), None);
+        assert_eq!(
+            f.rows(),
+            [
+                MODULE,
+                beta,
+                f.tnode("B-1"),
+                Fixture::anode(second),
+                proj,
+                f.tnode("NS-1"),
+                Fixture::anode(first),
+            ],
+            "only the live branches, open (the projects by name)"
+        );
+        // Shown, the mark goes.
+        f.select(Fixture::anode(first));
+        assert!(!f.app.agents[0].unseen);
+        f.ch('v');
+        assert!(!f.app.tree.only_active);
+        assert_eq!(f.app.selected, Fixture::anode(first));
+        // Without live agents the filter shows only the module.
+        f.app.agent_ended(first, 0);
+        f.app.agent_ended(second, 0);
+        f.ch('v');
+        assert_eq!(f.rows(), [MODULE]);
+        assert_eq!(f.app.selected, MODULE);
+    }
+
+    #[test]
+    fn the_filters_are_global_and_q_quits_on_every_node() {
+        let mut f = two_projects();
+        f.ch('f');
+        f.ch('v');
+        assert_eq!(f.app.filters(), (true, true));
+        f.ch('f');
+        f.ch('v');
+        assert_eq!(f.app.filters(), (false, false));
+        for node in [MODULE, NodeId::Project(f.pid("a")), f.tnode("A-1")] {
+            f.select(node);
+            assert_eq!(f.ch('q'), Action::Quit, "{node:?}");
+            assert_eq!(f.ctrl_c(), Action::Quit, "{node:?}");
+        }
+    }
+
+    /// Decisions 7 and 11 of NS-38 together: an unavailable project with a live agent of this
+    /// nick stays open and opens, so the agent stays reachable on the tree and by the shortcut;
+    /// without it, the refusal of before.
+    #[test]
+    fn an_unavailable_project_with_a_live_agent_stays_reachable() {
+        let (mut f, launcher) = running();
+        let id = launcher.ids[0];
+        let proj = NodeId::Project(f.pid("proj"));
+        f.shortcut();
+        fs::remove_file(projects::config_file(&f.root.join("proj"))).unwrap();
+        f.key(KeyCode::Char('z'));
+        assert_eq!(f.app.selected, NodeId::Agent(id), "it stays selected");
+        f.select(proj);
+        f.key(KeyCode::Left);
+        assert!(!f.app.tree.is_open(proj));
+        f.app.status = None;
+        f.key(KeyCode::Enter);
+        assert!(f.app.tree.is_open(proj), "it opens");
+        assert_eq!(f.status(), None);
+        f.select(MODULE);
+        f.shortcut();
+        assert_eq!(f.app.selected, NodeId::Agent(id));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        // Once the agent ends, it is closed and refused, as any unavailable project.
+        f.app.agent_ended(id, 0);
+        assert!(!f.app.tree.is_open(proj));
+        f.select(proj);
+        f.key(KeyCode::Enter);
+        assert!(f.status().unwrap().starts_with("Projeto indisponível: "));
+    }
+
+    /// A filter that takes the selected node away: the next sibling still there, by the rows
+    /// before the key (decision 9 of NS-38).
+    #[test]
+    fn a_filter_that_takes_the_selection_away_goes_to_the_next_sibling() {
+        let (mut f, _) = running();
+        f.shortcut();
+        f.select(f.tnode("NS-1"));
+        f.ch('v');
+        assert_eq!(f.app.selected, f.tnode("NS-2"), "NS-1 has no live agent");
+        f.ch('v');
+        f.select(f.tnode("NS-1"));
+        f.ch('o');
+        f.ch('s');
+        f.ch('f');
+        f.select(f.tnode("NS-1"));
+        f.ch('f');
+        assert_eq!(f.app.selected, f.tnode("NS-2"), "hidden again");
+    }
+
+    // ---- removing a project with its agents (NS-38, decision of the user) ----
+
+    /// The confirmation of the removal of `proj` (its node selected): the counts it shows.
+    fn removal(f: &mut Fixture) -> (i64, i64, i64) {
+        f.app.select(NodeId::Project(f.pid("proj")));
+        assert_eq!(f.ch('r'), Action::None);
+        match &f.app.dialog {
+            Some(Dialog::ConfirmRemove {
+                tickets,
+                agents,
+                live,
+                ..
+            }) => (*tickets, *agents, *live),
+            other => panic!("not in the removal: {other:?} {:?}", f.status()),
+        }
+    }
+
+    #[test]
+    fn the_removal_counts_the_agents_and_ends_the_live_ones_through_the_loop() {
+        let (mut f, launcher) = running();
+        let id = launcher.ids[0];
+        f.shortcut();
+        let project = f.app.project_row(f.pid("proj")).unwrap().project.clone();
+        assert_eq!(removal(&mut f), (2, 1, 1));
+        // n cancels: nothing ends.
+        f.ch('n');
+        assert_eq!(f.app.agents.len(), 1);
+        removal(&mut f);
+        assert_eq!(
+            f.ch('s'),
+            Action::RemoveProject {
+                project: project.clone(),
+                agents: vec![id],
+            }
+        );
+        assert_eq!(f.stored().len(), 1, "the loop ends the agents first");
+        // The loop terminated the session: the record ends, the lock goes, then the removal.
+        f.app.remove_project_ending_agents(&project, &[id]);
+        assert_eq!(
+            f.status(),
+            Some(
+                "Projeto removido do nick: proj. Nenhum arquivo foi apagado. O agente proj · \
+                 Tech Leader · NS-2 foi encerrado."
+            )
+        );
+        assert!(f.app.agents.is_empty());
+        assert_eq!(f.app.shown, None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.last_shown, None);
+        assert!(!agents::lock_path(&f.agents_dir(), &launcher.spawns[0].2).exists());
+        assert_eq!(f.stored(), Vec::<PathBuf>::new());
+        assert_eq!(f.agent_rows(), [], "its agents left the database with it");
+        assert_eq!(f.app.selected, MODULE);
+    }
+
+    #[test]
+    fn the_removal_without_a_live_agent_counts_the_ended_ones_and_removes_at_once() {
+        let (mut f, launcher) = running();
+        f.app.agent_ended(launcher.ids[0], 0);
+        let mut other = FakeLauncher::new(true);
+        f.select(f.tnode("NS-1"));
+        f.open_agent(0, &mut other);
+        f.app.agent_ended(other.ids[0], 0);
+        assert_eq!(removal(&mut f), (2, 2, 0));
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("Projeto removido do nick: proj. Nenhum arquivo foi apagado.")
+        );
+        assert_eq!(f.agent_rows(), []);
+    }
+
+    /// An agent active in another nick: this one can't end it, so the removal is refused (the
+    /// safe side, as "Editar ID" of NS-36), when it would open and again on the `s`.
+    #[test]
+    fn the_removal_is_refused_with_an_agent_active_in_another_nick() {
+        let refusal = "O projeto proj tem agente ativo em outro nick. Encerre os agentes dele lá \
+                       antes de remover o projeto.";
+        let (mut f, _) = with_agents();
+        let ticket = f.tnode_id("NS-1");
+        f.app
+            .db
+            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1")
+            .unwrap();
+        f.app.select(NodeId::Project(f.pid("proj")));
+        assert_eq!(f.ch('r'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some(refusal));
+        // Opened before the other nick opened its agent: refused on the s.
+        let (mut f, _) = with_agents();
+        removal(&mut f);
+        let ticket = f.tnode_id("NS-1");
+        f.app
+            .db
+            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1")
+            .unwrap();
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(f.status(), Some(refusal));
+        assert_eq!(f.stored().len(), 1, "nothing removed");
+    }
+
+    /// Review of the NS-38, P5: the new ticket goes to the project where `a` opened the dialog,
+    /// even if the selection moved meanwhile (a refresh by the end of an agent can move it);
+    /// a project gone from the database says why, and stores nothing.
+    #[test]
+    fn the_new_ticket_goes_to_the_project_where_the_dialog_opened() {
+        let mut f = two_projects();
+        let (a, b) = (f.pid("a"), f.pid("b"));
+        f.app.select(NodeId::Project(a));
+        f.ch('a');
+        f.type_text("do a");
+        f.app.select(NodeId::Project(b));
+        f.key(KeyCode::Enter);
+        let of = |f: &Fixture, id| f.app.db.list_tickets(id, true).unwrap();
+        assert!(
+            of(&f, a).iter().any(|t| t.title == "do a"),
+            "{:?}",
+            f.status()
+        );
+        assert!(!of(&f, b).iter().any(|t| t.title == "do a"));
+        // The project removed by another nick while the dialog is open.
+        f.app.select(NodeId::Project(b));
+        f.ch('a');
+        f.type_text("perdido");
+        f.app.db.delete_project(b).unwrap();
+        f.key(KeyCode::Enter);
+        assert!(
+            f.status()
+                .is_some_and(|s| s.starts_with("Erro no banco do nick")),
+            "{:?}",
+            f.status()
+        );
+        assert!(
+            matches!(f.app.dialog, Some(Dialog::NewTicket { .. })),
+            "it stays open"
+        );
     }
 }

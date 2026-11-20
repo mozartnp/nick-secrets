@@ -241,7 +241,7 @@ pub fn same_stage_message(ticket: &Ticket, to: TicketStage) -> String {
 
 /// Changes the stage of the ticket to `to`, with its row in the history (one transaction:
 /// `Db::change_ticket_stage`). The only path that writes the stage; only the confirmation of
-/// the dialog of the ticket screen calls it. The same stage is refused; a ticket gone, or moved
+/// the dialog of the node of a ticket calls it. The same stage is refused; a ticket gone, or moved
 /// by another nick meanwhile, stores nothing.
 pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String, String> {
     if ticket.stage == to.key() {

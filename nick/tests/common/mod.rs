@@ -33,7 +33,11 @@ pub const ENTER: &str = "\r";
 pub const ESC: &str = "\x1b";
 pub const LEFT: &str = "\x1b[D";
 pub const DOWN: &str = "\x1b[B";
+pub const UP: &str = "\x1b[A";
+pub const RIGHT: &str = "\x1b[C";
 pub const TAB: &str = "\t";
+/// The columns inside the border of the column on the left (the tree, NS-38: `LIST_WIDTH`).
+const TREE_COLS: usize = 38;
 
 /// The fake bin/nick-init (tests/fixtures/bin/nick-init).
 pub fn fake_init() -> PathBuf {
@@ -451,6 +455,14 @@ impl Nick {
         panic!("{needle:?} never showed up. Screen:\n{}", self.screen());
     }
 
+    /// Waits until `needle` is on the screen read as one line (`flat_screen`): a wrapped help
+    /// line reads whole.
+    pub fn wait_for_flat(&self, needle: &str) {
+        self.wait_until(&format!("{needle:?} on the screen"), || {
+            self.flat_screen().contains(needle)
+        });
+    }
+
     /// Waits until `needle` is in the raw output.
     pub fn wait_for_raw(&self, needle: &str) {
         let deadline = Instant::now() + TIMEOUT;
@@ -504,6 +516,91 @@ impl Nick {
     /// The pid of the nick.
     pub fn pid(&self) -> i32 {
         self.child.process_id().expect("the nick has a pid") as i32
+    }
+
+    /// The rows of the tree (NS-38): the columns inside the border of the column on the left,
+    /// from the first row under the top of the border.
+    pub fn tree_rows(&self) -> Vec<String> {
+        self.screen()
+            .lines()
+            .skip(1)
+            .map(|line| {
+                line.chars()
+                    .skip(1)
+                    .take(TREE_COLS)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Waits until `needle` is in the column on the left read as one line (`tree_rows`, the
+    /// non-empty ones joined by a space): a text wrapped in the 40 columns reads whole.
+    pub fn wait_for_tree(&self, needle: &str) {
+        self.wait_until(&format!("{needle:?} on the left"), || {
+            self.tree_rows()
+                .iter()
+                .map(|row| row.trim())
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(needle)
+        });
+    }
+
+    /// The row of the tree with the selection (`> ` on it), and its index in `tree_rows`.
+    pub fn selected_row(&self) -> Option<(usize, String)> {
+        self.tree_rows()
+            .into_iter()
+            .enumerate()
+            .find(|(_, row)| row.starts_with("> "))
+    }
+
+    /// Moves the selection of the tree with ↓ (then ↑) until its row contains `label`. Each key
+    /// waits for the selection to move; the ends of the tree are its first row and the row
+    /// before an empty one, so no key is sent past them.
+    pub fn select(&mut self, label: &str) {
+        self.wait_until("a selection on the tree", || self.selected_row().is_some());
+        for key in [DOWN, UP] {
+            loop {
+                let (at, row) = self.selected_row().expect("a selection");
+                if row.contains(label) {
+                    return;
+                }
+                let rows = self.tree_rows();
+                let last = rows.get(at + 1).is_none_or(|next| next.is_empty());
+                if (key == DOWN && last) || (key == UP && at == 0) {
+                    break;
+                }
+                self.send(key);
+                self.wait_until(&format!("the selection to leave {row:?}"), || {
+                    self.selected_row().is_some_and(|(_, now)| now != row)
+                });
+            }
+        }
+        panic!("{label:?} is not on the tree:\n{}", self.screen());
+    }
+
+    /// From anywhere on the tree: the module open, the project `name` selected and open (its
+    /// tickets on the tree).
+    pub fn open_project(&mut self, name: &str) {
+        self.wait_for(" Navegação ");
+        self.open_node("auto_scrum");
+        self.open_node(name);
+    }
+
+    /// Selects the node `label` and opens it (`→`) when it is closed (`▸`).
+    pub fn open_node(&mut self, label: &str) {
+        self.select(label);
+        let (_, row) = self.selected_row().expect("a selection");
+        if row.contains(&format!("▸ {label}")) {
+            self.send(RIGHT);
+            self.wait_until(&format!("{label} open"), || {
+                self.selected_row()
+                    .is_some_and(|(_, row)| row.contains(&format!("▾ {label}")))
+            });
+        }
     }
 
     /// Waits until `cond` holds; panics with the screen after the timeout.

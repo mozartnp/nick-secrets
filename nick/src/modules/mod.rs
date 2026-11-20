@@ -7,13 +7,13 @@
 pub mod auto_scrum;
 
 /// A module of the nick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleKind {
     AutoScrum,
 }
 
 impl ModuleKind {
-    /// Every module, in the order of the Modules screen.
+    /// Every module, in the order of the tree (each one a root).
     pub const ALL: &'static [ModuleKind] = &[ModuleKind::AutoScrum];
 
     /// The stable key of the module, the one stored in `modules.key`.

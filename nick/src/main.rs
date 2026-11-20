@@ -541,6 +541,21 @@ impl Shell {
                 self.end_all();
                 return Ok(true);
             }
+            Action::RemoveProject { project, agents } => {
+                // Its live agents first, all their groups at once (a single grace of 2 s, as
+                // `end_all`), then their records and the project (NS-38). The Exited their
+                // waiters send afterwards finds no session and is ignored.
+                let mut sessions = Vec::new();
+                for id in &agents {
+                    if let Some(index) = self.sessions.iter().position(|(agent, _)| agent == id) {
+                        let (_, session) = self.sessions.remove(index);
+                        self.sizes.remove(id);
+                        sessions.push(session);
+                    }
+                }
+                agent_session::terminate_all(&mut sessions);
+                self.app.remove_project_ending_agents(&project, &agents);
+            }
         }
         Ok(false)
     }

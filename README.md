@@ -4,9 +4,10 @@ Ferramentas pessoais de automação do dia a dia.
 
 ## O programa `nick`
 
-`nick` é a casca das ferramentas: uma TUI (como o `htop`) que mostra os módulos do nick, os
-projetos de cada módulo e os tickets de cada projeto. Por enquanto o único módulo é o auto_scrum,
-e a TUI cadastra projetos e mantém a lista de tickets de cada um. O resto do fluxo continua no
+`nick` é a casca das ferramentas: uma TUI (como o `htop`) com uma árvore à esquerda, como o
+explorador do VS Code (módulo > projeto > ticket > agente), e à direita o painel do que está
+selecionado. Por enquanto o único módulo é o auto_scrum, e a TUI cadastra projetos e mantém a
+lista de tickets de cada um. O resto do fluxo continua no
 `auto_scrum.sh` (abaixo).
 
 Requisito: Rust ([rustup](https://rustup.rs)). Para instalar, rode na raiz do repositório:
@@ -16,7 +17,8 @@ cargo install --path nick
 ```
 
 O binário vai para `~/.cargo/bin/nick`. Depois, é só rodar `nick` em qualquer terminal. O
-diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem no rodapé da TUI.
+diretório de onde ele é aberto não muda nada. As teclas de cada item da árvore aparecem no rodapé
+da TUI.
 
 - **Projetos:** são cadastrados na TUI, informando o caminho da pasta. Todo projeto cadastrado
   precisa ter `.nick/nick.conf`. Quando a pasta não tem o arquivo, a TUI oferece criá-lo pelo
@@ -27,8 +29,8 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   lugar). Cada ticket tem um título, o ID do Jira e a etapa atual (PO, Tech Leader, Dev, Review
   ou Concluído), que só o operador muda, com o histórico das mudanças. Sem o ID, o nick gera um
   ID provisório, que pode ser trocado depois. Um ticket pode ser ocultado, sem sair do banco, e
-  restaurado depois. A tela de cada ticket mostra a etapa, o histórico, se o plano e o review
-  existem em `.nick/docs/<ID>/` e os agentes do ticket. Os tickets ficam só no banco do nick:
+  restaurado depois. O painel de cada ticket mostra a etapa, o histórico e se o plano e o review
+  existem em `.nick/docs/<ID>/`; os agentes do ticket ficam abaixo dele na árvore. Os tickets ficam só no banco do nick:
   a única ação que mexe no projeto é a troca do ID, que renomeia a pasta `.nick/docs/<ID>/`
   (sem nunca sobrescrever outra).
 - **Agentes:** a partir de um ticket, a TUI oferece os mesmos tipos de conversa do menu do
@@ -37,9 +39,9 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   `claude` abre num terminal embutido, ao lado da lista, na pasta do projeto e com a configuração
   dele: o agente roda na jail ou fora dela conforme o `JAIL_ENABLED` do `.nick/nick.conf` do
   projeto, e fora dela a TUI avisa no topo do terminal. Vários agentes, de tickets e projetos
-  diferentes, ficam abertos ao mesmo tempo, e a visão "Agentes ativos" mostra todos.
+  diferentes, ficam abertos ao mesmo tempo, e o filtro "agentes ativos" da árvore mostra todos.
 - **Atalho entre a lista e o terminal:** `Ctrl+\` por padrão. Para trocar, abra
-  "Configurações" na tela de Módulos. O terminal integrado do VS Code fica com o `Ctrl+\` (é
+  "Configurações" no módulo, na árvore. O terminal integrado do VS Code fica com o `Ctrl+\` (é
   atalho dele, "dividir editor"). Para usar o nick ali, troque o atalho nas Configurações ou
   acrescente uma vez ao `keybindings.json` do usuário (`Ctrl+Shift+P` → "Preferences: Open
   Keyboard Shortcuts (JSON)"; no Linux, fica em `~/.config/Code/User/keybindings.json`), dentro

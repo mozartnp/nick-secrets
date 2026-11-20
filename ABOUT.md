@@ -2242,6 +2242,11 @@ pela verificação manual do `nick` no NS-31).
 
 ## Rust no projeto: a casca `nick` (NS-31)
 
+> **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): as telas Módulos e
+> Projetos viraram a árvore (Módulo > Projeto > Ticket > Agente), sempre lado a lado com o painel do
+> nó selecionado. O cadastro (`a`) e as Configurações (`c`) ficam no nó do módulo, a remoção (`r`)
+> no nó do projeto. As regras de cadastro, disponibilidade, init e remoção abaixo não mudaram.
+
 `nick/` é o crate da casca de verdade do épico NS-28 (fatia F2a): o programa `nick`, uma TUI em
 Rust com ratatui e crossterm que o operador abre de qualquer terminal (como o `htop`). Ela mostra
 **Módulos > Projetos**, lidos de um banco SQLite. Nesta fatia o único módulo é o auto_scrum, e a
@@ -2455,6 +2460,11 @@ volta do init, e sem resposta ele dá erro depois de 2 s.
 
 ## Rust no projeto: tickets na casca `nick` (NS-32)
 
+> **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): a tela de Tickets virou
+> o nível de tickets da árvore; as ações (`a` no nó do projeto; `e`, `o` no nó do ticket) e as
+> regras abaixo não mudaram. O filtro `f` passou a valer para a árvore inteira e não se desliga ao
+> subir.
+
 A fatia F2b do épico NS-28. A navegação da casca passa a ser **Módulos > Projetos > Tickets**.
 `Enter`/`→` sobre um projeto disponível abre a lista dos tickets dele, e `Esc`/`←` volta com o
 projeto ainda selecionado. Na lista, o operador cria, corrige o título, oculta e restaura
@@ -2562,6 +2572,11 @@ a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
   rodapé), nunca um texto que já estava na tela.
 
 ## Rust no projeto: agentes na casca `nick` (NS-33)
+
+> **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): o `g` fica no nó do
+> ticket, e o fim de um agente deixa a seleção no nó dele (agora encerrado), e não "de volta à
+> lista". A remoção de um projeto passou a levar os agentes dele: a confirmação os conta, os vivos
+> deste nick são encerrados, e um ativo em outro nick recusa a remoção.
 
 > **Mudou no NS-35** (seção "Rust no projeto: etapas do auto_scrum na casca `nick` (NS-35)"): o
 > `--check` passou a ter três linhas (`jail=`, `jira=` e `sentry=`), o diálogo das 4 etapas virou
@@ -2722,6 +2737,14 @@ nick: o roteiro fica em `.nick/docs/NS-33/verificacao_manual.md`, para o analist
 dela.
 
 ## Rust no projeto: vários agentes na casca `nick` (NS-34)
+
+> **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): a tela é sempre lado a
+> lado, com ou sem agente vivo (a regra "sem agente vivo, as telas são as de antes, byte a byte"
+> deixou de valer); o agente exibido é o do nó selecionado; a visão "Agentes ativos" virou o filtro
+> `v` da árvore, e o `x` fica no nó do agente; o fim do agente exibido deixa a seleção no nó dele, e
+> o atalho de foco vai ao último agente exibido; a altura fixa do rodapé passou a valer para os
+> rodapés de cada tipo de nó (`HELP_STATES`, no lugar do `LIST_SCREENS`). O tamanho dos PTYs não
+> mudou.
 
 A fatia F3b do épico NS-28, que fecha o P1 do épico (processos simultâneos difíceis de manusear).
 Vários agentes, de tickets e projetos diferentes, ficam vivos ao mesmo tempo, cada um no seu PTY,
@@ -3195,6 +3218,11 @@ A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nic
 
 ## Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)
 
+> **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): a tela do ticket virou
+> o painel do nó do ticket, à direita, sem a seção "Agentes do ticket" (os agentes ficam abaixo do
+> ticket na árvore, e `Enter` num agente vivo põe o foco no terminal dele). `m`, `i` e `g` ficam no
+> nó do ticket, com as mesmas regras, recusas e confirmações.
+
 A fatia F4b do épico NS-28. O ticket ganha uma **etapa atual**, com histórico, uma **tela do
 ticket** e a ação **"Editar ID"**, que renomeia a pasta `.nick/docs/<ID>/`.
 
@@ -3389,6 +3417,10 @@ recusado com agente vivo e o formulário do Dev sem plano). As sabotagens e as t
 
 ## Rust no projeto: foco evidente no painel (NS-37)
 
+> **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): as bordas de foco valem
+> sempre, também sem agente vivo (a árvore com a borda grossa ciano e o painel `Plain` + DIM); o
+> `Block::bordered()` sem estilo de "sem agente" deixou de existir.
+
 História filha do épico NS-28. No layout lado a lado (NS-34, com pelo menos um agente vivo), o
 painel com o foco fica evidente de relance, para o operador não mandar sem querer uma tecla para
 o `claude` quando queria navegar na lista.
@@ -3483,3 +3515,211 @@ segundo usa o modo `rules` do `claude` falso, que desenha uma régua `─` e uma
 `│caixa … │` na largura inteira do terminal, encostadas na borda. O teste cobra as duas inteiras
 no `Nick::panel()`, sem nenhum pedaço da borda grossa. Com o `trim_matches` da primeira versão
 do helper ele cai, conforme a sabotagem registrada em `.nick/docs/NS-37/review_sabotagens.txt`.
+
+## Rust no projeto: navegação em árvore (NS-38)
+
+História filha do épico NS-28. As telas em sequência (Módulos → Projetos → Tickets → Ticket, mais a
+visão "Agentes ativos") deram lugar a **uma árvore expansível à esquerda**, como o explorador do VS
+Code, e a um **painel contextual à direita**. "Configurações" continua sendo uma tela (`c` no nó do
+módulo; `Esc`/`←` voltam para a árvore), e o painel direito continua mostrando o nó selecionado.
+O enum `Screen` ficou com duas variantes, `Tree` e `Settings`. Fora do escopo: épicos, retomada de
+agentes (F5), arrastar itens, busca na árvore e lembrar entre aberturas quais ramos estavam
+abertos.
+
+**A árvore e seus níveis:** Módulo > Projeto > Ticket > Agente. O módulo é a raiz, mesmo único
+(`ModuleKind::ALL`). Cada linha tem 2 espaços por nível, `▾` aberto, `▸` fechado e 2 espaços numa
+folha (um ticket sem agentes, um agente, um módulo sem projetos), e o rótulo:
+- projeto: o nome e, indisponível, a marca (`projects::unavailable_text`), tudo apagado. O
+  caminho foi para o painel, para caber nas 40 colunas;
+- ticket: `<ID>  [<etapa>]  <título>  [provisório]  [oculto]` (os spans da lista do NS-36, com o
+  `[✓ Concluído]` verde e o oculto apagado);
+- agente: `<Etapa>  <estado>  [FORA DA JAIL]  <AAAA-MM-DD HH:MM>`, com o estado `● vivo` (deste
+  nick), `● saída nova` (vivo e marcado), `ativo em outro nick` ou `encerrado`, e os não vivos
+  apagados. **Diferença do plano:** o plano sugeria a data antes do estado. Na profundidade 3
+  sobram 28 colunas, e a data empurrava o estado e as marcas para fora da tela; com eles antes da
+  data, o fim cortado é só a data (o mesmo racional da etapa logo depois do ID, NS-36). **Review do
+  NS-38, P1:** a primeira versão punha `● saída nova` depois do `● vivo` e do `[FORA DA JAIL]`, e
+  a marca nunca aparecia num agente fora da jail (`PO  ● vivo  [FORA DA JAIL]  ● saída nova` tem 40
+  colunas) e saía cortada no Tech Leader. Um agente marcado é sempre vivo, então a marca toma o
+  lugar do `● vivo` e vem antes do aviso da jail, que o cabeçalho do painel mostra inteiro: o mais
+  longo, `Tech Leader  ● saída nova`, tem 25 colunas;
+- `  ● saída nova` no fim de um nó **fechado** com um agente marcado abaixo dele (o ancestral
+  aberto não repete a marca: o agente já está visível).
+
+O título é ` Navegação `, com ` (com ocultos)` e/ou ` (só ativos)` quando os filtros estão
+ligados. **Diferença do plano:** o plano sugeria ` (só agentes ativos)`; com os dois filtros o
+título passava das 38 colunas da borda e era cortado. O rodapé diz `v mostrar tudo`.
+
+**Decisões (os números são os do plano do NS-38; a 3 e a 4, a tela de Configurações e o
+`Screen` com duas variantes, estão no começo desta seção):**
+- **Decisão 1:** **Sempre lado a lado** (decisão do usuário). A árvore à esquerda (`ui::LIST_WIDTH`,
+  40 colunas, no máximo metade da janela) e o painel à direita, com ou sem agente vivo. Isso
+  derrubou a regra "sem agente vivo, as telas são as de antes, byte a byte" (NS-34) e a do NS-37 (o
+  `Block::bordered()` sem estilo): o `ui::split` não recebe mais o `beside`, e o `list_block` é
+  sempre `pane_block(!app.on_terminal())`. Sem agente, o foco está sempre na árvore (borda grossa
+  ciano), e o painel fica `Plain` + DIM;
+- **Decisão 2:** **O atalho de foco com um nó que não é agente vivo** vai ao **último agente
+  exibido** (`App::last_shown`, decisão do usuário): seleciona o nó dele (abrindo os ramos acima,
+  `reveal_and_select`) e põe o foco no terminal. O atalho de novo devolve o foco à árvore, no mesmo
+  agente. Sem agente vivo, ou com diálogo aberto, nada;
+- **Decisão 5:** **"Exibido" (`App::shown`) segue a seleção:** é `Some(id)` só com o nó de um agente
+  vivo deste nick selecionado (`App::select`). Mover a seleção para outro nó esconde o agente, e a
+  regra da marca `● saída nova` do NS-34 vale sem mudança (o laço do `main.rs` guarda o texto pelo
+  `left_shown` ao comparar o exibido antes e depois de cada evento: não precisou de mudança);
+- **Decisão 6:** **Os agentes da árvore são todos os do ticket no banco** (`Db::list_ticket_agents`,
+  todas as etapas e estados);
+- **Decisão 7:** **Um ticket oculto com agente vivo deste nick continua na árvore** (marcado
+  `[oculto]`, apagado), mesmo sem o filtro de ocultos;
+- **Decisão 8:** **Os filtros são globais:** `f` (ocultos) e `v` (só agentes ativos) valem para a
+  árvore inteira, juntos ou não, e não se desligam ao subir de nível (antes, sair da lista de
+  tickets desligava o `f`). Com o `v`, só os ramos com agente vivo deste nick e esses agentes,
+  **todos abertos**, sem mexer no estado aberto/fechado guardado (que volta quando o filtro
+  desliga). Sem agente vivo, só o módulo, e o painel diz `Nenhum agente ativo.`;
+- **Decisão 9:** **Seleção por identidade** (`tree::NodeId`). Depois de cada refresh, um nó que
+  sumiu (ticket ocultado sem o filtro, projeto removido, ticket apagado por outro nick, filtro que o
+  esconde) passa a seleção ao **irmão seguinte**, senão ao **anterior**, senão ao **ancestral** mais
+  próximo (`Tree::reselect`, sobre as linhas de antes e de depois). O ticket selecionado que sumiu
+  do banco diz `O ticket <ID> não existe mais no banco.`, como a tela do ticket dizia;
+- **Decisão 10:** **Fim do agente exibido:** a seleção **fica no nó** (agora um agente encerrado,
+  com os dados à direita), o foco vai para a árvore e o `last_shown` passa a ser o agente vivo
+  aberto mais recentemente (ou nenhum). Substitui o "passa a ser exibido o agente vivo aberto mais
+  recentemente" do NS-34;
+- **Decisão 11:** **Projeto indisponível:** apagado com a marca, não abre (`→`/`Enter` dão a
+  mensagem de antes), e um projeto aberto que fica indisponível é fechado no refresh. **Exceção,
+  achada na execução:** o plano não previa o encontro desta regra com a 7 ("todo agente vivo
+  continua alcançável"): se o projeto de um agente vivo ficasse indisponível, ele seria fechado e o
+  agente sumiria da árvore, até do atalho. Um projeto indisponível **com agente vivo deste nick**
+  continua expansível e não é fechado; sem agente vivo, vale a regra (exceção confirmada pelo
+  usuário);
+- **Decisão 12:** **Nenhuma migração e nenhuma dependência nova.** O `ModuleKind` só ganhou
+  `derive(Hash)`.
+
+**O que o refresh lê** (`App::refresh_tree`, depois de cada tecla sem diálogo aberto, a regra D9 do
+NS-31, e quando um agente abre ou termina): a disponibilidade dos projetos (do disco, como a tela de
+Projetos fazia), os tickets de **todos** os projetos (só banco: assim o painel de um projeto fechado
+tem a contagem, e o `reveal` acha o projeto de um ticket), os agentes dos tickets dos projetos
+abertos e dos que têm agente vivo, e o detalhe do ticket selecionado (os artefatos do disco, só
+dele). Os agentes vêm numa consulta por projeto (`Db::list_project_agents`, agrupada por ticket, na
+ordem de abertura), e não numa por ticket: o refresh roda a cada seta, e três projetos abertos de
+100 tickets eram 300 consultas por tecla (review do NS-38, P2). A seleção vai por `select`, e as
+linhas visíveis são recalculadas uma vez por refresh: o `key_tree` não as recalcula antes, porque o
+`reselect` precisa das linhas de antes da tecla (achado na execução: um filtro que escondia o nó
+selecionado levava a seleção para o lugar errado). A marca `● saída nova` recalcula as linhas na
+hora (`hidden_output` e `show`), para subir aos ancestrais fechados sem esperar uma tecla.
+
+**Ações por nó** (`App::key_tree` e `key_node`; os diálogos, as mensagens, as recusas e as
+confirmações são as mesmas funções de antes, e as variantes de `Dialog`/`Action` são as de antes,
+menos o `NewTicket`, que guarda o projeto, e a remoção de projeto, abaixo: o `ConfirmRemove` com
+`agents`/`live` e a `Action::RemoveProject`; review do NS-38, P4):
+
+| Nó | Teclas próprias |
+|---|---|
+| Todos | `↑/↓` e `k/j` movem; `→`/`Enter` abrem um nó fechado ou descem ao primeiro filho de um aberto; `←`/`Esc` fecham um aberto ou sobem ao pai (com o `v`, sempre sobem); `f`; `v`; `q`/`Ctrl+C` |
+| Módulo | `a` cadastrar projeto; `c` configurações |
+| Projeto | `a` novo ticket (o projeto do nó, guardado no `Dialog::NewTicket` quando o diálogo abre: um refresh pelo fim de um agente pode mover a seleção com o diálogo aberto, e o ticket iria para outro projeto; review do NS-38, P5); `r` remover (com a contagem dos tickets e dos agentes) |
+| Ticket | `e` editar título; `o` ocultar `(s/N)` ou restaurar; `g` abrir agente; `m` mudar etapa; `i` editar ID |
+| Agente vivo | `→`/`Enter` foco no terminal; `x` encerrar `(s/N)` |
+| Agente não vivo | `→`/`Enter`: `O agente <nome> não está rodando neste nick.` |
+
+O projeto de uma ação vem do nó (`App::selected_project`, `project_of`), e não de uma tela
+aberta. Cada ação nova seleciona o nó criado, com os ramos acima abertos: o projeto cadastrado, o
+ticket criado e o agente aberto (este com o foco no terminal).
+
+**Remover um projeto leva os agentes dele** (decisão do usuário depois do plano). Antes, o
+`DELETE` do projeto já apagava em cascata os registros dos agentes (pelos tickets), mas um
+`claude` vivo deste nick continuava rodando, sem nó na árvore e sem linha no banco, e a
+confirmação não citava os agentes. Agora o `r` no nó do projeto lê os agentes dele
+(`Db::list_project_agents`, uma consulta nova, sem migração):
+- **um agente `active` em outro nick** (este não tem o processo e não consegue encerrá-lo) recusa
+  a remoção: `O projeto <nome> tem agente ativo em outro nick. Encerre os agentes dele lá antes de
+  remover o projeto.`. É o lado seguro, como no "Editar ID" do NS-36, e vale também para o
+  `active` de um nick que morreu, até a limpeza da próxima abertura. A checagem é refeita no `s`,
+  porque outro nick pode ter aberto um agente nesse meio-tempo;
+- a confirmação diz, nesta ordem, os agentes vivos deste nick que serão encerrados (`O agente vivo
+  dele neste nick será encerrado.` ou `Os <N> agentes vivos dele neste nick serão encerrados.`), os
+  tickets (o texto do NS-32) e os registros que saem do banco (`O agente registrado dele será
+  apagado do banco.` ou `Os <N> agentes registrados dele (inclusive os encerrados) serão apagados
+  do banco.`). Sem nenhum deles, o texto do NS-31, byte a byte;
+- o `s` sem agente vivo remove na hora, como antes. Com agente vivo, vira
+  `Action::RemoveProject { project, agents }`: o laço tira as sessões e encerra os grupos numa
+  espera só (`agent_session::terminate_all`, como na saída com agentes), e
+  `App::remove_project_ending_agents` grava `ended`, solta as travas (como o `x`) e remove o
+  projeto. A barra diz `Projeto removido do nick: <nome>. Nenhum arquivo foi apagado. O agente
+  <nome> foi encerrado.` (ou `Os <N> agentes vivos dele foram encerrados.`). Nenhum arquivo do
+  projeto é tocado (o teste de PTY compara o retrato recursivo).
+
+**Painel direito contextual** (`ui::draw_node_panel`, no `areas.panel` de sempre; com um agente
+vivo selecionado, o `draw_agent` do NS-37 sem mudança):
+- módulo: `Projetos: N` (com ` (M indisponíveis)` quando há), `Agentes vivos neste nick: N` e, sem
+  projeto, `Nenhum projeto cadastrado. Pressione a para adicionar.`;
+- projeto: ` Projeto <nome> `, `Caminho:`, `Situação: disponível` ou a marca, `Tickets: N` (com
+  ` (M ocultos)` quando há) e, sem ticket, `Nenhum ticket neste projeto. Pressione a para criar.`
+  O texto `Nenhum ticket neste projeto, nem oculto.` da lista com o filtro saiu: o painel conta os
+  ocultos;
+- ticket: o `draw_ticket` do NS-36 sem a seção "Agentes do ticket" (`draw_ticket_detail`), título
+  ` Ticket <ID> `, e o histórico com toda a altura que sobra, ainda com `(+N mudanças mais
+  antigas)`;
+- agente não vivo: ` Agente `, `Nome:`, `Etapa:`, `Estado:`, `Aberto em:`, `Sessão:` e `Retomar um
+  agente encerrado ainda não é possível neste nick.`
+
+**Rodapés por nó e altura fixa.** O rodapé é por lugar (`ui::Place`: módulo, projeto, ticket,
+agente vivo, agente não vivo, Configurações), sempre com `· f mostrar ocultos|esconder ocultos ·
+v agentes ativos|mostrar tudo` antes de `· q sair`, e com `(N)` ou `(N, M com saída nova)` no `v`
+quando há agente vivo. No projeto e no ticket o rodapé diz `← fechar/subir` (o `←` também sobe
+de um nó fechado ou de uma folha; nit do review do NS-38, sem mudar a altura do rodapé); no
+módulo, `← fechar`. `HELP_STATES` (no lugar do `LIST_SCREENS`) é a lista exaustiva dos 21
+estados (cada lugar com os dois filtros, mais Configurações), e o `help_rows` reserva com agente
+vivo as linhas do mais longo deles. O teste `every_help_state_is_in_help_states` tem um `match`
+exaustivo sobre `Place`. Assim mover a seleção entre tipos de nó ou ligar os filtros não muda a
+altura do rodapé e não redimensiona nenhum PTY (P1 do review do NS-34): os `SIZE 23 58` e `SIZE
+34 78` de `a_resize_reaches_claude_below_the_header` passaram sem mudar números.
+
+**`nick/src/tree.rs` é um módulo novo, com reuso real:** o modelo puro da árvore (sem banco, sem
+tela, sem disco), usado pelo `app.rs` (seleção, movimento, refresh) e pelo `ui.rs` (desenho), e
+testado sem `App`, no molde do `tickets.rs`/`stages.rs`: o `NodeId`, o `TreeData` (o que o `App`
+preenche), o estado aberto/fechado, o `visible` (as linhas com a profundidade, os filtros e o
+`unseen_below`), o `parent`, o `reveal` e o `reselect`. Não há trait nem widget genérico de árvore
+(há um módulo só: regra "Como acrescentar um módulo" do NS-31) nem crate de árvore: a árvore é
+desenhada com o `List` do ratatui. O `RunningAgent` ganhou `ticket_id` e `project_id`, preenchidos
+no `open_agent`, para o filtro, o `reveal` e a marca que sobe sem ler o banco.
+
+**O que saiu do código:** as variantes `Modules`, `Projects`, `Tickets`, `Ticket` e
+`ActiveAgents`; `key_modules`, `key_projects`, `open_tickets`, `key_tickets`, `refresh_tickets`,
+`open_ticket`, `refresh_ticket`, `key_ticket`, `open_active_agents`, `key_active_agents`,
+`show_selected`; os `draw_modules`, `draw_projects`, `draw_tickets`, `draw_ticket` e
+`draw_active_agents`; os campos `module_index`, `project_index`, `project`, `ticket_index`,
+`ticket_rows`, `show_hidden` (foi para o `Tree`), `agent_index`, `back` e `ticket_agent_index`, e o
+campo `agents` do `TicketDetail`. Nenhum `#[allow(dead_code)]` segura código morto.
+
+**Testes adaptados e substituídos** (o mapa completo, teste a teste, está em
+`.nick/docs/NS-38/mapa_testes.md`):
+- os testes de unidade das ações (`app.rs`) passaram a navegar pela árvore pelos helpers do
+  `Fixture` (`add` seleciona o módulo, `new_ticket` o projeto da seleção, `with_tickets` abre o
+  projeto, `select_key`, `keys`, `visible_tickets`, `on_project`, `on_ticket`, e o `g` sobe do
+  agente ao ticket), com as mesmas asserções de mensagem, banco e disco (os retratos do "nada no
+  projeto" do NS-32 incluídos);
+- mudaram de propósito, com a decisão no próprio teste: o fim do agente exibido (decisão 10), o
+  `f` que não se desliga ao subir (8), a visão "Agentes ativos" que virou filtro (`v` e `x` no nó),
+  a tela do ticket que virou painel (os agentes no `ticket_agents`, a seleção por `select`), o
+  layout sem agente (1) e a borda sem agente (NS-37);
+- no PTY, a navegação ficou centralizada no `tests/common/mod.rs` (`Nick::tree_rows`,
+  `selected_row`, `select`, `open_node`, `open_project`, `wait_for_flat`, `wait_for_tree`), e as
+  esperas por títulos de tela antigos (`auto_scrum > Projetos`, `auto_scrum > <proj> > Tickets`,
+  `Módulos`, `Agentes ativos`) viraram textos da árvore, do painel ou do rodapé do nó. Regra do
+  NS-32 mantida: depois de um `ESC` de diálogo, espera-se o rodapé do nó (`a adicionar projeto`,
+  `a novo ticket`), que só existe com o diálogo fechado. Como o rodapé da árvore quebra em duas
+  linhas a 100 colunas, as esperas por ele são pela tela lida numa linha só (`wait_for_flat`).
+
+**Testes novos:** `tree.rs` (raiz mesmo única, profundidade, indisponível, ocultos e a decisão 7,
+o filtro `v` que devolve o estado, a marca que sobe, `parent`, `reveal`, `reselect` e a exceção do
+projeto indisponível com agente vivo); `app.rs` (navegação, refresh, seleção por identidade,
+filtro que esconde a seleção, teclas de um nó que não valem em outro, foco e exibição, atalho com
+o `last_shown`, fim do agente exibido, `x`, filtro `v` com a marca e o projeto indisponível com
+agente vivo); `ui.rs` (linhas, estilos, títulos dos filtros, caracteres de controle, os painéis
+de cada nó, o histórico longo, sempre lado a lado, os agentes vivos e a marca, os rodapés, o
+`HELP_STATES` e o tamanho dos terminais em cinco larguras, com cada tipo de nó, filtro, foco e
+marca); e, no PTY (`tests/agent.rs`), do módulo ao terminal só com setas e `Enter` (critério 3), o
+atalho com um ticket selecionado indo ao último agente e voltando (com a borda grossa ciano pelo
+`Nick::cell`), a navegação por todos os tipos de nó e filtros sem nenhum SIGWINCH novo (pelo modo
+`winsize` do `claude` falso) e o painel e o rodapé de cada tipo de nó. As telas de conferência
+estão em `.nick/docs/NS-38/telas/`.

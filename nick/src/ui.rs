@@ -12,15 +12,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::agents::AgentState;
-use crate::app::{App, Button, Dialog, RunningAgent, Screen, TicketField};
+use crate::agents::{Agent, AgentState};
+use crate::app::{App, Button, Dialog, Row, RunningAgent, Screen, TicketDetail, TicketField};
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
-use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects;
 use crate::stages::{self, Input, Rule};
-use crate::tickets::{self, TicketStage};
+use crate::tickets::{self, Ticket, TicketStage};
+use crate::tree::{NodeId, Visible};
 
 /// The widest the list gets beside an agent (NS-34); never more than half the window.
 pub const LIST_WIDTH: u16 = 40;
@@ -43,15 +43,11 @@ fn pane_block(focused: bool) -> Block<'static> {
     }
 }
 
-/// The block of the list: `Block::bordered()` as before the NS-37 without an agent running
-/// (the whole-width screens stay byte for byte), `pane_block` beside one, focused unless the
-/// focus is on the terminal (`App::on_terminal`, the same rule as the help).
+/// The block of the column on the left (the tree, or the settings): always `pane_block` since
+/// the NS-38 (always side by side), focused unless the focus is on the terminal
+/// (`App::on_terminal`, the same rule as the help).
 fn list_block(app: &App) -> Block<'static> {
-    if app.agents().is_empty() {
-        Block::bordered()
-    } else {
-        pane_block(!app.on_terminal())
-    }
+    pane_block(!app.on_terminal())
 }
 
 /// Where each part of the screen goes.
@@ -72,9 +68,9 @@ pub struct Areas {
 
 /// The layout of the screen `area`: the status and the help at the bottom, full width, taking
 /// the rows they need, word wrapped (up to a third of the screen each), so a long one is not
-/// cut; above them, without an agent running, the list over the whole width (the screens of
-/// before the NS-34); with one, the list on the left (`LIST_WIDTH`, at most half the width)
-/// and the panel of the shown agent on the right.
+/// cut; above them, always side by side since the NS-38 (with or without an agent): the tree
+/// (or the settings) on the left (`LIST_WIDTH`, at most half the width) and the panel on the
+/// right, the shown agent's or the selected node's.
 pub fn layout(app: &App, area: Rect) -> Areas {
     layout_for(app, area, app.shown_agent())
 }
@@ -92,9 +88,9 @@ pub fn agent_area(app: &App, area: Rect, agent: &RunningAgent) -> Rect {
 /// whether it runs in the jail are known: the size of its PTY at the spawn.
 pub fn new_agent_panel(app: &App, area: Rect) -> Rect {
     let running = app.agents().len() + 1;
-    let help = help_text_for(app, (app.screen, app.show_hidden), true, None, None);
+    let help = help_text_for(app, help_state(app), true, None, None);
     let help_rows = help_rows(app, area.width, running, &help);
-    split(area, 1, help_rows, true).panel
+    split(area, 1, help_rows).panel
 }
 
 /// The terminal of the agent `name` in `panel`: inside the border of the panel (NS-37, one cell
@@ -113,7 +109,7 @@ pub fn terminal_in_panel(panel: Rect, name: &str, jail: bool) -> Rect {
 fn layout_for(app: &App, area: Rect, agent: Option<&RunningAgent>) -> Areas {
     let status_rows = status_lines(app, area.width).len();
     let help_rows = help_rows(app, area.width, app.agents().len(), &help_text(app));
-    let mut areas = split(area, status_rows, help_rows, !app.agents().is_empty());
+    let mut areas = split(area, status_rows, help_rows);
     if let Some(agent) = agent.filter(|_| !areas.panel.is_empty()) {
         areas.terminal = terminal_in_panel(areas.panel, &agent.name, agent.jail);
         areas.header = header_in_panel(areas.panel, areas.terminal);
@@ -133,8 +129,9 @@ fn header_in_panel(panel: Rect, terminal: Rect) -> Rect {
 }
 
 /// The status and the help (`status_rows`, `help_rows`, up to a third of the screen each) at
-/// the bottom of `area`, and above them the list, beside the panel of an agent when `beside`.
-fn split(area: Rect, status_rows: usize, help_rows: usize, beside: bool) -> Areas {
+/// the bottom of `area`, and above them the column on the left beside the panel: always side
+/// by side since the NS-38 (decision 1), with or without an agent.
+fn split(area: Rect, status_rows: usize, help_rows: usize) -> Areas {
     let rows = |lines: usize| {
         u16::try_from(lines)
             .unwrap_or(u16::MAX)
@@ -146,23 +143,19 @@ fn split(area: Rect, status_rows: usize, help_rows: usize, beside: bool) -> Area
         Constraint::Length(rows(help_rows)),
     ])
     .areas(area);
-    let mut areas = Areas {
+    let [list, panel] = Layout::horizontal([
+        Constraint::Length(LIST_WIDTH.min(area.width / 2)),
+        Constraint::Min(0),
+    ])
+    .areas(body);
+    Areas {
         body,
-        list: body,
+        list,
+        panel,
         status,
         help,
         ..Areas::default()
-    };
-    if beside {
-        let [list, panel] = Layout::horizontal([
-            Constraint::Length(LIST_WIDTH.min(area.width / 2)),
-            Constraint::Min(0),
-        ])
-        .areas(body);
-        areas.list = list;
-        areas.panel = panel;
     }
-    areas
 }
 
 /// The status message word wrapped at `width` (one empty row without a message).
@@ -182,19 +175,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_with_terminal(frame, app, None);
 }
 
-/// Draws the whole screen (`layout`): the list of the current screen, the panel of the shown
+/// Draws the whole screen (`layout`): the tree (or the settings), the panel of the shown
 /// agent with `terminal` (its vt100 screen) when an agent runs, the status line and the help
 /// line, and the open dialog centered over the body.
 pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100::Screen>) {
     let areas = layout(app, frame.area());
     let (body, status, help) = (areas.list, areas.status, areas.help);
     match app.screen {
-        Screen::Modules => draw_modules(frame, app, body),
-        Screen::Projects => draw_projects(frame, app, body),
-        Screen::Tickets => draw_tickets(frame, app, body),
-        Screen::Ticket => draw_ticket(frame, app, body),
-        Screen::ActiveAgents => draw_active_agents(frame, app, body),
         Screen::Settings => draw_settings(frame, app, body),
+        Screen::Tree => draw_tree(frame, app, body),
     }
     if let Some(agent) = app.shown_agent() {
         draw_agent(
@@ -205,6 +194,8 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
             app.on_terminal(),
             terminal,
         );
+    } else {
+        draw_node_panel(frame, app, areas.panel);
     }
     let status_lines = status_lines(app, frame.area().width);
     let help_lines = help_lines(app, frame.area().width);
@@ -264,25 +255,86 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-/// The keys of the current screen, in the help line. With the focus on the terminal, only the
-/// way back to the list (every other key is the program's). With agents running, the lists
-/// that open "Agentes ativos" say so, with how many there are and how many are marked.
+/// Where the help is (NS-38): the kind of the selected node of the tree, or the settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Place {
+    Module,
+    Project,
+    Ticket,
+    LiveAgent,
+    /// An agent ended, or active in another nick.
+    OtherAgent,
+    Settings,
+}
+
+/// The place of the help, with the filters of the tree (the hidden tickets, only the active
+/// agents).
+type HelpState = (Place, bool, bool);
+
+/// The state of the help of `app` now.
+fn help_state(app: &App) -> HelpState {
+    let place = if app.screen == Screen::Settings {
+        Place::Settings
+    } else {
+        match app.selected() {
+            NodeId::Module(_) => Place::Module,
+            NodeId::Project(_) => Place::Project,
+            NodeId::Ticket(_) => Place::Ticket,
+            NodeId::Agent(id) if app.agent(id).is_some() => Place::LiveAgent,
+            NodeId::Agent(_) => Place::OtherAgent,
+        }
+    };
+    let (show_hidden, only_active) = app.filters();
+    (place, show_hidden, only_active)
+}
+
+/// The keys of the selected node, in the help line. With the focus on the terminal, only the
+/// way back (every other key is the program's). With agents running, `v` says how many there
+/// are and how many are marked.
 fn help_text(app: &App) -> String {
     let count = (!app.agents().is_empty()).then(|| agents_count(app));
     help_text_for(
         app,
-        (app.screen, app.show_hidden),
+        help_state(app),
         app.on_terminal(),
         app.dialog.as_ref(),
         count,
     )
 }
 
-/// `help_text` in a given state: the screen (with the filter of the tickets), the focus on the
-/// terminal, the open dialog, and the count of the agents (`None` without agents running).
+/// The keys of an open dialog.
+fn dialog_keys(dialog: &Dialog) -> &'static str {
+    match dialog {
+        Dialog::AddPath { .. } => "Enter confirmar · Esc cancelar",
+        Dialog::NeedsConfig { .. } => "←/→/Tab escolher · Enter acionar · Esc cancelar",
+        Dialog::ConfirmRemove { .. } => "s remover · qualquer outra tecla cancela",
+        Dialog::NewTicket { .. } => "Tab trocar de campo · Enter confirmar · Esc cancelar",
+        Dialog::EditTitle { .. } => "Enter confirmar · Esc cancelar",
+        Dialog::ConfirmHide { .. } => "s ocultar · qualquer outra tecla cancela",
+        Dialog::ChooseType { .. } => "↑/↓ escolher · Enter abrir · Esc cancelar",
+        Dialog::StageForm { .. } => {
+            "Tab/↑/↓ trocar de campo · Enter confirmar (no campo do editor: abrir o editor) · \
+             Esc cancelar"
+        }
+        Dialog::ConfirmPrompt { .. } => PROMPT_KEYS,
+        Dialog::AgentError { .. } => "Enter/Esc fechar",
+        Dialog::ConfirmEndAgent { .. } => "s encerrar · qualquer outra tecla cancela",
+        Dialog::ConfirmQuit => "s encerrar e sair · qualquer outra tecla cancela",
+        Dialog::CaptureShortcut { .. } => "Esc cancelar",
+        Dialog::ChooseTicketStage { .. } => "↑/↓ escolher · Enter escolher · Esc cancelar",
+        Dialog::ConfirmStageChange { .. } => "s mudar · qualquer outra tecla cancela",
+        Dialog::EditId { .. } => "Enter confirmar · Esc cancelar",
+        Dialog::ConfirmEditId { .. } => "s trocar · qualquer outra tecla cancela",
+    }
+}
+
+/// `help_text` in a given state: the place with the filters, the focus on the terminal, the
+/// open dialog, and the count of the agents (`None` without agents running). On the tree: the
+/// keys of the node, then the two filters (`v` always, as the view of before, which worked
+/// without agents too), then `q sair`.
 fn help_text_for(
     app: &App,
-    (screen, show_hidden): (Screen, bool),
+    (place, show_hidden, only_active): HelpState,
     on_terminal: bool,
     dialog: Option<&Dialog>,
     count: Option<String>,
@@ -291,95 +343,81 @@ fn help_text_for(
     if on_terminal {
         return format!("{shortcut} voltar à lista");
     }
-    let text = match (dialog, screen) {
-        (Some(Dialog::AddPath { .. }), _) => "Enter confirmar · Esc cancelar",
-        (Some(Dialog::NeedsConfig { .. }), _) => "←/→/Tab escolher · Enter acionar · Esc cancelar",
-        (Some(Dialog::ConfirmRemove { .. }), _) => "s remover · qualquer outra tecla cancela",
-        (Some(Dialog::NewTicket { .. }), _) => {
-            "Tab trocar de campo · Enter confirmar · Esc cancelar"
-        }
-        (Some(Dialog::EditTitle { .. }), _) => "Enter confirmar · Esc cancelar",
-        (Some(Dialog::ConfirmHide { .. }), _) => "s ocultar · qualquer outra tecla cancela",
-        (Some(Dialog::ChooseType { .. }), _) => "↑/↓ escolher · Enter abrir · Esc cancelar",
-        (Some(Dialog::StageForm { .. }), _) => {
-            "Tab/↑/↓ trocar de campo · Enter confirmar (no campo do editor: abrir o editor) · \
-             Esc cancelar"
-        }
-        (Some(Dialog::ConfirmPrompt { .. }), _) => PROMPT_KEYS,
-        (Some(Dialog::AgentError { .. }), _) => "Enter/Esc fechar",
-        (Some(Dialog::ConfirmEndAgent { .. }), _) => "s encerrar · qualquer outra tecla cancela",
-        (Some(Dialog::ConfirmQuit), _) => "s encerrar e sair · qualquer outra tecla cancela",
-        (Some(Dialog::CaptureShortcut { .. }), _) => "Esc cancelar",
-        (Some(Dialog::ChooseTicketStage { .. }), _) => {
-            "↑/↓ escolher · Enter escolher · Esc cancelar"
-        }
-        (Some(Dialog::ConfirmStageChange { .. }), _) => "s mudar · qualquer outra tecla cancela",
-        (Some(Dialog::EditId { .. }), _) => "Enter confirmar · Esc cancelar",
-        (Some(Dialog::ConfirmEditId { .. }), _) => "s trocar · qualquer outra tecla cancela",
-        (None, Screen::Tickets) if show_hidden => {
-            "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
-             g abrir agente · Enter detalhes · Esc voltar · q sair"
-        }
-        (None, Screen::Tickets) => {
-            "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
-             g abrir agente · Enter detalhes · Esc voltar · q sair"
-        }
-        (None, Screen::Ticket) => {
-            "↑/↓ mover · Enter abrir agente · m mudar etapa · i editar ID · g novo agente · \
-             Esc voltar · q sair"
-        }
-        (None, Screen::Modules) => "↑/↓ mover · Enter abrir · c configurações · q sair",
-        (None, Screen::Projects) => "↑/↓ mover · a adicionar · r remover · Esc voltar · q sair",
-        (None, Screen::ActiveAgents) => {
-            return format!(
-                "↑/↓ escolher · Enter abrir · x encerrar · {shortcut} alternar · Esc voltar · \
-                 q sair"
-            );
-        }
-        (None, Screen::Settings) => {
-            return "t trocar · p voltar ao padrão · Esc voltar · q sair".to_string();
-        }
-    };
-    let opens_the_view = dialog.is_none()
-        && matches!(
-            screen,
-            Screen::Modules | Screen::Projects | Screen::Tickets | Screen::Ticket
-        );
-    match (text.strip_suffix("q sair"), count) {
-        (Some(start), Some(count)) if opens_the_view => {
-            format!("{start}v agentes ativos ({count}) · q sair")
-        }
-        _ => text.to_string(),
+    if let Some(dialog) = dialog {
+        return dialog_keys(dialog).to_string();
     }
+    let keys = match place {
+        Place::Settings => return "t trocar · p voltar ao padrão · Esc voltar · q sair".into(),
+        Place::Module => {
+            "↑/↓ mover · →/Enter abrir · ← fechar · a adicionar projeto · c configurações".into()
+        }
+        Place::Project => {
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · r remover".into()
+        }
+        Place::Ticket => "↑/↓ mover · →/Enter abrir · ← fechar/subir · e editar título · \
+                          o ocultar/restaurar · g abrir agente · m mudar etapa · i editar ID"
+            .into(),
+        Place::LiveAgent => {
+            format!("↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · {shortcut} alternar")
+        }
+        Place::OtherAgent => "↑/↓ mover · ← subir".to_string(),
+    };
+    let hidden = if show_hidden {
+        "f esconder ocultos"
+    } else {
+        "f mostrar ocultos"
+    };
+    let active = if only_active {
+        "v mostrar tudo"
+    } else {
+        "v agentes ativos"
+    };
+    let count = count.map_or(String::new(), |count| format!(" ({count})"));
+    format!("{keys} · {hidden} · {active}{count} · q sair")
 }
 
-/// Every list screen, with the filter of the tickets: the helps `help_rows` reserves rows for.
-const LIST_SCREENS: [(Screen, bool); 7] = [
-    (Screen::Modules, false),
-    (Screen::Projects, false),
-    (Screen::Tickets, false),
-    (Screen::Tickets, true),
-    (Screen::Ticket, false),
-    (Screen::ActiveAgents, false),
-    (Screen::Settings, false),
+/// Every state of the help without a dialog: each kind of node with both filters, and the
+/// settings. `help_rows` reserves rows for the longest of them.
+const HELP_STATES: [HelpState; 21] = [
+    (Place::Module, false, false),
+    (Place::Module, true, false),
+    (Place::Module, false, true),
+    (Place::Module, true, true),
+    (Place::Project, false, false),
+    (Place::Project, true, false),
+    (Place::Project, false, true),
+    (Place::Project, true, true),
+    (Place::Ticket, false, false),
+    (Place::Ticket, true, false),
+    (Place::Ticket, false, true),
+    (Place::Ticket, true, true),
+    (Place::LiveAgent, false, false),
+    (Place::LiveAgent, true, false),
+    (Place::LiveAgent, false, true),
+    (Place::LiveAgent, true, true),
+    (Place::OtherAgent, false, false),
+    (Place::OtherAgent, true, false),
+    (Place::OtherAgent, false, true),
+    (Place::OtherAgent, true, true),
+    (Place::Settings, false, false),
 ];
 
 /// The rows reserved for the help with `running` agents (review NS-34, P1): never fewer than
-/// the longest help of the lists, with the longest count (`N, N com saída nova`), whatever the
-/// screen, the focus, the dialog or the marks. So toggling the focus, going to another list or
-/// a new mark does not resize every terminal (each resize redraws every claude and marks the
-/// hidden ones). The shorter help of the moment is drawn in the same rows. Without agents, the
-/// rows of the help itself, as before the NS-34.
+/// the longest help of the tree (`HELP_STATES`), with the longest count (`N, N com saída
+/// nova`), whatever the node, the filters, the focus, the dialog or the marks. So moving on
+/// the tree, toggling the focus or a new mark does not resize every terminal (each resize
+/// redraws every claude and marks the hidden ones). The shorter help of the moment is drawn in
+/// the same rows. Without agents, the rows of the help itself.
 fn help_rows(app: &App, width: u16, running: usize, help: &str) -> usize {
     let rows = wrap_words(help, width.max(1)).len();
     if running == 0 {
         return rows;
     }
     let count = format!("{running}, {running} com saída nova");
-    LIST_SCREENS
+    HELP_STATES
         .into_iter()
-        .map(|screen| {
-            let text = help_text_for(app, screen, false, None, Some(count.clone()));
+        .map(|state| {
+            let text = help_text_for(app, state, false, None, Some(count.clone()));
             wrap_words(&text, width.max(1)).len()
         })
         .fold(rows, usize::max)
@@ -478,55 +516,6 @@ fn selected_style() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = ModuleKind::ALL
-        .iter()
-        .map(|module| ListItem::new(module.name()))
-        .collect();
-    let list = List::new(items)
-        .block(list_block(app).title(" Módulos "))
-        .highlight_symbol("> ")
-        .highlight_style(selected_style());
-    let mut state = ListState::default().with_selected(Some(app.module_index));
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
-/// "Agentes ativos": every agent of this nick, in the order they were opened, with
-/// `[FORA DA JAIL]` (red) out of the jail and `● saída nova` when marked.
-fn draw_active_agents(frame: &mut Frame, app: &App, area: Rect) {
-    let block = list_block(app).title(" Agentes ativos ");
-    if app.agents().is_empty() {
-        frame.render_widget(
-            Paragraph::new("Nenhum agente ativo.")
-                .block(block)
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .agents()
-        .iter()
-        .map(|agent| {
-            let mut spans = vec![Span::raw(printable(&agent.name))];
-            if !agent.jail {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled("[FORA DA JAIL]", Style::new().fg(Color::Red)));
-            }
-            if agent.unseen {
-                spans.push(Span::raw("  ● saída nova"));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(selected_style());
-    let mut state = ListState::default().with_selected(Some(app.agent_index));
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
 /// "Configurações": the reserved shortcut, with `(padrão)` when the database has none.
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let default = if app.shortcut_stored {
@@ -546,105 +535,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_projects(frame: &mut Frame, app: &App, area: Rect) {
-    let block = list_block(app).title(format!(" {} > Projetos ", app.module().name()));
-    if app.rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new("Nenhum projeto cadastrado. Pressione a para adicionar.")
-                .block(block)
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .rows
-        .iter()
-        .map(|row| {
-            let mut spans = vec![
-                Span::raw(printable(&row.project.name)),
-                Span::raw("  "),
-                Span::raw(printable(&row.project.path.to_string_lossy())),
-            ];
-            let mut style = Style::new();
-            if let Some(mark) = projects::unavailable_text(row.availability) {
-                spans.push(Span::raw("  "));
-                spans.push(Span::raw(mark));
-                style = style.add_modifier(Modifier::DIM);
-            }
-            ListItem::new(Line::from(spans)).style(style)
-        })
-        .collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(selected_style());
-    let mut state = ListState::default().with_selected(Some(app.project_index));
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
-fn draw_tickets(frame: &mut Frame, app: &App, area: Rect) {
-    let project = app
-        .project
-        .as_ref()
-        .map_or(String::new(), |p| printable(&p.name));
-    let filter = if app.show_hidden {
-        " (com ocultos)"
-    } else {
-        ""
-    };
-    let block = list_block(app).title(format!(
-        " {} > {project} > Tickets{filter} ",
-        app.module().name()
-    ));
-    if app.ticket_rows.is_empty() {
-        let empty = if app.show_hidden {
-            "Nenhum ticket neste projeto, nem oculto. Pressione a para criar."
-        } else {
-            "Nenhum ticket neste projeto. Pressione a para criar."
-        };
-        frame.render_widget(
-            Paragraph::new(empty)
-                .block(block)
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .ticket_rows
-        .iter()
-        .map(|ticket| {
-            // The stage right after the ID: beside an agent the list has 40 columns, and the
-            // end of the row is cut (NS-36).
-            let mut spans = vec![
-                Span::raw(printable(&ticket.key)),
-                Span::raw("  "),
-                stage_mark(&ticket.stage),
-                Span::raw("  "),
-                Span::raw(printable(&ticket.title)),
-            ];
-            if ticket.is_provisional {
-                spans.push(Span::raw("  [provisório]"));
-            }
-            let mut style = Style::new();
-            if ticket.hidden_at.is_some() {
-                spans.push(Span::raw("  [oculto]"));
-                style = style.add_modifier(Modifier::DIM);
-            }
-            ListItem::new(Line::from(spans)).style(style)
-        })
-        .collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(selected_style());
-    let mut state = ListState::default().with_selected(Some(app.ticket_index));
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
-/// The mark of a stage on the list and on the ticket screen: `[<label>]`, and `[✓ Concluído]` in
-/// green for the done ones (which stay on the list: only `o` hides a ticket).
+/// The mark of a stage on the tree and on the panel of a ticket: `[<label>]`, and `[✓ Concluído]`
+/// in green for the done ones (which stay on the tree: only `o` hides a ticket).
 fn stage_mark(key: &str) -> Span<'static> {
     if key == TicketStage::Done.key() {
         Span::styled(
@@ -670,24 +562,256 @@ fn short_date(date: &str) -> String {
     }
 }
 
-/// The ticket screen (NS-36): the ticket, its stage and its artifacts on top; then the history
-/// of the stage (the newest when it does not fit, with how many older ones are left out) and
-/// the agents of the ticket, a list with selection.
-fn draw_ticket(frame: &mut Frame, app: &App, area: Rect) {
-    let project = app
-        .project
-        .as_ref()
-        .map_or(String::new(), |p| printable(&p.name));
-    let Some(detail) = app.ticket_detail.as_ref() else {
-        frame.render_widget(list_block(app), area);
-        return;
+/// The label of a project on the tree: its name and, unavailable, the mark (the path goes to
+/// the panel, to fit in 40 columns); dimmed when unavailable.
+fn project_spans(row: &Row) -> (Vec<Span<'static>>, Style) {
+    let mut spans = vec![Span::raw(printable(&row.project.name))];
+    let mut style = Style::new();
+    if let Some(mark) = projects::unavailable_text(row.availability) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::raw(mark));
+        style = style.add_modifier(Modifier::DIM);
+    }
+    (spans, style)
+}
+
+/// The label of a ticket: `<ID>  [<etapa>]  <título>  [provisório]  [oculto]` (the stage right
+/// after the ID: the end of the row is cut at 40 columns, NS-36); dimmed when hidden.
+fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
+    let mut spans = vec![
+        Span::raw(printable(&ticket.key)),
+        Span::raw("  "),
+        stage_mark(&ticket.stage),
+        Span::raw("  "),
+        Span::raw(printable(&ticket.title)),
+    ];
+    if ticket.is_provisional {
+        spans.push(Span::raw("  [provisório]"));
+    }
+    let mut style = Style::new();
+    if ticket.hidden_at.is_some() {
+        spans.push(Span::raw("  [oculto]"));
+        style = style.add_modifier(Modifier::DIM);
+    }
+    (spans, style)
+}
+
+/// The state of an agent record: `● vivo` (this nick runs it), `ativo em outro nick` (an active
+/// row without a session here) or `encerrado`.
+fn agent_state(app: &App, agent: &Agent) -> &'static str {
+    if app.agent(agent.id).is_some() {
+        "● vivo"
+    } else if agent.state == AgentState::Active.key() {
+        "ativo em outro nick"
+    } else {
+        "encerrado"
+    }
+}
+
+/// The label of an agent: `<Etapa>  <estado>`, `[FORA DA JAIL]` in red (live out of the jail),
+/// then the date it was opened. A marked agent (always live) shows `● saída nova` in the place
+/// of `● vivo`: at depth 3 the tree has 28 columns, and the mark must never be cut (review of the
+/// NS-38, P1); the warning of the jail, whole in the header of the panel, comes after it. The
+/// state and the marks before the date, so the 40 columns keep them (as the stage after the ID
+/// of a ticket); not live, dimmed.
+fn agent_spans(app: &App, agent: &Agent) -> (Vec<Span<'static>>, Style) {
+    let live = app.agent(agent.id);
+    let state = match live {
+        Some(live) if live.unseen => "● saída nova",
+        _ => agent_state(app, agent),
     };
+    let mut spans = vec![
+        Span::raw(printable(&tickets::stage_label(&agent.stage))),
+        Span::raw("  "),
+        Span::raw(state),
+    ];
+    let mut style = Style::new();
+    match live {
+        Some(live) if !live.jail => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("[FORA DA JAIL]", Style::new().fg(Color::Red)));
+        }
+        Some(_) => {}
+        None => style = style.add_modifier(Modifier::DIM),
+    }
+    let date = short_date(&agent.opened_at);
+    spans.push(Span::raw(format!(
+        "  {}",
+        date.strip_suffix(" UTC").unwrap_or(&date)
+    )));
+    (spans, style)
+}
+
+/// The tree (NS-38): two spaces a level, `▾` open, `▸` closed, two spaces on a leaf, and the
+/// label of the node; `● saída nova` at the end of a closed node with a marked agent below.
+/// The title says the filters on (` (com ocultos) (só ativos)`: both fit in the 40 columns).
+fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
+    let (show_hidden, only_active) = app.filters();
+    let mut title = " Navegação".to_string();
+    if show_hidden {
+        title.push_str(" (com ocultos)");
+    }
+    if only_active {
+        title.push_str(" (só ativos)");
+    }
+    title.push(' ');
+    let items: Vec<ListItem> = app
+        .visible()
+        .iter()
+        .map(|row| {
+            let (label, style) = node_spans(app, row);
+            let arrow = match (row.expandable, row.open) {
+                (true, true) => "▾ ",
+                (true, false) => "▸ ",
+                (false, _) => "  ",
+            };
+            let mut spans = vec![Span::raw(format!(
+                "{}{arrow}",
+                "  ".repeat(usize::from(row.depth))
+            ))];
+            spans.extend(label);
+            if row.unseen_below {
+                spans.push(Span::raw("  ● saída nova"));
+            }
+            ListItem::new(Line::from(spans)).style(style)
+        })
+        .collect();
+    let selected = app
+        .visible()
+        .iter()
+        .position(|row| row.id == app.selected());
+    let list = List::new(items)
+        .block(list_block(app).title(title))
+        .highlight_symbol("> ")
+        .highlight_style(selected_style());
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The label of a visible row and its style.
+fn node_spans(app: &App, row: &Visible) -> (Vec<Span<'static>>, Style) {
+    let none = || (vec![Span::raw("?")], Style::new());
+    match row.id {
+        NodeId::Module(module) => (vec![Span::raw(module.name())], Style::new()),
+        NodeId::Project(id) => app.project_row(id).map_or_else(none, project_spans),
+        NodeId::Ticket(id) => app.ticket(id).map_or_else(none, ticket_spans),
+        NodeId::Agent(id) => app
+            .agent_record(id)
+            .map_or_else(none, |agent| agent_spans(app, agent)),
+    }
+}
+
+/// The panel on the right of a node that is not a live agent (NS-38): the module, a project,
+/// a ticket, or an agent not live; `Nenhum agente ativo.` under the filter without agents. The
+/// focus is never on it (`pane_block(false)`).
+fn draw_node_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = pane_block(false);
+    let paragraph = |frame: &mut Frame, title: String, lines: Vec<Line<'static>>| {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block.clone().title(title))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    };
+    let (_, only_active) = app.filters();
+    match app.selected() {
+        NodeId::Module(module) if only_active && app.agents().is_empty() => paragraph(
+            frame,
+            format!(" {} ", module.name()),
+            vec![Line::from("Nenhum agente ativo.")],
+        ),
+        NodeId::Module(module) => {
+            let rows = app.project_rows();
+            let lines = if rows.is_empty() {
+                vec![Line::from(
+                    "Nenhum projeto cadastrado. Pressione a para adicionar.",
+                )]
+            } else {
+                let unavailable = rows
+                    .iter()
+                    .filter(|row| projects::unavailable_text(row.availability).is_some())
+                    .count();
+                let mut projects = format!("Projetos: {}", rows.len());
+                if unavailable > 0 {
+                    projects.push_str(&format!(" ({unavailable} indisponíveis)"));
+                }
+                vec![
+                    Line::from(projects),
+                    Line::from(format!("Agentes vivos neste nick: {}", app.agents().len())),
+                ]
+            };
+            paragraph(frame, format!(" {} ", module.name()), lines);
+        }
+        NodeId::Project(id) => {
+            let Some(row) = app.project_row(id) else {
+                frame.render_widget(block, area);
+                return;
+            };
+            let tickets = app.project_tickets(id);
+            let hidden = tickets.iter().filter(|t| t.hidden_at.is_some()).count();
+            let situation = projects::unavailable_text(row.availability).unwrap_or("disponível");
+            let mut count = format!("Tickets: {}", tickets.len());
+            if hidden > 0 {
+                count.push_str(&format!(" ({hidden} ocultos)"));
+            }
+            let mut lines = vec![
+                Line::from(format!(
+                    "Caminho: {}",
+                    printable(&row.project.path.to_string_lossy())
+                )),
+                Line::from(format!("Situação: {situation}")),
+                Line::from(count),
+            ];
+            if tickets.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(
+                    "Nenhum ticket neste projeto. Pressione a para criar.",
+                ));
+            }
+            paragraph(
+                frame,
+                format!(" Projeto {} ", printable(&row.project.name)),
+                lines,
+            );
+        }
+        NodeId::Ticket(_) => match app.ticket_detail.as_ref() {
+            Some(detail) => draw_ticket_detail(frame, detail, block, area),
+            None => frame.render_widget(block, area),
+        },
+        NodeId::Agent(id) => {
+            let Some(agent) = app.agent_record(id) else {
+                frame.render_widget(block, area);
+                return;
+            };
+            let state = agent_state(app, agent);
+            paragraph(
+                frame,
+                " Agente ".to_string(),
+                vec![
+                    Line::from(format!("Nome: {}", printable(&agent.name))),
+                    Line::from(format!(
+                        "Etapa: {}",
+                        printable(&tickets::stage_label(&agent.stage))
+                    )),
+                    Line::from(format!("Estado: {state}")),
+                    Line::from(format!("Aberto em: {}", short_date(&agent.opened_at))),
+                    Line::from(format!("Sessão: {}", printable(&agent.session_id))),
+                    Line::from(""),
+                    Line::from("Retomar um agente encerrado ainda não é possível neste nick."),
+                ],
+            );
+        }
+    }
+}
+
+/// The panel of a ticket (the ticket screen of the NS-36, without its agents, which are on the
+/// tree since the NS-38): the ticket, its stage and its artifacts on top; then the history of
+/// the stage with the rest of the height (the newest when it does not fit, with how many older
+/// ones are left out).
+fn draw_ticket_detail(frame: &mut Frame, detail: &TicketDetail, block: Block<'static>, area: Rect) {
     let ticket = &detail.ticket;
-    let block = list_block(app).title(format!(
-        " {} > {project} > {} ",
-        app.module().name(),
-        printable(&ticket.key)
-    ));
+    let block = block.title(format!(" Ticket {} ", printable(&ticket.key)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let mut head = vec![Span::raw(format!(
@@ -710,8 +834,7 @@ fn draw_ticket(frame: &mut Frame, app: &App, area: Rect) {
     let top = vec![
         Line::from(head),
         Line::from(vec![Span::raw("Etapa atual: "), stage]),
-        // The state before the path: beside an agent the screen has 40 columns, and the end of
-        // the line is cut (review of the NS-36, P3.1; as the stage after the ID on the list).
+        // The state before the path (review of the NS-36, P3.1): the end of a line is cut.
         Line::from(format!(
             "Plano {}:  {}",
             exists(detail.artifacts.plan),
@@ -734,29 +857,16 @@ fn draw_ticket(frame: &mut Frame, app: &App, area: Rect) {
             ..inner
         },
     );
-    let rest = inner.height - top_rows;
-    // Each section: its title, its rows (at least the "none" one); the history also a blank
-    // row below. The agents keep at least half of what is left (or what they need).
-    let as_rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let agents_need = 1 + as_rows(detail.agents.len().max(1));
-    let history_need = 2 + as_rows(detail.changes.len().max(1));
-    let agents_min = agents_need.min((rest / 2).max(2)).min(rest);
-    let history_rows = history_need.min(rest - agents_min);
     let history_area = Rect {
         y: inner.y + top_rows,
-        height: history_rows,
-        ..inner
-    };
-    let agents_area = Rect {
-        y: history_area.y + history_rows,
-        height: rest - history_rows,
+        height: inner.height - top_rows,
         ..inner
     };
     let mut history = vec![Line::from("Histórico de etapas")];
     if detail.changes.is_empty() {
         history.push(Line::from("Nenhuma mudança: o ticket começou em PO."));
     } else {
-        let slots = usize::from(history_rows.saturating_sub(2));
+        let slots = usize::from(history_area.height.saturating_sub(1));
         let mut shown = &detail.changes[..];
         if shown.len() > slots {
             let keep = slots.saturating_sub(1);
@@ -774,47 +884,6 @@ fn draw_ticket(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(history), history_area);
-    if agents_area.height == 0 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new("Agentes do ticket"),
-        Rect {
-            height: 1,
-            ..agents_area
-        },
-    );
-    let list_area = Rect {
-        y: agents_area.y + 1,
-        height: agents_area.height - 1,
-        ..agents_area
-    };
-    if detail.agents.is_empty() {
-        frame.render_widget(
-            Paragraph::new("Nenhum agente aberto para este ticket."),
-            list_area,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = detail
-        .agents
-        .iter()
-        .map(|agent| {
-            let state = if app.agent(agent.id).is_some() {
-                "● vivo"
-            } else if agent.state == AgentState::Active.key() {
-                "ativo em outro nick"
-            } else {
-                "encerrado"
-            };
-            ListItem::new(format!("{}  {state}", printable(&agent.name)))
-        })
-        .collect();
-    let list = List::new(items)
-        .highlight_symbol("> ")
-        .highlight_style(selected_style());
-    let mut state = ListState::default().with_selected(Some(app.ticket_agent_index));
-    frame.render_stateful_widget(list, list_area, &mut state);
 }
 
 /// How many rows `lines` take wrapped at `width` (an estimate that never falls short by much:
@@ -866,14 +935,28 @@ fn dialog_area(area: Rect, lines: &[Line]) -> Rect {
     }
 }
 
-/// The removal question, with the tickets that go with the project (plan D7). Without
-/// tickets it is the text of the NS-31, byte for byte.
-fn removal_question(name: &str, path: &str, tickets: i64) -> String {
-    let goes = match tickets {
+/// The removal question, with what goes with the project: its agents live in this nick, which
+/// are ended (NS-38), its tickets (plan D7 of NS-32) and its agent records, the ended ones too
+/// (NS-38). Without any of them it is the text of the NS-31, byte for byte.
+fn removal_question(name: &str, path: &str, tickets: i64, agents: i64, live: i64) -> String {
+    let ended = match live {
+        0 => String::new(),
+        1 => "O agente vivo dele neste nick será encerrado. ".to_string(),
+        n => format!("Os {n} agentes vivos dele neste nick serão encerrados. "),
+    };
+    let tickets = match tickets {
         0 => String::new(),
         1 => "O ticket dele será apagado do banco. ".to_string(),
         n => format!("Os {n} tickets dele (inclusive os ocultos) serão apagados do banco. "),
     };
+    let records = match agents {
+        0 => String::new(),
+        1 => "O agente registrado dele será apagado do banco. ".to_string(),
+        n => format!(
+            "Os {n} agentes registrados dele (inclusive os encerrados) serão apagados do banco. "
+        ),
+    };
+    let goes = format!("{ended}{tickets}{records}");
     format!(
         "Remover o projeto {name} ({path}) do nick? Os arquivos do projeto não são tocados. \
          {goes}(s/N)"
@@ -919,6 +1002,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             title,
             jira_id,
             focus,
+            ..
         } => {
             let label = |text: &'static str, mine: TicketField| {
                 if *focus == mine {
@@ -1182,12 +1266,19 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
                 None,
             )
         }
-        Dialog::ConfirmRemove { project, tickets } => (
+        Dialog::ConfirmRemove {
+            project,
+            tickets,
+            agents,
+            live,
+        } => (
             " Remover projeto ",
             vec![Line::from(removal_question(
                 &printable(&project.name),
                 &printable(&project.path.to_string_lossy()),
                 *tickets,
+                *agents,
+                *live,
             ))],
             None,
         ),
@@ -1529,89 +1620,16 @@ mod tests {
     }
 
     #[test]
-    fn the_modules_screen_lists_auto_scrum_with_its_help() {
-        let f = fixture();
-        let buffer = render(&f.app);
-        assert_has(&buffer, "Módulos");
-        assert_has(&buffer, "auto_scrum");
-        assert_eq!(
-            last_line(&buffer).trim(),
-            "↑/↓ mover · Enter abrir · c configurações · q sair"
-        );
-    }
-
-    #[test]
-    fn the_projects_screen_marks_the_unavailable_ones_dimmed() {
-        let mut f = fixture();
-        f.app.screen = Screen::Projects;
-        f.app.rows = vec![
-            Row {
-                project: project(1, "alfa", "/w/alfa"),
-                availability: Availability::Available,
-            },
-            Row {
-                project: project(2, "beta", "/w/beta"),
-                availability: Availability::DirMissing,
-            },
-            Row {
-                project: project(3, "gama", "/w/gama"),
-                availability: Availability::ConfigMissing,
-            },
-        ];
-        let buffer = render(&f.app);
-        assert_has(&buffer, "auto_scrum > Projetos");
-        assert_has(&buffer, "alfa  /w/alfa");
-        assert_has(
-            &buffer,
-            "beta  /w/beta  [indisponível: pasta não encontrada]",
-        );
-        assert_has(
-            &buffer,
-            "gama  /w/gama  [indisponível: sem .nick/nick.conf]",
-        );
-        let (y, _) = find(&buffer, "alfa  /w/alfa").unwrap();
-        assert!(
-            !text(&buffer)
-                .lines()
-                .nth(y as usize)
-                .unwrap()
-                .contains("indisponível"),
-            "the available one has no mark"
-        );
-        for name in ["beta", "gama"] {
-            let (y, x) = find(&buffer, name).unwrap();
-            assert!(
-                buffer[(x, y)].modifier.contains(Modifier::DIM),
-                "{name} is dimmed"
-            );
-        }
-        let (y, x) = find(&buffer, "alfa").unwrap();
-        assert!(!buffer[(x, y)].modifier.contains(Modifier::DIM));
-        assert_eq!(
-            last_line(&buffer).trim(),
-            "↑/↓ mover · a adicionar · r remover · Esc voltar · q sair"
-        );
-    }
-
-    #[test]
-    fn an_empty_projects_list_says_how_to_add() {
-        let mut f = fixture();
-        f.app.screen = Screen::Projects;
-        let buffer = render(&f.app);
-        assert_has(
-            &buffer,
-            "Nenhum projeto cadastrado. Pressione a para adicionar.",
-        );
-    }
-
-    #[test]
     fn the_status_message_is_shown_above_the_help() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         f.app.status = Some("A pasta x não existe.".into());
         let buffer = render(&f.app);
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
-        assert_eq!(lines[lines.len() - 2].trim(), "A pasta x não existe.");
+        let help = help_lines(&f.app, 100).len();
+        assert_eq!(
+            lines[lines.len() - 1 - help].trim(),
+            "A pasta x não existe."
+        );
     }
 
     /// A status longer than the screen wraps (NS-32: decision of the user), above the help line:
@@ -1619,30 +1637,29 @@ mod tests {
     #[test]
     fn a_long_status_message_wraps_above_the_help() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         let message = "Projeto indisponível: [indisponível: sem .nick/nick.conf]. Os tickets só \
                        abrem com a pasta e o .nick/nick.conf no lugar.";
         assert!(message.chars().count() > 100);
         f.app.status = Some(message.into());
         let buffer = render(&f.app);
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
-        let n = lines.len();
-        assert_eq!(
-            lines[n - 1].trim(),
-            "↑/↓ mover · a adicionar · r remover · Esc voltar · q sair"
-        );
+        // The help of the module takes two rows at 100 columns (NS-38).
+        let help = help_lines(&f.app, 100);
+        assert_eq!(help.len(), 2);
+        let n = lines.len() - help.len() + 1;
+        assert_eq!(lines[n - 1].trim(), help[0]);
         assert_eq!(
             format!("{} {}", lines[n - 3].trim(), lines[n - 2].trim()),
             message,
             "two rows, word wrapped"
         );
-        assert!(lines[n - 4].contains('└'), "the list ends right above");
+        assert!(lines[n - 4].contains('┗'), "the tree ends right above");
         // A word longer than the width is broken, not lost.
         let long = format!("Esse projeto já está cadastrado: /{}.", "x".repeat(150));
         f.app.status = Some(long.clone());
         let buffer = render(&f.app);
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
-        let n = lines.len();
+        let n = lines.len() - help.len() + 1;
         let joined: String = lines[n - 4..n - 1]
             .iter()
             .map(|l| l.trim())
@@ -1663,7 +1680,6 @@ mod tests {
     #[test]
     fn the_text_field_shows_the_label_and_what_was_typed() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         f.app.dialog = Some(Dialog::AddPath {
             input: "~/proj q".into(),
         });
@@ -1678,7 +1694,6 @@ mod tests {
     #[test]
     fn a_long_path_in_the_text_field_keeps_its_end_and_the_cursor_visible() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         let path = format!("/home/u/{}/fim-do-caminho", "x".repeat(97));
         assert_eq!(path.chars().count(), 120);
         f.app.dialog = Some(Dialog::AddPath {
@@ -1726,7 +1741,6 @@ mod tests {
     #[test]
     fn the_alert_shows_the_full_config_path_and_both_buttons() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         let dir = format!("/home/u/{}/projeto", "muito-longo".repeat(8));
         f.app.dialog = Some(Dialog::NeedsConfig {
             dir: PathBuf::from(&dir),
@@ -1738,7 +1752,7 @@ mod tests {
         // The path may wrap: compare the screen without line breaks nor borders.
         let flat: String = text(&buffer)
             .lines()
-            .map(|l| l.replace('│', "").trim().to_string())
+            .map(|l| l.replace(['│', '┃'], "").trim().to_string())
             .collect();
         assert!(
             flat.contains(&format!("{dir}/.nick/nick.conf")),
@@ -1765,10 +1779,11 @@ mod tests {
     #[test]
     fn the_removal_confirmation_names_the_project_and_s_n() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         f.app.dialog = Some(Dialog::ConfirmRemove {
             project: project(1, "alfa", "/w/alfa"),
             tickets: 0,
+            agents: 0,
+            live: 0,
         });
         let buffer = render(&f.app);
         let flat: String = text(&buffer)
@@ -1805,115 +1820,25 @@ mod tests {
         }
     }
 
-    fn on_tickets(f: &mut Fixture) {
-        f.app.screen = Screen::Tickets;
-        f.app.project = Some(project(1, "meu-proj", "/w/meu-proj"));
-    }
-
     /// The text of the dialog box, without borders, as one line.
     fn flat(buffer: &Buffer) -> String {
         text(buffer)
             .lines()
-            .map(|l| l.replace('│', "").trim().to_string())
+            .map(|l| l.replace(['│', '┃'], "").trim().to_string())
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
     }
 
     #[test]
-    fn the_tickets_screen_lists_id_and_title_with_the_provisional_mark() {
-        let mut f = fixture();
-        on_tickets(&mut f);
-        f.app.ticket_rows = vec![
-            ticket(1, "NS-1", "Corrigir o login", false, false),
-            ticket(2, "3f9a0c7e", "Sem ID ainda", true, false),
-        ];
-        let buffer = render(&f.app);
-        assert_has(&buffer, " auto_scrum > meu-proj > Tickets ");
-        assert_has(&buffer, "NS-1  [PO]  Corrigir o login");
-        assert_has(&buffer, "3f9a0c7e  [PO]  Sem ID ainda  [provisório]");
-        let (y, _) = find(&buffer, "NS-1").unwrap();
-        assert!(
-            !text(&buffer)
-                .lines()
-                .nth(y as usize)
-                .unwrap()
-                .contains("[provisório]")
-        );
-        assert!(find(&buffer, "(com ocultos)").is_none());
-        // With `g abrir agente` (NS-33) the help passes 100 columns and wraps, as with the filter.
-        let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
-        let n = lines.len();
-        assert_eq!(
-            format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()),
-            "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f mostrar ocultos · \
-             g abrir agente · Enter detalhes · Esc voltar · q sair"
-        );
-    }
-
-    #[test]
-    fn with_the_filter_the_hidden_ones_are_dimmed_and_marked() {
-        let mut f = fixture();
-        on_tickets(&mut f);
-        f.app.show_hidden = true;
-        f.app.ticket_rows = vec![
-            ticket(1, "NS-1", "Visível", false, false),
-            ticket(2, "NS-2", "Escondido", false, true),
-            ticket(3, "abcd1234", "Provisório escondido", true, true),
-        ];
-        let buffer = render(&f.app);
-        assert_has(&buffer, " auto_scrum > meu-proj > Tickets (com ocultos) ");
-        assert_has(&buffer, "NS-2  [PO]  Escondido  [oculto]");
-        assert_has(
-            &buffer,
-            "abcd1234  [PO]  Provisório escondido  [provisório]  [oculto]",
-        );
-        for key in ["NS-2", "abcd1234"] {
-            let (y, x) = find(&buffer, key).unwrap();
-            assert!(buffer[(x, y)].modifier.contains(Modifier::DIM), "{key}");
-        }
-        let (y, x) = find(&buffer, "NS-1").unwrap();
-        assert!(!buffer[(x, y)].modifier.contains(Modifier::DIM));
-        // 101 columns: the help wraps (NS-32, decision of the user), nothing is cut.
-        let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
-        let n = lines.len();
-        assert_eq!(
-            format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()),
-            "↑/↓ mover · a novo · e editar título · o ocultar/restaurar · f esconder ocultos · \
-             g abrir agente · Enter detalhes · Esc voltar · q sair"
-        );
-        assert_eq!(
-            lines[n - 3].trim(),
-            "",
-            "the empty status row, as in the NS-31"
-        );
-        assert!(lines[n - 4].contains('└'), "the list ends right above");
-    }
-
-    #[test]
-    fn an_empty_tickets_list_says_how_to_create_with_and_without_the_filter() {
-        let mut f = fixture();
-        on_tickets(&mut f);
-        assert_has(
-            &render(&f.app),
-            "Nenhum ticket neste projeto. Pressione a para criar.",
-        );
-        f.app.show_hidden = true;
-        assert_has(
-            &render(&f.app),
-            "Nenhum ticket neste projeto, nem oculto. Pressione a para criar.",
-        );
-    }
-
-    #[test]
     fn the_new_ticket_dialog_has_both_fields_and_the_cursor_on_the_focused_one() {
         let mut f = fixture();
-        on_tickets(&mut f);
         for (focus, typed) in [
             (TicketField::Title, "Meu título"),
             (TicketField::JiraId, "NS-12"),
         ] {
             f.app.dialog = Some(Dialog::NewTicket {
+                project_id: 1,
                 title: "Meu título".into(),
                 jira_id: "NS-12".into(),
                 focus,
@@ -1943,7 +1868,6 @@ mod tests {
     #[test]
     fn the_edit_title_dialog_shows_the_fixed_id_and_the_cursor() {
         let mut f = fixture();
-        on_tickets(&mut f);
         f.app.dialog = Some(Dialog::EditTitle {
             ticket: ticket(1, "NS-1", "Velho", false, false),
             input: "Novo".into(),
@@ -1962,7 +1886,6 @@ mod tests {
     #[test]
     fn the_hide_confirmation_names_the_ticket_and_s_n() {
         let mut f = fixture();
-        on_tickets(&mut f);
         f.app.dialog = Some(Dialog::ConfirmHide {
             ticket: ticket(1, "NS-1", "Corrigir", false, false),
         });
@@ -1984,7 +1907,6 @@ mod tests {
     #[test]
     fn the_removal_confirmation_counts_one_or_more_tickets() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         for (tickets, sentence) in [
             (1, "O ticket dele será apagado do banco."),
             (
@@ -1995,6 +1917,55 @@ mod tests {
             f.app.dialog = Some(Dialog::ConfirmRemove {
                 project: project(1, "alfa", "/w/alfa"),
                 tickets,
+                agents: 0,
+                live: 0,
+            });
+            let buffer = render(&f.app);
+            assert!(
+                flat(&buffer).contains(&format!(
+                    "Remover o projeto alfa (/w/alfa) do nick? Os arquivos do projeto não são \
+                     tocados. {sentence} (s/N)"
+                )),
+                "{}",
+                flat(&buffer)
+            );
+        }
+    }
+
+    /// NS-38 (decision of the user): the agents go with the project. The live ones of this nick
+    /// are ended; every record (the ended ones too) leaves the database.
+    #[test]
+    fn the_removal_confirmation_says_which_agents_go_with_the_project() {
+        let mut f = fixture();
+        for (tickets, agents, live, sentence) in [
+            (
+                1,
+                1,
+                1,
+                "O agente vivo dele neste nick será encerrado. O ticket dele será apagado do \
+                 banco. O agente registrado dele será apagado do banco.",
+            ),
+            (
+                3,
+                4,
+                2,
+                "Os 2 agentes vivos dele neste nick serão encerrados. Os 3 tickets dele \
+                 (inclusive os ocultos) serão apagados do banco. Os 4 agentes registrados dele \
+                 (inclusive os encerrados) serão apagados do banco.",
+            ),
+            (
+                2,
+                3,
+                0,
+                "Os 2 tickets dele (inclusive os ocultos) serão apagados do banco. Os 3 agentes \
+                 registrados dele (inclusive os encerrados) serão apagados do banco.",
+            ),
+        ] {
+            f.app.dialog = Some(Dialog::ConfirmRemove {
+                project: project(1, "alfa", "/w/alfa"),
+                tickets,
+                agents,
+                live,
             });
             let buffer = render(&f.app);
             assert!(
@@ -2009,27 +1980,20 @@ mod tests {
     }
 
     #[test]
-    fn control_characters_in_tickets_are_shown_as_question_marks() {
-        let mut f = fixture();
-        on_tickets(&mut f);
-        f.app.project = Some(project(1, "p\x1bq", "/w/p"));
-        f.app.ticket_rows = vec![ticket(1, "NS-1", "a\x1b[2Jb", false, false)];
-        let buffer = render(&f.app);
-        assert_has(&buffer, "auto_scrum > p?q > Tickets");
-        assert_has(&buffer, "NS-1  [PO]  a?[2Jb");
-    }
-
-    #[test]
     fn control_characters_are_shown_as_question_marks() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         f.app.rows = vec![Row {
             project: project(1, "a\x1b[2Jb", "/w/a\x1b[2Jb"),
             availability: Availability::DirMissing,
         }];
+        f.app.tree.open(MODULE);
+        f.app.relayout();
+        f.app.select(NodeId::Project(1));
         f.app.status = Some("A pasta x\ny não existe.".into());
         let buffer = render(&f.app);
-        assert_has(&buffer, "a?[2Jb  /w/a?[2Jb");
+        assert_has(&buffer, "a?[2Jb  [indisponível");
+        assert_has(&buffer, "Projeto a?[2Jb");
+        assert_has(&buffer, "Caminho: /w/a?[2Jb");
         assert_has(&buffer, "A pasta x?y não existe.");
         f.app.dialog = Some(Dialog::AddPath {
             input: "a\tb".into(),
@@ -2040,7 +2004,6 @@ mod tests {
     #[test]
     fn a_tiny_terminal_does_not_panic() {
         let mut f = fixture();
-        f.app.screen = Screen::Projects;
         f.app.dialog = Some(Dialog::NeedsConfig {
             dir: PathBuf::from("/x"),
             focus: Button::CreateConfig,
@@ -2127,16 +2090,6 @@ mod tests {
         assert_eq!(buffer[(0, 29)].symbol(), "┗");
     }
 
-    #[test]
-    fn without_an_agent_there_is_no_panel() {
-        // The Agent screen is gone (NS-34): without an agent running, the list takes the body
-        // and the panel is empty.
-        let f = fixture();
-        let areas = layout(&f.app, Rect::new(0, 0, 100, 30));
-        assert_eq!(areas.list, areas.body);
-        assert!(areas.panel.is_empty() && areas.terminal.is_empty());
-    }
-
     fn precheck(jail: bool) -> Precheck {
         Precheck {
             jail,
@@ -2149,9 +2102,7 @@ mod tests {
     #[test]
     fn the_menu_lists_the_types_with_the_selection() {
         let mut f = fixture();
-        on_tickets(&mut f);
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
-        f.app.ticket_rows = vec![t.clone()];
         f.app.dialog = Some(Dialog::ChooseType {
             project: PathBuf::from("/x/meu-proj"),
             ticket: t,
@@ -2184,9 +2135,7 @@ mod tests {
     /// The form of `kind` with `values`, `focus` on the field.
     fn form(kind: StageType, values: &[&str], focus: usize) -> Fixture {
         let mut f = fixture();
-        on_tickets(&mut f);
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
-        f.app.ticket_rows = vec![t.clone()];
         f.app.dialog = Some(Dialog::StageForm {
             project: PathBuf::from("/x/meu-proj"),
             ticket: t,
@@ -2246,7 +2195,6 @@ mod tests {
     /// The preview of a prompt of `rows` lines, scrolled `scroll` down.
     fn preview(rows: usize, scroll: usize, jail: bool, warning: Option<&str>) -> Fixture {
         let mut f = fixture();
-        on_tickets(&mut f);
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
         f.app.dialog = Some(Dialog::ConfirmPrompt {
             project: PathBuf::from("/x/meu-proj"),
@@ -2398,7 +2346,6 @@ mod tests {
     #[test]
     fn the_agent_alert_shows_each_line_of_the_message() {
         let mut f = fixture();
-        on_tickets(&mut f);
         f.app.dialog = Some(Dialog::AgentError {
             message: "Nada foi aberto.\n\nErro: a jail não funciona.\nDetalhe \x1b[2J".into(),
         });
@@ -2468,13 +2415,14 @@ mod tests {
         let db = Db::open(&root.join("nick.db")).unwrap();
         for name in names {
             let dir = root.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir_all(dir.join(".nick")).unwrap();
+            std::fs::write(dir.join(".nick/nick.conf"), "").unwrap();
             let p = db
                 .insert_project("auto_scrum", name, dir.to_str().unwrap())
                 .unwrap();
             let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
-            f.app.project = Some(p);
-            f.app.screen = Screen::Tickets;
+            let _ = p;
+            f.app.refresh_tree();
             f.app.open_agent(
                 &dir,
                 &t,
@@ -2520,7 +2468,7 @@ mod tests {
             Some((25, 41)),
             "the last row of the program"
         );
-        let (y, _) = find(&buffer, "auto_scrum > proj > Tickets").unwrap();
+        let (y, _) = find(&buffer, " Navegação ").unwrap();
         assert_eq!(y, 0);
         assert!(text(&buffer).lines().nth(26).unwrap().starts_with('└'));
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
@@ -2619,81 +2567,23 @@ mod tests {
     }
 
     #[test]
-    fn the_view_of_the_active_agents_marks_out_of_the_jail_and_new_output() {
-        let (mut f, _) = with_running(&["proj", "fora"]);
-        f.app.focus = Focus::List;
-        f.app.screen = Screen::ActiveAgents;
-        f.app.agents[0].unseen = true;
-        let buffer = render(&f.app);
-        assert_has(&buffer, " Agentes ativos ");
-        assert_has(&buffer, "proj · Dev · NS-1  ● saída nova");
-        assert_has(&buffer, "fora · Dev · NS-1  [FORA DA JAIL]");
-        let (y, x) = find(&buffer, "[FORA DA JAIL]").unwrap();
-        assert_eq!(buffer[(x, y)].fg, Color::Red);
-        let (y, _) = find(&buffer, "proj · Dev").unwrap();
-        assert!(
-            !text(&buffer)
-                .lines()
-                .nth(usize::from(y))
-                .unwrap()
-                .contains("[FORA")
-        );
-        assert_eq!(
-            last_line(&buffer).trim(),
-            "↑/↓ escolher · Enter abrir · x encerrar · Ctrl+\\ alternar · Esc voltar · q sair"
-        );
-        // The help shows the shortcut in use.
-        f.app.shortcut = Shortcut::from_db("ctrl+]").unwrap();
-        assert!(last_line(&render(&f.app)).contains("Ctrl+] alternar"));
-    }
-
-    #[test]
-    fn the_view_without_agents_says_so() {
-        let mut f = fixture();
-        f.app.screen = Screen::ActiveAgents;
-        assert_has(&render(&f.app), "Nenhum agente ativo.");
-    }
-
-    #[test]
-    fn the_lists_say_how_many_agents_run_only_with_agents() {
-        let (mut f, _) = with_running(&["proj", "fora", "outro"]);
-        f.app.focus = Focus::List;
-        f.app.screen = Screen::Modules;
-        assert_eq!(
-            last_line(&render(&f.app)).trim(),
-            "↑/↓ mover · Enter abrir · c configurações · v agentes ativos (3) · q sair"
-        );
-        f.app.agents[1].unseen = true;
-        f.app.screen = Screen::Projects;
-        assert_eq!(
-            last_line(&render(&f.app)).trim(),
-            "↑/↓ mover · a adicionar · r remover · Esc voltar · v agentes ativos (3, 1 com \
-             saída nova) · q sair"
-        );
-        f.app.screen = Screen::Tickets;
-        let lines: Vec<String> = text(&render(&f.app)).lines().map(str::to_string).collect();
-        let n = lines.len();
-        assert!(
-            format!("{} {}", lines[n - 2].trim(), lines[n - 1].trim()).ends_with(
-                "g abrir agente · Enter detalhes · Esc voltar · v agentes ativos (3, 1 com saída \
-                 nova) · q sair"
-            ),
-            "{lines:?}"
-        );
-        // With a dialog, the help of the dialog.
-        f.app.dialog = Some(Dialog::ConfirmQuit);
-        assert!(!last_line(&render(&f.app)).contains("v agentes"));
-    }
-
-    #[test]
     fn the_settings_show_the_shortcut_and_whether_it_is_the_default() {
         let mut f = fixture();
         f.app.screen = Screen::Settings;
         let buffer = render(&f.app);
         assert_has(&buffer, " Configurações ");
-        assert_has(
-            &buffer,
-            "Atalho para alternar entre a lista e o terminal: Ctrl+\\ (padrão)",
+        // In the column on the left (40 columns), word wrapped (NS-38).
+        let column = |buffer: &Buffer| {
+            (1..6)
+                .map(|y| list_row(buffer, y))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            column(&buffer)
+                .contains("Atalho para alternar entre a lista e o terminal: Ctrl+\\ (padrão)"),
+            "{}",
+            text(&buffer)
         );
         assert_eq!(
             last_line(&buffer).trim(),
@@ -2702,10 +2592,7 @@ mod tests {
         f.app.shortcut = Shortcut::from_db("alt+x").unwrap();
         f.app.shortcut_stored = true;
         let buffer = render(&f.app);
-        assert_has(
-            &buffer,
-            "Atalho para alternar entre a lista e o terminal: Alt+X",
-        );
+        assert!(column(&buffer).contains("Atalho para alternar entre a lista e o terminal: Alt+X"));
         assert!(find(&buffer, "(padrão)").is_none());
     }
 
@@ -2785,13 +2672,17 @@ mod tests {
         for (width, height) in [(100, 30), (50, 30), (140, 40)] {
             let area = Rect::new(0, 0, width, height);
             let mut sizes = Vec::new();
-            // The ticket screen (NS-36) by itself, so a LIST_SCREENS without it is caught.
-            for (screen, show_hidden) in LIST_SCREENS.into_iter().chain([(Screen::Ticket, false)]) {
+            // The tree with both filters and the settings (NS-38; before, LIST_SCREENS).
+            for (screen, show_hidden) in [
+                (Screen::Tree, false),
+                (Screen::Tree, true),
+                (Screen::Settings, false),
+            ] {
                 for focus in [Focus::Terminal, Focus::List] {
                     for unseen in [false, true] {
                         for dialog in [None, Some(Dialog::ConfirmQuit)] {
                             f.app.screen = screen;
-                            f.app.show_hidden = show_hidden;
+                            f.app.tree.show_hidden = show_hidden;
                             f.app.focus = focus;
                             f.app.agents[0].unseen = unseen;
                             f.app.dialog = dialog.filter(|_| focus == Focus::List);
@@ -2805,38 +2696,11 @@ mod tests {
                 "{width}x{height}: {sizes:?}"
             );
         }
-        // Without agents, the help takes only the rows it needs, as before the NS-34.
+        // Without agents, the help takes only the rows it needs, as before the NS-34 (the help
+        // of the module takes two at 100 columns, one at 140).
         let f = fixture();
-        assert_eq!(layout(&f.app, Rect::new(0, 0, 100, 30)).help.height, 1);
-    }
-
-    /// Every screen of a list is in `LIST_SCREENS` (NS-36), so the rows of the help with an
-    /// agent running never change between them. Today the help of the ticket screen fits in
-    /// the rows of the tickets list, so the size test above alone would not catch it missing.
-    #[test]
-    fn every_list_screen_is_in_list_screens() {
-        for screen in [
-            Screen::Modules,
-            Screen::Projects,
-            Screen::Tickets,
-            Screen::Ticket,
-            Screen::ActiveAgents,
-            Screen::Settings,
-        ] {
-            // Exhaustive: a new screen does not compile here until it is listed above.
-            match screen {
-                Screen::Modules
-                | Screen::Projects
-                | Screen::Tickets
-                | Screen::Ticket
-                | Screen::ActiveAgents
-                | Screen::Settings => {}
-            }
-            assert!(
-                LIST_SCREENS.iter().any(|(listed, _)| *listed == screen),
-                "{screen:?} is not in LIST_SCREENS"
-            );
-        }
+        assert_eq!(layout(&f.app, Rect::new(0, 0, 100, 30)).help.height, 2);
+        assert_eq!(layout(&f.app, Rect::new(0, 0, 140, 30)).help.height, 1);
     }
 
     /// Review NS-34, P2: the PTY of a new agent is born with the size `layout` gives it once
@@ -2861,7 +2725,8 @@ mod tests {
                 .insert_project("auto_scrum", last, dir.to_str().unwrap())
                 .unwrap();
             let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
-            f.app.project = Some(p);
+            let _ = p;
+            f.app.refresh_tree();
             f.app.open_agent(
                 &dir,
                 &t,
@@ -2878,9 +2743,7 @@ mod tests {
 
     // ---- the stage on the list, the ticket screen and its dialogs (NS-36) ----
 
-    use crate::app::TicketDetail;
-    use crate::db::{Agent, StageChangeRow};
-    use crate::docs::Artifacts;
+    use crate::db::StageChangeRow;
     use crate::tickets::TicketStage;
 
     fn staged(id: i64, key: &str, title: &str, stage: &str, hidden: bool) -> Ticket {
@@ -2898,187 +2761,10 @@ mod tests {
         }
     }
 
-    fn agent(id: i64, stage: &str, name: &str, state: &str) -> Agent {
-        Agent {
-            id,
-            ticket_id: 1,
-            stage: stage.into(),
-            session_id: format!("s-{id}"),
-            name: name.into(),
-            opened_at: "2026-11-19T00:00:00Z".into(),
-            state: state.into(),
-        }
-    }
-
-    /// The ticket screen of NS-12 (in Dev) of meu-proj, with `changes` and `agents`.
-    fn on_ticket(f: &mut Fixture, changes: Vec<StageChangeRow>, agents: Vec<Agent>) {
-        on_tickets(f);
-        f.app.screen = Screen::Ticket;
-        f.app.ticket_detail = Some(TicketDetail {
-            ticket: staged(1, "NS-12", "Título do ticket", "development", false),
-            changes,
-            agents,
-            artifacts: Artifacts {
-                plan: true,
-                review: false,
-            },
-        });
-    }
-
-    #[test]
-    fn the_list_shows_the_stage_after_the_id_and_done_in_green() {
-        let mut f = fixture();
-        on_tickets(&mut f);
-        f.app.show_hidden = true;
-        f.app.ticket_rows = vec![
-            staged(1, "NS-1", "Um", "tech_leader", false),
-            staged(2, "NS-2", "Dois", "done", false),
-            staged(3, "NS-3", "Três", "done", true),
-            staged(4, "NS-4", "Quatro", "archived", false),
-        ];
-        let buffer = render(&f.app);
-        assert_has(&buffer, "NS-1  [Tech Leader]  Um");
-        assert_has(&buffer, "NS-2  [✓ Concluído]  Dois");
-        assert_has(&buffer, "NS-3  [✓ Concluído]  Três  [oculto]");
-        assert_has(&buffer, "NS-4  [archived]  Quatro");
-        let (y, x) = find(&buffer, "[✓ Concluído]  Dois").unwrap();
-        assert_eq!(buffer[(x + 1, y)].fg, Color::Green);
-        let (y, x) = find(&buffer, "[Tech Leader]").unwrap();
-        assert_ne!(buffer[(x + 1, y)].fg, Color::Green);
-    }
-
-    #[test]
-    fn the_ticket_screen_shows_the_stage_the_artifacts_the_history_and_the_help() {
-        let mut f = fixture();
-        on_ticket(&mut f, Vec::new(), Vec::new());
-        let buffer = render(&f.app);
-        assert_has(&buffer, " auto_scrum > meu-proj > NS-12 ");
-        assert_has(&buffer, "NS-12  Título do ticket");
-        assert_has(&buffer, "Etapa atual: Dev");
-        assert_has(&buffer, "Plano (existe):  .nick/docs/NS-12/plan.md");
-        // The path from docs.rs: the name of the artifact is also the one of a template, which
-        // a structural test of the NS-35 keeps out of every other source.
-        assert_has(
-            &buffer,
-            &format!("Review (não existe):  {}", docs::review_path("NS-12")),
-        );
-        assert_has(&buffer, "Histórico de etapas");
-        assert_has(&buffer, "Nenhuma mudança: o ticket começou em PO.");
-        assert_has(&buffer, "Agentes do ticket");
-        assert_has(&buffer, "Nenhum agente aberto para este ticket.");
-        assert_eq!(
-            last_line(&buffer).trim(),
-            "↑/↓ mover · Enter abrir agente · m mudar etapa · i editar ID · g novo agente · \
-             Esc voltar · q sair"
-        );
-        // A history, oldest first, with the date as AAAA-MM-DD HH:MM UTC (raw when odd).
-        on_ticket(
-            &mut f,
-            vec![
-                change("po", "tech_leader", "2026-11-19T21:46:05Z"),
-                change("tech_leader", "development", "ontem"),
-            ],
-            Vec::new(),
-        );
-        let buffer = render(&f.app);
-        let (first, _) = find(&buffer, "2026-11-19 21:46 UTC  PO → Tech Leader").unwrap();
-        let (second, _) = find(&buffer, "ontem  Tech Leader → Dev").unwrap();
-        assert!(first < second);
-        assert!(find(&buffer, "Nenhuma mudança").is_none());
-        // Done, hidden and provisional, with the marks of the list.
-        let mut t = staged(1, "abcd1234", "Fim", "done", true);
-        t.is_provisional = true;
-        f.app.ticket_detail.as_mut().unwrap().ticket = t;
-        let buffer = render(&f.app);
-        assert_has(&buffer, "abcd1234  Fim  [provisório]  [oculto]");
-        assert_has(&buffer, "Etapa atual: [✓ Concluído]");
-        let (y, x) = find(&buffer, "[✓ Concluído]").unwrap();
-        assert_eq!(buffer[(x + 1, y)].fg, Color::Green);
-    }
-
-    #[test]
-    fn a_long_history_shows_the_newest_and_how_many_are_older() {
-        let mut f = fixture();
-        let changes: Vec<StageChangeRow> = (0..30)
-            .map(|i| {
-                let (from, to) = if i % 2 == 0 {
-                    ("po", "review")
-                } else {
-                    ("review", "po")
-                };
-                change(from, to, &format!("2026-11-19T10:{i:02}:00Z"))
-            })
-            .collect();
-        on_ticket(
-            &mut f,
-            changes,
-            vec![agent(9, "po", "meu-proj · PO · NS-12", "ended")],
-        );
-        let buffer = render(&f.app);
-        assert_has(&buffer, "2026-11-19 10:29 UTC  Review → PO");
-        assert!(
-            find(&buffer, "2026-11-19 10:00 UTC").is_none(),
-            "the oldest go"
-        );
-        let screen = text(&buffer);
-        let shown = screen.matches("2026-11-19 10:").count();
-        assert_has(&buffer, &format!("(+{} mudanças mais antigas)", 30 - shown));
-        let (cut, _) = find(&buffer, "mudanças mais antigas").unwrap();
-        let (newest, _) = find(&buffer, "10:29").unwrap();
-        assert!(cut < newest, "the count on top of the section");
-        assert_has(&buffer, "meu-proj · PO · NS-12  encerrado");
-    }
-
-    #[test]
-    fn the_agents_of_the_ticket_show_their_state_and_the_selection() {
-        let (mut f, root) = with_running(&["p"]);
-        f.app.focus = Focus::List;
-        let db = Db::open(&root.join("nick.db")).unwrap();
-        let mut agents = db.list_ticket_agents(1).unwrap();
-        assert_eq!(agents.len(), 1);
-        agents.push(agent(900, "po", "p · PO · NS-1", "active"));
-        agents.push(agent(901, "tech_leader", "p · Tech Leader · NS-1", "ended"));
-        f.app.screen = Screen::Ticket;
-        f.app.ticket_detail = Some(TicketDetail {
-            ticket: staged(1, "NS-1", "t", "po", false),
-            changes: Vec::new(),
-            agents,
-            artifacts: Artifacts::default(),
-        });
-        f.app.ticket_agent_index = 1;
-        let buffer = render_at(&f.app, 140, 40, None);
-        assert_has(&buffer, "p · Dev · NS-1  ● vivo");
-        assert_has(&buffer, "> p · PO · NS-1  ativo em outro nick");
-        assert_has(&buffer, "p · Tech Leader · NS-1  encerrado");
-        // Beside the agent, the screen is on the left (40 columns), and the help has the view.
-        let areas = layout(&f.app, Rect::new(0, 0, 140, 40));
-        assert_eq!(areas.list.width, LIST_WIDTH);
-        // The state of each artifact comes before its path, so the 40 columns keep it (review of
-        // the NS-36, P3.1): only the end of the path is cut. The focus is on the list: its
-        // border is the thick one (NS-37).
-        assert_has(&buffer, "┃Plano (não existe):  .nick/docs/NS-1/");
-        assert_has(&buffer, "┃Review (não existe):  .nick/docs/NS-1/");
-        let help = help_text(&f.app);
-        assert!(
-            help.ends_with("Esc voltar · v agentes ativos (1) · q sair"),
-            "{help}"
-        );
-        // Narrow terminals do not panic.
-        for (w, h) in [(40, 12), (20, 6), (10, 3), (3, 3)] {
-            render_at(&f.app, w, h, None);
-        }
-        let mut f = fixture();
-        on_ticket(&mut f, vec![change("po", "done", "x")], Vec::new());
-        for (w, h) in [(30, 8), (12, 4), (2, 2)] {
-            render_at(&f.app, w, h, None);
-        }
-    }
-
     #[test]
     fn the_dialogs_of_the_stage_and_of_the_id() {
         let mut f = fixture();
-        on_ticket(&mut f, Vec::new(), Vec::new());
-        let t = f.app.ticket_detail.as_ref().unwrap().ticket.clone();
+        let t = staged(1, "NS-12", "Título do ticket", "development", false);
         f.app.dialog = Some(Dialog::ChooseTicketStage {
             ticket: t.clone(),
             index: 3,
@@ -3233,18 +2919,22 @@ mod tests {
         assert_border(&buffer, (0, 26), true, "┗");
         assert_border(&buffer, (40, 0), false, "┌");
         assert_border(&buffer, (99, 10), false, "│");
-        // The title of the list stays on the border.
-        assert_has(&buffer, "auto_scrum > proj > Tickets");
+        // The title of the tree stays on the border.
+        assert_has(&buffer, " Navegação ");
     }
 
     #[test]
     fn every_list_screen_shows_where_the_focus_is() {
         let (mut f, _) = with_running(&["proj"]);
-        // The ticket screen without its detail is the empty block; with it, the titled one.
-        for (screen, show_hidden) in LIST_SCREENS {
+        // The tree with both filters and the settings (NS-38; before, LIST_SCREENS).
+        for (screen, show_hidden) in [
+            (Screen::Tree, false),
+            (Screen::Tree, true),
+            (Screen::Settings, false),
+        ] {
             for focus in [Focus::List, Focus::Terminal] {
                 f.app.screen = screen;
-                f.app.show_hidden = show_hidden;
+                f.app.tree.show_hidden = show_hidden;
                 f.app.focus = focus;
                 let on_list = focus == Focus::List;
                 let buffer = render_at(&f.app, 100, 30, None);
@@ -3254,47 +2944,6 @@ mod tests {
                 assert_border(&buffer, (0, 0), on_list, corner);
                 assert_border(&buffer, (39, 5), on_list, side);
                 assert_border(&buffer, (40, 0), !on_list, panel);
-            }
-        }
-    }
-
-    #[test]
-    fn the_ticket_screen_with_its_detail_shows_where_the_focus_is() {
-        let (mut f, _) = with_running(&["proj"]);
-        on_ticket(&mut f, vec![], vec![]);
-        f.app.focus = Focus::List;
-        let buffer = render_at(&f.app, 100, 30, None);
-        assert_has(&buffer, "> NS-12 ");
-        assert_border(&buffer, (0, 0), true, "┏");
-        f.app.focus = Focus::Terminal;
-        assert_border(&render_at(&f.app, 100, 30, None), (0, 0), false, "┌");
-    }
-
-    /// Without an agent running the screens are those of before, byte for byte: the list keeps
-    /// the plain border without a style, and nothing on the screen is thick or cyan.
-    #[test]
-    fn without_an_agent_the_border_of_the_list_is_as_before() {
-        let mut f = fixture();
-        let mut screens = vec![Screen::Modules, Screen::Settings, Screen::ActiveAgents];
-        f.app.project = Some(project(1, "proj", "/p"));
-        f.app.ticket_rows = vec![ticket(1, "NS-1", "Um", false, false)];
-        screens.push(Screen::Tickets);
-        for screen in screens {
-            f.app.screen = screen;
-            let buffer = render(&f.app);
-            let cell = &buffer[(0, 0)];
-            assert_eq!(cell.symbol(), "┌", "{screen:?}");
-            assert_eq!(cell.fg, Color::Reset, "{screen:?}");
-            assert!(cell.modifier.is_empty(), "{screen:?}");
-            assert_eq!(
-                buffer[(99, 10)].symbol(),
-                "│",
-                "{screen:?}: the whole width"
-            );
-            assert!(buffer[(99, 10)].modifier.is_empty(), "{screen:?}");
-            for cell in buffer.content() {
-                assert_ne!(cell.fg, FOCUS_COLOR, "{screen:?}");
-                assert!(!"┏┓┗┛━┃".contains(cell.symbol()), "{screen:?}");
             }
         }
     }
@@ -3392,5 +3041,561 @@ mod tests {
                 "({column}, {row})"
             );
         }
+    }
+
+    // ---- the tree (NS-38) ----
+
+    use crate::modules::ModuleKind;
+    use crate::tree::NodeId;
+
+    const MODULE: NodeId = NodeId::Module(ModuleKind::AutoScrum);
+
+    /// A database with the projects `alfa` (available) and `beta` (its folder missing). `alfa`
+    /// has NS-1 "Um" (Tech Leader) with an ended Dev agent and a PO agent active in another
+    /// nick, NS-2 "Dois" (done), NS-3 "Três" (hidden) and abcd1234 "Quatro" (provisional).
+    /// The module, `alfa` and NS-1 open, the module selected.
+    fn with_tree() -> (Fixture, PathBuf) {
+        let mut f = fixture();
+        let root = std::fs::canonicalize(f._tmp.path()).unwrap();
+        let alfa = root.join("alfa");
+        std::fs::create_dir_all(alfa.join(".nick")).unwrap();
+        std::fs::write(alfa.join(".nick/nick.conf"), "").unwrap();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let a = db
+            .insert_project("auto_scrum", "alfa", alfa.to_str().unwrap())
+            .unwrap();
+        db.insert_project("auto_scrum", "beta", root.join("beta").to_str().unwrap())
+            .unwrap();
+        let sql = |query: &str, id: i64| {
+            db.connection().execute(query, [id]).unwrap();
+        };
+        let t1 = db.insert_ticket(a.id, "NS-1", false, "Um").unwrap();
+        sql(
+            "UPDATE tickets SET stage = 'tech_leader' WHERE id = ?1",
+            t1.id,
+        );
+        let t2 = db.insert_ticket(a.id, "NS-2", false, "Dois").unwrap();
+        sql("UPDATE tickets SET stage = 'done' WHERE id = ?1", t2.id);
+        let t3 = db.insert_ticket(a.id, "NS-3", false, "Três").unwrap();
+        sql(
+            "UPDATE tickets SET hidden_at = '2026-11-20T00:00:00Z' WHERE id = ?1",
+            t3.id,
+        );
+        db.insert_ticket(a.id, "abcd1234", true, "Quatro").unwrap();
+        let ended = db
+            .insert_agent(t1.id, "development", "s-1", "alfa · Dev · NS-1")
+            .unwrap();
+        db.end_agent(ended.id).unwrap();
+        sql(
+            "UPDATE agents SET opened_at = '2026-11-19T21:46:05Z' WHERE id = ?1",
+            ended.id,
+        );
+        let other = db
+            .insert_agent(t1.id, "po", "s-2", "alfa · PO · NS-1")
+            .unwrap();
+        sql(
+            "UPDATE agents SET opened_at = '2026-11-20T00:00:00Z' WHERE id = ?1",
+            other.id,
+        );
+        f.app.refresh_tree();
+        f.app.tree.open(MODULE);
+        f.app.tree.open(NodeId::Project(a.id));
+        f.app.tree.open(NodeId::Ticket(t1.id));
+        f.app.refresh_tree();
+        (f, root)
+    }
+
+    /// The node of the ticket `key`.
+    fn tnode(app: &App, key: &str) -> NodeId {
+        NodeId::Ticket(
+            app.tickets
+                .values()
+                .flatten()
+                .find(|t| t.key == key)
+                .unwrap()
+                .id,
+        )
+    }
+
+    /// The cells of the list (the 40 columns on the left) of the row `y`, as text.
+    fn list_row(buffer: &Buffer, y: u16) -> String {
+        (1..LIST_WIDTH - 1)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn the_tree_starts_closed_on_the_module_with_its_panel_and_help() {
+        let (mut f, _) = with_tree();
+        f.app.tree = crate::tree::Tree::default();
+        f.app.refresh_tree();
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Navegação ");
+        assert_eq!(list_row(&buffer, 1), "> ▸ auto_scrum");
+        // The panel of the module on the right.
+        assert_has(&buffer, " auto_scrum ");
+        assert_has(&buffer, "Projetos: 2 (1 indisponíveis)");
+        assert_has(&buffer, "Agentes vivos neste nick: 0");
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · →/Enter abrir · ← fechar · a adicionar projeto · c configurações · \
+             f mostrar ocultos · v agentes ativos · q sair"
+        );
+        // Without a project: the text of before.
+        let f = fixture();
+        let buffer = render(&f.app);
+        assert_eq!(list_row(&buffer, 1), ">   auto_scrum", "a leaf");
+        assert_has(
+            &buffer,
+            "Nenhum projeto cadastrado. Pressione a para adicionar.",
+        );
+    }
+
+    #[test]
+    fn the_rows_are_indented_with_the_arrows_and_the_label_of_each_node() {
+        let (f, _) = with_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let rows: Vec<String> = (1..10).map(|y| list_row(&buffer, y)).collect();
+        assert_eq!(
+            rows,
+            [
+                "> ▾ auto_scrum",
+                "    ▾ alfa",
+                "      ▾ NS-1  [Tech Leader]  Um",
+                "          Dev  encerrado  2026-11-19 21:46",
+                "          PO  ativo em outro nick  2026-11-20 00:00",
+                "        NS-2  [✓ Concluído]  Dois",
+                "        abcd1234  [PO]  Quatro  [provisório]",
+                "      beta  [indisponível: pasta não encontrada]",
+                "",
+            ]
+            .map(|row| {
+                // The end of a row is cut at the 38 columns inside the border (NS-34).
+                row.chars()
+                    .take(38)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            }),
+            "{}",
+            text(&buffer)
+        );
+    }
+
+    #[test]
+    fn the_styles_of_the_nodes() {
+        let (mut f, _) = with_tree();
+        f.app.tree.show_hidden = true;
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let at = |needle| find(&buffer, needle).unwrap();
+        let dim = |(y, x): (u16, u16)| buffer[(x, y)].modifier.contains(Modifier::DIM);
+        assert!(!dim(at("alfa")));
+        assert!(dim(at("beta  [indisponível")), "unavailable: dimmed");
+        assert!(dim(at("NS-3  [PO]  Três  [oculto]")), "hidden: dimmed");
+        assert!(!dim(at("NS-2")));
+        assert!(dim(at("Dev  encerrado")), "not live: dimmed");
+        assert!(dim(at("PO  ativo em outro nick")));
+        let (y, x) = at("[✓ Concluído]");
+        assert_eq!(buffer[(x + 1, y)].fg, Color::Green);
+        let (y, x) = at("[Tech Leader]");
+        assert_ne!(buffer[(x + 1, y)].fg, Color::Green);
+        // The title says the filters.
+        assert_has(&buffer, " Navegação (com ocultos) ");
+        f.app.tree.only_active = true;
+        f.app.refresh_tree();
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Navegação (com ocultos) (só ativos) ");
+        assert_has(&buffer, "Nenhum agente ativo.");
+        f.app.tree.show_hidden = false;
+        assert_has(&render(&f.app), " Navegação (só ativos) ");
+    }
+
+    #[test]
+    fn control_characters_in_the_tree_and_in_the_panel_are_shown_as_question_marks() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let id = match tnode(&f.app, "NS-2") {
+            NodeId::Ticket(id) => id,
+            _ => unreachable!(),
+        };
+        db.connection()
+            .execute("UPDATE tickets SET title = 'a\x1b[2Jb' WHERE id = ?1", [id])
+            .unwrap();
+        f.app.refresh_tree();
+        f.app.select(NodeId::Ticket(id));
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "NS-2  [✓ Concluído]  a?[2Jb");
+        assert_has(&buffer, "NS-2  a?[2Jb");
+        assert!(!text(&buffer).contains('\x1b'));
+    }
+
+    #[test]
+    fn the_panel_of_a_project_and_of_an_agent_not_live() {
+        let (mut f, root) = with_tree();
+        let alfa = f.app.rows[0].project.id;
+        f.app.select(NodeId::Project(alfa));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, " Projeto alfa ");
+        assert_has(
+            &buffer,
+            &format!("Caminho: {}", root.join("alfa").display()),
+        );
+        assert_has(&buffer, "Situação: disponível");
+        assert_has(&buffer, "Tickets: 4 (1 ocultos)");
+        let beta = f.app.rows[1].project.id;
+        f.app.select(NodeId::Project(beta));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, " Projeto beta ");
+        assert_has(&buffer, "Situação: [indisponível: pasta não encontrada]");
+        assert_has(&buffer, "Tickets: 0");
+        assert_has(
+            &buffer,
+            "Nenhum ticket neste projeto. Pressione a para criar.",
+        );
+        // An ended agent and one active in another nick.
+        let agents = f
+            .app
+            .ticket_agents
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        f.app.select(NodeId::Agent(agents[0].id));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, " Agente ");
+        assert_has(&buffer, "Nome: alfa · Dev · NS-1");
+        assert_has(&buffer, "Etapa: Dev");
+        assert_has(&buffer, "Estado: encerrado");
+        assert_has(&buffer, "Aberto em: 2026-11-19 21:46 UTC");
+        assert_has(&buffer, "Sessão: s-1");
+        assert_has(
+            &buffer,
+            "Retomar um agente encerrado ainda não é possível neste nick.",
+        );
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · ← subir · f mostrar ocultos · v agentes ativos · q sair"
+        );
+        f.app.select(NodeId::Agent(agents[1].id));
+        assert_has(
+            &render_at(&f.app, 140, 30, None),
+            "Estado: ativo em outro nick",
+        );
+    }
+
+    /// The panel of a ticket: the ticket screen of the NS-36 without its agents (on the tree).
+    #[test]
+    fn the_panel_of_a_ticket_shows_the_stage_the_artifacts_and_the_history() {
+        let (mut f, _) = with_tree();
+        f.app.select(tnode(&f.app, "NS-1"));
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, " Ticket NS-1 ");
+        assert_has(&buffer, "NS-1  Um");
+        assert_has(&buffer, "Etapa atual: Tech Leader");
+        assert_has(&buffer, "Plano (não existe):  .nick/docs/NS-1/plan.md");
+        assert_has(
+            &buffer,
+            &format!("Review (não existe):  {}", docs::review_path("NS-1")),
+        );
+        assert_has(&buffer, "Histórico de etapas");
+        assert_has(&buffer, "Nenhuma mudança: o ticket começou em PO.");
+        assert!(find(&buffer, "Agentes do ticket").is_none(), "on the tree");
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · e editar título · \
+             o ocultar/restaurar · g abrir agente · m mudar etapa · i editar ID · \
+             f mostrar ocultos · v agentes ativos · q sair"
+        );
+        // A history, oldest first, with the date as AAAA-MM-DD HH:MM UTC (raw when odd).
+        let detail = f.app.ticket_detail.as_mut().unwrap();
+        detail.changes = vec![
+            change("po", "tech_leader", "2026-11-19T21:46:05Z"),
+            change("tech_leader", "development", "ontem"),
+        ];
+        let buffer = render_at(&f.app, 140, 30, None);
+        let (first, _) = find(&buffer, "2026-11-19 21:46 UTC  PO → Tech Leader").unwrap();
+        let (second, _) = find(&buffer, "ontem  Tech Leader → Dev").unwrap();
+        assert!(first < second);
+        // Done, hidden and provisional, with the marks of the list.
+        let mut t = staged(1, "abcd1234", "Fim", "done", true);
+        t.is_provisional = true;
+        f.app.ticket_detail.as_mut().unwrap().ticket = t;
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "abcd1234  Fim  [provisório]  [oculto]");
+        assert_has(&buffer, "Etapa atual: [✓ Concluído]");
+        let (y, x) = find(&buffer, "Etapa atual: [✓ Concluído]").unwrap();
+        assert_eq!(buffer[(x + 14, y)].fg, Color::Green);
+    }
+
+    #[test]
+    fn a_long_history_in_the_panel_shows_the_newest_and_how_many_are_older() {
+        let (mut f, _) = with_tree();
+        f.app.select(tnode(&f.app, "NS-1"));
+        f.app.refresh_tree();
+        f.app.ticket_detail.as_mut().unwrap().changes = (0..40)
+            .map(|i| {
+                let (from, to) = if i % 2 == 0 {
+                    ("po", "review")
+                } else {
+                    ("review", "po")
+                };
+                change(from, to, &format!("2026-11-19T10:{i:02}:00Z"))
+            })
+            .collect();
+        let buffer = render(&f.app);
+        assert_has(&buffer, "2026-11-19 10:39 UTC  Review → PO");
+        assert!(
+            find(&buffer, "2026-11-19 10:00 UTC").is_none(),
+            "the oldest go"
+        );
+        let shown = text(&buffer).matches("2026-11-19 10:").count();
+        assert_has(&buffer, &format!("(+{} mudanças mais antigas)", 40 - shown));
+        let (cut, _) = find(&buffer, "mudanças mais antigas").unwrap();
+        let (newest, _) = find(&buffer, "10:39").unwrap();
+        assert!(cut < newest, "the count on top of the section");
+        // With the whole height of the panel (no section of agents below it).
+        assert!(shown >= 15, "{shown}");
+    }
+
+    /// Replaces `without_an_agent_the_border_of_the_list_is_as_before` (NS-37) and
+    /// `without_an_agent_there_is_no_panel` (NS-33/34): decision 1 of NS-38, always side by
+    /// side; without an agent the focus is on the tree.
+    #[test]
+    fn without_an_agent_the_tree_is_on_the_left_focused_and_the_panel_on_the_right() {
+        let (mut f, _) = with_tree();
+        for screen in [Screen::Tree, Screen::Settings] {
+            f.app.screen = screen;
+            let areas = layout(&f.app, Rect::new(0, 0, 100, 30));
+            // Above the status and the help (the help of the module takes two rows here).
+            let body = 30 - 1 - areas.help.height;
+            assert_eq!(areas.list, Rect::new(0, 0, 40, body), "{screen:?}");
+            assert_eq!(areas.panel, Rect::new(40, 0, 60, body), "{screen:?}");
+            let buffer = render(&f.app);
+            assert_border(&buffer, (0, 0), true, "┏");
+            assert_border(&buffer, (39, 10), true, "┃");
+            assert_border(&buffer, (40, 0), false, "┌");
+            assert_border(&buffer, (99, 10), false, "│");
+        }
+        // Narrow: at most half the window.
+        assert_eq!(layout(&f.app, Rect::new(0, 0, 60, 30)).list.width, 30);
+    }
+
+    #[test]
+    fn the_live_agents_on_the_tree_and_the_mark_that_goes_up() {
+        let (mut f, _) = with_running(&["proj", "fora"]);
+        f.app.focus = Focus::List;
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Dev  ● vivo");
+        assert_has(&buffer, "[FORA DA JAIL]");
+        let (y, x) = find(&buffer, "[FORA DA JAIL]").unwrap();
+        assert_eq!(buffer[(x + 1, y)].fg, Color::Red);
+        let (y, x) = find(&buffer, "● vivo").unwrap();
+        assert!(
+            !buffer[(x, y)].modifier.contains(Modifier::DIM),
+            "live: not dimmed"
+        );
+        // The first one marked: on its row; and on its closed ancestors.
+        f.app.agents[0].unseen = true;
+        f.app.relayout();
+        assert_has(&render_at(&f.app, 140, 30, None), "Dev  ● saída nova");
+        let proj = NodeId::Project(f.app.agents[0].project_id);
+        f.app.tree.close(proj);
+        f.app.relayout();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let row = text(&buffer)
+            .lines()
+            .find(|line| line.contains("▸ proj"))
+            .unwrap()
+            .to_string();
+        assert!(row.contains("▸ proj  ● saída nova"), "{row}");
+        assert_eq!(
+            help_text(&f.app).rsplit(" · ").nth(1).unwrap(),
+            "v agentes ativos (2, 1 com saída nova)"
+        );
+    }
+
+    #[test]
+    fn the_help_of_each_node_with_the_filters_and_the_count() {
+        let (mut f, _) = with_running(&["proj"]);
+        f.app.focus = Focus::List;
+        let live = f.app.selected;
+        assert!(matches!(live, NodeId::Agent(_)));
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · Ctrl+\\ alternar · \
+             f mostrar ocultos · v agentes ativos (1) · q sair"
+        );
+        f.app.tree.show_hidden = true;
+        f.app.tree.only_active = true;
+        assert!(help_text(&f.app).ends_with("f esconder ocultos · v mostrar tudo (1) · q sair"));
+        let project = NodeId::Project(f.app.agents[0].project_id);
+        f.app.select(project);
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · r remover · \
+             f esconder ocultos · v mostrar tudo (1) · q sair"
+        );
+        f.app.screen = Screen::Settings;
+        assert_eq!(
+            help_text(&f.app),
+            "t trocar · p voltar ao padrão · Esc voltar · q sair"
+        );
+        // With the focus on the terminal: only the way back.
+        f.app.screen = Screen::Tree;
+        f.app.select(live);
+        f.app.focus = Focus::Terminal;
+        assert_eq!(help_text(&f.app), "Ctrl+\\ voltar à lista");
+    }
+
+    /// Every place of the help is in `HELP_STATES`, with both filters (the rows of the help
+    /// with an agent running never change between them; review NS-34, P1).
+    #[test]
+    fn every_help_state_is_in_help_states() {
+        for place in [
+            Place::Module,
+            Place::Project,
+            Place::Ticket,
+            Place::LiveAgent,
+            Place::OtherAgent,
+            Place::Settings,
+        ] {
+            // Exhaustive: a new place does not compile here until it is listed above.
+            match place {
+                Place::Module
+                | Place::Project
+                | Place::Ticket
+                | Place::LiveAgent
+                | Place::OtherAgent
+                | Place::Settings => {}
+            }
+            let filters: &[(bool, bool)] = if place == Place::Settings {
+                &[(false, false)]
+            } else {
+                &[(false, false), (true, false), (false, true), (true, true)]
+            };
+            for &(hidden, active) in filters {
+                assert!(
+                    HELP_STATES.contains(&(place, hidden, active)),
+                    "{place:?} {hidden} {active}"
+                );
+            }
+        }
+    }
+
+    /// Moving the selection between the kinds of node and toggling the filters resizes no
+    /// terminal (the plan of NS-38, step 11; review NS-34, P1).
+    #[test]
+    fn moving_on_the_tree_and_the_filters_resize_no_terminal() {
+        let (mut f, root) = with_running(&["proj", "fora"]);
+        // An ended agent of `proj`, beside the live one.
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let ticket = f.app.agents[0].ticket_id;
+        let ended = db
+            .insert_agent(ticket, "po", "s-x", "proj · PO · NS-1")
+            .unwrap();
+        db.end_agent(ended.id).unwrap();
+        f.app.refresh_tree();
+        let nodes = [
+            MODULE,
+            NodeId::Project(f.app.agents[0].project_id),
+            NodeId::Ticket(ticket),
+            NodeId::Agent(f.app.agents[0].id),
+            NodeId::Agent(ended.id),
+        ];
+        for (width, height) in [(100, 30), (120, 40), (50, 30), (140, 40), (80, 24)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut sizes: Vec<Vec<Rect>> = Vec::new();
+            for screen in [Screen::Tree, Screen::Settings] {
+                for node in nodes {
+                    for (hidden, active) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        for focus in [Focus::List, Focus::Terminal] {
+                            for unseen in [false, true] {
+                                f.app.screen = screen;
+                                f.app.select(node);
+                                f.app.tree.show_hidden = hidden;
+                                f.app.tree.only_active = active;
+                                f.app.focus = focus;
+                                f.app.agents[1].unseen = unseen;
+                                f.app.relayout();
+                                sizes.push(
+                                    f.app
+                                        .agents()
+                                        .iter()
+                                        .map(|agent| agent_area(&f.app, area, agent))
+                                        .collect(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                sizes.iter().find(|s| **s != sizes[0]),
+                None,
+                "{width}x{height}: {:?}",
+                sizes[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiny_terminal_does_not_panic_on_the_tree() {
+        let (mut f, _) = with_tree();
+        for node in [MODULE, tnode(&f.app, "NS-1")] {
+            f.app.select(node);
+            f.app.refresh_tree();
+            for (w, h) in [(1, 1), (2, 2), (3, 3), (10, 3), (20, 6), (40, 12)] {
+                render_at(&f.app, w, h, None);
+            }
+        }
+        let (f, _) = with_running(&["proj"]);
+        for (w, h) in [(1, 1), (3, 3), (20, 6)] {
+            render_at(&f.app, w, h, None);
+        }
+    }
+
+    /// A stage the database should never have (the `CHECK` forbids it) shows raw on the tree,
+    /// with no panic (NS-36).
+    #[test]
+    fn an_unknown_stage_shows_raw_on_the_tree() {
+        let (spans, _) = ticket_spans(&staged(4, "NS-4", "Quatro", "archived", false));
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "NS-4  [archived]  Quatro");
+    }
+
+    /// Review of the NS-38, P1: the mark of new output shows whole on the row of the agent at
+    /// the real width of the tree (28 columns at depth 3), whatever the stage and the jail. A
+    /// marked agent is live: the mark takes the place of `● vivo`, before `[FORA DA JAIL]`.
+    #[test]
+    fn the_mark_of_a_live_agent_fits_in_the_tree_out_of_the_jail() {
+        let (mut f, root) = with_running(&["fora"]);
+        f.app.focus = Focus::List;
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let id = f.app.agents[0].id;
+        db.connection()
+            .execute(
+                "UPDATE agents SET stage = 'tech_leader' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        f.app.refresh_tree();
+        f.app.agents[0].unseen = true;
+        f.app.relayout();
+        let buffer = render(&f.app);
+        let (y, _) = find(&buffer, "Tech Leader").expect("the row of the agent");
+        let row = list_row(&buffer, y);
+        assert!(row.contains("Tech Leader  ● saída nova"), "{row:?}");
+        assert!(!row.contains("● vivo"), "the mark in its place: {row:?}");
+        // Seen, `● vivo` and `[FORA DA JAIL]` again (the end cut at 40 columns).
+        f.app.agents[0].unseen = false;
+        let row = list_row(&render(&f.app), y);
+        assert!(row.contains("Tech Leader  ● vivo  [FORA"), "{row:?}");
     }
 }

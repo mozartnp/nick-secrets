@@ -531,6 +531,18 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// The agents of every ticket of the project, of every stage and state, in the order they
+    /// were opened: what goes with it when it is removed, and the agents of an open branch of
+    /// the tree (NS-38).
+    pub fn list_project_agents(&self, project_id: i64) -> rusqlite::Result<Vec<Agent>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents \
+             WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id = ?1) ORDER BY id"
+        ))?;
+        stmt.query_map(params![project_id], agent_from_row)?
+            .collect()
+    }
+
     /// Every `active` agent, of any project, in the order they were opened.
     pub fn list_active_agents(&self) -> rusqlite::Result<Vec<Agent>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -1423,6 +1435,26 @@ CREATE TABLE ticket_stage_changes (
         let c = db.insert_agent(ticket, "development", "s-3", "n").unwrap();
         db.end_agent(b.id).unwrap();
         assert_eq!(db.list_active_agents().unwrap(), [a, c]);
+    }
+
+    /// The agents of a project, of every ticket (the hidden ones too), stage and state, in the
+    /// order they were opened; none of another project (the removal of a project, NS-38).
+    #[test]
+    fn list_project_agents_lists_every_agent_of_the_tickets_of_that_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let hidden = db.insert_ticket(project, "NS-2", false, "t").unwrap();
+        db.set_ticket_hidden(hidden.id, true).unwrap();
+        let other = db.insert_project("auto_scrum", "q", "/q").unwrap();
+        let elsewhere = db.insert_ticket(other.id, "NS-1", false, "t").unwrap();
+        let a = db.insert_agent(ticket, "po", "s-1", "n").unwrap();
+        let b = db.insert_agent(hidden.id, "review", "s-2", "n").unwrap();
+        db.insert_agent(elsewhere.id, "po", "s-3", "n").unwrap();
+        let c = db.insert_agent(ticket, "development", "s-4", "n").unwrap();
+        db.end_agent(b.id).unwrap();
+        let b = db.list_ticket_agents(hidden.id).unwrap().remove(0);
+        assert_eq!(db.list_project_agents(project).unwrap(), [a, b, c]);
+        assert_eq!(db.list_project_agents(9999).unwrap(), []);
     }
 
     // ---- migration 4: settings (NS-34) ----

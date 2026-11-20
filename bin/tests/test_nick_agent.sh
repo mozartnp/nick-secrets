@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
-# test_nick_agent: testes em bash puro (sem framework) do bin/nick-agent (NS-33), o launcher
+# test_nick_agent: testes em bash puro (sem framework) do bin/nick-agent (NS-33, NS-35), o launcher
 # que a casca nick usa pra abrir o claude de um agente: carrega o .nick/nick.conf do cwd pelo
-# lib/config/ e lança pelo mesmo caminho do auto_scrum.sh (jail_check, claude_settings_load,
-# jail_agent_notice e jail_exec do lib/). O ai-jail e o claude reais nunca são usados: os casos
+# lib/config/, monta o prompt pelo auto_scrum/prompt.sh (--render) e lança pelo mesmo caminho do
+# auto_scrum.sh (jail_check, claude_settings_load, jail_agent_notice e jail_exec do lib/). Os logs
+# do --render vão pro NICK_PROMPT_LOGS_DIR de cada caso, nunca pro auto_scrum/logs/ real. O
+# ai-jail e o claude reais nunca são usados: os casos
 # põem à frente do PATH os falsos de bin/tests/fixtures/bin/ (os mesmos dos testes Rust da
 # casca), e o argv esperado sai da própria lib (jail_options, jail_mcp_hosts, jail_agent_notice
 # e o permissions.json), nunca escrito à mão. Cada caso roda com o cwd num projeto temporário:
@@ -15,6 +17,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LAUNCHER="$ROOT_DIR/bin/nick-agent"
 NICK_INIT="$ROOT_DIR/bin/nick-init"
 AUTO_SCRUM_SH="$ROOT_DIR/auto_scrum/auto_scrum.sh"
+REAL_LOGS_DIR="$ROOT_DIR/auto_scrum/logs"
 CONFIG_SH="$ROOT_DIR/lib/config/config.sh"
 KEYS_SH="$ROOT_DIR/lib/config/keys.sh"
 JAIL_SH="$ROOT_DIR/lib/jail/jail.sh"
@@ -35,7 +38,18 @@ BASH_BIN="$(command -v bash)"
 # Um UUID e um nome de exemplo, como a casca passa.
 SESSION_ID="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60"
 AGENT_NAME="proj · Dev · NS-1"
-USAGE="Uso: nick-agent --check | --session-id <uuid> --name <nome>"
+USAGE="Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>"
+# Os 8 tipos do choose_type do auto_scrum.sh, na ordem do menu com tudo ligado.
+ALL_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
+# O texto que o EDITOR falso grava (po e tech_leader) e a DESCRIPTION que sai dele ($(cat), sem
+# os \n do fim).
+EDITOR_TEXT=$'Descrição longa de teste\ncom duas linhas.\n\n'
+EDITOR_DESCRIPTION=$'Descrição longa de teste\ncom duas linhas.'
+# O prompt de exemplo do lançamento: duas linhas e \n no fim, que o $(cat) tira.
+PROMPT_TEXT=$'Prompt de teste\ncom duas linhas.\n\n'
+PROMPT_ARG=$'Prompt de teste\ncom duas linhas.'
+# Retrato do auto_scrum/logs/ real: nenhum caso pode escrever lá.
+real_logs_before="$(ls -la "$REAL_LOGS_DIR" 2> /dev/null || true)"
 
 # code_lines <file>: imprime as linhas de <file> que não são comentário de linha inteira.
 code_lines() {
@@ -75,7 +89,8 @@ new_project() {
 }
 
 # run_agent <case_dir> <cwd> [VAR=valor...] -- [args...]: roda bash <launcher> [args] com o cwd
-# em <cwd>, HOME em <case_dir>/home (vazio: as toolchains que a jail monta vêm do home, e o
+# em <cwd>, os logs do --render em <case_dir>/logs (NICK_PROMPT_LOGS_DIR), HOME em
+# <case_dir>/home (vazio: as toolchains que a jail monta vêm do home, e o
 # resultado não pode depender da máquina), os falsos à frente do PATH, os logs dos falsos em
 # <case_dir> (fora do projeto) e sem as variáveis FAKE_*, PLAYWRIGHT_BROWSERS_PATH e as chaves
 # da jail do ambiente de quem roda a suíte (dentro da jail, o próprio nick define a
@@ -94,7 +109,7 @@ run_agent() {
     -u JAIL_ENABLED -u JAIL_CLIPBOARD -u JAIL_ALLOW_HOSTS -u JAIL_FORWARD_PORTS \
     HOME="$case_dir/home" PATH="$FIXTURES_BIN:$PATH" FAKE_JAIL_LOG="$case_dir/jail.argv" \
     FAKE_CLAUDE_LOG="$case_dir/claude.argv" FAKE_CLAUDE_ENV="$case_dir/claude.env" \
-    FAKE_ORDER_LOG="$case_dir/order" "${env_args[@]}" "$BASH_BIN" "$LAUNCHER" "$@" < /dev/null \
+    FAKE_ORDER_LOG="$case_dir/order" NICK_PROMPT_LOGS_DIR="$case_dir/logs" "${env_args[@]}" "$BASH_BIN" "$LAUNCHER" "$@" < /dev/null \
     > "$case_dir/out" 2> "$case_dir/err") || rc=$?
   echo "$rc" > "$case_dir/rc"
 }
@@ -121,17 +136,46 @@ hosts_of() {
   printf '%s %s' "$(lib_call "$1" jail_mcp_hosts "$2" "$3")" "$4"
 }
 
-# expected_claude_argv <case_dir> <jail> <hosts> <ports>: o argv que o claude falso deve
-# receber, um por linha: as regras de deny/ask inline, o aviso da jail (só com <jail> "true"),
-# --session-id e --name. Sem --permission-mode e sem prompt.
+# expected_claude_argv <case_dir> <jail> <hosts> <ports> [type]: o argv que o claude falso deve
+# receber, um por linha: as regras de deny/ask inline, --permission-mode auto (só com [type]
+# development), o aviso da jail (só com <jail> "true"), --session-id, --name e o prompt de
+# exemplo (PROMPT_ARG) por último. [type] padrão: po_discussion.
 expected_claude_argv() {
-  local case_dir="$1" jail="$2" hosts="$3" ports="$4" args=()
+  local case_dir="$1" jail="$2" hosts="$3" ports="$4" type="${5:-po_discussion}" args=()
   args=(--settings "$(cat "$PERMISSIONS_JSON")")
+  if [ "$type" = "development" ]; then
+    args+=(--permission-mode auto)
+  fi
   if [ "$jail" = "true" ]; then
     args+=(--append-system-prompt "$(lib_call "$case_dir" jail_agent_notice "$hosts" "$ports")")
   fi
-  args+=(--session-id "$SESSION_ID" --name "$AGENT_NAME")
+  args+=(--session-id "$SESSION_ID" --name "$AGENT_NAME" "$PROMPT_ARG")
   printf '%s\n' "${args[@]}"
+}
+
+# launch_args <case_dir> [type]: grava o prompt de exemplo em <case_dir>/prompt.md (fora do
+# projeto) e imprime, um por linha, os argumentos do lançamento: --session-id, --name, --type
+# ([type], padrão po_discussion) e --prompt-file. Use com mapfile.
+launch_args() {
+  local case_dir="$1" type="${2:-po_discussion}"
+  mkdir -p "$case_dir"
+  printf '%s' "$PROMPT_TEXT" > "$case_dir/prompt.md"
+  printf '%s\n' --session-id "$SESSION_ID" --name "$AGENT_NAME" --type "$type" --prompt-file "$case_dir/prompt.md"
+}
+
+# launch <case_dir> <cwd> [VAR=valor...] [-- type]: run_agent com os argumentos de launch_args.
+launch() {
+  local case_dir="$1" cwd="$2" env_args=() type="po_discussion" args
+  shift 2
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    env_args+=("$1")
+    shift
+  done
+  if [ "$#" -gt 1 ]; then
+    type="$2"
+  fi
+  mapfile -t args < <(launch_args "$case_dir" "$type")
+  run_agent "$case_dir" "$cwd" "${env_args[@]}" -- "${args[@]}"
 }
 
 # expected_jail_argv <case_dir> <clipboard> <hosts> <ports>: o argv que o ai-jail falso deve
@@ -167,7 +211,7 @@ jail_on_conf=(JAIL_ENABLED='"true"' JAIL_CLIPBOARD='"brando"' JIRA_ENABLED='"tru
 echo "== lançamento com a jail ligada: argv exato do ai-jail e do claude (calculado pela lib) =="
 case_dir="$TEST_TMP/jail_on"
 proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
-run_agent "$case_dir" "$proj" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+launch "$case_dir" "$proj"
 assert_eq "0" "$(file_of "$case_dir/rc")" "jail ligada: o launcher sai com 0 (o claude falso saiu com 0)"
 hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
 assert_eq "mcp.atlassian.com mcp.sentry.dev $hosts_example" "$hosts" "guarda: os hosts saem de jail_mcp_hosts + JAIL_ALLOW_HOSTS"
@@ -179,7 +223,7 @@ else
   failures=$((failures + 1))
 fi
 assert_eq "$(expected_jail_argv "$case_dir" brando "$hosts" "$ports_example")" "$(file_of "$case_dir/jail.argv")" \
-  "o ai-jail recebe jail_options (brando, MCPs + JAIL_ALLOW_HOSTS, portas), --, claude --settings <regras> --append-system-prompt <aviso> --session-id <uuid> --name <nome>"
+  "o ai-jail recebe jail_options (brando, MCPs + JAIL_ALLOW_HOSTS, portas), --, claude --settings <regras> --append-system-prompt <aviso> --session-id <uuid> --name <nome> <prompt>"
 assert_eq "$(expected_claude_argv "$case_dir" true "$hosts" "$ports_example")" "$(file_of "$case_dir/claude.argv")" \
   "o claude falso recebe exatamente o que vem depois do --"
 jail_argv="$(file_of "$case_dir/jail.argv")"
@@ -189,26 +233,26 @@ done
 assert_eq "ai-jail -- true"$'\n'"ai-jail"$'\n'"claude" "$(file_of "$case_dir/order")" "a checagem (-- true), depois o lançamento pelo ai-jail e só então o claude"
 assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): ativa" "o aviso de jail_print_status aparece no terminal do agente"
 assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "o claude roda com o cwd no projeto"
-assert_eq "$AGENT_NAME" "$(tail -n 1 "$case_dir/claude.argv" 2> /dev/null || true)" "o último argumento do claude é o nome (nenhum prompt)"
-assert_not_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode" "o claude não recebe --permission-mode"
+assert_eq "$PROMPT_ARG" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "o último argumento do claude é o prompt (o conteúdo do --prompt-file sem os \\n do fim)"
+assert_not_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode" "po_discussion: o claude não recebe --permission-mode"
 
 echo
 echo "== lançamento com a jail desligada: o ai-jail não é chamado =="
 case_dir="$TEST_TMP/jail_off"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' JIRA_ENABLED='"true"' "JAIL_ALLOW_HOSTS=\"$hosts_example\"")"
-run_agent "$case_dir" "$proj" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+launch "$case_dir" "$proj"
 assert_eq "0" "$(file_of "$case_dir/rc")" "jail desligada: o launcher sai com 0"
 assert_eq "$(expected_claude_argv "$case_dir" false "" "")" "$(file_of "$case_dir/claude.argv")" \
-  "jail desligada: claude --settings <regras> --session-id <uuid> --name <nome>"
+  "jail desligada: claude --settings <regras> --session-id <uuid> --name <nome> <prompt>"
 assert_not_exists "$case_dir/jail.argv" "jail desligada: nenhum lançamento pelo ai-jail"
 assert_eq "claude" "$(file_of "$case_dir/order")" "jail desligada: o ai-jail não é chamado nem pra checar"
 assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): desligada" "jail desligada: o aviso de jail_print_status"
 assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "jail desligada: o claude roda com o cwd no projeto"
-assert_eq "$AGENT_NAME" "$(tail -n 1 "$case_dir/claude.argv" 2> /dev/null || true)" "jail desligada: o último argumento é o nome (nenhum prompt)"
+assert_eq "$PROMPT_ARG" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "jail desligada: o último argumento é o prompt"
 for jail_value in TRUE '' sim; do
   case_dir="$TEST_TMP/jail_value_${jail_value:-vazio}"
   proj="$(new_project "$case_dir" "JAIL_ENABLED=\"$jail_value\"")"
-  run_agent "$case_dir" "$proj" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+  launch "$case_dir" "$proj"
   assert_not_exists "$case_dir/jail.argv" "JAIL_ENABLED=\"$jail_value\": só \"true\" exato liga a jail"
   assert_eq "$(expected_claude_argv "$case_dir" false "" "")" "$(file_of "$case_dir/claude.argv")" "JAIL_ENABLED=\"$jail_value\": o argv da jail desligada"
 done
@@ -219,8 +263,8 @@ case_a="$TEST_TMP/two_a"
 case_b="$TEST_TMP/two_b"
 proj_a="$(new_project "$case_a" JAIL_ENABLED='"true"' "JAIL_ALLOW_HOSTS=\"a.example.com\"")"
 proj_b="$(new_project "$case_b" JAIL_ENABLED='"false"' "JAIL_ALLOW_HOSTS=\"b.example.com\"")"
-run_agent "$case_a" "$proj_a" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
-run_agent "$case_b" "$proj_b" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+launch "$case_a" "$proj_a"
+launch "$case_b" "$proj_b"
 assert_eq "0|0" "$(file_of "$case_a/rc")|$(file_of "$case_b/rc")" "os dois projetos: o launcher sai com 0"
 assert_eq "$(expected_jail_argv "$case_a" "" " a.example.com" "")" "$(file_of "$case_a/jail.argv")" "projeto A (jail ligada): o ai-jail recebe os hosts de A"
 assert_not_contains "$(file_of "$case_a/jail.argv")" "b.example.com" "projeto A: nada da configuração de B"
@@ -230,9 +274,10 @@ assert_eq "PWD=$proj_a" "$(env_pwd "$case_a")" "projeto A: o claude roda no cwd 
 assert_eq "PWD=$proj_b" "$(env_pwd "$case_b")" "projeto B: o claude roda no cwd de B"
 
 echo
-echo "== --check: só valida, imprime jail=true/jail=false e não grava nada =="
+echo "== --check: só valida, imprime as três linhas jail=/jira=/sentry= e não grava nada =="
 for check_case in "true|jail=true" "false|jail=false" "TRUE|jail=false" "|jail=false"; do
   IFS='|' read -r check_value check_expected <<< "$check_case"
+  check_expected="$check_expected"$'\n'"jira=true"$'\n'"sentry=false"
   case_dir="$TEST_TMP/check_${check_value:-vazio}"
   proj="$(new_project "$case_dir" "JAIL_ENABLED=\"$check_value\"" JIRA_ENABLED='"true"' "JAIL_ALLOW_HOSTS=\"$hosts_example\"")"
   # Sem .nick/.gitignore, troca/ nem docs/: o lançamento os criaria (config_dir_prepare).
@@ -240,7 +285,7 @@ for check_case in "true|jail=true" "false|jail=false" "TRUE|jail=false" "|jail=f
   run_agent "$case_dir" "$proj" -- --check
   label="--check com JAIL_ENABLED=\"$check_value\""
   assert_eq "0" "$(file_of "$case_dir/rc")" "$label: sai com 0"
-  assert_eq "$check_expected" "$(file_of "$case_dir/out")" "$label: o stdout é só a linha $check_expected"
+  assert_eq "$check_expected" "$(file_of "$case_dir/out")" "$label: o stdout são as três linhas, nesta ordem: ${check_expected//$'\n'/ }"
   if [ "$check_value" = "TRUE" ]; then
     assert_contains "$(file_of "$case_dir/err")" "valor \"TRUE\" inválido para JAIL_ENABLED" "$label: o aviso de valor inválido do config_load vai pro stderr, sem mudar o resultado"
   else
@@ -260,14 +305,26 @@ case_dir="$TEST_TMP/check_warning"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
 grep -v '^STACK_DESCRIPTION=' "$proj/.nick/nick.conf" > "$case_dir/conf" && mv "$case_dir/conf" "$proj/.nick/nick.conf"
 run_agent "$case_dir" "$proj" -- --check
-assert_eq "0|jail=false" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com chave ausente: sai com 0 e o stdout continua só jail=false"
+assert_eq "0|jail=false"$'\n'"jira=false"$'\n'"sentry=false" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com chave ausente: sai com 0 e o stdout continua só as três linhas"
 assert_contains "$(file_of "$case_dir/err")" "Aviso: $proj/.nick/nick.conf não tem todas as chaves" "--check com chave ausente: o aviso do config_load vai pro stderr"
+# jira=/sentry=: true só com "true" exato (a regra do choose_type e do jail_exec).
+for flag_case in "true|true|true" "TRUE|false|false" " true|false|false" "|false|false" "false|false|true"; do
+  IFS='|' read -r flag_value flag_jira flag_sentry <<< "$flag_case"
+  case_dir="$TEST_TMP/check_flags_${flag_value// /_}_$flag_sentry"
+  sentry_value="$flag_value"
+  [ "$flag_case" = "false|false|true" ] && sentry_value="true"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' "JIRA_ENABLED=\"$flag_value\"" "SENTRY_ENABLED=\"$sentry_value\"")"
+  before="$(tree_snapshot "$proj")"
+  run_agent "$case_dir" "$proj" -- --check
+  assert_eq "0|jail=false"$'\n'"jira=$flag_jira"$'\n'"sentry=$flag_sentry" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com JIRA_ENABLED=\"$flag_value\" e SENTRY_ENABLED=\"$sentry_value\": jira=$flag_jira, sentry=$flag_sentry"
+  assert_eq "$before" "$(tree_snapshot "$proj")" "--check com JIRA_ENABLED=\"$flag_value\": nenhum arquivo do projeto muda"
+done
 
 echo
 echo "== lançamento: cria o que o config_dir_prepare cria (paridade com o auto_scrum) =="
 case_dir="$TEST_TMP/dir_prepare"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
-run_agent "$case_dir" "$proj" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+launch "$case_dir" "$proj"
 assert_eq "0" "$(file_of "$case_dir/rc")" "dir_prepare: o launcher sai com 0"
 assert_eq "*"$'\n'"!.gitignore"$'\n'"!nick.conf" "$(file_of "$proj/.nick/.gitignore")" "o .nick/.gitignore do config_dir_prepare"
 assert_exists "$proj/.nick/troca" "a pasta .nick/troca/"
@@ -275,13 +332,15 @@ assert_exists "$proj/.nick/docs" "a pasta .nick/docs/"
 
 echo
 echo "== sem configuração: sai com 1, aponta o bin/nick-init e não lança nada =="
-for mode in check launch; do
+for mode in check launch render; do
   case_dir="$TEST_TMP/no_conf_$mode"
   mkdir -p "$case_dir/proj"
   if [ "$mode" = "check" ]; then
     run_agent "$case_dir" "$case_dir/proj" -- --check
+  elif [ "$mode" = "render" ]; then
+    run_agent "$case_dir" "$case_dir/proj" -- --render po_discussion --title "assunto"
   else
-    run_agent "$case_dir" "$case_dir/proj" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+    launch "$case_dir" "$case_dir/proj"
   fi
   assert_eq "1" "$(file_of "$case_dir/rc")" "sem .nick/nick.conf ($mode): sai com 1"
   assert_eq "Erro: não há configuração do projeto em $case_dir/proj/.nick/nick.conf. Rode na raiz do projeto: $NICK_INIT" \
@@ -289,13 +348,16 @@ for mode in check launch; do
   assert_eq "" "$(file_of "$case_dir/out")" "sem .nick/nick.conf ($mode): nada no stdout"
   assert_eq "" "$(file_of "$case_dir/order")" "sem .nick/nick.conf ($mode): nem o ai-jail nem o claude"
   assert_not_exists "$case_dir/proj/.nick" "sem .nick/nick.conf ($mode): nada criado no projeto"
+  assert_not_exists "$case_dir/logs" "sem .nick/nick.conf ($mode): nenhum log de prompt"
   case_dir="$TEST_TMP/legacy_conf_$mode"
   mkdir -p "$case_dir/proj"
   config_lines > "$case_dir/proj/.nick.conf"
   if [ "$mode" = "check" ]; then
     run_agent "$case_dir" "$case_dir/proj" -- --check
+  elif [ "$mode" = "render" ]; then
+    run_agent "$case_dir" "$case_dir/proj" -- --render po_discussion --title "assunto"
   else
-    run_agent "$case_dir" "$case_dir/proj" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+    launch "$case_dir" "$case_dir/proj"
   fi
   assert_eq "1" "$(file_of "$case_dir/rc")" "só o .nick.conf antigo ($mode): sai com 1"
   assert_contains "$(file_of "$case_dir/err")" "Erro: a configuração do projeto agora fica em .nick/nick.conf, e $case_dir/proj/.nick.conf não é mais lido." \
@@ -330,8 +392,10 @@ jail_fail() {
   proj="$(new_project "$case_dir" "${conf[@]}")"
   if [ "$mode" = "check" ]; then
     run_agent "$case_dir" "$proj" "${env_args[@]}" -- --check
+  elif [ "$mode" = "render" ]; then
+    run_agent "$case_dir" "$proj" "${env_args[@]}" -- --render po_discussion --title "assunto"
   else
-    run_agent "$case_dir" "$proj" "${env_args[@]}" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+    launch "$case_dir" "$proj" "${env_args[@]}"
   fi
   assert_eq "1" "$(file_of "$case_dir/rc")" "$name ($mode): sai com 1"
   assert_contains "$(file_of "$case_dir/err")" "$message" "$name ($mode): o erro do jail_check"
@@ -339,8 +403,9 @@ jail_fail() {
   assert_eq "" "$(file_of "$case_dir/out")" "$name ($mode): nada no stdout (nem jail=…)"
   assert_not_exists "$case_dir/claude.argv" "$name ($mode): o claude falso não é chamado"
   assert_not_exists "$case_dir/jail.argv" "$name ($mode): nenhum lançamento pelo ai-jail"
+  assert_not_exists "$case_dir/logs" "$name ($mode): nenhum log de prompt"
 }
-for mode in check launch; do
+for mode in check launch render; do
   jail_fail no_jail "$mode" "ai-jail não encontrado no PATH." PATH="$min_bin" -- JAIL_ENABLED='"true"'
   jail_fail old_version "$mode" "versão do ai-jail não suportada: encontrada 2.14.0" FAKE_JAIL_VERSION=2.14.0 -- JAIL_ENABLED='"true"'
   jail_fail bad_clipboard "$mode" "JAIL_CLIPBOARD=\"xyz\" em" -- JAIL_ENABLED='"true"' JAIL_CLIPBOARD='"xyz"'
@@ -348,7 +413,7 @@ for mode in check launch; do
 done
 case_dir="$TEST_TMP/no_jail_control"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"true"')"
-run_agent "$case_dir" "$proj" PATH="$min_with_jail_bin" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
+launch "$case_dir" "$proj" PATH="$min_with_jail_bin"
 assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: o mesmo PATH mínimo com o ai-jail falso: o launcher sai com 0$(file_of "$case_dir/err")"
 assert_exists "$case_dir/claude.argv" "controle positivo: com o ai-jail falso, o claude falso é chamado"
 
@@ -357,7 +422,15 @@ echo "== argumentos: qualquer outro uso sai com 1 e mostra o uso =="
 case_dir="$TEST_TMP/args"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
 arg_case=0
-for args in "" "--foo" "--session-id $SESSION_ID" "--name x" "--session-id" "--session-id $SESSION_ID --name" "--check --name x" "--check --check" "--session-id $SESSION_ID --name x --check" "x"; do
+printf '%s' "$PROMPT_TEXT" > "$case_dir/prompt.md"
+: > "$case_dir/vazio.md"
+pf="$case_dir/prompt.md"
+for args in "" "--foo" "--session-id $SESSION_ID" "--name x" "--session-id" "--session-id $SESSION_ID --name" "--check --name x" "--check --check" "--session-id $SESSION_ID --name x --check" "x" \
+  "--session-id $SESSION_ID --name x" "--session-id $SESSION_ID --name x --type po" "--session-id $SESSION_ID --name x --prompt-file $pf" \
+  "--session-id $SESSION_ID --name x --type xpto --prompt-file $pf" "--session-id $SESSION_ID --name x --type po --prompt-file $case_dir/nao-existe.md" \
+  "--session-id $SESSION_ID --name x --type po --prompt-file $case_dir/vazio.md" "--session-id $SESSION_ID --name x --type po --prompt-file $case_dir" \
+  "--session-id $SESSION_ID --name x --type po --prompt-file" \
+  "--check --render po" "--render" "--session-id $SESSION_ID --render po"; do
   arg_case=$((arg_case + 1))
   rm -f "$case_dir/order"
   # Lista de propósito: cada palavra é um argumento.
@@ -371,9 +444,9 @@ done
 for empty_case in "session" "name"; do
   rm -f "$case_dir/order"
   if [ "$empty_case" = "session" ]; then
-    run_agent "$case_dir" "$proj" -- --session-id "" --name "$AGENT_NAME"
+    run_agent "$case_dir" "$proj" -- --session-id "" --name "$AGENT_NAME" --type po --prompt-file "$pf"
   else
-    run_agent "$case_dir" "$proj" -- --session-id "$SESSION_ID" --name ""
+    run_agent "$case_dir" "$proj" -- --session-id "$SESSION_ID" --name "" --type po --prompt-file "$pf"
   fi
   assert_eq "1" "$(file_of "$case_dir/rc")" "valor vazio ($empty_case): sai com 1"
   assert_contains "$(file_of "$case_dir/err")" "$USAGE" "valor vazio ($empty_case): o uso no stderr"
@@ -381,63 +454,274 @@ for empty_case in "session" "name"; do
 done
 assert_not_exists "$proj/.nick/.gitignore" "argumentos inválidos: nada criado no projeto"
 rm -f "$case_dir/order"
-run_agent "$case_dir" "$proj" -- --name "$AGENT_NAME" --session-id "$SESSION_ID"
-assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: --name antes de --session-id também vale"
+run_agent "$case_dir" "$proj" -- --prompt-file "$pf" --type po --name "$AGENT_NAME" --session-id "$SESSION_ID"
+assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: os quatro em qualquer ordem também valem"
+assert_not_exists "$case_dir/logs" "argumentos: nenhum log de prompt gravado"
 
 echo
-echo "== diferencial com o auto_scrum.sh: as mesmas opções do ai-jail e o mesmo argv do claude =="
-# run_auto_scrum <case_dir> <cwd>: roda main() do auto_scrum.sh de ponta a ponta (etapa PO,
-# po_discussion, com o menu de Jira e Sentry ligados), com os mesmos falsos e o mesmo ambiente
-# do run_agent, check_requirements stubado e LOGS_DIR temporário (como o run_main de
+echo "== --render: monta o prompt pelo prompt.sh, grava o log fora do projeto e devolve log= + o status da jail =="
+# render_args <type>: as respostas de exemplo de cada tipo, cada argumento terminado por NUL (use
+# com mapfile -d ''; a descrição longa tem quebra de linha), já aparadas (é o que a casca manda,
+# depois de aparar como o read).
+render_args() {
+  case "$1" in
+    po) printf '%s\0' --title "Título de teste" --description "$EDITOR_DESCRIPTION" ;;
+    po_discussion) printf '%s\0' --title "Assunto de teste" ;;
+    po_jira) printf '%s\0' --jira-link "https://jira.example.com/browse/SC-1" --description "extra do jira" ;;
+    po_sentry) printf '%s\0' --sentry-link "https://sentry.example.com/issues/1" ;;
+    tech_leader) printf '%s\0' --jira-id SC-1 --title "Título da tarefa" --description "$EDITOR_DESCRIPTION" ;;
+    tech_leader_jira) printf '%s\0' --jira-link "https://jira.example.com/browse/SC-2" --description "contexto extra" ;;
+    development) printf '%s\0' --jira-id SC-1 ;;
+    review) printf '%s\0' --jira-id SC-2 --plan-path outro/plano.md ;;
+  esac
+}
+# render <case_dir> <cwd> <type> [VAR=valor...]: run_agent com --render <type> e as respostas de
+# render_args.
+render() {
+  local case_dir="$1" cwd="$2" type="$3" args
+  shift 3
+  mapfile -t -d '' args < <(render_args "$type")
+  run_agent "$case_dir" "$cwd" "$@" -- --render "$type" "${args[@]}"
+}
+render_conf=(JAIL_ENABLED='"false"' JIRA_ENABLED='"true"' SENTRY_ENABLED='"true"' PRODUCTION_ENABLED='"true"' PERMISSION_ENABLED='"true"' STACK_DESCRIPTION='"Bash"')
+off_status="Jail (ai-jail): desligada — o agente roda direto no seu shell."
+for type in "${ALL_TYPES[@]}"; do
+  case_dir="$TEST_TMP/render_$type"
+  proj="$(new_project "$case_dir" "${render_conf[@]}")"
+  before="$(tree_snapshot "$proj")"
+  render "$case_dir" "$proj" "$type"
+  label="--render $type"
+  assert_eq "0" "$(file_of "$case_dir/rc")" "$label: sai com 0$(file_of "$case_dir/err")"
+  log="$(find "$case_dir/logs" -name "${type}_*.md" 2> /dev/null | head -n 1 || true)"
+  assert_eq "1" "$(find "$case_dir/logs" -type f 2> /dev/null | wc -l || true)" "$label: um log só, no diretório de logs"
+  assert_eq "true" "$([[ "$(basename "$log")" =~ ^${type}_[0-9]{8}_[0-9]{6}\.md$ ]] && echo true || echo false)" "$label: o log se chama <tipo>_<AAAAmmdd_HHMMSS>.md (o nome do auto_scrum.sh)"
+  assert_eq "log=$log"$'\n'"$off_status" "$(file_of "$case_dir/out")" "$label: o stdout é log=<caminho absoluto> e o status da jail (jail_print_status)"
+  assert_eq "/" "${log:0:1}" "$label: o caminho do log é absoluto"
+  assert_eq "" "$(file_of "$case_dir/err")" "$label: nada no stderr"
+  assert_contains "$(file_of "$log")" "## Troca de arquivos com o usuário" "$label: o log tem o exchange_block no fim"
+  # shellcheck disable=SC2016
+  assert_not_contains "$(file_of "$log")" '${' "$label: nenhuma variável sobra sem expandir"
+  assert_eq "$before" "$(tree_snapshot "$proj")" "$label: nada muda no projeto (retrato recursivo)"
+  assert_not_exists "$proj/.nick/.gitignore" "$label: sem .nick/.gitignore criado"
+  assert_eq "" "$(file_of "$case_dir/order")" "$label: nem o ai-jail nem o claude"
+done
+assert_contains "$(file_of "$(find "$TEST_TMP/render_development/logs" -type f 2> /dev/null | head -n 1 || true)")" ".nick/docs/SC-1/plan.md" "--render development sem --plan-path: o plano padrão .nick/docs/<ID>/plan.md, calculado pelo bash"
+review_log="$(file_of "$(find "$TEST_TMP/render_review/logs" -type f 2> /dev/null | head -n 1 || true)")"
+assert_contains "$review_log" "outro/plano.md" "--render review com --plan-path: o caminho informado"
+assert_contains "$review_log" ".nick/docs/SC-2/review.md" "--render review: o REVIEW_PATH ao lado do plano"
+assert_contains "$(file_of "$(find "$TEST_TMP/render_po/logs" -type f 2> /dev/null | head -n 1 || true)")" "$EDITOR_DESCRIPTION" "--render po: a descrição longa vai inteira, com as quebras de linha"
+# A jail ligada: o status é o de jail_print_status, depois do jail_check (com o Landlock dele).
+case_dir="$TEST_TMP/render_jail_on"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"true"' JAIL_CLIPBOARD='"restrito"')"
+render "$case_dir" "$proj" po_discussion
+assert_eq "0" "$(file_of "$case_dir/rc")" "--render com a jail ligada: sai com 0"
+assert_contains "$(sed -n 2p "$case_dir/out" 2> /dev/null || true)" "Jail (ai-jail): ativa" "--render com a jail ligada: a 2ª linha é o status da jail ligada"
+assert_contains "$(sed -n 2p "$case_dir/out" 2> /dev/null || true)" "modo de clipboard restrito" "--render com a jail ligada: com o modo do JAIL_CLIPBOARD"
+assert_eq "ai-jail -- true" "$(file_of "$case_dir/order")" "--render com a jail ligada: só a checagem -- true, nenhum lançamento"
+assert_not_exists "$case_dir/claude.argv" "--render com a jail ligada: o claude não é chamado"
+
+echo
+echo "== --render: recusas (saída 1, uso no stderr, nenhum log) =="
+case_dir="$TEST_TMP/render_refusals"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+refusal_case=0
+# render_refused <message> <args...>: --render com <args>, recusado com <message> no stderr.
+render_refused() {
+  local message="$1"
+  shift
+  refusal_case=$((refusal_case + 1))
+  rm -rf "$case_dir/logs" "$case_dir/order"
+  run_agent "$case_dir" "$proj" -- --render "$@"
+  local label="--render $*"
+  assert_eq "1" "$(file_of "$case_dir/rc")" "$label: sai com 1"
+  assert_contains "$(file_of "$case_dir/err")" "Erro: $message" "$label: Erro: $message"
+  assert_contains "$(file_of "$case_dir/err")" "$USAGE" "$label: o uso no stderr"
+  assert_eq "" "$(file_of "$case_dir/out")" "$label: nada no stdout"
+  assert_not_exists "$case_dir/logs" "$label: nenhum log gravado"
+  assert_eq "" "$(file_of "$case_dir/order")" "$label: nada é chamado"
+}
+render_refused "informe o tipo depois do --render."
+render_refused "o tipo 'xpto' não existe." xpto --title a
+render_refused "o tipo '../po' não existe." ../po --title a
+render_refused "o tipo 'po_jira' não está disponível neste projeto." po_jira --jira-link x
+render_refused "o tipo 'tech_leader_jira' não está disponível neste projeto." tech_leader_jira --jira-link x
+render_refused "o tipo 'po_sentry' não está disponível neste projeto." po_sentry --sentry-link x
+render_refused "a resposta --description não pertence ao tipo 'po_discussion'." po_discussion --title a --description b
+render_refused "a resposta --plan-path não pertence ao tipo 'tech_leader'." tech_leader --jira-id SC-1 --title a --description b --plan-path x
+render_refused "a resposta --title foi repetida." po_discussion --title a --title b
+render_refused "falta a resposta --description do tipo 'po'." po --title a
+render_refused "falta a resposta --title do tipo 'po'." po --title "" --description b
+render_refused "falta a resposta --jira-id do tipo 'development'." development
+render_refused "falta a resposta --jira-id do tipo 'review'." review --jira-id ""
+# Só espaço, tab e \n: vazio para o read do script, numa resposta lida por ele (review do
+# NS-35). A descrição longa vem do read_via_editor, que aceita um texto só de espaços (o arquivo
+# não é vazio): o controle positivo fica logo abaixo.
+render_refused "falta a resposta --title do tipo 'po_discussion'." po_discussion --title "   "
+render_refused "falta a resposta --jira-id do tipo 'development'." development --jira-id $'\t'
+render_refused "falta a resposta --jira-link do tipo 'po_jira'." po_jira --jira-link " "
+for bad_id in a/b .. "a b" "."; do
+  render_refused "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta .nick/docs/<ID>/)." development --jira-id "$bad_id"
+done
+render_refused "falta o valor de --title." po_discussion --title
+render_refused "argumento desconhecido: '--foo'" po_discussion --title a --foo b
+render_refused "argumento desconhecido: 'x'" po_discussion x
+case_dir="$TEST_TMP/render_blank_description"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+run_agent "$case_dir" "$proj" -- --render po --title a --description "   "
+assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: a descrição longa só com espaços é aceita, como no read_via_editor"
+# Os tipos com Jira/Sentry, com as flags ligadas: o controle positivo da recusa acima.
+case_dir="$TEST_TMP/render_flags_on"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' JIRA_ENABLED='"true"' SENTRY_ENABLED='"true"')"
+run_agent "$case_dir" "$proj" -- --render po_jira --jira-link x
+assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: po_jira com JIRA_ENABLED=\"true\" sai com 0"
+case_dir="$TEST_TMP/render_jira_typo"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' JIRA_ENABLED='"TRUE"')"
+run_agent "$case_dir" "$proj" -- --render po_jira --jira-link x
+assert_eq "1" "$(file_of "$case_dir/rc")" "po_jira com JIRA_ENABLED=\"TRUE\" (não exato): recusado, a regra do choose_type"
+
+echo
+echo "== --render: warn_legacy_plan no stderr para development e review =="
+for type in development review; do
+  case_dir="$TEST_TMP/render_legacy_$type"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+  mkdir -p "$proj/docs/plans"
+  : > "$proj/docs/plans/SC-1_x.md"
+  run_agent "$case_dir" "$proj" -- --render "$type" --jira-id SC-1
+  assert_eq "0" "$(file_of "$case_dir/rc")" "$type com docs/plans/SC-1_x.md: sai com 0"
+  assert_eq "Aviso: .nick/docs/SC-1/plan.md não existe, mas há um plano no lugar antigo: docs/plans/SC-1_x.md — para usá-lo, informe esse caminho na pergunta abaixo." \
+    "$(file_of "$case_dir/err")" "$type: o aviso do warn_legacy_plan no stderr"
+  assert_contains "$(file_of "$case_dir/out")" "log=" "$type: o stdout continua log= e o status"
+done
+
+echo
+echo "== lançamento: o prompt é o último argumento, e só o development tem --permission-mode auto =="
+for type in "${ALL_TYPES[@]}"; do
+  case_dir="$TEST_TMP/launch_$type"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+  launch "$case_dir" "$proj" -- "$type"
+  assert_eq "0" "$(file_of "$case_dir/rc")" "lançamento --type $type: sai com 0"
+  assert_eq "$(expected_claude_argv "$case_dir" false "" "" "$type")" "$(file_of "$case_dir/claude.argv")" \
+    "lançamento --type $type: claude --settings <regras>$([ "$type" = development ] && echo ' --permission-mode auto') --session-id <uuid> --name <nome> <prompt>"
+  if [ "$type" = "development" ]; then
+    assert_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode"$'\n'"auto" "lançamento --type development: --permission-mode auto"
+  else
+    assert_not_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode" "lançamento --type $type: sem --permission-mode"
+  fi
+  assert_eq "$PROMPT_ARG" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "lançamento --type $type: o prompt é o último argumento"
+done
+assert_not_exists "$TEST_TMP/launch_po/logs" "lançamento: nenhum log de prompt (quem grava é o --render)"
+
+echo
+echo "== diferencial com o auto_scrum.sh: os 8 tipos, a matriz de flags, o mesmo log byte a byte, o mesmo argv do claude e as mesmas opções do ai-jail =="
+# O EDITOR falso (po e tech_leader): grava EDITOR_TEXT no arquivo.
+fake_editor="$TEST_TMP/fake_editor"
+# Aspas simples intencionais: o "$1" é do script gerado, não daqui.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nprintf %%s %q > "$1"\n' "$EDITOR_TEXT" > "$fake_editor"
+chmod +x "$fake_editor"
+# script_answers <type>: o stdin do auto_scrum.sh depois do número do menu (as respostas cruas,
+# com os espaços que o read apara; a descrição longa vem do EDITOR falso).
+script_answers() {
+  case "$1" in
+    po) printf '%s\n' '  Título de teste  ' ;;
+    po_discussion) printf '%s\n' $'\tAssunto de teste\t' ;;
+    po_jira) printf '%s\n' 'https://jira.example.com/browse/SC-1' '  extra do jira  ' ;;
+    po_sentry) printf '%s\n' 'https://sentry.example.com/issues/1' '' ;;
+    tech_leader) printf '%s\n' 'SC-1' 'Título da tarefa' ;;
+    tech_leader_jira) printf '%s\n' 'https://jira.example.com/browse/SC-2' 'contexto extra' ;;
+    development) printf '%s\n' 'SC-1' '' ;;
+    review) printf '%s\n' ' SC-2 ' 'outro/plano.md' ;;
+  esac
+}
+# run_auto_scrum <case_dir> <cwd> <type> <menu number>: roda main() do auto_scrum.sh de ponta a
+# ponta (o número do menu, as respostas e s), com os mesmos falsos e o mesmo ambiente do
+# run_agent, o EDITOR falso, check_requirements stubado e LOGS_DIR temporário (como o run_main de
 # auto_scrum/tests/test_auto_scrum.sh).
 run_auto_scrum() {
-  local case_dir="$1" cwd="$2" rc=0
+  local case_dir="$1" cwd="$2" type="$3" number="$4" rc=0
   mkdir -p "$case_dir/home"
   (cd "$cwd" && timeout 10 env -u PLAYWRIGHT_BROWSERS_PATH -u FAKE_JAIL_VERSION -u FAKE_CLAUDE_MODE \
     HOME="$case_dir/home" PATH="$FIXTURES_BIN:$PATH" FAKE_JAIL_LOG="$case_dir/jail.argv" \
-    FAKE_CLAUDE_LOG="$case_dir/claude.argv" FAKE_ORDER_LOG="$case_dir/order" \
+    FAKE_CLAUDE_LOG="$case_dir/claude.argv" FAKE_ORDER_LOG="$case_dir/order" EDITOR="$fake_editor" \
     "$BASH_BIN" -c "source '$AUTO_SCRUM_SH'; check_requirements() { :; }; LOGS_DIR='$case_dir/logs'; main" \
-    <<< $'2\nassunto de teste\ns' > "$case_dir/out" 2> "$case_dir/err") || rc=$?
+    <<< "$(printf '%s\n' "$number"; script_answers "$type"; printf 's\n')" > "$case_dir/out" 2> "$case_dir/err") || rc=$?
   echo "$rc" > "$case_dir/rc"
 }
 # options_until_dashes <file>: as linhas de <file> até o "--" (as opções do ai-jail).
 options_until_dashes() {
   sed '/^--$/q' "$1" 2> /dev/null || true
 }
-for diff_jail in true false; do
-  diff_conf=("JAIL_ENABLED=\"$diff_jail\"" JAIL_CLIPBOARD='"brando"' JIRA_ENABLED='"true"' SENTRY_ENABLED='"true"' "JAIL_ALLOW_HOSTS=\"$hosts_example\"" "JAIL_FORWARD_PORTS=\"$ports_example\"")
-  as_dir="$TEST_TMP/diff_auto_scrum_$diff_jail"
-  ag_dir="$TEST_TMP/diff_agent_$diff_jail"
-  as_proj="$(new_project "$as_dir" "${diff_conf[@]}")"
-  # O mesmo HOME nos dois (o aviso da jail cita as toolchains do home).
-  mkdir -p "$ag_dir"
-  cp -a "$as_proj" "$ag_dir/proj"
-  ag_proj="$ag_dir/proj"
-  # O projeto do auto_scrum e o do launcher são pastas diferentes; o mesmo caminho no aviso
-  # exige o mesmo HOME, então os dois usam o home do caso do auto_scrum.
-  run_auto_scrum "$as_dir" "$as_proj"
-  run_agent "$ag_dir" "$ag_proj" HOME="$as_dir/home" -- --session-id "$SESSION_ID" --name "$AGENT_NAME"
-  label="diferencial, jail $diff_jail"
-  assert_eq "0|0" "$(file_of "$as_dir/rc")|$(file_of "$ag_dir/rc")" "$label: o auto_scrum e o launcher saem com 0"
-  as_log="$(find "$as_dir/logs" -name 'po_discussion_*.md' 2> /dev/null | head -n 1)"
-  as_prompt="$(file_of "$as_log")"
-  as_claude="$(file_of "$as_dir/claude.argv")"
-  assert_contains "$as_claude" "assunto de teste" "$label: guarda: o claude do auto_scrum recebeu o prompt"
-  # O argv do auto_scrum sem o prompt final; o do launcher sem --session-id/--name (as 4 últimas
-  # linhas: o UUID e o nome não têm quebra de linha).
-  as_prefix="${as_claude%"$as_prompt"}"
-  ag_prefix="$(head -n -4 "$ag_dir/claude.argv" 2> /dev/null || true)"
-  assert_eq "$as_prefix" "$ag_prefix"$'\n' "$label: o argv do claude do launcher é o do auto_scrum sem o prompt (e sem --session-id/--name)"
-  assert_eq "--session-id"$'\n'"$SESSION_ID"$'\n'"--name"$'\n'"$AGENT_NAME" "$(tail -n 4 "$ag_dir/claude.argv" 2> /dev/null || true)" \
-    "$label: o launcher termina com --session-id <uuid> --name <nome>"
-  if [ "$diff_jail" = "true" ]; then
-    assert_contains "$(options_until_dashes "$as_dir/jail.argv")" "--forward-port" "$label: guarda: o ai-jail do auto_scrum foi chamado com as opções"
-    assert_eq "$(options_until_dashes "$as_dir/jail.argv")" "$(options_until_dashes "$ag_dir/jail.argv")" "$label: o ai-jail recebe as mesmas opções até o --"
-  else
-    assert_not_exists "$as_dir/jail.argv" "$label: o auto_scrum não chama o ai-jail"
-    assert_not_exists "$ag_dir/jail.argv" "$label: o launcher não chama o ai-jail"
-  fi
+# without_session <file>: o argv de <file> sem as 4 linhas --session-id <uuid> --name <nome>.
+without_session() {
+  awk -v id="$SESSION_ID" -v name="$AGENT_NAME" '
+    skip > 0 { skip--; next }
+    !done && $0 == "--session-id" { getline uuid; getline flag; getline value
+      if (uuid == id && flag == "--name" && value == name) { done = 1; next }
+      print; print uuid; print flag; print value; next }
+    { print }' "$1" 2> /dev/null || true
+}
+# A matriz (plano do NS-35, 4.2): nome|jail|chaves. Tudo desligado (TDD_ENABLED="false"), tudo
+# ligado (com STACK_DESCRIPTION preenchido e a jail ligada, que cobre cada papel com a jail
+# ligada; os outros com a jail desligada) e cada flag ligada sozinha.
+diff_matrix=(
+  'tudo_desligado|false|TDD_ENABLED="false"'
+  'tudo_ligado|true|JIRA_ENABLED="true";SENTRY_ENABLED="true";PRODUCTION_ENABLED="true";TDD_ENABLED="true";PERMISSION_ENABLED="true";STACK_DESCRIPTION="Bash e Rust"'
+  'so_jira|false|JIRA_ENABLED="true";TDD_ENABLED="false"'
+  'so_sentry|false|SENTRY_ENABLED="true";TDD_ENABLED="false"'
+  'so_production|false|PRODUCTION_ENABLED="true";TDD_ENABLED="false"'
+  'so_tdd|false|TDD_ENABLED="true"'
+  'so_permission|false|PERMISSION_ENABLED="true";TDD_ENABLED="false"'
+)
+diff_types_seen=""
+for diff_combo in "${diff_matrix[@]}"; do
+  IFS='|' read -r diff_name diff_jail diff_keys <<< "$diff_combo"
+  IFS=';' read -r -a diff_conf <<< "$diff_keys"
+  diff_conf+=("JAIL_ENABLED=\"$diff_jail\"" JAIL_CLIPBOARD='"brando"' "JAIL_ALLOW_HOSTS=\"$hosts_example\"" "JAIL_FORWARD_PORTS=\"$ports_example\"")
+  # O menu do choose_type com estas flags (a posição dos tipos com Jira/Sentry muda).
+  diff_menu=(po po_discussion)
+  [[ " ${diff_conf[*]} " == *' JIRA_ENABLED="true" '* ]] && diff_menu+=(po_jira)
+  [[ " ${diff_conf[*]} " == *' SENTRY_ENABLED="true" '* ]] && diff_menu+=(po_sentry)
+  diff_menu+=(tech_leader)
+  [[ " ${diff_conf[*]} " == *' JIRA_ENABLED="true" '* ]] && diff_menu+=(tech_leader_jira)
+  diff_menu+=(development review)
+  for diff_index in "${!diff_menu[@]}"; do
+    type="${diff_menu[$diff_index]}"
+    diff_types_seen="$diff_types_seen $type"
+    as_dir="$TEST_TMP/diff_${diff_name}_${type}_auto_scrum"
+    ag_dir="$TEST_TMP/diff_${diff_name}_${type}_agent"
+    as_proj="$(new_project "$as_dir" "${diff_conf[@]}")"
+    mkdir -p "$ag_dir"
+    cp -a "$as_proj" "$ag_dir/proj"
+    ag_proj="$ag_dir/proj"
+    label="diferencial $diff_name, $type (jail $diff_jail)"
+    run_auto_scrum "$as_dir" "$as_proj" "$type" "$((diff_index + 1))"
+    # O mesmo HOME nos dois (o aviso da jail cita as toolchains do home).
+    render "$ag_dir" "$ag_proj" "$type" HOME="$as_dir/home"
+    ag_log="$(sed -n '1s/^log=//p' "$ag_dir/out" 2> /dev/null || true)"
+    as_log="$(find "$as_dir/logs" -name "${type}_*.md" 2> /dev/null | head -n 1 || true)"
+    assert_eq "0|0" "$(file_of "$as_dir/rc")|$(file_of "$ag_dir/rc")" "$label: o auto_scrum e o --render saem com 0$(file_of "$ag_dir/err")"
+    assert_eq "true" "$([ -s "$as_log" ] && cmp -s "$as_log" "$ag_log" && echo true || echo false)" "$label: o log do --render é igual ao do auto_scrum.sh, byte a byte"
+    rm -f "$ag_dir/order"
+    run_agent "$ag_dir" "$ag_proj" HOME="$as_dir/home" -- --session-id "$SESSION_ID" --name "$AGENT_NAME" --type "$type" --prompt-file "$ag_log"
+    assert_eq "0" "$(file_of "$ag_dir/rc")" "$label: o lançamento sai com 0"
+    assert_contains "$(file_of "$as_dir/claude.argv")" "## Troca de arquivos com o usuário" "$label: guarda: o claude do auto_scrum recebeu o prompt"
+    assert_eq "$(file_of "$as_dir/claude.argv")" "$(without_session "$ag_dir/claude.argv")" "$label: o argv do claude é o do auto_scrum.sh, tirando --session-id <uuid> --name <nome>"
+    assert_eq "--session-id"$'\n'"$SESSION_ID"$'\n'"--name"$'\n'"$AGENT_NAME" "$(grep -A3 -x -- '--session-id' "$ag_dir/claude.argv" 2> /dev/null || true)" "$label: guarda: o launcher passa --session-id <uuid> --name <nome>"
+    if [ "$diff_jail" = "true" ]; then
+      assert_contains "$(options_until_dashes "$as_dir/jail.argv")" "--forward-port" "$label: guarda: o ai-jail do auto_scrum foi chamado com as opções"
+      assert_eq "$(options_until_dashes "$as_dir/jail.argv")" "$(options_until_dashes "$ag_dir/jail.argv")" "$label: o ai-jail recebe as mesmas opções até o --"
+    else
+      assert_not_exists "$as_dir/jail.argv" "$label: o auto_scrum não chama o ai-jail"
+      assert_not_exists "$ag_dir/jail.argv" "$label: o launcher não chama o ai-jail"
+    fi
+  done
 done
+for type in "${ALL_TYPES[@]}"; do
+  assert_contains "$diff_types_seen " " $type " "diferencial: o tipo $type entrou na matriz"
+done
+# Controle positivo do without_session: só as 4 linhas certas saem.
+printf '%s\n' a --session-id "$SESSION_ID" --name "$AGENT_NAME" b > "$TEST_TMP/ws_sample"
+assert_eq "a"$'\n'"b" "$(without_session "$TEST_TMP/ws_sample")" "controle positivo: without_session tira só --session-id <uuid> --name <nome>"
 
 echo
 echo "== estrutura do launcher =="
@@ -446,9 +730,9 @@ assert_contains "$(head -n 1 "$LAUNCHER")" "#!/usr/bin/env bash" "o launcher é 
 assert_eq "set -euo pipefail" "$(printf '%s\n' "$launcher_code" | grep -v '^[[:space:]]*$' | sed -n 1p)" "a 1ª linha de código depois do shebang (e do cabeçalho) é set -euo pipefail"
 assert_eq "x" "$([ -x "$LAUNCHER" ] && echo x || true)" "o launcher tem bit de execução (como o bin/nick-init)"
 # shellcheck disable=SC2016
-assert_eq 'source "$SCRIPT_DIR/../lib/config/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/config/keys.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' \
-  "$(printf '%s\n' "$launcher_code" | grep -E '^[[:space:]]*(source|\.)[[:space:]]' || true)" "as únicas linhas source são as quatro do lib/, na ordem do auto_scrum.sh"
-assert_eq "config_register_nick_keys" "$(printf '%s\n' "$launcher_code" | grep -v '^[[:space:]]*$' | grep -A1 'lib/claude/claude.sh"$' | tail -n 1)" \
+assert_eq 'source "$SCRIPT_DIR/../lib/config/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/config/keys.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"'$'\n''source "$SCRIPT_DIR/../auto_scrum/prompt.sh"' \
+  "$(printf '%s\n' "$launcher_code" | grep -E '^[[:space:]]*(source|\.)[[:space:]]' || true)" "as únicas linhas source são as quatro do lib/, na ordem do auto_scrum.sh, e a quinta, do auto_scrum/prompt.sh"
+assert_eq "config_register_nick_keys" "$(printf '%s\n' "$launcher_code" | grep -v '^[[:space:]]*$' | grep -A1 'auto_scrum/prompt.sh"$' | tail -n 1)" \
   "config_register_nick_keys vem logo depois das linhas source, no topo (fora de função)"
 assert_eq "" "$(claude_command_lines "$LAUNCHER")" "nenhuma linha de código chama claude ou ai-jail fora do jail_exec \"\$JAIL_ENABLED\""
 assert_eq "1" "$(printf '%s\n' "$launcher_code" | grep -c 'jail_exec ' || true)" "uma única chamada de jail_exec"
@@ -459,13 +743,31 @@ printf '%s\n' '# claude no comentário não conta' 'claude_settings_load NICK_CL
 # shellcheck disable=SC2016
 assert_eq 'exec claude --settings "$x"'$'\n''ai-jail -- claude' "$(claude_command_lines "$sample")" \
   "controle positivo: o filtro acha claude/ai-jail chamados direto e ignora comentário, claude_* e o jail_exec"
-assert_not_contains "$launcher_code" "--permission-mode" "o launcher nunca passa --permission-mode"
+# --permission-mode: uma única ocorrência no código, condicionada ao development (adaptado no
+# NS-35: até o NS-34 o launcher nunca o passava).
+# permission_lines <file>: as linhas de código de <file> com --permission-mode.
+permission_lines() {
+  code_lines "$1" | grep -F -- '--permission-mode' || true
+}
+# shellcheck disable=SC2016
+assert_eq '  [ "$type" = "development" ] && claude_args+=(--permission-mode auto)' "$(permission_lines "$LAUNCHER")" \
+  "o launcher passa --permission-mode numa linha só, condicionada a --type development"
+# shellcheck disable=SC2016
+printf '%s\n' '# --permission-mode no comentário' 'claude_args+=(--permission-mode auto)' '  [ "$type" = "development" ] && claude_args+=(--permission-mode auto)' > "$sample"
+# shellcheck disable=SC2016
+assert_eq 'claude_args+=(--permission-mode auto)'$'\n''  [ "$type" = "development" ] && claude_args+=(--permission-mode auto)' "$(permission_lines "$sample")" \
+  "controle positivo: o filtro acha toda linha de código com --permission-mode (e ignora comentário)"
 assert_eq "" "$(printf '%s\n' "$launcher_code" | grep -E '(^|[^A-Z_])CLAUDE_[A-Z_]*=' || true)" "nenhuma global CLAUDE_* atribuída (só NICK_CLAUDE_*)"
 # shellcheck disable=SC2016
 assert_eq "x" "$(printf '%s\n' 'CLAUDE_X=1' | grep -qE '(^|[^A-Z_])CLAUDE_[A-Z_]*=' && echo x || true)" "controle positivo: o filtro acha CLAUDE_X="
 assert_contains "$launcher_code" "jail_mcp_hosts " "os hosts dos MCPs saem da lib (jail_mcp_hosts)"
 assert_not_contains "$launcher_code" "mcp.atlassian.com" "o launcher não repete os hosts dos MCPs"
-
+assert_eq "" "$(printf '%s\n' "$launcher_code" | grep -nE "envsubst|templates/|build_[a-z]+_blocks[^_]" || true)" "o launcher não monta prompt por conta própria (sem envsubst, templates/ nem build_*_blocks: tudo pelo prompt.sh)"
+# Os tipos do launcher são os do choose_type (com tudo ligado), na mesma ordem.
+choose_keys="$(timeout 5 "$BASH_BIN" -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED=true; SENTRY_ENABLED=true; for n in 1 2 3 4 5 6 7 8; do choose_type <<< \"\$n\" > /dev/null 2>&1; printf '%s\n' \"\$TYPE\"; done" 2> /dev/null || true)"
+assert_eq "$(printf '%s\n' "${ALL_TYPES[@]}")" "$choose_keys" "guarda: os 8 tipos desta suíte são os do choose_type, na ordem"
+assert_eq "$(printf '%s ' "${ALL_TYPES[@]}")" "$(sed -n 's/^AGENT_TYPES=(\(.*\))$/\1 /p' "$LAUNCHER")" "AGENT_TYPES do launcher são os 8 tipos do choose_type, na ordem"
+assert_eq "$real_logs_before" "$(ls -la "$REAL_LOGS_DIR" 2> /dev/null || true)" "nenhum caso escreveu no auto_scrum/logs/ real"
 echo
 echo "== shellcheck -x no launcher, nesta suíte e nos falsos =="
 if command -v shellcheck > /dev/null 2>&1; then

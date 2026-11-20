@@ -1,6 +1,6 @@
 //! The terminal of an agent (NS-33): a PTY running `bash <bin/nick-agent> --session-id <uuid>
-//! --name <name>` (the launcher runs claude, inside the jail when the project asks for it,
-//! through lib/), a vt100 parser that emulates its screen, a reader thread that drains the PTY
+//! --name <name> --type <type> --prompt-file <log>` (the launcher runs claude with the prompt
+//! of the log, inside the jail when the project asks for it, through lib/; NS-35), a vt100 parser that emulates its screen, a reader thread that drains the PTY
 //! all the time (an unread PTY fills up and blocks the child on write) and a waiter thread that
 //! reaps the child. Written from the findings of the panel prototype (NS-29,
 //! prototype/panel/src/session.rs), whose cases are the source of the tests.
@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+use crate::stages::StageType;
 
 /// Lines of scrollback kept by the parser.
 pub const SCROLLBACK_LINES: usize = 10_000;
@@ -113,15 +115,20 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Opens a PTY of `rows`x`cols` (at least 2x2) and runs `bash <launcher> --session-id
-    /// <session_id> --name <name>` in it, with the cwd at `project`, the environment of the nick
-    /// plus TERM=xterm-256color and COLORTERM=truecolor. Events go to `tx`, as `AgentEvent`s of
-    /// `agent_id` (the `id` of the row of the agent, stored before the spawn).
+    /// <session_id> --name <name> --type <kind> --prompt-file <prompt_file>` in it, with the cwd
+    /// at `project`, the environment of the nick plus TERM=xterm-256color and
+    /// COLORTERM=truecolor. Events go to `tx`, as `AgentEvent`s of `agent_id` (the `id` of the
+    /// row of the agent, stored before the spawn). The launcher decides the rest of the argv of
+    /// claude by the type (the auto mode of the Dev stage): the shell never passes it.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn<E: From<AgentEvent> + Send + 'static>(
         launcher: &Path,
         project: &Path,
         agent_id: i64,
         session_id: &str,
         name: &str,
+        kind: StageType,
+        prompt_file: &Path,
         (rows, cols): (u16, u16),
         tx: Sender<E>,
     ) -> Result<AgentSession, Error> {
@@ -131,6 +138,8 @@ impl AgentSession {
             agent_id,
             session_id,
             name,
+            kind,
+            prompt_file,
             (rows, cols),
             &[],
             tx,
@@ -144,6 +153,8 @@ impl AgentSession {
         agent_id: i64,
         session_id: &str,
         name: &str,
+        kind: StageType,
+        prompt_file: &Path,
         (rows, cols): (u16, u16),
         env: &[(&str, &str)],
         tx: Sender<E>,
@@ -153,6 +164,9 @@ impl AgentSession {
         let mut command = CommandBuilder::new("bash");
         command.arg(launcher);
         command.args(["--session-id", session_id, "--name", name]);
+        command.args(["--type", kind.key()]);
+        command.arg("--prompt-file");
+        command.arg(prompt_file);
         command.cwd(project);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -446,6 +460,8 @@ mod tests {
                 "JAIL_ENABLED=\"false\"\n",
             )
             .unwrap();
+            // The prompt of the launch (out of the project), as --render would leave it.
+            fs::write(root.join("prompt.md"), PROMPT_TEXT).unwrap();
             Case {
                 _tmp: tmp,
                 root,
@@ -501,6 +517,8 @@ mod tests {
                 agent_id,
                 "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60",
                 "proj · Dev · NS-1",
+                StageType::PoDiscussion,
+                &self.path("prompt.md"),
                 size,
                 &env,
                 tx,
@@ -519,6 +537,10 @@ mod tests {
 
     /// The id of the agent of `Case::spawn`.
     const AGENT_ID: i64 = 42;
+
+    /// The prompt of the launches: two lines and line breaks at the end, which the launcher
+    /// drops ($(cat ...)).
+    const PROMPT_TEXT: &str = "Prompt de teste\ncom duas linhas.\n\n";
 
     /// The events of `rx` so far, all of them from `AGENT_ID`.
     fn session_events(rx: &mpsc::Receiver<AgentEvent>) -> Vec<SessionEvent> {
@@ -572,9 +594,14 @@ mod tests {
         wait_for_text(&session, "OK");
         let argv = fs::read_to_string(case.path("claude.argv")).expect("the fake claude ran");
         assert!(argv.starts_with("--settings\n{"), "{argv}");
-        assert!(argv.ends_with(
-            "--session-id\n0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60\n--name\nproj · Dev · NS-1\n"
-        ));
+        // The session id and the name, then the prompt of the file as the last argument.
+        assert!(
+            argv.ends_with(
+                "--session-id\n0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60\n--name\nproj · Dev · NS-1\n\
+                 Prompt de teste\ncom duas linhas.\n"
+            ),
+            "{argv}"
+        );
         let env = fs::read_to_string(case.path("claude.env")).unwrap();
         assert!(env.lines().any(|l| l == "TERM=xterm-256color"), "{env}");
         assert!(env.lines().any(|l| l == "COLORTERM=truecolor"), "{env}");

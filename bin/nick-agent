@@ -1,23 +1,36 @@
 #!/usr/bin/env bash
 #
-# nick-agent: opens the claude of one agent of the nick shell (NS-33) in the project of the cwd,
-# by the same launch path as auto_scrum.sh: the project config (.nick/nick.conf of the cwd,
-# through lib/config/), jail_check, claude_settings_load, jail_agent_notice and jail_exec of
-# lib/. The nick shell runs it as `bash <absolute path of this script> ...` with the cwd at the
-# project, first with --check outside the PTY and then, in the PTY, to launch:
+# nick-agent: opens the claude of one agent of the nick shell (NS-33, NS-35) in the project of the
+# cwd, with the prompt of an auto_scrum stage, by the same path as auto_scrum.sh: the project
+# config (.nick/nick.conf of the cwd, through lib/config/), jail_check, claude_settings_load,
+# jail_agent_notice and jail_exec of lib/, and the prompt assembly of auto_scrum/prompt.sh. The
+# nick shell runs it as `bash <absolute path of this script> ...` with the cwd at the project:
+# --check and --render outside the PTY, then the launch in it.
 #   nick-agent --check
-#       only validates (the config and the jail), launching nothing and writing nothing in the
-#       project. On success prints one line on stdout, jail=true or jail=false (the effective
-#       value: true only with JAIL_ENABLED="true" exactly, the rule of jail_exec), and exits
-#       with 0; the warnings of config_load go to stderr and don't change the result. On
-#       failure, the message of the lib on stderr and exit 1.
-#   nick-agent --session-id <uuid> --name <name>
+#       only validates (the config and the jail), launching nothing and writing nothing. On
+#       success prints exactly three lines on stdout, jail=, jira= and sentry=, each true or
+#       false (true only with "true" exactly in the config: the rule of jail_exec and of
+#       choose_type), and exits with 0; the warnings of config_load go to stderr and don't change
+#       the result. On failure, the message of the lib on stderr and exit 1.
+#   nick-agent --render <type> [--title <v>] [--description <v>] [--jira-id <v>]
+#              [--jira-link <v>] [--sentry-link <v>] [--plan-path <v>]
+#       the same checks, then the answers of <type> (one of the 8 types of choose_type, available
+#       by the same flags) with the rules of its ask_questions_<type> (required, optional,
+#       jira_id_valid), the default plan path, and the prompt
+#       built by prompt.sh into auto_scrum/logs/<type>_<date>.md (the log of auto_scrum.sh). Prints
+#       log=<absolute path of the log> and then the jail status (jail_print_status). Writes
+#       nothing in the project and launches nothing. The answers come trimmed as read does: the
+#       nick shell trims them (stages::trim_read); here an answer that read takes, made only of
+#       spaces, tabs and line breaks, counts as empty (read would leave it empty), and the long
+#       description (read_via_editor, which takes the text as it is) only has to be non-empty.
+#   nick-agent --session-id <uuid> --name <name> --type <type> --prompt-file <file>
 #       the same checks, then config_dir_prepare (as auto_scrum does before launching),
-#       jail_print_status and jail_exec of claude with the deny/ask rules, the jail notice (only
-#       with the jail on), --session-id and --name. No --permission-mode and no prompt: the
-#       stages get their scripts in a later slice (F4).
+#       jail_print_status and jail_exec of claude with the argv of auto_scrum.sh plus --session-id
+#       and --name: the deny/ask rules, --permission-mode auto only with --type development, the
+#       jail notice (only with the jail on), --session-id, --name and the content of <file> (the
+#       log of --render) as the last argument.
 # The UUID format is not checked here (claude checks it; the nick always generates a valid one).
-# There is no variable that swaps this script nor any part of the path: the shell finds it by a
+# There is no variable that swaps this script nor any part of the launch: the shell finds it by a
 # path fixed at build time, and this is the path that guarantees the jail and the rules.
 set -euo pipefail
 
@@ -33,15 +46,24 @@ source "$SCRIPT_DIR/../lib/config/keys.sh"
 source "$SCRIPT_DIR/../lib/jail/jail.sh"
 # shellcheck source=SCRIPTDIR/../lib/claude/claude.sh
 source "$SCRIPT_DIR/../lib/claude/claude.sh"
+# The prompt assembly of the auto_scrum stages, the same auto_scrum.sh loads (NS-35): the
+# answers, the blocks, render_prompt, jira_id_valid and warn_legacy_plan.
+# shellcheck source=SCRIPTDIR/../auto_scrum/prompt.sh
+source "$SCRIPT_DIR/../auto_scrum/prompt.sh"
 
 # The keys of the config (lib/config/keys.sh). A bad registration stops the script on load
 # (set -e): it is a programming error.
 config_register_nick_keys
 
 # The keys this script reads, written by config_load (empty when the file lacks them; an
-# inherited environment variable of the same name never counts).
+# inherited environment variable of the same name never counts). The prompt blocks read
+# STACK_DESCRIPTION and the *_ENABLED flags.
+STACK_DESCRIPTION=""
 JIRA_ENABLED=""
 SENTRY_ENABLED=""
+PERMISSION_ENABLED=""
+PRODUCTION_ENABLED=""
+TDD_ENABLED=""
 JAIL_ENABLED=""
 JAIL_CLIPBOARD=""
 JAIL_FORWARD_PORTS=""
@@ -52,15 +74,18 @@ NICK_CLAUDE_SETTINGS=""
 # The extra hosts of the jail: the MCPs (jail_mcp_hosts) and then JAIL_ALLOW_HOSTS, the same
 # string auto_scrum.sh builds.
 AGENT_JAIL_HOSTS=""
+# The types of the stages: the $TYPE values of choose_type (auto_scrum.sh), in its order
+# (bin/tests/test_nick_agent.sh compares both).
+AGENT_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
 
 # usage_error <message>: the error and the usage on stderr, exit 1 (the pattern of bin/nick-init).
 usage_error() {
   echo "Erro: $1" >&2
-  echo "Uso: nick-agent --check | --session-id <uuid> --name <nome>" >&2
+  echo "Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>" >&2
   exit 1
 }
 
-# load_and_check: the checks of both modes, in order — the old .nick.conf, the cwd config (the
+# load_and_check: the checks of every mode, in order — the old .nick.conf, the cwd config (the
 # message of auto_scrum's resolve_stack when it is missing), config_load, jail_check (the config
 # of the cwd is always the team's shared one) and claude_settings_load. Any failure exits with
 # 1, with the message of the lib on stderr.
@@ -78,51 +103,182 @@ load_and_check() {
   claude_settings_load NICK_CLAUDE_SETTINGS || exit 1
 }
 
-main() {
-  local session_id="" name="" claude_args
-  if [ "$#" -eq 0 ]; then
-    usage_error "informe --check ou --session-id <uuid> --name <nome>."
-  fi
-  if [ "$1" = "--check" ]; then
-    [ "$#" -eq 1 ] || usage_error "o --check não aceita outros argumentos."
-    load_and_check
-    if [ "$JAIL_ENABLED" = "true" ]; then
-      echo "jail=true"
-    else
-      echo "jail=false"
-    fi
-    exit 0
-  fi
+# type_known <type>: whether <type> is one of AGENT_TYPES.
+type_known() {
+  local known
+  for known in "${AGENT_TYPES[@]}"; do
+    [ "$known" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# type_available <type>: the rule of choose_type — po_jira and tech_leader_jira only with
+# JIRA_ENABLED="true", po_sentry only with SENTRY_ENABLED="true".
+type_available() {
+  case "$1" in
+    po_jira | tech_leader_jira) [ "$JIRA_ENABLED" = "true" ] ;;
+    po_sentry) [ "$SENTRY_ENABLED" = "true" ] ;;
+    *) return 0 ;;
+  esac
+}
+
+# type_answers <type>: the answers of <type>, in the order of its ask_questions_<type>, as
+# <flag>:<rule> words: required (read_required), optional (read_optional), id (read_jira_id:
+# required and jira_id_valid) or text (read_via_editor: required, but taken as it is).
+type_answers() {
+  case "$1" in
+    po) echo "--title:required --description:text" ;;
+    po_discussion) echo "--title:required" ;;
+    po_jira | tech_leader_jira) echo "--jira-link:required --description:optional" ;;
+    po_sentry) echo "--sentry-link:required --description:optional" ;;
+    tech_leader) echo "--jira-id:id --title:required --description:text" ;;
+    development | review) echo "--jira-id:id --plan-path:optional" ;;
+  esac
+}
+
+# render_mode <type> [answers...]: the --render mode (see the header).
+render_mode() {
+  local type="${1:-}" answers flag rule value seen=" " log_file rules blank
+  [ "$#" -ge 1 ] || usage_error "informe o tipo depois do --render."
+  shift
+  type_known "$type" || usage_error "o tipo '$type' não existe."
+  answers=" $(type_answers "$type") "
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --session-id | --name)
+      --title | --description | --jira-id | --jira-link | --sentry-link | --plan-path) ;;
+      *) usage_error "argumento desconhecido: '$1'" ;;
+    esac
+    [ "$#" -ge 2 ] || usage_error "falta o valor de $1."
+    case "$answers" in
+      *" $1:"*) ;;
+      *) usage_error "a resposta $1 não pertence ao tipo '$type'." ;;
+    esac
+    case "$seen" in
+      *" $1 "*) usage_error "a resposta $1 foi repetida." ;;
+    esac
+    seen="$seen$1 "
+    case "$1" in
+      --title) TITLE="$2" ;;
+      --description) DESCRIPTION="$2" ;;
+      --jira-id) JIRA_ID="$2" ;;
+      --jira-link) JIRA_LINK="$2" ;;
+      --sentry-link) SENTRY_LINK="$2" ;;
+      --plan-path) PLAN_PATH="$2" ;;
+    esac
+    shift 2
+  done
+  read -r -a rules <<< "$answers"
+  for flag in "${rules[@]}"; do
+    rule="${flag#*:}"
+    flag="${flag%%:*}"
+    case "$flag" in
+      --title) value="$TITLE" ;;
+      --description) value="$DESCRIPTION" ;;
+      --jira-id) value="$JIRA_ID" ;;
+      --jira-link) value="$JIRA_LINK" ;;
+      --sentry-link) value="$SENTRY_LINK" ;;
+      --plan-path) value="$PLAN_PATH" ;;
+    esac
+    # What read leaves of an answer of only spaces, tabs and line breaks: nothing.
+    blank="${value//[$' \t\n']/}"
+    case "$rule" in
+      required | id) [ -n "$blank" ] || usage_error "falta a resposta $flag do tipo '$type'." ;;
+      text) [ -n "$value" ] || usage_error "falta a resposta $flag do tipo '$type'." ;;
+    esac
+    # The message of read_jira_id (auto_scrum.sh), without its "Tente de novo.".
+    if [ "$rule" = "id" ] && ! jira_id_valid "$value"; then
+      usage_error "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/)."
+    fi
+  done
+
+  load_and_check
+  type_available "$type" || usage_error "o tipo '$type' não está disponível neste projeto."
+  # The plan and the review paths, with the same lines as ask_questions_development and
+  # ask_questions_review (auto_scrum.sh), after the warning of a plan in the old place.
+  case "$type" in
+    development)
+      warn_legacy_plan
+      PLAN_PATH="${PLAN_PATH:-$NICK_DOCS_DIR/$JIRA_ID/plan.md}"
+      ;;
+    review)
+      warn_legacy_plan
+      PLAN_PATH="${PLAN_PATH:-$NICK_DOCS_DIR/$JIRA_ID/plan.md}"
+      REVIEW_PATH="$NICK_DOCS_DIR/$JIRA_ID/review.md"
+      ;;
+  esac
+  build_prompt_blocks
+  mkdir -p "$PROMPT_LOGS_DIR"
+  log_file="$PROMPT_LOGS_DIR/${type}_$(date +%Y%m%d_%H%M%S).md"
+  render_prompt "$PROMPT_TEMPLATES_DIR" "$type" "$log_file"
+  echo "log=$log_file"
+  jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
+}
+
+# launch_mode <args...>: the launch (see the header).
+launch_mode() {
+  local session_id="" name="" type="" prompt_file="" claude_args
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --session-id | --name | --type | --prompt-file)
         [ "$#" -ge 2 ] || usage_error "falta o valor de $1."
-        if [ "$1" = "--session-id" ]; then
-          session_id="$2"
-        else
-          name="$2"
-        fi
+        case "$1" in
+          --session-id) session_id="$2" ;;
+          --name) name="$2" ;;
+          --type) type="$2" ;;
+          --prompt-file) prompt_file="$2" ;;
+        esac
         shift 2
         ;;
-      --check) usage_error "o --check não aceita outros argumentos." ;;
+      --check | --render) usage_error "o $1 não aceita outros argumentos." ;;
       *) usage_error "argumento desconhecido: '$1'" ;;
     esac
   done
   [ -n "$session_id" ] || usage_error "informe o --session-id <uuid> (não vazio)."
   [ -n "$name" ] || usage_error "informe o --name <nome> (não vazio)."
+  [ -n "$type" ] || usage_error "informe o --type <tipo>."
+  type_known "$type" || usage_error "o tipo '$type' não existe."
+  [ -n "$prompt_file" ] || usage_error "informe o --prompt-file <arquivo>."
+  if [ ! -f "$prompt_file" ] || [ ! -r "$prompt_file" ] || [ ! -s "$prompt_file" ]; then
+    usage_error "o --prompt-file $prompt_file não é um arquivo legível e não vazio."
+  fi
 
   load_and_check
   config_dir_prepare || exit 1
   jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
-  # The same argv as auto_scrum.sh, without the prompt and the --permission-mode of the Dev
-  # stage (bin/tests/test_nick_agent.sh compares both): the rules inline, the jail notice only
-  # with the jail on, then the session id and the name the nick chose.
+  # The argv of auto_scrum.sh plus --session-id and --name (bin/tests/test_nick_agent.sh compares
+  # both): the rules inline, auto mode only in the Development stage (ABOUT.md, "Modo auto só na
+  # etapa de Desenvolvimento"), the jail notice only with the jail on, the session id and the name
+  # the nick chose, and the prompt last, read as the script reads it ($(cat), without the final
+  # line breaks).
   claude_args=(--settings "$NICK_CLAUDE_SETTINGS")
+  [ "$type" = "development" ] && claude_args+=(--permission-mode auto)
   if [ "$JAIL_ENABLED" = "true" ]; then
     claude_args+=(--append-system-prompt "$(jail_agent_notice "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS")")
   fi
   claude_args+=(--session-id "$session_id" --name "$name")
-  jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}"
+  jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$(cat "$prompt_file")"
+}
+
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage_error "informe --check, --render <tipo> ou --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>."
+  fi
+  case "$1" in
+    --check)
+      [ "$#" -eq 1 ] || usage_error "o --check não aceita outros argumentos."
+      load_and_check
+      # The effective values: true only with "true" exactly.
+      if [ "$JAIL_ENABLED" = "true" ]; then echo "jail=true"; else echo "jail=false"; fi
+      if [ "$JIRA_ENABLED" = "true" ]; then echo "jira=true"; else echo "jira=false"; fi
+      if [ "$SENTRY_ENABLED" = "true" ]; then echo "sentry=true"; else echo "sentry=false"; fi
+      exit 0
+      ;;
+    --render)
+      shift
+      render_mode "$@"
+      ;;
+    *) launch_mode "$@" ;;
+  esac
 }
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then

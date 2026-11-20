@@ -1,11 +1,12 @@
 //! Entering and leaving the TUI (raw mode and the alternate screen), suspending it to run a
-//! program on the normal terminal, the modes of the agent screen (mouse capture and bracketed
-//! paste, only while an agent is on screen), the gate that pauses the input thread and the
-//! panic hook.
+//! program on the normal terminal (bin/nick-init, and `$EDITOR` since the NS-35:
+//! `run_suspended`, immune to Ctrl+C and Ctrl+\\ meanwhile), the modes of the agent screen
+//! (mouse capture and bracketed paste, only while an agent is on screen), the gate that pauses
+//! the input thread and the panic hook.
 
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -17,6 +18,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use signal_hook::consts::{SIGINT, SIGQUIT};
 
 /// The terminal of the TUI.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -171,6 +173,57 @@ impl TerminalGuard {
     }
 }
 
+/// Runs `f` on the normal terminal with the input thread paused (NS-35, from the path of the
+/// init): closes `gate` (and waits for the thread to leave its read, so the program has the
+/// stdin to itself), suspends the TUI (`TerminalGuard::suspend`) and opens the gate again,
+/// whatever `f` did. The error is the one of entering the TUI again.
+pub fn run_suspended<T>(
+    guard: &mut TerminalGuard,
+    gate: &InputGate,
+    f: impl FnOnce() -> T,
+) -> io::Result<T> {
+    gated(gate, || guard.suspend(f))
+}
+
+/// Runs `f` with `gate` closed (the input thread out of its read and held), and opens it again
+/// after.
+fn gated<T>(gate: &InputGate, f: impl FnOnce() -> T) -> T {
+    gate.close();
+    let result = f();
+    gate.open();
+    result
+}
+
+/// While alive, SIGINT and SIGQUIT only set a flag that nobody reads (so they do nothing to
+/// the nick). Dropping it removes the handlers: back in raw mode, Ctrl+C is a key again. Out of
+/// raw mode, the terminal sends Ctrl+C/Ctrl+\\ to the whole foreground group, the nick included,
+/// and the default action would kill it without restoring the TUI (review NS-31, P1). Like
+/// system(3) does, the parent ignores them while the child runs; the child still gets them,
+/// since a handler (unlike SIG_IGN) goes back to the default on exec. Moved from init.rs in the
+/// NS-35 (the editor uses it too).
+pub(crate) struct IgnoreTerminalSignals {
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl IgnoreTerminalSignals {
+    pub(crate) fn new() -> IgnoreTerminalSignals {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ids = [SIGINT, SIGQUIT]
+            .into_iter()
+            .filter_map(|signal| signal_hook::flag::register(signal, Arc::clone(&flag)).ok())
+            .collect();
+        IgnoreTerminalSignals { ids }
+    }
+}
+
+impl Drop for IgnoreTerminalSignals {
+    fn drop(&mut self) {
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore();
@@ -214,6 +267,30 @@ mod tests {
         gate.open();
         reader.join().unwrap();
         assert!(entered.load(Ordering::SeqCst));
+    }
+
+    /// The gate of `run_suspended` (`gated`), without a terminal: the suspension itself needs a
+    /// real terminal, covered by the PTY tests of the init and of the editor.
+    #[test]
+    fn the_gate_is_closed_while_the_suspended_part_runs_and_open_after() {
+        let gate = Arc::new(InputGate::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        let (g, e) = (Arc::clone(&gate), Arc::clone(&entered));
+        // `f` checks that a reader is held while it runs.
+        let held = gated(&gate, || {
+            let reader = std::thread::spawn(move || {
+                g.enter();
+                e.store(true, Ordering::SeqCst);
+                g.leave();
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            let held = !entered.load(Ordering::SeqCst);
+            (held, reader)
+        });
+        let (held, reader) = held;
+        assert!(held, "the reader waits while the part runs");
+        reader.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst), "the gate is open after");
     }
 
     #[test]

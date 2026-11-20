@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#
+# Fake $EDITOR of the nick integration tests (NS-35: tests/agent.rs points EDITOR here). It is
+# called as the editor of read_via_editor is, with the temporary file as its only argument,
+# appends that path to $FAKE_EDITOR_LOG (if set) and acts by FAKE_EDITOR_MODE:
+#   (empty) writes a fixed text of two lines, with line breaks at the end, to the file;
+#   empty   leaves the file empty (size 0), as an editor closed without saving;
+#   wait    prints EDITOR-PRONTO and waits until it is ended (a Ctrl+C reaches it).
+set -euo pipefail
+
+if [ -n "${FAKE_EDITOR_LOG:-}" ]; then
+  printf '%s\n' "$1" >> "$FAKE_EDITOR_LOG"
+fi
+case "${FAKE_EDITOR_MODE:-}" in
+  empty) : > "$1" ;;
+  wait)
+    printf 'EDITOR-PRONTO\n'
+    while true; do
+      sleep 0.05
+    done
+    ;;
+  *) printf 'Descrição do editor falso\ncom duas linhas.\n\n' > "$1" ;;
+esac

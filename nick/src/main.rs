@@ -1,7 +1,7 @@
 //! Entry point of `nick`: the command line, the state directory and the database (before the
 //! TUI: an error there is printed on the normal terminal), the cleanup of the agents left by a
 //! dead nick, the panic hook, and the loop of the TUI. Only this file reads the environment
-//! (HOME, XDG_STATE_HOME, NICK_INIT_BIN and the test hook NICK_TEST_PANIC).
+//! (HOME, XDG_STATE_HOME, NICK_INIT_BIN, EDITOR and the test hook NICK_TEST_PANIC).
 //!
 //! The loop is driven by a channel (finding of NS-29): an input thread reads the terminal
 //! (paused by its gate while bin/nick-init runs), a signal thread turns SIGTERM and SIGHUP into
@@ -24,6 +24,7 @@ use nick::agent_session::{self, AgentEvent, AgentSession, SessionEvent};
 use nick::agents;
 use nick::app::{Action, AgentTerm, App, Focus};
 use nick::db::Db;
+use nick::editor::TerminalEditorRunner;
 use nick::init::{self, TerminalInitRunner};
 use nick::keys::TermModes;
 use nick::launch::{self, TerminalAgentLauncher};
@@ -103,8 +104,10 @@ fn main() -> ExitCode {
         app.set_status(messages.join(" "));
     }
 
+    // The editor of the long texts of the stage forms (NS-35): ${EDITOR:-nano}.
+    let editor = std::env::var_os("EDITOR");
     terminal::install_panic_hook();
-    match run(app) {
+    match run(app, editor) {
         Ok(None) => ExitCode::SUCCESS,
         // Ended by a signal: 128 + the signal, like a shell reports it (143, 129).
         Ok(Some(signal)) => ExitCode::from(u8::try_from(128 + signal).unwrap_or(1)),
@@ -178,7 +181,7 @@ fn spawn_signals(tx: Sender<LoopEvent>) -> io::Result<()> {
 }
 
 /// The loop of the TUI. Returns the signal that ended it, if any.
-fn run(app: App) -> io::Result<Option<i32>> {
+fn run(app: App, editor: Option<OsString>) -> io::Result<Option<i32>> {
     let mut guard = TerminalGuard::enter()?;
     let (tx, rx) = mpsc::channel::<LoopEvent>();
     let gate = Arc::new(InputGate::default());
@@ -193,6 +196,7 @@ fn run(app: App) -> io::Result<Option<i32>> {
         shown: None,
         agent_modes: false,
         exit_error: None,
+        editor,
     };
     let result = shell.event_loop(&mut guard, &gate, &rx);
     // The error of the database when the agents were ended on the way out goes to the normal
@@ -219,6 +223,8 @@ struct Shell {
     agent_modes: bool,
     /// The error of the database when every agent was ended on the way out (`end_all`).
     exit_error: Option<String>,
+    /// The value of EDITOR (the editor of the long texts of the stage forms).
+    editor: Option<OsString>,
 }
 
 impl Shell {
@@ -306,6 +312,12 @@ impl Shell {
                 }
                 LoopEvent::Input(input) => {
                     self.read_agent_term();
+                    // The window of the preview of the prompt depends on the screen: the App
+                    // gets it from the same count the drawing uses.
+                    let area = self.frame_area(guard)?;
+                    if let Some((rows, max)) = ui::prompt_window(&self.app, area) {
+                        self.app.set_prompt_window(rows, max);
+                    }
                     let is_mouse = matches!(input, Event::Mouse(_));
                     let action = match input {
                         Event::Key(key) => self.app.handle_key(key),
@@ -327,6 +339,12 @@ impl Shell {
                 }
             }
         }
+    }
+
+    /// A launcher for the runs outside the PTY (`--check` and `--render`): the size of a PTY is
+    /// never asked.
+    fn offline_launcher(&self) -> TerminalAgentLauncher<LoopEvent> {
+        TerminalAgentLauncher::new(self.tx.clone(), Box::new(|_: &str, _: bool| (0, 0)))
     }
 
     /// The session of the agent `id`.
@@ -444,10 +462,27 @@ impl Shell {
                 }
                 self.app.after_init(outcome);
             }
+            Action::CheckAgent { project, ticket } => {
+                let mut launcher = self.offline_launcher();
+                self.app.check_agent(&project, &ticket, &mut launcher);
+            }
+            Action::EditDescription => {
+                let mut runner = TerminalEditorRunner::new(guard, gate, self.editor.as_deref());
+                self.app.edit_description(&mut runner);
+                if let Some(err) = runner.error {
+                    return Err(err);
+                }
+            }
+            Action::RenderPrompt => {
+                let mut launcher = self.offline_launcher();
+                self.app.render_prompt(&mut launcher);
+            }
             Action::OpenAgent {
                 project,
                 ticket,
-                stage,
+                kind,
+                log,
+                precheck,
             } => {
                 // The PTY is born with its size: the panel the new agent will have (the same
                 // count as `ui::layout`), less its header, known at the spawn.
@@ -456,8 +491,10 @@ impl Shell {
                     let area = ui::terminal_in_panel(panel, name, jail);
                     (area.height, area.width)
                 };
-                let mut launcher = TerminalAgentLauncher::new(self.tx.clone(), Box::new(size_of));
-                self.app.open_agent(&project, &ticket, stage, &mut launcher);
+                let mut launcher = TerminalAgentLauncher::new(self.tx.clone(), Box::new(size_of))
+                    .with_jail(precheck.jail);
+                self.app
+                    .open_agent(&project, &ticket, kind, &log, precheck, &mut launcher);
                 if let (Some(session), Some(id)) = (launcher.session.take(), self.app.shown()) {
                     let size = session.with_screen(|screen| screen.size());
                     self.sizes.insert(id, size);

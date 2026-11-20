@@ -1,8 +1,11 @@
 //! Integration tests of the agents (NS-33): the real `nick` binary in a PTY (tests/common), with
 //! the real bin/nick-agent and the fake claude and ai-jail of bin/tests/fixtures/bin first in the
-//! PATH, a temporary HOME and XDG_STATE_HOME (never the operator's database) and a clean
-//! environment. Nothing real is launched. Rule of the NS-32: after an ESC, wait for a text that
-//! only exists in the next state.
+//! PATH, the fake EDITOR of tests/fixtures/bin, a temporary HOME and XDG_STATE_HOME (never the
+//! operator's database), the logs of the prompts in the world (NICK_PROMPT_LOGS_DIR, never
+//! auto_scrum/logs/) and a clean environment. Nothing real is launched. Since the NS-35 every
+//! agent opens through the menu of the types, the form and the preview of the prompt
+//! (`open_agent`). Rule of the NS-32: after an ESC, wait for a text that only exists in the next
+//! state.
 
 mod common;
 
@@ -10,7 +13,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{DOWN, ENTER, ESC, Nick, World};
+use common::{DOWN, ENTER, ESC, Nick, TAB, World};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -39,8 +42,18 @@ fn logs(world: &World) -> Logs {
     }
 }
 
-/// Runs the nick with the fakes first in the PATH, their logs in the world, the claude mode and
-/// `extra`.
+/// The directory of the logs of the prompts of a world (NICK_PROMPT_LOGS_DIR).
+fn prompt_logs(world: &World) -> PathBuf {
+    world.root.join("prompt_logs")
+}
+
+/// The fake EDITOR (tests/fixtures/bin/editor).
+fn fake_editor() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin/editor")
+}
+
+/// Runs the nick with the fakes first in the PATH, their logs in the world, the fake EDITOR, the
+/// logs of the prompts in the world, the claude mode and `extra`.
 fn spawn(world: &World, mode: &str, extra: &[(&str, &str)]) -> Nick {
     let l = logs(world);
     let path = common::fake_path();
@@ -50,6 +63,8 @@ fn spawn(world: &World, mode: &str, extra: &[(&str, &str)]) -> Nick {
         l.jail.display().to_string(),
         l.pids.display().to_string(),
     );
+    let prompts = prompt_logs(world).display().to_string();
+    let editor = fake_editor().display().to_string();
     let mut all = vec![
         ("PATH", path.as_str()),
         ("FAKE_CLAUDE_MODE", mode),
@@ -57,6 +72,8 @@ fn spawn(world: &World, mode: &str, extra: &[(&str, &str)]) -> Nick {
         ("FAKE_CLAUDE_ENV", env.as_str()),
         ("FAKE_JAIL_LOG", jail.as_str()),
         ("FAKE_CLAUDE_PIDS", pids.as_str()),
+        ("NICK_PROMPT_LOGS_DIR", prompts.as_str()),
+        ("EDITOR", editor.as_str()),
     ];
     all.extend_from_slice(extra);
     world.spawn(&world.root, &all)
@@ -80,18 +97,101 @@ fn open_tickets(nick: &mut Nick, name: &str) {
     nick.wait_for("g abrir agente");
 }
 
-/// `g`, `downs` x ↓ and Enter: opens the agent of that stage on the selected ticket.
-fn open_agent(nick: &mut Nick, downs: usize) {
+/// The type each stage of the NS-33/NS-34 tests (`downs` in PO, Tech Leader, Dev, Review)
+/// opens with since the NS-35: the PO by its discussion (one line), the others by their own type.
+const TYPE_OF_STAGE: [&str; 4] = [
+    "PO - Conversar para definir ticket",
+    "Tech Leader - Criar plano",
+    "Desenvolvimento",
+    "Review",
+];
+
+/// `g` and the check: true when the menu of the types opened, false on the alert.
+fn open_menu(nick: &mut Nick) -> bool {
     nick.send("g");
-    nick.wait_for("Abrir agente");
-    for _ in 0..downs {
+    nick.wait_until("the menu or the alert", || {
+        let screen = nick.screen();
+        screen.contains("Qual tipo de conversa") || screen.contains("Agente não aberto")
+    });
+    nick.screen().contains("Qual tipo de conversa")
+}
+
+/// Every label of the menu of the types, the longest first (one is the start of another).
+const TYPE_LABELS: [&str; 8] = [
+    "Tech Leader - Criar plano a partir do Jira",
+    "PO - Criar ticket a partir do Sentry",
+    "PO - Conversar para definir ticket",
+    "PO - Criar ticket a partir do Jira",
+    "Tech Leader - Criar plano",
+    "PO - Criar ticket",
+    "Desenvolvimento",
+    "Review",
+];
+
+/// The type selected on the menu.
+fn selected_type(nick: &Nick) -> Option<&'static str> {
+    let screen = nick.screen();
+    TYPE_LABELS
+        .into_iter()
+        .find(|label| screen.contains(&format!("> {label}")))
+}
+
+/// On the menu, ↓ until `label` is selected (each ↓ waits for the selection to move), and
+/// Enter: its form.
+fn choose_type(nick: &mut Nick, label: &str) {
+    nick.wait_until("a type selected", || selected_type(nick).is_some());
+    while selected_type(nick) != Some(label) {
+        let before = selected_type(nick);
         nick.send(DOWN);
+        nick.wait_until(&format!("the selection to leave {before:?}"), || {
+            selected_type(nick) != before
+        });
     }
     nick.send(ENTER);
+    nick.wait_for(&format!("Tipo: {label}"));
+}
+
+/// `g`, the type of the stage `downs` and its form answered (the ID comes from the ticket; the
+/// long text from the fake EDITOR), then `s` on the preview: opens the agent of that stage on
+/// the selected ticket (NS-35). Stops on the alert when the check fails.
+fn open_agent(nick: &mut Nick, downs: usize) {
+    if !open_menu(nick) {
+        return;
+    }
+    choose_type(nick, TYPE_OF_STAGE[downs]);
+    match downs {
+        0 => nick.send("Assunto de teste"),
+        1 => {
+            nick.send(TAB);
+            nick.send("Título de teste");
+            nick.send(TAB);
+            nick.send(ENTER);
+            nick.wait_for("Descrição do editor falso (2 linhas; Enter edita)");
+            // The focus went back to the ID.
+        }
+        _ => {}
+    }
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    nick.send("s");
 }
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
+}
+
+/// The logs of the prompts of the world.
+fn prompt_files(world: &World) -> Vec<PathBuf> {
+    fs::read_dir(prompt_logs(world))
+        .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default()
+}
+
+/// The only log of a prompt of the world.
+fn only_log(world: &World) -> PathBuf {
+    let files = prompt_files(world);
+    assert_eq!(files.len(), 1, "{files:?}");
+    files[0].clone()
 }
 
 /// The output after the last time the TUI left the alternate screen: only the cursor shows.
@@ -154,15 +254,21 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
     nick.wait_for("O agente proj · Dev · NS-1 terminou.");
     assert!(nick.screen().contains("g abrir agente"), "back on the list");
     assert!(nick.screen().contains("> NS-1"), "the same ticket selected");
-    // The argv: the session id of the database and the name; the cwd is the project.
+    // The argv: the session id of the database and the name, then the prompt (NS-35); the Dev
+    // stage in auto mode (NS-35); the cwd is the project.
     let argv = read(&logs(&world).claude);
     assert!(
-        argv.ends_with(&format!(
+        argv.contains(&format!(
             "--session-id\n{session_id}\n--name\nproj · Dev · NS-1\n"
         )),
         "{argv}"
     );
-    assert!(!argv.contains("--permission-mode"), "{argv}");
+    let log = only_log(&world);
+    assert!(
+        argv.ends_with(&format!("{}\n", read(&log).trim_end_matches('\n'))),
+        "the prompt is the last argument: {argv}"
+    );
+    assert!(argv.contains("--permission-mode\nauto\n"), "{argv}");
     let env = read(&logs(&world).env);
     assert!(
         env.lines().any(|l| l == format!("PWD={}", proj.display())),
@@ -297,6 +403,255 @@ fn a_config_removed_after_the_list_opened_is_refused() {
     assert_eq!(world.agents(), []);
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- the stages of the auto_scrum (NS-35): menu, form, editor and preview ----
+
+/// The labels of the menu on the screen, in order (the types the check offered).
+fn menu_labels(nick: &Nick) -> Vec<&'static str> {
+    let screen = nick.screen();
+    let mut found: Vec<(usize, &'static str)> = Vec::new();
+    for label in TYPE_LABELS {
+        for (row, line) in screen.lines().enumerate() {
+            // The label alone on its row (one label is the start of another).
+            let rest = line
+                .find(label)
+                .map(|at| line[at + label.len()..].trim_start_matches(' '));
+            if rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('│')) {
+                found.push((row, label));
+            }
+        }
+    }
+    found.sort();
+    found.into_iter().map(|(_, label)| label).collect()
+}
+
+#[test]
+fn the_menu_follows_jira_and_sentry_of_the_project() {
+    for (lines, expected) in [
+        (
+            vec!["JAIL_ENABLED=\"false\""],
+            vec![
+                "PO - Criar ticket",
+                "PO - Conversar para definir ticket",
+                "Tech Leader - Criar plano",
+                "Desenvolvimento",
+                "Review",
+            ],
+        ),
+        (
+            vec![
+                "JAIL_ENABLED=\"false\"",
+                "JIRA_ENABLED=\"true\"",
+                "SENTRY_ENABLED=\"true\"",
+            ],
+            vec![
+                "PO - Criar ticket",
+                "PO - Conversar para definir ticket",
+                "PO - Criar ticket a partir do Jira",
+                "PO - Criar ticket a partir do Sentry",
+                "Tech Leader - Criar plano",
+                "Tech Leader - Criar plano a partir do Jira",
+                "Desenvolvimento",
+                "Review",
+            ],
+        ),
+    ] {
+        let (world, _) = world_with(&lines);
+        let mut nick = spawn(&world, "", &[]);
+        open_tickets(&mut nick, "proj");
+        assert!(open_menu(&mut nick));
+        nick.wait_for("> PO - Criar ticket");
+        assert_eq!(menu_labels(&nick), expected, "{lines:?}");
+        nick.send(ESC);
+        nick.wait_for("g abrir agente");
+        nick.send("q");
+        assert_eq!(nick.wait_exit(), Some(0));
+    }
+}
+
+#[test]
+fn a_po_discussion_goes_through_the_form_and_the_preview_with_the_prompt_last() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let before = common::snapshot(&proj);
+    let mut nick = spawn(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "PO - Conversar para definir ticket");
+    nick.wait_for("Assunto para discutir:");
+    // Spaces around it: trimmed as the read of the script does.
+    nick.send("  Assunto do teste PTY  ");
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    assert_eq!(
+        common::snapshot(&proj),
+        before,
+        "the render writes nothing in the project"
+    );
+    let log = only_log(&world);
+    let prompt = read(&log);
+    assert!(prompt.contains("Assunto do teste PTY"), "{prompt}");
+    assert!(
+        !prompt.contains("  Assunto do teste PTY"),
+        "trimmed: {prompt}"
+    );
+    let flat = nick.flat_screen();
+    assert!(flat.contains(OFF_JAIL), "{flat}");
+    assert!(
+        flat.contains("Jail (ai-jail): desligada — o agente roda direto no seu shell."),
+        "{flat}"
+    );
+    assert!(
+        flat.contains(&format!("Salvo em {}", log.display())),
+        "{flat}"
+    );
+    // The scroll: one row down, then back to the top.
+    nick.wait_for("linhas 1–");
+    nick.send(DOWN);
+    nick.wait_for("linhas 2–");
+    nick.send("\x1b[H");
+    nick.wait_for("linhas 1–");
+    nick.send("s");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    let argv = read(&logs(&world).claude);
+    assert!(
+        argv.ends_with(&format!("{}\n", prompt.trim_end_matches('\n'))),
+        "the prompt is the last argument: {argv}"
+    );
+    assert!(!argv.contains("--permission-mode"), "{argv}");
+    assert_eq!(world.agents()[0].1, "po");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_development_stage_opens_in_auto_mode() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 2);
+    nick.wait_for("O agente proj · Dev · NS-1 terminou.");
+    let argv = read(&logs(&world).claude);
+    assert!(argv.contains("--permission-mode\nauto\n"), "{argv}");
+    let prompt = read(&only_log(&world));
+    assert!(prompt.contains(".nick/docs/NS-1/plan.md"), "{prompt}");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn cancelling_on_the_preview_launches_nothing_and_keeps_the_log() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "Review");
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    nick.send("n");
+    let log = only_log(&world);
+    wait_flat(
+        &nick,
+        &format!(
+            "Cancelado. O prompt gerado continua salvo em: {}",
+            log.display()
+        ),
+    );
+    assert!(nick.screen().contains("g abrir agente"), "back on the list");
+    assert_eq!(world.agents(), []);
+    assert!(!logs(&world).claude.exists(), "claude never ran");
+    assert!(log.is_file(), "the log stays");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn the_long_text_comes_from_the_editor_with_the_tui_back_whole() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let editor_log = world.root.join("editor.log");
+    let editor_log_s = editor_log.display().to_string();
+    let mut nick = spawn(&world, "", &[("FAKE_EDITOR_LOG", &editor_log_s)]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "PO - Criar ticket");
+    nick.send("Título do pedido PTY");
+    nick.send(TAB);
+    nick.wait_for("(vazio — Enter abre o editor)");
+    nick.send(ENTER);
+    nick.wait_for("Descrição do editor falso (2 linhas; Enter edita)");
+    assert!(nick.on_alternate_screen(), "the TUI is back");
+    assert!(
+        nick.screen().contains("Tipo: PO - Criar ticket"),
+        "the form is back"
+    );
+    assert!(
+        nick.raw().contains("Descrição do pedido — abrindo "),
+        "the line of read_via_editor before the editor"
+    );
+    let used = read(&editor_log);
+    assert_eq!(used.lines().count(), 1, "{used}");
+    assert!(
+        !Path::new(used.trim()).exists(),
+        "the temporary file is gone: {used}"
+    );
+    // The focus went back to the title: Enter builds the prompt with the text of the editor.
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    let prompt = read(&only_log(&world));
+    assert!(
+        prompt.contains("Descrição do editor falso\ncom duas linhas.\n"),
+        "{prompt}"
+    );
+    nick.send(ESC);
+    nick.wait_for("g abrir agente");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn an_empty_editor_leaves_the_field_empty_with_the_message() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "", &[("FAKE_EDITOR_MODE", "empty")]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "Tech Leader - Criar plano");
+    nick.send(TAB);
+    nick.send("Título");
+    nick.send(TAB);
+    nick.send(ENTER);
+    nick.wait_for("Esse campo é obrigatório, tente de novo.");
+    assert!(nick.on_alternate_screen(), "the TUI is back");
+    assert!(nick.screen().contains("(vazio — Enter abre o editor)"));
+    assert!(prompt_files(&world).is_empty(), "no render");
+    nick.send(ESC);
+    nick.wait_for("g abrir agente");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn ctrl_c_in_the_editor_only_interrupts_the_editor() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "", &[("FAKE_EDITOR_MODE", "wait")]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "PO - Criar ticket");
+    nick.send(TAB);
+    nick.send(ENTER);
+    nick.wait_for("EDITOR-PRONTO");
+    nick.send("\x03");
+    wait_flat(&nick, "ele foi interrompido.");
+    assert!(nick.on_alternate_screen(), "the TUI is back");
+    assert!(
+        nick.screen().contains("Tipo: PO - Criar ticket"),
+        "the form stays"
+    );
+    nick.send(ESC);
+    nick.wait_for("g abrir agente");
+    // Back in raw mode, Ctrl+C is a key again and quits.
+    nick.send("\x03");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_restored_at_the_end(&nick.raw());
 }
 
 // ---- the terminal of the agent ----
@@ -1085,4 +1440,88 @@ fn the_only_process_in_a_pty_is_bash_with_the_launcher() {
     }
     let good = "let mut command = CommandBuilder::new(\"bash\");\n        command.arg(launcher);";
     assert_eq!(launch_violations(good), (1, Vec::new()));
+}
+
+/// The violations of the prompt rule (NS-35) in `source`, comments left out: a piece of the
+/// prompt assembly (templates/, envsubst, exchange_block, build_*, *_BLOCK), the name of a
+/// template, or a read of the config of the project. The prompt is built by bash only.
+fn prompt_violations(source: &str) -> Vec<String> {
+    let code: String = source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut violations = Vec::new();
+    for needle in [
+        "templates/",
+        "envsubst",
+        "exchange_block",
+        "build_",
+        "_BLOCK",
+    ] {
+        if code.contains(needle) {
+            violations.push(needle.to_string());
+        }
+    }
+    for template in [
+        "po",
+        "po_discussion",
+        "po_jira",
+        "po_sentry",
+        "tech_leader",
+        "tech_leader_jira",
+        "development",
+        "review",
+    ] {
+        let name = format!("{template}.md");
+        // The name alone (`"po.md"`, `/po.md`), not the end of another name.
+        let found = code.match_indices(&name).any(|(at, _)| {
+            !code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        });
+        if found {
+            violations.push(name);
+        }
+    }
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    for read in ["read_to_string(", "fs::read("] {
+        for (at, _) in compact.match_indices(read) {
+            let call: String = compact[at..].chars().take(80).collect();
+            if call.contains("nick.conf") || call.contains("config_file(") {
+                violations.push(format!("{read} of the config"));
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn no_rust_source_builds_the_prompt_nor_reads_the_config() {
+    for (name, source) in sources() {
+        assert_eq!(prompt_violations(&source), Vec::<String>::new(), "{name}");
+    }
+    // Positive control: the filter sees each kind of violation, and not a comment.
+    for bad in [
+        "let t = root.join(\"auto_scrum/templates/\");",
+        "Command::new(\"bash\").arg(\"-c\").arg(\"envsubst < x\")",
+        "let s = exchange_block();",
+        "build_po_blocks();",
+        "let b = PO_VALIDATION_BLOCK;",
+        "let t = \"po.md\";",
+        "dir.join(\"tech_leader_jira.md\")",
+        "fs::read_to_string(project.join(\".nick/nick.conf\"))",
+        "std::fs::read_to_string( projects::config_file(&dir) )",
+    ] {
+        assert!(!prompt_violations(bad).is_empty(), "{bad}");
+    }
+    assert_eq!(
+        prompt_violations("// envsubst and po.md in a comment"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        prompt_violations("let log = \"logs/x_1.md\"; let p = \"plan.md\";"),
+        Vec::<String>::new()
+    );
 }

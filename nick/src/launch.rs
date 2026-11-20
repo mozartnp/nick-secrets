@@ -4,24 +4,34 @@
 //! time (the checkout the binary was built from, as bin/nick-init) and, unlike the init, no
 //! variable swaps it: one would let something else run in place of the path that guarantees
 //! the jail and the rules. Before the PTY, the shell runs `bash <launcher> --check` (outside
-//! the PTY, so an error of the config or of the jail reaches the TUI) and learns from its one
-//! line whether the agent runs in the jail. The launch goes through the `AgentLauncher` trait,
-//! so the TUI state (app.rs) is tested with a fake one that only records the calls.
+//! the PTY, so an error of the config or of the jail reaches the TUI) and learns from its three
+//! lines whether the agent runs in the jail and which stage types the project offers (Jira,
+//! Sentry). Then `bash <launcher> --render <type> <answers>` (NS-35) builds the prompt by bash,
+//! into its log, and the shell only reads that log for the preview: no Rust builds a prompt, reads
+//! a template or reads the config of the project. The launch goes through the `AgentLauncher`
+//! trait, so the TUI state (app.rs) is tested with a fake one that only records the calls.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
 use crate::agent_session::{AgentEvent, AgentSession};
 use crate::paths::normalize;
+use crate::stages::StageType;
 
 /// bin/nick-agent of the checkout this binary was built from, before normalization.
 const DEFAULT_LAUNCHER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-agent");
 
-/// When `--check` exits with 0 but its stdout is not exactly one `jail=` line: the jail is
-/// never presumed.
+/// When `--check` exits with 0 but its stdout is not exactly the three lines `jail=`, `jira=`
+/// and `sentry=`: nothing is ever presumed.
 pub const UNEXPECTED_CHECK_MESSAGE: &str =
     "O bin/nick-agent respondeu algo inesperado na verificação.";
+
+/// When `--render` exits with 0 but its stdout does not start with `log=<absolute path>`.
+pub const UNEXPECTED_RENDER_MESSAGE: &str =
+    "O bin/nick-agent respondeu algo inesperado na montagem do prompt.";
 
 /// The launcher: bin/nick-agent of the checkout, normalized (without `..`).
 pub fn launcher_path() -> PathBuf {
@@ -33,34 +43,69 @@ pub fn launcher_path() -> PathBuf {
 pub struct Precheck {
     /// Whether the agent runs inside the jail (`jail=true`).
     pub jail: bool,
+    /// Whether the project uses Jira (`jira=true`): the types with Jira are offered.
+    pub jira: bool,
+    /// Whether the project uses Sentry (`sentry=true`): the type with Sentry is offered.
+    pub sentry: bool,
     /// What the check wrote on stderr (the warnings of the config), when anything.
     pub warning: Option<String>,
 }
 
+/// The error of a run of the launcher outside the PTY that did not exit with 0 (`code` is None
+/// when killed by a signal): its stderr (the message of the lib, or its usage error), or, when it
+/// said nothing, a message with the code and `what` it was doing ("verificação", "montagem do
+/// prompt").
+fn launcher_failure(code: Option<i32>, stderr: String, what: &str) -> String {
+    if !stderr.trim().is_empty() {
+        return stderr;
+    }
+    match code {
+        Some(code) => format!("O bin/nick-agent falhou na {what} (código {code})."),
+        None => format!("O bin/nick-agent foi interrompido na {what}."),
+    }
+}
+
+/// The value of the line `<name>=true` or `<name>=false`, exactly.
+fn flag_line(line: &[u8], name: &str) -> Option<bool> {
+    let value = line.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+    match value {
+        b"true" => Some(true),
+        b"false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Reads the result of `--check`: the exit code (None when killed by a signal), its stdout and
-/// its stderr. Exit 0 with exactly `jail=true` or `jail=false` (one line) is a success, with
-/// the stderr as a warning; anything else on stdout is an error, so the jail is never presumed.
-/// A failure is the stderr of the launcher (the message of the lib), or a message with the code
+/// its stderr. Exit 0 with exactly the three lines `jail=`, `jira=` and `sentry=`, in this
+/// order, each `true` or `false` (with or without the final line break), is a success, with the
+/// stderr as a warning; anything else on stdout is an error, so nothing is ever presumed. A
+/// failure is the stderr of the launcher (the message of the lib), or a message with the code
 /// when it said nothing.
 pub fn parse_check(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<Precheck, String> {
     let stderr = String::from_utf8_lossy(stderr).trim_end().to_string();
     if code != Some(0) {
-        if !stderr.trim().is_empty() {
-            return Err(stderr);
-        }
-        return Err(match code {
-            Some(code) => format!("O bin/nick-agent falhou na verificação (código {code})."),
-            None => "O bin/nick-agent foi interrompido na verificação.".to_string(),
-        });
+        return Err(launcher_failure(code, stderr, "verificação"));
     }
     let stdout = stdout.strip_suffix(b"\n").unwrap_or(stdout);
-    let jail = match stdout {
-        b"jail=true" => true,
-        b"jail=false" => false,
-        _ => return Err(UNEXPECTED_CHECK_MESSAGE.to_string()),
+    let lines: Vec<&[u8]> = stdout.split(|b| *b == b'\n').collect();
+    let flags = match lines.as_slice() {
+        [jail, jira, sentry] => (
+            flag_line(jail, "jail"),
+            flag_line(jira, "jira"),
+            flag_line(sentry, "sentry"),
+        ),
+        _ => (None, None, None),
+    };
+    let (Some(jail), Some(jira), Some(sentry)) = flags else {
+        return Err(UNEXPECTED_CHECK_MESSAGE.to_string());
     };
     let warning = (!stderr.trim().is_empty()).then_some(stderr);
-    Ok(Precheck { jail, warning })
+    Ok(Precheck {
+        jail,
+        jira,
+        sentry,
+        warning,
+    })
 }
 
 /// Runs `bash <launcher> --check` with the cwd at `project`, the stdin closed and the output
@@ -77,13 +122,132 @@ pub fn run_check(launcher: &Path, project: &Path) -> Result<Precheck, String> {
     parse_check(output.status.code(), &output.stdout, &output.stderr)
 }
 
-/// Opens an agent: the check before the PTY and the launch in it.
+/// The answers of a form, for `--render`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderRequest {
+    pub kind: StageType,
+    /// The `--render` arguments and their values, in order (stages::render_args).
+    pub answers: Vec<(&'static str, String)>,
+}
+
+/// What a successful `--render` gave: the log with the prompt, read for the preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    /// The log of the prompt (auto_scrum/logs/<type>_<date>.md), absolute.
+    pub log: PathBuf,
+    /// Its content: the prompt, as bash built it.
+    pub prompt: String,
+    /// The jail status (`jail_print_status`), the lines after `log=`.
+    pub status: String,
+    /// What the render wrote on stderr (the warnings of the config, the plan in the old place).
+    pub warning: Option<String>,
+}
+
+/// The log and the status of a `--render`, before the log is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOutput {
+    pub log: PathBuf,
+    pub status: String,
+    pub warning: Option<String>,
+}
+
+/// Reads the result of `--render`, like `parse_check`: a failure is the stderr of the launcher
+/// (its usage error or the message of the lib), or a message with the code; exit 0 must start
+/// with the line `log=<absolute path>`, and the rest of the stdout is the jail status.
+pub fn parse_render(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<RenderOutput, String> {
+    let stderr = String::from_utf8_lossy(stderr).trim_end().to_string();
+    if code != Some(0) {
+        return Err(launcher_failure(code, stderr, "montagem do prompt"));
+    }
+    let (first, rest) = match stdout.iter().position(|b| *b == b'\n') {
+        Some(at) => (&stdout[..at], &stdout[at + 1..]),
+        None => (stdout, &b""[..]),
+    };
+    let log = first
+        .strip_prefix(b"log=")
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| UNEXPECTED_RENDER_MESSAGE.to_string())?;
+    let status = String::from_utf8_lossy(rest).trim_end().to_string();
+    let warning = (!stderr.trim().is_empty()).then_some(stderr);
+    Ok(RenderOutput {
+        log,
+        status,
+        warning,
+    })
+}
+
+/// Runs `bash <launcher> --render <type> <answers>` with the cwd at `project`, the stdin closed
+/// and the output captured (outside the PTY), reads it with `parse_render` and then reads the
+/// log for the preview (reading the log is not building the prompt). A log that cannot be read,
+/// or is not UTF-8, is an error with its path.
+pub fn run_render(
+    launcher: &Path,
+    project: &Path,
+    request: &RenderRequest,
+) -> Result<Rendered, String> {
+    run_render_with_env(launcher, project, request, &[])
+}
+
+/// `run_render` with `env` added to the environment of the launcher (the tests point
+/// NICK_PROMPT_LOGS_DIR at a temporary dir, so no log goes to auto_scrum/logs/).
+pub(crate) fn run_render_with_env(
+    launcher: &Path,
+    project: &Path,
+    request: &RenderRequest,
+    env: &[(&str, &str)],
+) -> Result<Rendered, String> {
+    let mut command = Command::new("bash");
+    command
+        .arg(launcher)
+        .arg("--render")
+        .arg(request.kind.key())
+        .current_dir(project)
+        .stdin(Stdio::null());
+    for (flag, value) in &request.answers {
+        command.arg(flag).arg(value);
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("Não consegui rodar o bin/nick-agent: {err}."))?;
+    let out = parse_render(output.status.code(), &output.stdout, &output.stderr)?;
+    let prompt = std::fs::read_to_string(&out.log).map_err(|err| {
+        format!(
+            "Não consegui ler o prompt gerado em {}: {err}.",
+            out.log.display()
+        )
+    })?;
+    Ok(Rendered {
+        log: out.log,
+        prompt,
+        status: out.status,
+        warning: out.warning,
+    })
+}
+
+/// Opens an agent: the check before the form, the render of the prompt and the launch in the
+/// PTY.
 pub trait AgentLauncher {
     /// `bash <launcher> --check` with the cwd at `project`.
     fn check(&mut self, launcher: &Path, project: &Path) -> Result<Precheck, String>;
-    /// Starts `bash <launcher> --session-id <session_id> --name <name>` in a PTY with the cwd
-    /// at `project`, for the agent whose row has the id `agent_id` (its events carry it). The
-    /// error is the system's.
+    /// `bash <launcher> --render <type> <answers>` with the cwd at `project`.
+    fn render(
+        &mut self,
+        launcher: &Path,
+        project: &Path,
+        request: &RenderRequest,
+    ) -> Result<Rendered, String>;
+    /// Starts `bash <launcher> --session-id <session_id> --name <name> --type <kind>
+    /// --prompt-file <prompt_file>` in a PTY with the cwd at `project`, for the agent whose row
+    /// has the id `agent_id` (its events carry it). The error is the system's.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         &mut self,
         launcher: &Path,
@@ -91,6 +255,8 @@ pub trait AgentLauncher {
         agent_id: i64,
         session_id: &str,
         name: &str,
+        kind: StageType,
+        prompt_file: &Path,
     ) -> Result<(), String>;
 }
 
@@ -98,10 +264,11 @@ pub trait AgentLauncher {
 /// jail (its header, which wraps, takes rows from its terminal: ui.rs).
 pub type SizeOf = Box<dyn Fn(&str, bool) -> (u16, u16)>;
 
-/// The real launcher: the check by `run_check`, and the launch in an `AgentSession` whose
-/// events go to `tx`, of the size `size_of` gives for its name and the jail of the last check
-/// (review NS-34, P2: the PTY is born with its final size). The loop takes the session from
-/// `session`.
+/// The real launcher: the check by `run_check`, the render by `run_render`, and the launch in an
+/// `AgentSession` whose events go to `tx`, of the size `size_of` gives for its name and the jail
+/// (review NS-34, P2: the PTY is born with its final size): the jail of the last check, or the one
+/// `with_jail` gives (the launch does not run the check again: NS-35). The loop takes the session
+/// from `session`.
 pub struct TerminalAgentLauncher<E> {
     tx: Sender<E>,
     size_of: SizeOf,
@@ -118,6 +285,12 @@ impl<E> TerminalAgentLauncher<E> {
             session: None,
         }
     }
+
+    /// The jail of the agent, known from its check (the size of its header depends on it).
+    pub fn with_jail(mut self, jail: bool) -> TerminalAgentLauncher<E> {
+        self.jail = jail;
+        self
+    }
 }
 
 impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLauncher<E> {
@@ -127,6 +300,15 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
         Ok(check)
     }
 
+    fn render(
+        &mut self,
+        launcher: &Path,
+        project: &Path,
+        request: &RenderRequest,
+    ) -> Result<Rendered, String> {
+        run_render(launcher, project, request)
+    }
+
     fn spawn(
         &mut self,
         launcher: &Path,
@@ -134,6 +316,8 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
         agent_id: i64,
         session_id: &str,
         name: &str,
+        kind: StageType,
+        prompt_file: &Path,
     ) -> Result<(), String> {
         let session = AgentSession::spawn(
             launcher,
@@ -141,6 +325,8 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
             agent_id,
             session_id,
             name,
+            kind,
+            prompt_file,
             (self.size_of)(name, self.jail),
             self.tx.clone(),
         )
@@ -171,22 +357,42 @@ mod tests {
         );
     }
 
+    /// A precheck without a warning.
+    fn pre(jail: bool, jira: bool, sentry: bool) -> Precheck {
+        Precheck {
+            jail,
+            jira,
+            sentry,
+            warning: None,
+        }
+    }
+
     #[test]
     fn jail_true_and_jail_false_are_read() {
         assert_eq!(
-            parse_check(Some(0), b"jail=true\n", b""),
-            Ok(Precheck {
-                jail: true,
-                warning: None
-            })
+            parse_check(Some(0), b"jail=true\njira=false\nsentry=false\n", b""),
+            Ok(pre(true, false, false))
         );
         assert_eq!(
-            parse_check(Some(0), b"jail=false\n", b""),
-            Ok(Precheck {
-                jail: false,
-                warning: None
-            })
+            parse_check(Some(0), b"jail=false\njira=false\nsentry=false\n", b""),
+            Ok(pre(false, false, false))
         );
+    }
+
+    #[test]
+    fn the_flags_of_jira_and_sentry_are_read() {
+        for jail in [true, false] {
+            for jira in [true, false] {
+                for sentry in [true, false] {
+                    let stdout = format!("jail={jail}\njira={jira}\nsentry={sentry}\n");
+                    assert_eq!(
+                        parse_check(Some(0), stdout.as_bytes(), b""),
+                        Ok(pre(jail, jira, sentry)),
+                        "{stdout:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -194,13 +400,26 @@ mod tests {
         for stdout in [
             &b""[..],
             b"\n",
-            b"jail=TRUE\n",
-            b"jail=1\n",
+            // The one line of the NS-33, alone.
+            b"jail=true\n",
+            b"jail=false\n",
+            b"jail=TRUE\njira=false\nsentry=false\n",
+            b"jail=1\njira=false\nsentry=false\n",
             b"jail=true\njail=true\n",
-            b"Configura\xc3\xa7\xc3\xa3o carregada\njail=true\n",
-            b"jail=true\nmais\n",
-            b" jail=true\n",
-            b"jail=truex\n",
+            b"Configura\xc3\xa7\xc3\xa3o carregada\njail=true\njira=false\nsentry=false\n",
+            b"jail=true\njira=false\nsentry=false\nmais\n",
+            b" jail=true\njira=false\nsentry=false\n",
+            b"jail=truex\njira=false\nsentry=false\n",
+            // The order swapped, a line missing, a value not exact, a line too many.
+            b"jira=false\njail=true\nsentry=false\n",
+            b"jail=true\nsentry=false\njira=false\n",
+            b"jail=true\njira=false\n",
+            b"jail=true\nsentry=false\n",
+            b"jail=true\njira=TRUE\nsentry=false\n",
+            b"jail=true\njira=false\nsentry=sim\n",
+            b"jail=true\njira=false\nsentry=false\n\n",
+            b"jail=true\njira=false\nsentry=false\njail=true\n",
+            b"jail=true\r\njira=false\r\nsentry=false\r\n",
         ] {
             assert_eq!(
                 parse_check(Some(0), stdout, b""),
@@ -209,8 +428,8 @@ mod tests {
                 String::from_utf8_lossy(stdout)
             );
         }
-        // Without the final line break, the line is still the line.
-        assert!(parse_check(Some(0), b"jail=false", b"").is_ok());
+        // Without the final line break, the lines are still the lines.
+        assert!(parse_check(Some(0), b"jail=false\njira=true\nsentry=false", b"").is_ok());
     }
 
     #[test]
@@ -218,20 +437,17 @@ mod tests {
         assert_eq!(
             parse_check(
                 Some(0),
-                b"jail=false\n",
+                b"jail=false\njira=false\nsentry=false\n",
                 b"Aviso: chave ausente\n  X=\"\"\n"
             ),
             Ok(Precheck {
-                jail: false,
-                warning: Some("Aviso: chave ausente\n  X=\"\"".into())
+                warning: Some("Aviso: chave ausente\n  X=\"\"".into()),
+                ..pre(false, false, false)
             })
         );
         assert_eq!(
-            parse_check(Some(0), b"jail=true\n", b"  \n"),
-            Ok(Precheck {
-                jail: true,
-                warning: None
-            }),
+            parse_check(Some(0), b"jail=true\njira=false\nsentry=false\n", b"  \n"),
+            Ok(pre(true, false, false)),
             "blank stderr is no warning"
         );
     }
@@ -242,9 +458,13 @@ mod tests {
             parse_check(Some(1), b"", b"Erro: a jail falhou.\nDetalhe\n"),
             Err("Erro: a jail falhou.\nDetalhe".into())
         );
-        // Even with a jail= line: a non-zero exit never opens.
+        // Even with the three lines: a non-zero exit never opens.
         assert_eq!(
-            parse_check(Some(1), b"jail=false\n", b"Erro: x\n"),
+            parse_check(
+                Some(1),
+                b"jail=false\njira=false\nsentry=false\n",
+                b"Erro: x\n"
+            ),
             Err("Erro: x".into())
         );
         assert_eq!(
@@ -254,6 +474,69 @@ mod tests {
         assert_eq!(
             parse_check(None, b"", b""),
             Err("O bin/nick-agent foi interrompido na verificação.".into())
+        );
+    }
+
+    #[test]
+    fn a_render_gives_the_log_the_status_and_the_warning() {
+        assert_eq!(
+            parse_render(
+                Some(0),
+                b"log=/x/logs/po_20261119_120000.md\nJail (ai-jail): desligada.\n",
+                b""
+            ),
+            Ok(RenderOutput {
+                log: PathBuf::from("/x/logs/po_20261119_120000.md"),
+                status: "Jail (ai-jail): desligada.".into(),
+                warning: None
+            })
+        );
+        assert_eq!(
+            parse_render(Some(0), b"log=/x/l.md\na\nb\n", b"Aviso: plano antigo\n"),
+            Ok(RenderOutput {
+                log: PathBuf::from("/x/l.md"),
+                status: "a\nb".into(),
+                warning: Some("Aviso: plano antigo".into())
+            })
+        );
+        assert_eq!(
+            parse_render(Some(0), b"log=/x/l.md", b"").map(|o| o.status),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
+    fn a_render_without_an_absolute_log_or_that_failed_is_an_error() {
+        for stdout in [
+            &b""[..],
+            b"log=\n",
+            b"log=logs/x_1.md\nstatus\n",
+            b"status\nlog=/x/l.md\n",
+            b" log=/x/l.md\n",
+            b"LOG=/x/l.md\n",
+        ] {
+            assert_eq!(
+                parse_render(Some(0), stdout, b""),
+                Err(UNEXPECTED_RENDER_MESSAGE.to_string()),
+                "{:?}",
+                String::from_utf8_lossy(stdout)
+            );
+        }
+        assert_eq!(
+            parse_render(
+                Some(1),
+                b"log=/x/l.md\n",
+                b"Erro: o tipo 'x' nao existe.\nUso: ...\n"
+            ),
+            Err("Erro: o tipo 'x' nao existe.\nUso: ...".into())
+        );
+        assert_eq!(
+            parse_render(Some(3), b"", b""),
+            Err("O bin/nick-agent falhou na montagem do prompt (código 3).".into())
+        );
+        assert_eq!(
+            parse_render(None, b"", b""),
+            Err("O bin/nick-agent foi interrompido na montagem do prompt.".into())
         );
     }
 
@@ -270,11 +553,18 @@ mod tests {
             )),
             "{err}"
         );
-        // With the jail off (no ai-jail involved), jail=false and the warnings of the config.
+        // With the jail off (no ai-jail involved), jail=false, the flags and the warnings of the
+        // config.
         fs::create_dir_all(proj.join(".nick")).unwrap();
-        fs::write(proj.join(".nick/nick.conf"), "JAIL_ENABLED=\"false\"\n").unwrap();
+        fs::write(
+            proj.join(".nick/nick.conf"),
+            "JAIL_ENABLED=\"false\"\nJIRA_ENABLED=\"true\"\nSENTRY_ENABLED=\"TRUE\"\n",
+        )
+        .unwrap();
         let check = run_check(&launcher_path(), &proj).unwrap();
         assert!(!check.jail);
+        assert!(check.jira, "jira=true with \"true\"");
+        assert!(!check.sentry, "sentry=false with \"TRUE\" (not exact)");
         assert!(
             check
                 .warning
@@ -295,5 +585,88 @@ mod tests {
         // The app checks that the launcher is a file before (the alert with its path); here,
         // bash's own error is the message.
         assert!(err.contains("nao-existe"), "{err}");
+    }
+
+    #[test]
+    fn run_render_runs_the_real_launcher_and_reads_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let proj = root.join("proj");
+        let logs = root.join("logs");
+        fs::create_dir_all(proj.join(".nick")).unwrap();
+        fs::write(proj.join(".nick/nick.conf"), "JAIL_ENABLED=\"false\"\n").unwrap();
+        let logs_env = logs.display().to_string();
+        let env = [("NICK_PROMPT_LOGS_DIR", logs_env.as_str())];
+        let request = RenderRequest {
+            kind: StageType::PoDiscussion,
+            answers: vec![("--title", "Assunto de teste".into())],
+        };
+        let rendered = run_render_with_env(&launcher_path(), &proj, &request, &env).unwrap();
+        assert_eq!(rendered.log.parent(), Some(logs.as_path()), "{rendered:?}");
+        let name = rendered
+            .log
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            name.starts_with("po_discussion_") && name.ends_with(".md"),
+            "{name}"
+        );
+        assert_eq!(rendered.prompt, fs::read_to_string(&rendered.log).unwrap());
+        assert!(rendered.prompt.contains("Assunto de teste"), "{rendered:?}");
+        assert_eq!(
+            rendered.status,
+            "Jail (ai-jail): desligada — o agente roda direto no seu shell."
+        );
+        assert!(
+            rendered
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("não tem todas as chaves")),
+            "{rendered:?}"
+        );
+        assert!(
+            !proj.join(".nick/.gitignore").exists(),
+            "--render writes nothing in the project"
+        );
+        // A refusal of the launcher: its usage error, and no log.
+        let bad = RenderRequest {
+            kind: StageType::Po,
+            answers: vec![("--title", "x".into())],
+        };
+        let err = run_render_with_env(&launcher_path(), &proj, &bad, &env).unwrap_err();
+        assert!(
+            err.starts_with("Erro: falta a resposta --description do tipo 'po'."),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_dir(&logs).unwrap().count(),
+            1,
+            "only the first log"
+        );
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_read_is_an_error_with_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-agent");
+        // A launcher that answers a log that does not exist.
+        fs::write(&fake, "echo log=/nao/existe/po_x.md\necho status\n").unwrap();
+        let request = RenderRequest {
+            kind: StageType::Po,
+            answers: Vec::new(),
+        };
+        let err = run_render(&fake, tmp.path(), &request).unwrap_err();
+        assert!(
+            err.starts_with("Não consegui ler o prompt gerado em /nao/existe/po_x.md:"),
+            "{err}"
+        );
+        // Not UTF-8.
+        let log = tmp.path().join("log.md");
+        fs::write(&log, b"\xff\xfe").unwrap();
+        fs::write(&fake, format!("echo log={}\n", log.display())).unwrap();
+        let err = run_render(&fake, tmp.path(), &request).unwrap_err();
+        assert!(err.contains(&log.display().to_string()), "{err}");
     }
 }

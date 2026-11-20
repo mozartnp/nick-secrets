@@ -7,6 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_SCRUM_SH="$SCRIPT_DIR/../auto_scrum.sh"
+# The prompt assembly (NS-35): moved from auto_scrum.sh, loaded by it and by bin/nick-agent.
+PROMPT_SH="$SCRIPT_DIR/../prompt.sh"
 JAIL_LIB_SH="$SCRIPT_DIR/../../lib/jail/jail.sh"
 PERMISSIONS_JSON="$SCRIPT_DIR/../../lib/claude/permissions.json"
 
@@ -210,10 +212,10 @@ echo "== main(): roteamento estrutural pro po_jira (case/export/envsubst) =="
 main_src="$(cat "$AUTO_SCRUM_SH")"
 assert_contains "$main_src" "po_jira) ask_questions_po_jira ;;" "case \"\$TYPE\" roteia po_jira pra ask_questions_po_jira"
 
-export_block="$(grep -A3 '^  export ' "$AUTO_SCRUM_SH")"
+export_block="$(grep -A3 '^  export ' "$PROMPT_SH")"
 assert_contains "$export_block" "JIRA_LINK" "JIRA_LINK está na lista de export de main()"
 
-envsubst_line="$(grep -F "envsubst '" "$AUTO_SCRUM_SH")"
+envsubst_line="$(grep -F "envsubst '" "$PROMPT_SH")"
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '$JIRA_LINK' é o texto literal buscado dentro da linha do
 # envsubst, não uma variável pra expandir aqui.
@@ -275,9 +277,9 @@ assert_contains "$tl_rules_result" "$reuse_tl_text" "TECH_LEADER_PLAN_RULES_BLOC
 
 echo
 echo "== main(): TECH_LEADER_PLAN_RULES_BLOCK exportada e na lista do envsubst =="
-export_block="$(grep -A3 '^  export ' "$AUTO_SCRUM_SH")"
+export_block="$(grep -A3 '^  export ' "$PROMPT_SH")"
 assert_contains "$export_block" "TECH_LEADER_PLAN_RULES_BLOCK" "TECH_LEADER_PLAN_RULES_BLOCK está na lista de export de main()"
-envsubst_line="$(grep -F "envsubst '" "$AUTO_SCRUM_SH")"
+envsubst_line="$(grep -F "envsubst '" "$PROMPT_SH")"
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '$TECH_LEADER_PLAN_RULES_BLOCK' é o texto literal buscado
 # dentro da linha do envsubst, não uma variável pra expandir aqui.
@@ -1599,8 +1601,8 @@ done
 # TYPE é renderizado sem passar pelo menu: dá source, não carrega configuração, chama os
 # build_*_blocks na ordem em que main() os chama, exporta e roda o envsubst com a lista lida
 # do próprio script — os mesmos passos de main() depois de resolve_stack.
-tdd_none_builds="$(grep -E '^  build_[a-z_]+_blocks$' "$AUTO_SCRUM_SH" | tr -d ' ' | paste -sd ';' -)"
-tdd_none_envsubst_vars="$(grep -F "envsubst '" "$AUTO_SCRUM_SH" | sed -E "s/.*envsubst '([^']*)'.*/\1/")"
+tdd_none_builds="$(grep -E '^  build_[a-z_]+_blocks$' "$PROMPT_SH" | tr -d ' ' | paste -sd ';' -)"
+tdd_none_envsubst_vars="$(grep -F "envsubst '" "$PROMPT_SH" | sed -E "s/.*envsubst '([^']*)'.*/\1/")"
 tdd_none_jira_text="$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; $tdd_none_builds; JIRA_LINK='https://jira.example.com/browse/SC-20'; DESCRIPTION=''; export ${tdd_none_envsubst_vars//\$/}; envsubst '$tdd_none_envsubst_vars' < '$SCRIPT_DIR/../templates/tech_leader_jira.md'; printf '<FIM>'" 2>/dev/null || true)"
 assert_eq "$tdd_ref_tech_leader_jira_on" "$tdd_none_jira_text" "chaves vazias, tech_leader_jira (renderizado sem o menu): o prompt é idêntico à referência fixa (TDD ligada)"
 
@@ -1676,25 +1678,26 @@ echo "== consistência: variáveis dos templates = lista do envsubst = lista do 
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '${}' é a lista de caracteres pro tr apagar, não expansão.
 vars_templates="$(grep -ohE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' "$SCRIPT_DIR"/../templates/*.md | tr -d '${}' | LC_ALL=C sort -u)"
-vars_envsubst="$(grep -F "envsubst '" "$AUTO_SCRUM_SH" | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | tr -d '$' | LC_ALL=C sort -u)"
+vars_envsubst="$(grep -F "envsubst '" "$PROMPT_SH" | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | tr -d '$' | LC_ALL=C sort -u)"
 # Do "  export" até a primeira linha que não termina em "\" (inclusive a própria linha do
 # export, se ela for única). Não usa grep -A3: com um export mais curto, pegaria linhas
 # seguintes do main().
-vars_export="$(awk '/^  export /{found=1} found{print} found && !/\\$/{exit}' "$AUTO_SCRUM_SH" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | grep -E '^[A-Z_][A-Z0-9_]*$' | LC_ALL=C sort -u)"
+vars_export="$(awk '/^  export /{found=1} found{print} found && !/\\$/{exit}' "$PROMPT_SH" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | grep -E '^[A-Z_][A-Z0-9_]*$' | LC_ALL=C sort -u)"
 assert_eq "$vars_templates" "$vars_envsubst" "variáveis usadas nos templates são exatamente as da lista do envsubst"
 assert_eq "$vars_envsubst" "$vars_export" "lista do envsubst é exatamente a lista do export"
 
 echo
-echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config/config.sh, lib/config/keys.sh, lib/jail/jail.sh e lib/claude/claude.sh (config nunca é executada) =="
+echo "== auto_scrum.sh: as únicas linhas source/. são as de lib/config/config.sh, lib/config/keys.sh, lib/jail/jail.sh, lib/claude/claude.sh e prompt.sh (config nunca é executada) =="
 # A configuração nunca é executada: o leitor (config_load) não usa source/eval, e
 # lib/config/config.sh e lib/config/keys.sh não têm source, . nem eval (testes estruturais em
 # lib/tests/test_config.sh e lib/tests/test_keys.sh). Aqui, a lista inteira de linhas source/.
-# tem de ser só a dos quatro arquivos das bibliotecas, nesta ordem.
+# tem de ser só a dos quatro arquivos das bibliotecas, nesta ordem, e depois a do prompt.sh
+# (NS-35: a montagem do prompt, compartilhada com o bin/nick-agent).
 # shellcheck disable=SC2016
 # Aspas simples intencionais: '$SCRIPT_DIR' é o texto literal buscado no código-fonte.
 source_lines="$(grep -E '^[[:space:]]*(source|\.)[[:space:]]' "$AUTO_SCRUM_SH" || true)"
 # shellcheck disable=SC2016
-assert_eq 'source "$SCRIPT_DIR/../lib/config/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/config/keys.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$source_lines" "auto_scrum.sh tem quatro linhas source/.: lib/config/config.sh, lib/config/keys.sh, lib/jail/jail.sh e depois lib/claude/claude.sh"
+assert_eq 'source "$SCRIPT_DIR/../lib/config/config.sh"'$'\n''source "$SCRIPT_DIR/../lib/config/keys.sh"'$'\n''source "$SCRIPT_DIR/../lib/jail/jail.sh"'$'\n''source "$SCRIPT_DIR/../lib/claude/claude.sh"'$'\n''source "$SCRIPT_DIR/prompt.sh"' "$source_lines" "auto_scrum.sh tem cinco linhas source/.: lib/config/config.sh, lib/config/keys.sh, lib/jail/jail.sh, lib/claude/claude.sh e depois prompt.sh"
 
 echo
 echo "== auto_scrum.sh: carrega lib/config/config.sh com a diretiva do shellcheck logo acima =="
@@ -1723,6 +1726,98 @@ echo "== auto_scrum.sh: carrega lib/claude/claude.sh com a diretiva do shellchec
 claude_source_number="$(grep -nxF 'source "$SCRIPT_DIR/../lib/claude/claude.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
 assert_eq "true" "$([ -n "$claude_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/../lib/claude/claude.sh\""
 assert_eq "# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh" "$( [ -n "$claude_source_number" ] && sed -n "$((claude_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/../lib/claude/claude.sh'"
+
+echo
+echo "== auto_scrum.sh: carrega prompt.sh com a diretiva do shellcheck logo acima, antes do config_register_nick_keys =="
+# shellcheck disable=SC2016
+prompt_source_number="$(grep -nxF 'source "$SCRIPT_DIR/prompt.sh"' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$prompt_source_number" ] && echo true || echo false)" "auto_scrum.sh tem a linha source \"\$SCRIPT_DIR/prompt.sh\""
+assert_eq "# shellcheck source=SCRIPTDIR/prompt.sh" "$( [ -n "$prompt_source_number" ] && sed -n "$((prompt_source_number - 1))p" "$AUTO_SCRUM_SH" || true)" "a linha acima do source é '# shellcheck source=SCRIPTDIR/prompt.sh'"
+prompt_register_number="$(grep -nx 'config_register_nick_keys' "$AUTO_SCRUM_SH" | cut -d: -f1 || true)"
+assert_eq "true" "$([ -n "$prompt_source_number" ] && [ -n "$claude_source_number" ] && [ -n "$prompt_register_number" ] && [ "$claude_source_number" -lt "$prompt_source_number" ] && [ "$prompt_source_number" -lt "$prompt_register_number" ] && echo true || echo false)" "o source do prompt.sh vem depois do de lib/claude/claude.sh e antes do config_register_nick_keys"
+
+echo
+echo "== prompt.sh: a montagem do prompt, carregada com source (NS-35) =="
+assert_eq "# shellcheck shell=bash" "$(head -n 1 "$PROMPT_SH" 2>/dev/null || true)" "a 1ª linha do prompt.sh é '# shellcheck shell=bash' (sem shebang)"
+assert_eq "false" "$([ -x "$PROMPT_SH" ] && echo true || echo false)" "prompt.sh não tem bit de execução"
+prompt_code="$(grep -vE '^[[:space:]]*#' "$PROMPT_SH" 2>/dev/null || true)"
+assert_eq "" "$(grep -nE '(^|[[:space:];&|(])(exit|source|eval)([[:space:];)]|$)|^[[:space:]]*\.[[:space:]]' <<< "$prompt_code" || true)" "prompt.sh não tem exit, source, . nem eval em código"
+assert_eq "" "$(grep -nE 'set -[a-z]*e' <<< "$prompt_code" || true)" "prompt.sh não ativa set -e (é de quem carrega)"
+# Controle positivo do filtro de exit/source/eval.
+# shellcheck disable=SC2016
+# Aspas simples intencionais: é texto de código bash, comparado literalmente.
+assert_eq "3" "$(printf '%s\n' '  exit 1' 'source x' '  eval "$y"' 'exit_code=1' | grep -cE '(^|[[:space:];&|(])(exit|source|eval)([[:space:];)]|$)|^[[:space:]]*\.[[:space:]]' || true)" "controle positivo: o filtro acha exit, source e eval, e ignora exit_code="
+
+# Carga limpa: só as globais e as funções esperadas, sem saída (o retrato compgen -v das suítes
+# de lib/, com o clean_bash_vars), com lib/config/config.sh carregada antes (CONFIG_*_NAME).
+prompt_clean_dir="$TEST_TMP/prompt_clean"
+mkdir -p "$prompt_clean_dir/tty"
+prompt_clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
+prompt_config_sh="$SCRIPT_DIR/../../lib/config/config.sh"
+prompt_expected_vars="$(printf '%s\n' DESCRIPTION EXCHANGE_DIR JIRA_ID JIRA_LINK NICK_DIR NICK_DOCS_DIR PERMISSION_BLOCK_PO PLAN_PATH PO_TICKET_FORMAT_BLOCK PO_VALIDATION_BLOCK PRODUCTION_BLOCK_PO PROMPT_LOGS_DIR PROMPT_TEMPLATES_DIR REVIEW_PATH SENTRY_BLOCK_PO SENTRY_BLOCK_TL SENTRY_LINK STACK_BLOCK_DEV STACK_BLOCK_REVIEW STACK_BLOCK_TL TDD_BLOCK_DEV TDD_BLOCK_REVIEW TDD_BLOCK_TL TDD_CRITERIA_BLOCK_TL TECH_LEADER_PLAN_RULES_BLOCK TITLE | LC_ALL=C sort)"
+prompt_expected_funcs="$(printf '%s\n' build_permission_blocks build_po_blocks build_production_blocks build_prompt_blocks build_sentry_blocks build_stack_blocks build_tdd_blocks build_tech_leader_blocks exchange_block jira_id_valid render_prompt warn_legacy_plan | LC_ALL=C sort)"
+prompt_clean_rc=0
+timeout 2 bash --norc --noprofile -c "source '$prompt_config_sh'; compgen -v | LC_ALL=C sort > '$prompt_clean_dir/vars_before'; declare -F | sed 's/^declare -f //' | LC_ALL=C sort > '$prompt_clean_dir/funcs_before'; source '$PROMPT_SH' > '$prompt_clean_dir/out' 2>&1; compgen -v | LC_ALL=C sort > '$prompt_clean_dir/vars_after'; declare -F | sed 's/^declare -f //' | LC_ALL=C sort > '$prompt_clean_dir/funcs_after'" < /dev/null || prompt_clean_rc=$?
+assert_eq "0" "$prompt_clean_rc" "prompt.sh carrega sem erro (com lib/config/config.sh antes)"
+assert_eq "" "$(cat "$prompt_clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "carregar o prompt.sh não imprime nada"
+assert_eq "$prompt_expected_vars" "$(LC_ALL=C comm -13 "$prompt_clean_dir/vars_before" "$prompt_clean_dir/vars_after" 2>/dev/null | grep -vxE "$prompt_clean_bash_vars" || true)" "carregar o prompt.sh só cria as globais do prompt (respostas, blocos, nomes da árvore e PROMPT_*)"
+assert_eq "$prompt_expected_funcs" "$(LC_ALL=C comm -13 "$prompt_clean_dir/funcs_before" "$prompt_clean_dir/funcs_after" 2>/dev/null || true)" "carregar o prompt.sh só define as funções do prompt"
+if script -qec true /dev/null > /dev/null 2>&1; then
+  script -qec "stty cols 80 rows 24; timeout 2 bash --norc --noprofile -c \"source '$prompt_config_sh'; compgen -v | LC_ALL=C sort > '$prompt_clean_dir/tty/vars_before'; source '$PROMPT_SH' > /dev/null 2>&1; compgen -v | LC_ALL=C sort > '$prompt_clean_dir/tty/vars_after'\"" /dev/null < /dev/null > /dev/null 2>&1 || true
+  assert_eq "$prompt_expected_vars" "$(LC_ALL=C comm -13 "$prompt_clean_dir/tty/vars_before" "$prompt_clean_dir/tty/vars_after" 2>/dev/null | grep -vxE "$prompt_clean_bash_vars" || true)" "no pseudo-terminal 80x24, carregar o prompt.sh cria as mesmas globais"
+else
+  echo "  PULADO: script (util-linux) não disponível para o caso no pseudo-terminal"
+fi
+# Carregado por um caminho relativo, de outro cwd: os caminhos continuam absolutos.
+prompt_relative="$(realpath --relative-to="$TEST_TMP" "$PROMPT_SH")"
+prompt_paths="$(cd "$TEST_TMP" && timeout 2 env -u NICK_PROMPT_LOGS_DIR bash -c "source '$prompt_config_sh'; source '$prompt_relative'; printf '%s|%s' \"\$PROMPT_TEMPLATES_DIR\" \"\$PROMPT_LOGS_DIR\"" 2>/dev/null || true)"
+prompt_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+assert_eq "$prompt_root/templates|$prompt_root/logs" "$prompt_paths" "PROMPT_TEMPLATES_DIR e PROMPT_LOGS_DIR são absolutos, ao lado do prompt.sh (pelo BASH_SOURCE)"
+assert_eq "/tmp/x|$prompt_root/logs|$prompt_root/logs" "$(timeout 2 bash -c "source '$prompt_config_sh'; NICK_PROMPT_LOGS_DIR=/tmp/x; source '$PROMPT_SH'; printf '%s|' \"\$PROMPT_LOGS_DIR\"; NICK_PROMPT_LOGS_DIR=relativo; source '$PROMPT_SH'; printf '%s|' \"\$PROMPT_LOGS_DIR\"; NICK_PROMPT_LOGS_DIR=''; source '$PROMPT_SH'; printf '%s' \"\$PROMPT_LOGS_DIR\"" 2>/dev/null || true)" "NICK_PROMPT_LOGS_DIR absoluto troca o PROMPT_LOGS_DIR (testes); relativo ou vazio é ignorado"
+
+echo
+echo "== prompt.sh: as funções movidas saíram do auto_scrum.sh (sem definição duplicada) =="
+for moved_fn in jira_id_valid warn_legacy_plan build_stack_blocks build_sentry_blocks build_permission_blocks build_production_blocks build_po_blocks build_tdd_blocks build_tech_leader_blocks exchange_block build_prompt_blocks render_prompt; do
+  assert_eq "1" "$(grep -cE "^${moved_fn}\(\) \{" "$PROMPT_SH" 2>/dev/null || true)" "prompt.sh define $moved_fn uma vez"
+  assert_eq "0" "$(grep -cE "^[[:space:]]*${moved_fn}[[:space:]]*\(\)" "$AUTO_SCRUM_SH" || true)" "auto_scrum.sh não define $moved_fn"
+done
+assert_eq "x" "$(printf '%s\n' 'jira_id_valid() {' | grep -qE '^[[:space:]]*jira_id_valid[[:space:]]*\(\)' && echo x || true)" "controle positivo: o filtro acha a definição jira_id_valid() {"
+# shellcheck disable=SC2016
+# Aspas simples intencionais: é texto de código bash, comparado literalmente.
+for moved_global in 'TITLE=""' 'STACK_BLOCK_DEV=""' 'PO_VALIDATION_BLOCK=""' 'TECH_LEADER_PLAN_RULES_BLOCK=""' 'NICK_DIR="$CONFIG_NICK_DIR_NAME"'; do
+  assert_eq "0|1" "$(grep -cxF "$moved_global" "$AUTO_SCRUM_SH" || true)|$(grep -cxF "$moved_global" "$PROMPT_SH" 2>/dev/null || true)" "a global $moved_global saiu do auto_scrum.sh para o prompt.sh"
+done
+
+echo
+echo "== prompt.sh: build_prompt_blocks na ordem de antes; main() chama build_prompt_blocks e render_prompt, sem envsubst direto =="
+assert_eq "build_stack_blocks;build_sentry_blocks;build_permission_blocks;build_production_blocks;build_po_blocks;build_tdd_blocks;build_tech_leader_blocks" "$(sed -n '/^build_prompt_blocks() {/,/^}/p' "$PROMPT_SH" 2>/dev/null | grep -E '^  build_[a-z_]+_blocks$' | tr -d ' ' | paste -sd ';' -)" "build_prompt_blocks chama os sete build_*_blocks na ordem de antes"
+prompt_main_body="$(awk '/^main\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
+assert_eq "1" "$(grep -cxE '  build_prompt_blocks' <<< "$prompt_main_body" || true)" "main() chama build_prompt_blocks uma vez"
+assert_eq "0" "$(grep -cE '^  build_[a-z]+_blocks$' <<< "$(grep -v build_prompt_blocks <<< "$prompt_main_body")" || true)" "main() não chama mais os build_*_blocks um a um"
+# shellcheck disable=SC2016
+assert_eq "1" "$(grep -cF 'render_prompt "$TEMPLATES_DIR" "$TYPE" "$log_file"' <<< "$prompt_main_body" || true)" "main() chama render_prompt com TEMPLATES_DIR, TYPE e o log"
+assert_eq "" "$(grep -vE '^[[:space:]]*#' <<< "$prompt_main_body" | grep -n 'envsubst' || true)" "main() não chama envsubst direto"
+assert_eq "" "$(grep -vE '^[[:space:]]*#' "$AUTO_SCRUM_SH" | grep -nE "envsubst '|exchange_block" || true)" "auto_scrum.sh não roda envsubst nem exchange_block (o check_requirements só confere que o envsubst existe)"
+
+echo
+echo "== prompt.sh: render_prompt monta o mesmo log do main() =="
+render_dir="$TEST_TMP/render_prompt"
+mkdir -p "$render_dir"
+render_text="$(cd "$render_dir" && timeout 2 bash -c "source '$AUTO_SCRUM_SH'; TITLE='Assunto x'; build_prompt_blocks; render_prompt '$SCRIPT_DIR/../templates' po_discussion '$render_dir/log.md'; cat '$render_dir/log.md'" 2>/dev/null || true)"
+assert_contains "$render_text" "Assunto x" "render_prompt expande o TITLE no template"
+assert_contains "$render_text" "## Troca de arquivos com o usuário" "render_prompt acrescenta o exchange_block no fim"
+# shellcheck disable=SC2016
+assert_not_contains "$render_text" '${' "render_prompt não deixa \${...} sem expandir"
+
+echo
+echo "== shellcheck -x no prompt.sh =="
+if command -v shellcheck > /dev/null 2>&1; then
+  prompt_sc_rc=0
+  prompt_sc_out="$(shellcheck -x "$PROMPT_SH" 2>&1)" || prompt_sc_rc=$?
+  assert_eq "0" "$prompt_sc_rc" "shellcheck -x limpo: auto_scrum/prompt.sh${prompt_sc_out:+ — $prompt_sc_out}"
+else
+  echo "  PULADO: shellcheck não instalado"
+fi
 
 echo
 echo "== lib/config/config.sh: nenhuma chave concreta na parte genérica da biblioteca nem nos testes dela =="
@@ -2327,11 +2422,11 @@ main_line_of() {
 # Aspas simples intencionais: '$JAIL_ENABLED' e '$LOGS_DIR' são texto literal do código-fonte.
 order_check="$(main_line_of '  jail_check "$JAIL_ENABLED"')"
 order_load="$(main_line_of '  claude_settings_load NICK_CLAUDE_SETTINGS || exit 1')"
-order_build="$(main_line_of '  build_stack_blocks')"
+order_build="$(main_line_of '  build_prompt_blocks')"
 order_menu="$(main_line_of '  choose_type')"
 # shellcheck disable=SC2016
 order_logs="$(main_line_of '  mkdir -p "$LOGS_DIR"')"
-assert_eq "true" "$([ -n "$order_check" ] && [ -n "$order_load" ] && [ -n "$order_build" ] && [ -n "$order_menu" ] && [ -n "$order_logs" ] && [ "$order_check" -lt "$order_load" ] && [ "$order_load" -lt "$order_build" ] && [ "$order_build" -lt "$order_menu" ] && [ "$order_menu" -lt "$order_logs" ] && echo true || echo false)" "em main(): jail_check < claude_settings_load ... || exit 1 < build_stack_blocks < choose_type < mkdir -p \$LOGS_DIR"
+assert_eq "true" "$([ -n "$order_check" ] && [ -n "$order_load" ] && [ -n "$order_build" ] && [ -n "$order_menu" ] && [ -n "$order_logs" ] && [ "$order_check" -lt "$order_load" ] && [ "$order_load" -lt "$order_build" ] && [ "$order_build" -lt "$order_menu" ] && [ "$order_menu" -lt "$order_logs" ] && echo true || echo false)" "em main(): jail_check < claude_settings_load ... || exit 1 < build_prompt_blocks < choose_type < mkdir -p \$LOGS_DIR"
 assert_eq "1" "$(grep -c 'claude_settings_load' <<< "$auto_scrum_code" || true)" "claude_settings_load é chamada uma vez só no auto_scrum.sh"
 assert_eq "" "$(grep -nE '\$\([^)]*claude_settings_load' "$AUTO_SCRUM_SH" || true)" "claude_settings_load nunca roda dentro de \$( (o resultado volta por printf -v)"
 assert_eq "1" "$(grep -cx 'NICK_CLAUDE_SETTINGS=""' "$AUTO_SCRUM_SH" || true)" "NICK_CLAUDE_SETTINGS=\"\" está no bloco de globais do topo"
@@ -2414,8 +2509,8 @@ assert_eq "" "$(grep -nE '\$\((jail_check|jail_exec)\b' "$AUTO_SCRUM_SH" || true
 main_body="$(awk '/^main\(\) \{/{found=1} found{print} found && /^\}/{exit}' "$AUTO_SCRUM_SH")"
 jail_check_at="$(grep -n 'jail_check ' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
 jail_resolve_at="$(grep -nx '  resolve_stack' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
-jail_build_at="$(grep -n 'build_stack_blocks' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
-assert_eq "true" "$([ -n "$jail_check_at" ] && [ -n "$jail_resolve_at" ] && [ -n "$jail_build_at" ] && [ "$jail_resolve_at" -lt "$jail_check_at" ] && [ "$jail_check_at" -lt "$jail_build_at" ] && echo true || echo false)" "em main(), jail_check vem logo depois de resolve_stack e antes de build_stack_blocks"
+jail_build_at="$(grep -n 'build_prompt_blocks' <<< "$main_body" | cut -d: -f1 | head -n1 || true)"
+assert_eq "true" "$([ -n "$jail_check_at" ] && [ -n "$jail_resolve_at" ] && [ -n "$jail_build_at" ] && [ "$jail_resolve_at" -lt "$jail_check_at" ] && [ "$jail_check_at" -lt "$jail_build_at" ] && echo true || echo false)" "em main(), jail_check vem logo depois de resolve_stack e antes de build_prompt_blocks"
 assert_eq "1" "$(grep -cE '^[[:space:]]*jail_check .*\|\| exit 1$' <<< "$main_body" || true)" "em main(), a falha de jail_check encerra com exit 1 (na própria linha da chamada)"
 
 echo

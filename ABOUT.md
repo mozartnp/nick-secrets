@@ -57,7 +57,8 @@ regras. Regras a seguir em todo script novo ou alterado:
   `SC2016` da linha do `envsubst` em `main()`.
 - Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
   morde) só numa cópia descartável **fora do repositório**, com só (caminhos a partir da
-  raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/templates/`,
+  raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/prompt.sh` (desde o
+  NS-35), `auto_scrum/templates/`,
   `auto_scrum/tests/`, `bin/`, `lib/`, `README.md` (lido pelo teste README × helper de
   `lib/tests/test_jail.sh`), `.gitignore` (lido pelos testes de `.gitignore` de
   `auto_scrum/tests/test_auto_scrum.sh`) e `nick/` sem `nick/target/` (a casca Rust, desde o
@@ -1223,8 +1224,12 @@ se o `shellcheck` rodar de dentro de `auto_scrum/` (da raiz dá SC1091), e com `
 resolve de qualquer cwd. Rode `shellcheck -x`, pra ele seguir o `source`. O `SCRIPT_DIR` vem de
 `BASH_SOURCE[0]`, então o caminho também funciona quando os testes dão `source` no script de
 outro cwd. As quatro linhas `source`, nessa ordem (config/config → config/keys → jail →
-claude), são as únicas linhas `source`/`.` do `auto_scrum.sh` (um teste compara a lista
+claude), e, desde o NS-35, uma quinta, `source "$SCRIPT_DIR/prompt.sh"` (a montagem do prompt,
+que não é biblioteca de `lib/`: seção "Rust no projeto: etapas do auto_scrum na casca `nick`
+(NS-35)"), são as únicas linhas `source`/`.` do `auto_scrum.sh` (um teste compara a lista
 inteira), e a chamada `config_register_nick_keys` vem logo depois, no topo, fora de função. O
+`bin/nick-agent` carrega as mesmas cinco, na mesma ordem (a quinta é
+`source "$SCRIPT_DIR/../auto_scrum/prompt.sh"`), com a mesma chamada. O
 `bin/nick-init` carrega só as duas de `lib/config/`, na mesma ordem, com a mesma chamada. A
 garantia de que a configuração nunca é executada fica nos testes estruturais de
 `lib/config/config.sh` e `lib/config/keys.sh` e nos testes de gramática.
@@ -1348,6 +1353,13 @@ proteção contra erro, não um isolamento. O isolamento, opcional, é a jail: c
 `JAIL_ENABLED="true"`, o agente roda dentro do sandbox ai-jail, que limita a escrita ao
 projeto e esconde `~/.ssh`, `~/.gnupg` etc. (ver seção "Sandbox do agente com ai-jail
 (`JAIL_ENABLED`)").
+
+**Na casca `nick` (NS-35), a mesma regra:** o agente aberto pelo painel com o tipo
+`development` sobe com `--permission-mode auto`, e os outros sete tipos no modo padrão. Quem
+decide é o `bin/nick-agent`, pelo `--type` que o painel passa
+(`[ "$type" = "development" ] && claude_args+=(--permission-mode auto)`, a regra do `auto_scrum.sh`
+com o `$TYPE`). O
+Rust nunca passa `--permission-mode`: um teste estrutural proíbe o texto em `nick/src/`.
 
 ## Sandbox do agente com ai-jail (`JAIL_ENABLED`)
 
@@ -2548,6 +2560,12 @@ a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
 
 ## Rust no projeto: agentes na casca `nick` (NS-33)
 
+> **Mudou no NS-35** (seção "Rust no projeto: etapas do auto_scrum na casca `nick` (NS-35)"): o
+> `--check` passou a ter três linhas (`jail=`, `jira=` e `sentry=`), o diálogo das 4 etapas virou
+> o menu dos 8 tipos do `choose_type` com formulário e prévia do prompt, e o modo de lançamento
+> sem prompt e sem `--permission-mode` deixou de existir (o lançamento exige `--type` e
+> `--prompt-file`). O texto abaixo é o registro do NS-33.
+
 A fatia F3a do épico NS-28. Na tela de tickets, `g` sobre um ticket visível de um projeto
 disponível abre o diálogo "Abrir agente" (PO, Tech Leader, Dev, Review), e a etapa escolhida
 abre o `claude` num terminal embutido que ocupa a tela, com uma linha de cabeçalho. **Um agente
@@ -2920,3 +2938,251 @@ captura, encerrar pela visão, sair com dois agentes, SIGTERM e panic com dois a
 inundação escondida. A verificação com o `claude` e o ai-jail reais, no terminal standalone e no VS
 Code, não roda dentro da jail do nick. O roteiro fica em `.nick/docs/NS-34/verificacao_manual.md`,
 para o analista executar fora dela.
+
+## Rust no projeto: etapas do auto_scrum na casca `nick` (NS-35)
+
+A fatia F4a do épico NS-28. O `g` sobre um ticket deixa de abrir o `claude` sem prompt e passa a
+seguir o fluxo do `auto_scrum.sh`: os mesmos tipos de conversa, as mesmas perguntas, o mesmo
+prompt, a mesma confirmação e o mesmo argv do `claude`.
+
+**O fluxo:**
+1. `g` (com as recusas de antes: ticket oculto e projeto indisponível) → `Action::CheckAgent` →
+   `App::check_agent`: o launcher precisa ser arquivo, e o `bin/nick-agent --check` precisa
+   passar. Uma falha vira o alerta "Agente não aberto", com `Nada foi aberto.` no topo, como no
+   NS-33;
+2. o menu "Abrir agente" com os 8 tipos do `choose_type`, na mesma ordem e com os mesmos textos,
+   filtrados pelas flags do `--check` (`StageType::menu`);
+3. o formulário do tipo, com as perguntas do `ask_questions_<tipo>` (`StageType::fields`): os
+   campos de uma linha são digitados no próprio diálogo (`app::edit_text`, `Tab`/`Shift+Tab`/
+   `↑`/`↓` trocam de campo), e a descrição longa abre no `$EDITOR` (`Action::EditDescription`).
+   `Enter` num campo de uma linha valida tudo (`stages::render_args`): a primeira recusa vai para
+   a barra, com o foco no campo recusado. `Esc` fecha sem gravar nada;
+4. `Action::RenderPrompt` → `bin/nick-agent --render <tipo> <respostas>`, fora do PTY, que monta o
+   prompt pelo bash e grava o log;
+5. a prévia (`Dialog::ConfirmPrompt`), sobre a tela inteira acima da linha de ajuda (limpa toda,
+   para nada da lista aparecer por trás), numa caixa com margem de uma célula: no topo, o
+   status da jail (fora dela, `FORA DA JAIL: o agente roda direto no seu shell.` em vermelho e
+   negrito, como no cabeçalho do agente, e depois as linhas do `jail_print_status`) e os avisos
+   do `--render` (o plano no lugar antigo, a configuração); no meio, o prompt com quebra por
+   palavra (mantendo a indentação; o tab vira espaços até a próxima coluna múltipla de 8, só na
+   prévia, para não aparecer como `?` do `printable`) e rolagem (`↑/↓/PgUp/PgDn/Home/End`); embaixo,
+   `linhas a–b de N`, `Confirma o envio para o claude? (s/N)` e `Salvo em <log>`. As teclas ficam
+   só na linha de ajuda, como nos outros diálogos. A rolagem fica presa ao começo e ao fim pela
+   janela (linhas por página, rolagem máxima) que o laço calcula com o `ui::prompt_window` (a
+   mesma conta do desenho) e passa ao `App` antes de cada tecla (`App::set_prompt_window`), no
+   molde do `set_agent_term`: o `App` não depende do `ui` (review do NS-35). A quebra
+   (`wrap_keeping_spaces`) é linear, medida sobre fatias do texto, porque uma descrição longa
+   chega a 128 KiB e a conta roda a cada tecla. Só `s`/`S` (`is_yes`) lançam; `n`/`N`/`Esc` fecham com `Cancelado. O
+   prompt gerado continua salvo em: <log>` (o texto do script), e as outras teclas são ignoradas;
+6. `Action::OpenAgent` → `App::open_agent`, como no NS-34 (sessão, nome, trava, linha `active`,
+   spawn e foco no terminal), mas **sem rodar o `--check` de novo**: usa o `Precheck` guardado
+   desde o passo 1 (a jail e o aviso). O lançamento de verdade repete as validações no bash.
+
+Com um diálogo aberto, o atalho reservado continua ignorado (NS-34), `q` não sai, e o `Ctrl+C`
+com o foco na lista continua saindo (ou perguntando, com agentes vivos).
+
+**Onde a montagem do prompt passou a morar e por quê (D1).** O `auto_scrum/prompt.sh`, novo, é
+carregado com `source` pelo `auto_scrum.sh` e pelo `bin/nick-agent`. Tem as globais do prompt
+(as respostas, os blocos e os nomes da árvore `.nick/`), o `PROMPT_TEMPLATES_DIR` e o
+`PROMPT_LOGS_DIR` (calculados pelo `BASH_SOURCE`), as funções movidas **com o corpo idêntico**
+(`jira_id_valid`, `warn_legacy_plan`, os sete `build_*_blocks` e o `exchange_block`, com os
+comentários) e duas funções novas: `build_prompt_blocks`, que chama os sete `build_*_blocks` na
+ordem de antes, e `render_prompt <templates_dir> <tipo> <log>`, com o `export`, o `envsubst` (a
+mesma lista e o mesmo `SC2016`) e o `exchange_block` que estavam no `main()`. O `main()` chama
+as duas. O arquivo **não fica em `lib/`, de propósito**: as regras de `lib/` exigem prefixo por
+biblioteca e proíbem ler globais do chamador, e cumpri-las seria reescrever cada `build_*_blocks`
+com parâmetros e `printf -v`, que é o risco que o ticket apontava. O prompt também é domínio do
+auto_scrum (os templates moram em `auto_scrum/templates/`). Ele segue, no espírito de `lib/`: 1ª
+linha `# shellcheck shell=bash`, sem shebang, sem bit de execução e sem `set -euo pipefail`; ao
+ser carregado só define (globais, constantes e funções), sem imprimir nem rodar comando além do
+`$(cd …; pwd)` do `BASH_SOURCE`; não chama `exit`, `source` nem `eval`; e depende de
+`lib/config/config.sh` já carregado. O ticket de limpeza do `auto_scrum.sh` pode rever o lugar.
+**Prova antes/depois:** o `.nick/docs/NS-35/gerar_prompts.sh` gera, pelo `main()` do script, o
+log dos 8 tipos em cada combinação da matriz de flags (41 prompts). Os gerados com o `main` de
+antes e com o NS-35 deram `diff -r` vazio.
+
+**A interface nova do `bin/nick-agent` (D2)**, três modos (`Uso: nick-agent --check | --render
+<tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>`):
+- `--check`: o mesmo de antes, mas o stdout de sucesso tem **exatamente três linhas, nesta
+  ordem**: `jail=true|false`, `jira=true|false` e `sentry=true|false`, cada uma `true` só com
+  `"true"` exato no `.nick/nick.conf` (a regra do `choose_type` e do `jail_exec`). O
+  `launch::parse_check` exige as três, nessa ordem, com ou sem o `\n` final. Qualquer outra forma,
+  inclusive a linha `jail=` sozinha do NS-33, dá `UNEXPECTED_CHECK_MESSAGE`: nada é presumido;
+- `--render <tipo> [--title|--description|--jira-id|--jira-link|--sentry-link|--plan-path <v>]`,
+  cada valor num argumento só, em qualquer ordem. Recusa (`usage_error`, saída 1, nenhum log):
+  tipo fora dos 8 (`AGENT_TYPES`, os do `choose_type`, conferidos por teste), tipo indisponível
+  pelas flags (a regra do `choose_type`), resposta que não pertence ao tipo, repetida, sem valor,
+  obrigatória ausente ou vazia (numa resposta que o script lê com `read`, uma feita só de espaço,
+  tab e `\n` conta como vazia, porque o `read` a deixaria vazia; a descrição longa, que vem do
+  `read_via_editor` e é aceita como está, só não pode ser vazia — review do NS-35), e ID que o
+  `jira_id_valid` recusa (a mensagem do `read_jira_id`
+  sem o "Tente de novo."). Roda o `load_and_check`, aplica no Dev e no Review o
+  `warn_legacy_plan` (stderr) e as mesmas linhas do plano padrão e do `REVIEW_PATH` do
+  `ask_questions_*`, o `build_prompt_blocks` e o `render_prompt`. O stdout é `log=<caminho
+  absoluto>` e depois a saída do `jail_print_status` (o status que o script mostra antes da
+  confirmação). Não grava nada no projeto (sem `config_dir_prepare`) e não abre o `claude`;
+- o lançamento exige os quatro `--session-id`, `--name`, `--type` (um dos 8) e `--prompt-file`
+  (arquivo regular, legível e não vazio), em qualquer ordem. O argv é o do `auto_scrum.sh` com
+  `--session-id <uuid> --name <nome>` antes do prompt: `claude --settings <regras>
+  [--permission-mode auto só no development] [--append-system-prompt <aviso> só com a jail]
+  --session-id <uuid> --name <nome> "$(cat <arquivo>)"`. O prompt é o último argumento, lido como
+  o script lê (o `$(cat …)` tira os `\n` do fim). O modo sem prompt do NS-33 deixou de existir.
+
+**O log dos testes (`NICK_PROMPT_LOGS_DIR`).** O log do `--render` fica no `PROMPT_LOGS_DIR`, o
+`auto_scrum/logs/` do checkout, que tem dados reais. Os testes do launcher e da casca rodam o
+`bin/nick-agent` real (a casca acha o launcher por um caminho fixado na compilação, sem variável
+que o troque), então rodar numa cópia temporária do `bin/`+`lib/`+`auto_scrum/` não serve para
+os testes de PTY. A saída mais simples: o `prompt.sh` aceita a variável de ambiente
+`NICK_PROMPT_LOGS_DIR`, que, quando é um caminho absoluto, troca o `PROMPT_LOGS_DIR` (relativo ou
+vazio é ignorado). Todo teste que roda o `--render` a aponta para um temporário, e a suíte bash
+confere no fim que o `auto_scrum/logs/` real não mudou. Ela só escolhe onde o log é gravado, não
+o que é lançado (diferente do launcher, que nenhuma variável troca). O `auto_scrum.sh` não a usa:
+ele continua com o `LOGS_DIR` dele.
+
+**Como o painel recebe as flags:** só pelo `--check`. O Rust não lê o `.nick/nick.conf`, não lê
+template e não monta prompt: ele coleta as respostas, mostra o log (ler o log para a prévia não
+é montar prompt) e lança pelo launcher. Um teste estrutural (`nick/tests/agent.rs`,
+`no_rust_source_builds_the_prompt_nor_reads_the_config`) proíbe em `nick/src/` (fora de
+comentário) `templates/`, `envsubst`, `exchange_block`, `build_`, `_BLOCK`, o nome de um template
+(`po.md`, …) e um `read_to_string`/`fs::read` do `nick.conf`, com controle positivo de cada filtro.
+
+**Os tipos e os formulários (`nick/src/stages.rs`).** Um módulo sem tela, no molde do
+`tickets.rs`: `StageType` (8 variantes) com `key()` (o `$TYPE`), `label()` (o texto do menu),
+`stage()` (a `Stage` do banco: `po*` → PO, `tech_leader*` → Tech Leader), `menu(jira, sentry)` e
+`fields()` (rótulo, argumento do `--render`, regra e se é linha ou editor). As regras são as do
+script: as linhas são aparadas como o `read -r` com o `IFS` padrão (`trim_read`: espaço, tab e
+`\n` nas pontas, e **não** o `trim()` Unicode: o `read` não tira o NBSP), um obrigatório vazio
+(ou só com espaços) é recusado com `Esse campo é obrigatório: <rótulo>.`, um opcional vazio não é
+enviado, e o ID passa pelo `tickets::jira_id_valid` (recusa: `tickets::INVALID_ID_MESSAGE`). O
+texto do editor **não** é aparado (o `$(cat …)` só tira os `\n` do fim, e o `read_via_editor`
+não apara). O plano vazio vai sem `--plan-path`, e quem calcula `.nick/docs/<ID>/plan.md` é o
+bash; o rótulo do plano mostra esse padrão com o ID digitado no momento.
+
+**O ID vem do ticket, editável, e o nome do agente fica com o ID do ticket.** O campo do ID nasce
+com o `ticket.key`. Se o operador o troca, o prompt usa o ID digitado, mas o nome do agente
+continua `<projeto> · <Etapa> · <ID do ticket>` (a troca do ID do ticket é da F4b). O banco não
+mudou (nenhuma migração): `agents.stage` continua com a `Stage`, e o tipo não é gravado
+(histórico e etapa atual são do NS-36).
+
+**O `$EDITOR` pela TUI (D8).** O caminho do init foi generalizado sem mudar o comportamento dele:
+`terminal::run_suspended(guard, gate, f)` fecha o portão da thread de entrada, suspende a TUI e
+reabre o portão, e o `IgnoreTerminalSignals` foi para o `terminal.rs`. O `TerminalInitRunner` usa
+essa função, e os testes do init passaram sem mudança. O `editor.rs` (novo) tem o trait
+`EditorRunner` (o `App` é testado com um falso) e o `TerminalEditorRunner`: o editor é o
+`$EDITOR`, ou o `nano` quando ela não está definida ou está vazia (`${EDITOR:-nano}`, lido só no
+`main.rs`), rodado como **um** programa, sem dividir por espaço (um `EDITOR="code -w"` falha nos
+dois). Ele roda pelo `bash` (`command -v -- "$0" || exit 127; exec "$0" "$1"`), o único programa
+que a casca abre com `Command` (regra estrutural do NS-33), que também o acha no `PATH` como o
+script. Imprime `<rótulo> — abrindo <editor> (salve e feche o editor para continuar).`, abre um
+temporário (`tempfile::NamedTempFile`, sempre apagado) e lê o arquivo de volta. Arquivo com
+tamanho 0 → `Empty`; senão o texto sem os `\n` do fim; não UTF-8, editor ausente (`comando não
+encontrado`), sem permissão, que sai com código ≠ 0 ou morto por sinal → `Não consegui abrir o
+editor <editor>: <motivo>.` na barra. Sem "Pressione Enter" na volta. O nick ignora o `Ctrl+C` e
+o `Ctrl+\` enquanto o editor roda (só o editor os recebe), como no init. **Diferenças do script,
+de propósito:**
+- sem laço no vazio: o script reabre o editor até ter texto, e só sai com `Ctrl+C`. No painel não
+  há `Ctrl+C` para sair do laço, então o campo fica vazio, a barra mostra `Esse campo é
+  obrigatório, tente de novo.`, e o operador decide (`Enter` reabre, `Esc` desiste). Um arquivo
+  só com quebras de linha (não vazio para o `-s` do script, mas vazio depois do `$(cat …)`) conta
+  como vazio no painel: o `--render` recusaria a descrição obrigatória vazia;
+- reabrir um campo já preenchido abre o editor **com o texto atual** (o script nunca reedita);
+- enquanto o editor está aberto, o laço fica parado no `run_suspended`: os agentes continuam
+  rodando, os eventos de saída se acumulam no canal e são tratados na volta, com o aviso de saída
+  nova acumulado, e um SIGTERM/SIGHUP também só é tratado na volta (impacto aceito no ticket);
+- um texto salvo leva o foco ao próximo campo (dando a volta para o primeiro), onde o `Enter`
+  monta o prompt.
+
+**O modo `auto` do Dev no painel** é decidido no bash, pelo `--type` (seção "Modo auto só na
+etapa de Desenvolvimento"). O `AgentLauncher::spawn` e o `AgentSession::spawn` ganharam o tipo e
+o arquivo do prompt, que viram `--type <key> --prompt-file <log>` no `CommandBuilder`, que
+continua sendo `bash <launcher>`. O `AgentLauncher` ganhou o `render` (`launch::run_render`, que
+roda o `--render` com o stdin em `/dev/null`, lê a saída com `parse_render` — falha: o stderr ou
+o código; sucesso: a 1ª linha `log=<absoluto>` e o resto como status, senão `O bin/nick-agent
+respondeu algo inesperado na montagem do prompt.` — e lê o log para a prévia; ilegível ou não
+UTF-8 é erro com o caminho). O `TerminalAgentLauncher` recebe a jail do `Precheck` guardado
+(`with_jail`), para o PTY nascer com o tamanho final do painel (NS-34). O `tempfile` passou de
+dev-dependency para dependency (já estava no `Cargo.lock`; nenhum crate novo).
+
+**Convivência com o `auto_scrum.sh` até a limpeza.** Os textos do menu e os rótulos dos campos
+ficam duplicados (Rust e bash). Amarram os dois: o teste do menu (`stages.rs`) roda o
+`choose_type` real nas 4 combinações de Jira e Sentry (com `COLUMNS=1`, para o `select` listar um
+item por linha) e compara com o `menu()`; e cada rótulo de campo precisa aparecer no
+`auto_scrum.sh` (o do plano pelo começo, `Arquivo do plano (opcional, Enter para usar `), com
+controle positivo. A lista dos 8 tipos do launcher (`AGENT_TYPES`) é comparada com a do
+`choose_type`. **Diferenciais:** o bash (`bin/tests/test_nick_agent.sh`) roda, para os 8 tipos e
+a matriz de flags (tudo desligado, tudo ligado com a jail e `STACK_DESCRIPTION`, e cada uma de
+Jira, Sentry, produção, TDD e permissão sozinha), o `main()` do script e o launcher (`--render` e
+lançamento) e compara o log byte a byte, o argv do `claude` (tirando `--session-id`/`--name`) e
+as opções do `ai-jail`; o Rust (`nick/tests/stages.rs`) monta as respostas pelo `stages.rs`, com
+espaços nas pontas, chama o `launch::run_render` e o `AgentSession::spawn` reais e compara com o
+script.
+
+**Ajustes do review do NS-35:** o `--render` recusa a resposta só com espaços (acima, com casos
+novos na suíte e o controle positivo da descrição longa só com espaços, aceita como no script);
+as falhas do launcher fora do PTY têm uma fonte só (`launch::launcher_failure`, usada pelo
+`parse_check` e pelo `parse_render`), o alerta "Nada foi aberto." também (`App::agent_failed`, do
+`--check` e do `--render`), e o launcher sem PTY do laço também (`Shell::offline_launcher`); o
+`App` deixou de chamar o `ui` (a janela da prévia vem do laço); a quebra da prévia ficou linear;
+o tab aparece como espaços na prévia; e a prévia ocupa a tela acima da ajuda, limpa, com as teclas
+num lugar só. As telas antes desses ajustes ficaram em `.nick/docs/NS-35/prints_antes_do_review/`.
+
+**Achados, sem correção** (os dois últimos herdados do script):
+- a variável `NICK_PROMPT_LOGS_DIR` vale também em produção: um operador que a tenha no ambiente
+  vai ter os logs do painel fora do `auto_scrum/logs/` (observação do review, aceita: ela só
+  escolhe onde o log é gravado);
+- dois `--render` do mesmo tipo no mesmo segundo usam o mesmo nome de log
+  (`<tipo>_<AAAAmmdd_HHMMSS>.md`), e o segundo sobrescreve o primeiro (D9);
+- o prompt vai como argumento do `claude`, e a descrição longa como argumento do `--render`. O
+  Linux limita cada argumento a 128 KiB (`MAX_ARG_STRLEN`), como no script (impacto aceito no
+  ticket). Se o `--render` ou o lançamento falharem por isso, o erro do sistema vai para o alerta
+  ou para a barra. Nenhum mecanismo novo (D10).
+
+**Testes adaptados, com o motivo:**
+- `auto_scrum/tests/test_auto_scrum.sh`: os testes do bloco `export`, da linha do `envsubst`, da
+  lista do `envsubst` × templates × `export` e da extração das chamadas `build_*_blocks` passaram a
+  ler o `prompt.sh` (o texto mudou de arquivo, as asserções não); "as únicas linhas source"
+  espera cinco; os dois testes de ordem do `main()` (`jail_check < … < build_stack_blocks < …`)
+  passaram a procurar `build_prompt_blocks`, que é a chamada que o `main()` faz agora;
+- `bin/tests/test_nick_agent.sh`: os casos de lançamento passaram a passar `--type` e
+  `--prompt-file` (o prompt é o último argumento esperado); os do `--check` esperam três linhas;
+  os de argumentos ganharam os casos novos; o diferencial do NS-33 virou o da matriz; e "o launcher
+  nunca passa `--permission-mode`" virou "uma única linha, condicionada a `development`", com
+  controle positivo;
+- `nick/src/launch.rs`: `jail_true_and_jail_false_are_read`, `any_other_stdout_with_exit_0_is_an_error`,
+  `the_stderr_of_a_success_is_a_warning` e `a_failure_is_the_stderr_or_the_code` usam as três
+  linhas (os formatos recusados continuam recusados, e entraram ordem trocada, linha faltando,
+  valor não exato e linha a mais);
+- `nick/src/agent_session.rs`: o `Case` dos testes grava um prompt e passa `--type`/`--prompt-file`;
+  `the_launcher_runs_claude_with_the_session_id_and_the_name_in_the_project` espera o prompt depois
+  do `--name`;
+- `nick/src/app.rs`: os testes do diálogo das etapas (`ChooseStage`) viraram os do menu, do
+  formulário, do editor e da prévia; o helper `open_agent` percorre o fluxo novo (a etapa PO abre
+  pelo `po_discussion`, de uma linha), e os testes do NS-33/NS-34 que o usam passaram sem mudar as
+  asserções. O alerta do launcher ausente e o do `--check` com falha passaram a ser provocados pelo
+  `g` (é ali que o `--check` roda agora), com as mesmas asserções; `with_a_dialog_open_the_shortcut_is_ignored`
+  abre o menu novo no lugar do diálogo antigo;
+- `nick/src/ui.rs`: o teste do diálogo das 4 etapas virou o do menu dos tipos; o `NoSpawn` passa o
+  `Precheck` ao `open_agent`;
+- `nick/tests/agent.rs`: o helper `open_agent` escolhe o tipo, preenche o formulário (o editor
+  falso no Tech Leader) e confirma na prévia. Só `an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends`
+  mudou duas asserções, porque o comportamento mudou de propósito: o argv termina com o prompt (e
+  não mais com o `--name`), e o Dev agora tem `--permission-mode auto`. Os testes do init
+  (`nick/tests/tui.rs`, inclusive o do `Ctrl+C`) não mudaram;
+- `tests/test_cargo_suite.sh`: o `shellcheck -x` cobre também o editor falso.
+
+**Testes novos:** `stages.rs` (menu nas 4 combinações, `key`/`label`/`stage`/`fields`, o aparo do
+`read`, a validação, os pares do `--render`, o diferencial do menu e os rótulos), `launch.rs`
+(`parse_check` com as três linhas, `parse_render`, `run_render` com o launcher real e o log
+ilegível), `editor.rs` (o editor real com editores falsos: texto, vazio, temporário apagado,
+ausente, código ≠ 0 e não UTF-8), `terminal.rs` (o portão do `run_suspended`), `app.rs` (check
+antes do menu, menu pelas flags, ID do ticket editável, recusas com a barra e o foco, editor
+`Text`/`Empty`/`Failed`/reabertura, os pares do `render` nos 8 tipos, o `s` sem segundo check, o
+cancelamento e os limites da rolagem), `ui.rs` (menu, formulário, rótulo do plano, prévia com o
+`FORA DA JAIL` em vermelho, aviso, rolagem e terminal estreito) e, no PTY (`nick/tests/agent.rs`):
+o menu com e sem Jira/Sentry, o `po_discussion` de ponta a ponta (com rolagem e o prompt como
+último argumento), o Dev em modo `auto`, o cancelamento na prévia, o `po` com o editor falso
+(`nick/tests/fixtures/bin/editor`), o editor que deixa o arquivo vazio e o `Ctrl+C` dentro do
+editor, que só interrompe o editor.
+
+A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nick. O roteiro fica em
+`.nick/docs/NS-35/verificacao_manual.md`, para o analista executar fora dela.

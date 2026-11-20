@@ -27,11 +27,13 @@ diretório de onde ele é aberto não muda nada. As teclas de cada tela aparecem
   lugar). Cada ticket tem um título e o ID do Jira. Sem o ID, o nick gera um ID provisório. Um
   ticket pode ser ocultado, sem sair do banco, e restaurado depois. Os tickets ficam só no banco
   do nick: nenhuma ação sobre eles cria ou altera arquivo do projeto.
-- **Agentes:** a partir de um ticket, a TUI abre o `claude` da etapa escolhida num terminal
-  embutido, ao lado da lista, na pasta do projeto e com a configuração dele: o agente roda na
-  jail ou fora dela conforme o `JAIL_ENABLED` do `.nick/nick.conf` do projeto, e fora dela a TUI
-  avisa no topo do terminal. Vários agentes, de tickets e projetos diferentes, ficam abertos ao
-  mesmo tempo, e a visão "Agentes ativos" mostra todos.
+- **Agentes:** a partir de um ticket, a TUI oferece os mesmos tipos de conversa do menu do
+  `auto_scrum`, faz as mesmas perguntas (a descrição longa abre no seu `$EDITOR`, ou no `nano`),
+  monta o mesmo prompt do script, mostra o prompt final e pede a confirmação antes de abrir. O
+  `claude` abre num terminal embutido, ao lado da lista, na pasta do projeto e com a configuração
+  dele: o agente roda na jail ou fora dela conforme o `JAIL_ENABLED` do `.nick/nick.conf` do
+  projeto, e fora dela a TUI avisa no topo do terminal. Vários agentes, de tickets e projetos
+  diferentes, ficam abertos ao mesmo tempo, e a visão "Agentes ativos" mostra todos.
 - **Atalho entre a lista e o terminal:** `Ctrl+\` por padrão. Para trocar, abra
   "Configurações" na tela de Módulos. O terminal integrado do VS Code fica com o `Ctrl+\` (é
   atalho dele, "dividir editor"). Para usar o nick ali, troque o atalho nas Configurações ou

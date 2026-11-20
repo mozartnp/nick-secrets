@@ -13,6 +13,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRATE_DIR="$ROOT_DIR/nick"
 CARGO_SUITE="$CRATE_DIR/tests/test_cargo.sh"
 FAKE_INIT="$CRATE_DIR/tests/fixtures/bin/nick-init"
+# The fake $EDITOR of the stage forms (NS-35).
+FAKE_EDITOR="$CRATE_DIR/tests/fixtures/bin/editor"
 
 failures=0
 
@@ -114,9 +116,9 @@ assert_eq "" "$(code_lines "$CARGO_SUITE" | grep -n '\[\[' || true)" "nick/tests
 assert_eq "true" "$([ -x "$CARGO_SUITE" ] && [ -x "$SCRIPT_DIR/test_cargo_suite.sh" ] && echo true || echo false)" "as duas suítes têm bit de execução"
 
 echo
-echo "== shellcheck -x nas suítes e no init falso =="
+echo "== shellcheck -x nas suítes, no init falso e no editor falso =="
 if command -v shellcheck > /dev/null 2>&1; then
-  for checked in "$CARGO_SUITE" "$SCRIPT_DIR/test_cargo_suite.sh" "$FAKE_INIT"; do
+  for checked in "$CARGO_SUITE" "$SCRIPT_DIR/test_cargo_suite.sh" "$FAKE_INIT" "$FAKE_EDITOR"; do
     sc_rc=0
     sc_out="$(shellcheck -x "$checked" 2>&1)" || sc_rc=$?
     assert_eq "0" "$sc_rc" "shellcheck -x limpo: ${checked#"$ROOT_DIR"/}${sc_out:+ — $sc_out}"

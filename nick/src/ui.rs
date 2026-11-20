@@ -12,11 +12,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::agents::Stage;
 use crate::app::{App, Button, Dialog, Focus, RunningAgent, Screen, TicketField};
+use crate::launch::{Precheck, Rendered};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects;
+use crate::stages::{self, Input, Rule};
 
 /// The widest the list gets beside an agent (NS-34); never more than half the window.
 pub const LIST_WIDTH: u16 = 40;
@@ -166,8 +167,22 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
         Paragraph::new(help_lines).style(Style::new().add_modifier(Modifier::DIM)),
         help,
     );
-    if let Some(dialog) = &app.dialog {
-        draw_dialog(frame, app, dialog, areas.body);
+    match &app.dialog {
+        // The preview of the prompt takes almost the whole screen (NS-35).
+        Some(Dialog::ConfirmPrompt {
+            precheck,
+            rendered,
+            scroll,
+            ..
+        }) => draw_prompt(
+            frame,
+            prompt_area(frame.area(), areas),
+            precheck,
+            rendered,
+            *scroll,
+        ),
+        Some(dialog) => draw_dialog(frame, app, dialog, areas.body),
+        None => {}
     }
 }
 
@@ -236,7 +251,12 @@ fn help_text_for(
         }
         (Some(Dialog::EditTitle { .. }), _) => "Enter confirmar · Esc cancelar",
         (Some(Dialog::ConfirmHide { .. }), _) => "s ocultar · qualquer outra tecla cancela",
-        (Some(Dialog::ChooseStage { .. }), _) => "↑/↓ escolher · Enter abrir · Esc cancelar",
+        (Some(Dialog::ChooseType { .. }), _) => "↑/↓ escolher · Enter abrir · Esc cancelar",
+        (Some(Dialog::StageForm { .. }), _) => {
+            "Tab/↑/↓ trocar de campo · Enter confirmar (no campo do editor: abrir o editor) · \
+             Esc cancelar"
+        }
+        (Some(Dialog::ConfirmPrompt { .. }), _) => PROMPT_KEYS,
         (Some(Dialog::AgentError { .. }), _) => "Enter/Esc fechar",
         (Some(Dialog::ConfirmEndAgent { .. }), _) => "s encerrar · qualquer outra tecla cancela",
         (Some(Dialog::ConfirmQuit), _) => "s encerrar e sair · qualquer outra tecla cancela",
@@ -740,7 +760,12 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             ]));
             (" Configuração do nick ", lines, None)
         }
-        Dialog::ChooseStage { ticket, index, .. } => {
+        Dialog::ChooseType {
+            ticket,
+            types,
+            index,
+            ..
+        } => {
             let mut lines = vec![
                 Line::from(format!(
                     "Ticket {} — {}",
@@ -748,19 +773,69 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
                     printable(&ticket.title)
                 )),
                 Line::from(""),
+                Line::from("Qual tipo de conversa você quer iniciar?"),
             ];
-            for (i, stage) in Stage::ALL.iter().enumerate() {
+            for (i, kind) in types.iter().enumerate() {
                 lines.push(if i == *index {
                     Line::from(vec![
                         Span::raw("> "),
-                        Span::styled(stage.label(), Style::new().add_modifier(Modifier::REVERSED)),
+                        Span::styled(kind.label(), Style::new().add_modifier(Modifier::REVERSED)),
                     ])
                 } else {
-                    Line::from(format!("  {}", stage.label()))
+                    Line::from(format!("  {}", kind.label()))
                 });
             }
             (" Abrir agente ", lines, None)
         }
+        Dialog::StageForm {
+            ticket,
+            kind,
+            values,
+            focus,
+            ..
+        } => {
+            let mut lines = vec![
+                Line::from(format!(
+                    "Ticket {} — {}",
+                    printable(&ticket.key),
+                    printable(&ticket.title)
+                )),
+                Line::from(format!("Tipo: {}", kind.label())),
+            ];
+            let fields = kind.fields();
+            // The plan shows its default with the ID typed now.
+            let jira_id = fields
+                .iter()
+                .position(|f| f.rule == Rule::JiraId)
+                .map_or("", |i| values[i].as_str());
+            let mut cursor = None;
+            for (i, question) in fields.iter().enumerate() {
+                lines.push(Line::from(""));
+                let label = format!("{}:", stages::field_label(question, jira_id));
+                lines.push(if i == *focus {
+                    Line::styled(printable(&label), Style::new().add_modifier(Modifier::BOLD))
+                } else {
+                    Line::from(printable(&label))
+                });
+                match question.input {
+                    Input::Line => {
+                        let typed = field(&values[i]);
+                        if i == *focus {
+                            let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+                            cursor = Some((row, typed.chars().count()));
+                        }
+                        lines.push(Line::from(typed));
+                    }
+                    Input::Editor => lines.push(Line::styled(
+                        editor_summary(&values[i]),
+                        Style::new().add_modifier(Modifier::DIM),
+                    )),
+                }
+            }
+            (" Abrir agente ", lines, cursor)
+        }
+        // Drawn by `draw_prompt`, over the whole screen.
+        Dialog::ConfirmPrompt { .. } => return,
         Dialog::AgentError { message } => (
             " Agente não aberto ",
             message.lines().map(|l| Line::from(printable(l))).collect(),
@@ -817,12 +892,250 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
     }
 }
 
+/// An editor field in the form: `(vazio — Enter abre o editor)`, or its first line and how
+/// many lines it has.
+fn editor_summary(text: &str) -> String {
+    if text.is_empty() {
+        return "(vazio — Enter abre o editor)".to_string();
+    }
+    let count = text.lines().count().max(1);
+    let first = printable(text.lines().next().unwrap_or(""));
+    let lines = if count == 1 {
+        "1 linha".to_string()
+    } else {
+        format!("{count} linhas")
+    };
+    format!("{first} ({lines}; Enter edita)")
+}
+
+/// The keys of the preview of the prompt.
+const PROMPT_KEYS: &str = "↑/↓/PgUp/PgDn/Home/End rolar · s enviar · n/Esc cancelar";
+
+/// `line` broken into rows of at most `width` columns, at the last space that fits when there is
+/// one (the spaces are kept, unlike `wrap_words`: the indentation of the prompt shows). Linear:
+/// each row looks at most at the characters that fit in it, measured on slices of `line` (review
+/// of the NS-35: a long description reaches 128 KiB).
+fn wrap_keeping_spaces(line: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        let rest = &line[start..];
+        let mut used = 0;
+        let mut end = start;
+        // Where the row ends when it breaks at the last space (after it), a space that is not
+        // the first character of the row.
+        let mut after_space = None;
+        for (at, c) in rest.char_indices() {
+            let size = Span::raw(&rest[at..at + c.len_utf8()]).width();
+            // A character wider than the row still goes, alone.
+            if used + size > width && end > start {
+                break;
+            }
+            used += size;
+            end = start + at + c.len_utf8();
+            if c == ' ' && at > 0 {
+                after_space = Some(end);
+            }
+        }
+        if end < line.len()
+            && let Some(cut) = after_space
+        {
+            end = cut;
+        }
+        rows.push(line[start..end].to_string());
+        start = end;
+    }
+    rows
+}
+
+/// `line` with each tab turned into the spaces up to the next column multiple of 8, as a
+/// terminal shows it: in the preview only (`printable` would show a `?`), the prompt itself keeps
+/// the tab.
+fn expand_tabs(line: &str) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut column = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let spaces = 8 - column % 8;
+            out.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            out.push(c);
+            column += Span::raw(c.encode_utf8(&mut [0; 4]) as &str).width();
+        }
+    }
+    out
+}
+
+/// Where the preview of the prompt goes on a screen of `area`: everything above the help line
+/// (the keys of the preview are there, as in the other dialogs), the status row included.
+fn prompt_area(area: Rect, areas: Areas) -> Rect {
+    Rect {
+        height: areas.help.y.saturating_sub(area.y),
+        ..area
+    }
+}
+
+/// Where the parts of the preview of the prompt go in `area` (`prompt_area`).
+struct PromptLayout {
+    /// The bordered box, with a margin of one cell.
+    outer: Rect,
+    /// On top: the jail status (and `FORA DA JAIL` out of it) and the warnings.
+    top: Vec<Line<'static>>,
+    top_area: Rect,
+    /// The prompt, word wrapped: every row, of which the window shows `body.height`.
+    prompt: Vec<String>,
+    body: Rect,
+    bottom_area: Rect,
+}
+
+/// The rows of the top of the preview: out of the jail, the warning in red and bold (as in the
+/// header of an agent); the status lines of `jail_print_status`; and the warnings of the render.
+fn prompt_top(precheck: &Precheck, rendered: &Rendered, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if !precheck.jail {
+        let red = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+        for row in wrap_words(&format!("{OFF_JAIL}."), width) {
+            lines.push(Line::styled(row, red));
+        }
+    }
+    let texts = rendered.status.lines().chain(
+        rendered
+            .warning
+            .as_deref()
+            .map_or("", |warning| warning)
+            .lines(),
+    );
+    for text in texts {
+        for row in wrap_words(&printable(text), width) {
+            lines.push(Line::from(row));
+        }
+    }
+    lines
+}
+
+/// The bottom of the preview: where the window is, the question of auto_scrum.sh and where the
+/// log is (the keys are on the help line).
+fn prompt_bottom(rendered: &Rendered, scroll: usize, shown: usize, total: usize) -> Vec<String> {
+    let last = (scroll + shown).min(total);
+    vec![
+        format!(
+            "linhas {}–{last} de {total}",
+            (scroll + 1).min(total.max(1))
+        ),
+        "Confirma o envio para o claude? (s/N)".to_string(),
+        format!("Salvo em {}", printable(&rendered.log.to_string_lossy())),
+    ]
+}
+
+fn prompt_layout(area: Rect, precheck: &Precheck, rendered: &Rendered) -> PromptLayout {
+    let outer = Rect {
+        x: area.x + 1.min(area.width / 2),
+        y: area.y + 1.min(area.height / 2),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let inner = Block::bordered().inner(outer);
+    let width = inner.width.max(1);
+    let third = (inner.height / 3).max(1);
+    let top = prompt_top(precheck, rendered, width);
+    let top_rows = u16::try_from(top.len()).unwrap_or(u16::MAX).min(third);
+    // The bottom: its 3 lines, wrapped at most to a third.
+    let bottom_rows: u16 = prompt_bottom(rendered, 0, 0, 0)
+        .iter()
+        .map(|line| u16::try_from(wrap_words(line, width).len()).unwrap_or(u16::MAX))
+        .sum::<u16>()
+        .min(third);
+    // A blank row under the top separates it from the prompt.
+    let gap = u16::from(top_rows > 0);
+    let body_rows = inner.height.saturating_sub(top_rows + gap + bottom_rows);
+    let prompt = rendered
+        .prompt
+        .lines()
+        .flat_map(|line| wrap_keeping_spaces(&printable(&expand_tabs(line)), width))
+        .collect();
+    PromptLayout {
+        outer,
+        top,
+        top_area: Rect {
+            height: top_rows,
+            ..inner
+        },
+        prompt,
+        body: Rect {
+            y: inner.y + top_rows + gap,
+            height: body_rows,
+            ..inner
+        },
+        bottom_area: Rect {
+            y: inner.y + top_rows + gap + body_rows,
+            height: bottom_rows,
+            ..inner
+        },
+    }
+}
+
+/// The window of the preview of the prompt open in `app`, on a screen of `area`: the rows of the
+/// prompt shown at a time (a page) and the largest scroll (its end), for the loop to give the App
+/// (`App::set_prompt_window`) before each key; None without the preview.
+pub fn prompt_window(app: &App, area: Rect) -> Option<(usize, usize)> {
+    let (precheck, rendered) = app.prompt_preview()?;
+    let layout = prompt_layout(prompt_area(area, layout(app, area)), precheck, rendered);
+    let rows = usize::from(layout.body.height);
+    Some((rows, layout.prompt.len().saturating_sub(rows)))
+}
+
+/// The preview of the prompt (NS-35), over the screen above the help line (cleared whole, so
+/// nothing of the list behind shows), in a box with a margin of one cell: the jail status and the
+/// warnings on top, the prompt in the middle (word wrapped, from the row `scroll`), and the
+/// position, the `(s/N)` question and the log at the bottom.
+fn draw_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    precheck: &Precheck,
+    rendered: &Rendered,
+    scroll: usize,
+) {
+    frame.render_widget(Clear, area);
+    let layout = prompt_layout(area, precheck, rendered);
+    if layout.outer.width < 3 || layout.outer.height < 3 {
+        return;
+    }
+    frame.render_widget(Block::bordered().title(" Prompt final "), layout.outer);
+    frame.render_widget(Paragraph::new(layout.top.clone()), layout.top_area);
+    let rows = usize::from(layout.body.height);
+    let scroll = scroll.min(layout.prompt.len().saturating_sub(rows));
+    let shown: Vec<Line> = layout
+        .prompt
+        .iter()
+        .skip(scroll)
+        .take(rows)
+        .map(|row| Line::from(row.as_str()))
+        .collect();
+    let count = shown.len();
+    frame.render_widget(Paragraph::new(shown), layout.body);
+    let bottom: Vec<Line> = prompt_bottom(rendered, scroll, count, layout.prompt.len())
+        .iter()
+        .flat_map(|line| wrap_words(line, layout.bottom_area.width))
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(bottom), layout.bottom_area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{Button, Dialog, Row, Screen, TicketField};
     use crate::db::Db;
     use crate::projects::{Availability, Project};
+    use crate::stages::StageType;
     use crate::tickets::Ticket;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1482,29 +1795,260 @@ mod tests {
         assert!(areas.panel.is_empty() && areas.terminal.is_empty());
     }
 
+    fn precheck(jail: bool) -> Precheck {
+        Precheck {
+            jail,
+            jira: false,
+            sentry: false,
+            warning: None,
+        }
+    }
+
     #[test]
-    fn the_stage_dialog_lists_the_four_stages_with_the_selection() {
+    fn the_menu_lists_the_types_with_the_selection() {
         let mut f = fixture();
         on_tickets(&mut f);
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
         f.app.ticket_rows = vec![t.clone()];
-        f.app.dialog = Some(Dialog::ChooseStage {
+        f.app.dialog = Some(Dialog::ChooseType {
             project: PathBuf::from("/x/meu-proj"),
             ticket: t,
-            index: 2,
+            precheck: precheck(false),
+            types: StageType::menu(true, false),
+            index: 5,
         });
         let buffer = render(&f.app);
         assert_has(&buffer, " Abrir agente ");
         assert_has(&buffer, "Ticket NS-1 — Corrigir o login");
-        let (po, _) = find(&buffer, "  PO").unwrap();
-        let (tl, _) = find(&buffer, "  Tech Leader").unwrap();
-        let (dev, x) = find(&buffer, "> Dev").unwrap();
-        let (review, _) = find(&buffer, "  Review").unwrap();
-        assert!(po < tl && tl < dev && dev < review);
+        assert_has(&buffer, "Qual tipo de conversa você quer iniciar?");
+        let rows: Vec<u16> = StageType::menu(true, false)
+            .iter()
+            .map(|kind| {
+                find(&buffer, kind.label())
+                    .unwrap_or_else(|| panic!("{}", kind.label()))
+                    .0
+            })
+            .collect();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "{rows:?}");
+        let (dev, x) = find(&buffer, "> Desenvolvimento").unwrap();
         assert!(buffer[(x + 2, dev)].modifier.contains(Modifier::REVERSED));
+        assert!(find(&buffer, "Sentry").is_none(), "no Sentry type off");
         assert_eq!(
             last_line(&buffer).trim(),
             "↑/↓ escolher · Enter abrir · Esc cancelar"
+        );
+    }
+
+    /// The form of `kind` with `values`, `focus` on the field.
+    fn form(kind: StageType, values: &[&str], focus: usize) -> Fixture {
+        let mut f = fixture();
+        on_tickets(&mut f);
+        let t = ticket(1, "NS-1", "Corrigir o login", false, false);
+        f.app.ticket_rows = vec![t.clone()];
+        f.app.dialog = Some(Dialog::StageForm {
+            project: PathBuf::from("/x/meu-proj"),
+            ticket: t,
+            precheck: precheck(false),
+            kind,
+            values: values.iter().map(|v| v.to_string()).collect(),
+            focus,
+        });
+        f
+    }
+
+    #[test]
+    fn the_form_shows_each_question_with_the_editor_field_empty_or_filled() {
+        let f = form(StageType::TechLeader, &["NS-1", "Título x", ""], 1);
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Tipo: Tech Leader - Criar plano");
+        let (id, _) = find(&buffer, "ID do Jira (ex: SC-123):").unwrap();
+        let (title, _) = find(&buffer, "Título da tarefa:").unwrap();
+        let (description, _) = find(&buffer, "Descrição / contexto:").unwrap();
+        assert!(id < title && title < description);
+        let (_, x) = find(&buffer, "Título da tarefa:").unwrap();
+        assert!(
+            buffer[(x, title)].modifier.contains(Modifier::BOLD),
+            "focused"
+        );
+        assert_has(&buffer, "(vazio — Enter abre o editor)");
+        let f = form(
+            StageType::TechLeader,
+            &["NS-1", "Título x", "Primeira linha\nsegunda\nterceira"],
+            2,
+        );
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Primeira linha (3 linhas; Enter edita)");
+        assert!(find(&buffer, "segunda").is_none(), "only the first line");
+        let f = form(StageType::Po, &["", "uma"], 1);
+        assert_has(&render(&f.app), "uma (1 linha; Enter edita)");
+        assert!(
+            last_line(&render(&f.app)).contains("Tab/↑/↓ trocar de campo"),
+            "{}",
+            last_line(&render(&f.app))
+        );
+    }
+
+    #[test]
+    fn the_label_of_the_plan_shows_the_current_id() {
+        let f = form(StageType::Development, &["SC-42", ""], 0);
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Arquivo do plano (opcional, Enter para usar");
+        assert!(
+            flat(&buffer).contains(".nick/docs/SC-42/plan.md):"),
+            "{}",
+            flat(&buffer)
+        );
+    }
+
+    /// The preview of a prompt of `rows` lines, scrolled `scroll` down.
+    fn preview(rows: usize, scroll: usize, jail: bool, warning: Option<&str>) -> Fixture {
+        let mut f = fixture();
+        on_tickets(&mut f);
+        let t = ticket(1, "NS-1", "Corrigir o login", false, false);
+        f.app.dialog = Some(Dialog::ConfirmPrompt {
+            project: PathBuf::from("/x/meu-proj"),
+            ticket: t,
+            precheck: precheck(jail),
+            kind: StageType::PoDiscussion,
+            rendered: Rendered {
+                log: PathBuf::from("/repo/auto_scrum/logs/po_discussion_20261119_120000.md"),
+                prompt: (1..=rows).map(|i| format!("linha {i}\n")).collect(),
+                status: if jail {
+                    "⚠️ Jail (ai-jail): ativa | modo de clipboard médio".into()
+                } else {
+                    "Jail (ai-jail): desligada — o agente roda direto no seu shell.".into()
+                },
+                warning: warning.map(str::to_string),
+            },
+            scroll,
+        });
+        f
+    }
+
+    #[test]
+    fn the_preview_shows_the_status_the_prompt_and_the_question() {
+        let f = preview(
+            5,
+            0,
+            false,
+            Some("Aviso: plano antigo em docs/plans/NS-1_x.md"),
+        );
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Prompt final ");
+        let (row, x) = find(&buffer, "FORA DA JAIL: o agente roda direto no seu shell.").unwrap();
+        let cell = &buffer[(x, row)];
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert_has(
+            &buffer,
+            "Jail (ai-jail): desligada — o agente roda direto no seu shell.",
+        );
+        assert_has(&buffer, "Aviso: plano antigo em docs/plans/NS-1_x.md");
+        for i in 1..=5 {
+            assert_has(&buffer, &format!("linha {i}"));
+        }
+        assert_has(&buffer, "linhas 1–5 de 5");
+        assert_has(&buffer, "Confirma o envio para o claude? (s/N)");
+        assert_has(
+            &buffer,
+            "Salvo em /repo/auto_scrum/logs/po_discussion_20261119_120000.md",
+        );
+        assert_has(&buffer, PROMPT_KEYS);
+        // In the jail: no warning in red.
+        let buffer = render(&preview(5, 0, true, None).app);
+        assert!(find(&buffer, "FORA DA JAIL").is_none());
+        assert_has(&buffer, "Jail (ai-jail): ativa | modo de clipboard médio");
+    }
+
+    #[test]
+    fn the_preview_scrolls_and_says_where_it_is() {
+        let area = Rect::new(0, 0, 100, 30);
+        let (rows, max) = prompt_window(&preview(100, 0, true, None).app, area).unwrap();
+        assert_eq!(max, 100 - rows);
+        assert_eq!(
+            prompt_window(&fixture().app, area),
+            None,
+            "no preview, no window"
+        );
+        let buffer = render(&preview(100, 10, true, None).app);
+        assert_has(&buffer, &format!("linhas 11–{} de 100", 10 + rows));
+        assert!(find(&buffer, "linha 10 ").is_none() && find(&buffer, "linha 10\n").is_none());
+        assert_has(&buffer, "linha 11");
+        assert!(find(&buffer, &format!("linha {}", 11 + rows)).is_none());
+        // A scroll past the end is drawn at the end.
+        let buffer = render(&preview(100, 500, true, None).app);
+        assert_has(&buffer, "linha 100");
+        assert_has(&buffer, &format!("linhas {}–100 de 100", 101 - rows));
+    }
+
+    #[test]
+    fn a_long_line_of_the_prompt_wraps_keeping_its_indentation() {
+        assert_eq!(
+            wrap_keeping_spaces("  um dois tres", 8),
+            ["  um ", "dois ", "tres"]
+        );
+        assert_eq!(wrap_keeping_spaces("", 8), [""]);
+        assert_eq!(wrap_keeping_spaces("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        // Wide characters count 2 columns; one wider than the row still goes, alone.
+        assert_eq!(wrap_keeping_spaces("日本語", 4), ["日本", "語"]);
+        assert_eq!(wrap_keeping_spaces("日x", 1), ["日", "x"]);
+        // A long line (the limit of an argument is 128 KiB) wraps in linear time.
+        let long = "palavra ".repeat(16 * 1024);
+        let start = std::time::Instant::now();
+        let rows = wrap_keeping_spaces(&long, 80);
+        assert_eq!(rows.concat(), long);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_tab_of_the_prompt_shows_as_spaces_up_to_the_next_stop() {
+        assert_eq!(expand_tabs("a\tb"), "a       b");
+        assert_eq!(expand_tabs("\tx"), "        x");
+        assert_eq!(expand_tabs("abcdefgh\ti"), "abcdefgh        i");
+        assert_eq!(expand_tabs("sem tab"), "sem tab");
+        let mut f = preview(1, 0, true, None);
+        if let Some(Dialog::ConfirmPrompt { rendered, .. }) = &mut f.app.dialog {
+            rendered.prompt = "fn main() {\n\tcodigo();\n}\n".into();
+        }
+        let buffer = render(&f.app);
+        assert_has(&buffer, "        codigo();");
+        assert!(find(&buffer, "?codigo").is_none(), "no ? for the tab");
+    }
+
+    #[test]
+    fn the_preview_covers_the_screen_above_the_help_and_the_keys_show_once() {
+        let f = preview(100, 0, true, None);
+        let buffer = render(&f.app);
+        let text = text(&buffer);
+        assert_eq!(text.matches(PROMPT_KEYS).count(), 1, "{text}");
+        assert_eq!(
+            last_line(&buffer).trim(),
+            PROMPT_KEYS,
+            "the keys on the help line"
+        );
+        // Nothing of the list behind shows through: no corner of its frame beside the box.
+        for (row, line) in text.lines().enumerate().take(29) {
+            assert!(
+                !line.starts_with('└') && !line.starts_with('┌'),
+                "{row}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preview_on_a_narrow_terminal_does_not_panic() {
+        for (w, h) in [(20, 10), (8, 4), (3, 3), (1, 1)] {
+            render_at(&preview(30, 3, false, Some("Aviso")).app, w, h, None);
+        }
+        render_at(
+            &form(StageType::Development, &["SC-1", ""], 1).app,
+            20,
+            8,
+            None,
         );
     }
 
@@ -1533,21 +2077,31 @@ mod tests {
     // ---- several agents side by side (NS-34) ----
 
     use crate::keys::Shortcut;
-    use crate::launch::{AgentLauncher, Precheck};
+    use crate::launch::{AgentLauncher, RenderRequest};
     use std::path::Path;
 
-    /// Spawns nothing: the app only needs the check to say whether the agent is in the jail.
-    struct NoSpawn(bool);
+    /// Spawns nothing (the jail comes in the precheck given to `open_agent`).
+    struct NoSpawn;
 
     impl AgentLauncher for NoSpawn {
         fn check(&mut self, _: &Path, _: &Path) -> Result<Precheck, String> {
-            Ok(Precheck {
-                jail: self.0,
-                warning: None,
-            })
+            unreachable!("open_agent does not check again")
         }
 
-        fn spawn(&mut self, _: &Path, _: &Path, _: i64, _: &str, _: &str) -> Result<(), String> {
+        fn render(&mut self, _: &Path, _: &Path, _: &RenderRequest) -> Result<Rendered, String> {
+            unreachable!("open_agent does not render")
+        }
+
+        fn spawn(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            _: i64,
+            _: &str,
+            _: &str,
+            _: StageType,
+            _: &Path,
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -1581,8 +2135,10 @@ mod tests {
             f.app.open_agent(
                 &dir,
                 &t,
-                Stage::Development,
-                &mut NoSpawn(!name.starts_with("fora")),
+                StageType::Development,
+                Path::new("/log.md"),
+                precheck(!name.starts_with("fora")),
+                &mut NoSpawn,
             );
         }
         (f, root)
@@ -1920,8 +2476,14 @@ mod tests {
                 .unwrap();
             let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
             f.app.project = Some(p);
-            f.app
-                .open_agent(&dir, &t, Stage::Development, &mut NoSpawn(jail));
+            f.app.open_agent(
+                &dir,
+                &t,
+                StageType::Development,
+                Path::new("/log.md"),
+                precheck(jail),
+                &mut NoSpawn,
+            );
             let agent = f.app.shown_agent().unwrap();
             assert_eq!(agent.name, name);
             assert_eq!(agent_area(&f.app, area, agent), expected, "{names:?}");

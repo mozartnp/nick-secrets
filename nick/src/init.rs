@@ -8,13 +8,9 @@ use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
-use signal_hook::consts::{SIGINT, SIGQUIT};
 
 use crate::paths::{normalize, printable};
-use crate::terminal::{InputGate, TerminalGuard};
+use crate::terminal::{self, IgnoreTerminalSignals, InputGate, TerminalGuard};
 
 /// bin/nick-init of the checkout this binary was built from, before normalization.
 const DEFAULT_INIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-init");
@@ -58,9 +54,8 @@ impl<'a> TerminalInitRunner<'a> {
 
 impl InitRunner for TerminalInitRunner<'_> {
     fn run(&mut self, init: &Path, project: &Path) -> InitOutcome {
-        self.gate.close();
-        let result = self.guard.suspend(|| run_in_terminal(init, project));
-        self.gate.open();
+        let result =
+            terminal::run_suspended(self.guard, self.gate, || run_in_terminal(init, project));
         match result {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -97,31 +92,6 @@ fn run_in_terminal(init: &Path, project: &Path) -> InitOutcome {
     // Any line, or the end of the input, goes back.
     let _ = io::stdin().lock().read_line(&mut String::new());
     outcome
-}
-
-/// While alive, SIGINT and SIGQUIT only set a flag that nobody reads (so they do nothing to
-/// the nick). Dropping it removes the handlers: back in raw mode, Ctrl+C is a key again.
-struct IgnoreTerminalSignals {
-    ids: Vec<signal_hook::SigId>,
-}
-
-impl IgnoreTerminalSignals {
-    fn new() -> IgnoreTerminalSignals {
-        let flag = Arc::new(AtomicBool::new(false));
-        let ids = [SIGINT, SIGQUIT]
-            .into_iter()
-            .filter_map(|signal| signal_hook::flag::register(signal, Arc::clone(&flag)).ok())
-            .collect();
-        IgnoreTerminalSignals { ids }
-    }
-}
-
-impl Drop for IgnoreTerminalSignals {
-    fn drop(&mut self) {
-        for id in self.ids.drain(..) {
-            signal_hook::low_level::unregister(id);
-        }
-    }
 }
 
 /// The init to run: NICK_INIT_BIN when it is set and not empty (made absolute against the cwd

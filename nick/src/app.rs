@@ -3,8 +3,12 @@
 //! bin/nick-init is `Action::RunInit`, and only the "Criar configuração" button of the
 //! missing-config alert produces it (plan D7 of NS-31). The navigation is Modules > Projects >
 //! Tickets; the rules of the tickets are in tickets.rs, and none of them touches a file of the
-//! project. From a ticket, `g` and a stage open an agent (NS-33): `Action::OpenAgent`, which
-//! the loop hands to `open_agent` with the real `AgentLauncher` (launch.rs). Several agents
+//! project. From a ticket, `g` opens an agent (NS-33) by the flow of auto_scrum.sh (NS-35): the
+//! check of the launcher (`Action::CheckAgent`), the menu of the stage types its flags offer, the
+//! form of the type (stages.rs; the long text in `$EDITOR`, `Action::EditDescription`), the
+//! prompt built by bash (`Action::RenderPrompt`), its preview with the `(s/N)` confirmation, and
+//! `Action::OpenAgent`, which the loop hands to `open_agent` with the real `AgentLauncher`
+//! (launch.rs). Several agents
 //! run at once (NS-34): the list stays on the left and the shown agent on the right, and the
 //! reserved shortcut (`keys::Shortcut`, kept in the database) toggles the focus between them;
 //! with the focus on the terminal every other key goes to the program (`Action::Send`). The
@@ -16,14 +20,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-use crate::agents::{self, OpenAgent, Stage};
+use crate::agents::{self, OpenAgent};
 use crate::db::{Db, SETTING_RESERVED_SHORTCUT};
+use crate::editor::{EditorOutcome, EditorRunner};
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
-use crate::launch::{self, AgentLauncher};
+use crate::launch::{self, AgentLauncher, Precheck, RenderRequest, Rendered};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
+use crate::stages::{self, Input, StageType};
 use crate::tickets::{self, Ticket};
 
 /// The list on the screen.
@@ -86,12 +92,33 @@ pub enum Dialog {
     EditTitle { ticket: Ticket, input: String },
     /// The `(s/N)` confirmation of hiding a ticket.
     ConfirmHide { ticket: Ticket },
-    /// "Abrir agente": the stage of an agent for the ticket of the project at `project`
-    /// (`index` in `Stage::ALL`).
-    ChooseStage {
+    /// "Abrir agente": the type of the stage for the ticket of the project at `project`, among
+    /// `types` (the menu of `choose_type` with the flags of the check), `index` selected.
+    ChooseType {
         project: PathBuf,
         ticket: Ticket,
+        precheck: Precheck,
+        types: Vec<StageType>,
         index: usize,
+    },
+    /// The form of `kind`: one value per field (stages.rs), `focus` the field being answered.
+    StageForm {
+        project: PathBuf,
+        ticket: Ticket,
+        precheck: Precheck,
+        kind: StageType,
+        values: Vec<String>,
+        focus: usize,
+    },
+    /// The prompt bash built, before the launch: the `(s/N)` confirmation, with the prompt
+    /// scrolled `scroll` lines down.
+    ConfirmPrompt {
+        project: PathBuf,
+        ticket: Ticket,
+        precheck: Precheck,
+        kind: StageType,
+        rendered: Rendered,
+        scroll: usize,
     },
     /// Why no agent was opened (the launcher is missing, or its check failed).
     AgentError { message: String },
@@ -113,12 +140,26 @@ pub enum Action {
     RunInit {
         project: PathBuf,
     },
-    /// Open an agent of `stage` for `ticket`, with the cwd at `project` (the path in the
-    /// database); the loop calls `open_agent`.
+    /// Check the launcher before the menu of the types (`g` on a ticket); the loop calls
+    /// `check_agent`.
+    CheckAgent {
+        project: PathBuf,
+        ticket: Ticket,
+    },
+    /// Open the editor on the focused field of the form; the loop calls `edit_description`.
+    EditDescription,
+    /// Build the prompt of the form (its answers passed the rules); the loop calls
+    /// `render_prompt`.
+    RenderPrompt,
+    /// Open an agent of `kind` for `ticket`, with the cwd at `project` (the path in the
+    /// database) and the prompt of `log` (confirmed on the preview); the loop calls
+    /// `open_agent`.
     OpenAgent {
         project: PathBuf,
         ticket: Ticket,
-        stage: Stage,
+        kind: StageType,
+        log: PathBuf,
+        precheck: Precheck,
     },
     /// Write these bytes to the agent's terminal.
     Send(Vec<u8>),
@@ -213,6 +254,10 @@ pub struct App {
     /// default).
     pub(crate) shortcut: Shortcut,
     pub(crate) shortcut_stored: bool,
+    /// The window of the preview of the prompt: the rows shown at a time (a page) and the
+    /// largest scroll (its end). The loop computes it from the screen (`ui::prompt_window`) and
+    /// sets it before each key, so the App does not know the drawing.
+    pub(crate) prompt_window: (usize, usize),
 }
 
 impl App {
@@ -244,6 +289,23 @@ impl App {
             back: Screen::Modules,
             shortcut: Shortcut::DEFAULT,
             shortcut_stored: false,
+            prompt_window: (0, 0),
+        }
+    }
+
+    /// The window of the preview of the prompt (rows shown, largest scroll), set by the loop
+    /// before each key while the preview is open.
+    pub fn set_prompt_window(&mut self, rows: usize, max: usize) {
+        self.prompt_window = (rows, max);
+    }
+
+    /// The preview of the prompt, when it is open: the check and the prompt bash built.
+    pub fn prompt_preview(&self) -> Option<(&Precheck, &Rendered)> {
+        match &self.dialog {
+            Some(Dialog::ConfirmPrompt {
+                precheck, rendered, ..
+            }) => Some((precheck, rendered)),
+            _ => None,
         }
     }
 
@@ -347,6 +409,9 @@ impl App {
             }
             // The agents are carried out by the loop (main.rs).
             Action::None
+            | Action::CheckAgent { .. }
+            | Action::EditDescription
+            | Action::RenderPrompt
             | Action::OpenAgent { .. }
             | Action::Send(_)
             | Action::ScrollPageUp
@@ -397,11 +462,29 @@ impl App {
             }) => self.key_new_ticket(key, title, jira_id, focus),
             Some(Dialog::EditTitle { ticket, input }) => self.key_edit_title(key, ticket, input),
             Some(Dialog::ConfirmHide { ticket }) => self.key_confirm_hide(key, ticket),
-            Some(Dialog::ChooseStage {
+            Some(Dialog::ChooseType {
                 project,
                 ticket,
+                precheck,
+                types,
                 index,
-            }) => self.key_choose_stage(key, project, ticket, index),
+            }) => self.key_choose_type(key, project, ticket, precheck, types, index),
+            Some(Dialog::StageForm {
+                project,
+                ticket,
+                precheck,
+                kind,
+                values,
+                focus,
+            }) => self.key_stage_form(key, project, ticket, precheck, kind, values, focus),
+            Some(Dialog::ConfirmPrompt {
+                project,
+                ticket,
+                precheck,
+                kind,
+                rendered,
+                scroll,
+            }) => self.key_confirm_prompt(key, project, ticket, precheck, kind, rendered, scroll),
             Some(Dialog::AgentError { message }) => self.key_agent_error(key, message),
             Some(Dialog::ConfirmEndAgent { id, .. }) => confirmed(key, Action::EndAgent(id)),
             Some(Dialog::ConfirmQuit) => confirmed(key, Action::QuitEndingAgents),
@@ -735,7 +818,7 @@ impl App {
                 }
             }
             KeyCode::Char('f') => self.show_hidden = !self.show_hidden,
-            KeyCode::Char('g') => self.choose_stage(),
+            KeyCode::Char('g') => return self.choose_stage(),
             KeyCode::Char('v') => self.open_active_agents(),
             KeyCode::Esc | KeyCode::Left => {
                 self.screen = Screen::Projects;
@@ -831,82 +914,44 @@ impl App {
         Action::None
     }
 
-    /// `g` on a ticket: the stage dialog, only for a visible ticket of a project available now
-    /// (read from the disk at the key, like the Enter on a project).
-    fn choose_stage(&mut self) {
+    /// `g` on a ticket: the check of the launcher (`Action::CheckAgent`), then the menu, only for
+    /// a visible ticket of a project available now (read from the disk at the key, like the Enter
+    /// on a project).
+    fn choose_stage(&mut self) -> Action {
         let Some(ticket) = self.ticket_rows.get(self.ticket_index).cloned() else {
-            return;
+            return Action::None;
         };
         if ticket.hidden_at.is_some() {
             self.status = Some(format!(
                 "O ticket {} está oculto. Restaure-o (o) para abrir um agente.",
                 ticket.key
             ));
-            return;
+            return Action::None;
         }
         let Some(project) = self.project.as_ref() else {
-            return;
+            return Action::None;
         };
         if let Some(mark) = projects::unavailable_text(projects::availability(&project.path)) {
             self.status = Some(format!(
                 "Projeto indisponível: {mark}. O agente só abre com a pasta e o \
                  .nick/nick.conf no lugar."
             ));
-            return;
+            return Action::None;
         }
-        self.dialog = Some(Dialog::ChooseStage {
+        Action::CheckAgent {
             project: project.path.clone(),
             ticket,
-            index: 0,
-        });
-    }
-
-    fn key_choose_stage(
-        &mut self,
-        key: KeyEvent,
-        project: PathBuf,
-        ticket: Ticket,
-        mut index: usize,
-    ) -> Action {
-        match key.code {
-            KeyCode::Esc => return Action::None,
-            KeyCode::Enter => {
-                return Action::OpenAgent {
-                    project,
-                    ticket,
-                    stage: Stage::ALL[index],
-                };
-            }
-            KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => index = (index + 1).min(Stage::ALL.len() - 1),
-            _ => {}
         }
-        self.dialog = Some(Dialog::ChooseStage {
-            project,
-            ticket,
-            index,
-        });
-        Action::None
     }
 
-    fn key_agent_error(&mut self, key: KeyEvent, message: String) -> Action {
-        if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-            self.dialog = Some(Dialog::AgentError { message });
-        }
-        Action::None
-    }
-
-    /// Opens an agent of `stage` for `ticket` with the cwd at `project` (plan D9): checks that
-    /// the launcher exists, runs its `--check` (a failure becomes the alert, and nothing is
-    /// stored nor launched), then generates the session ID and the name, takes the lock and
-    /// stores the `active` row (agents.rs), and only then starts the PTY. A failing start ends
-    /// the row and releases the lock. The agent joins the running ones, is shown and gets the
-    /// focus; the list stays on the same ticket.
-    pub fn open_agent(
+    /// The check before the menu (plan D7 of NS-35): the launcher must be a file, and its
+    /// `--check` must pass (a failure becomes the alert, with `Nada foi aberto.` on top, and
+    /// nothing is stored nor launched). Then the menu of the types the flags of the project offer
+    /// (`StageType::menu`).
+    pub fn check_agent(
         &mut self,
         project: &Path,
         ticket: &Ticket,
-        stage: Stage,
         launcher: &mut dyn AgentLauncher,
     ) {
         if !self.launcher.is_file() {
@@ -918,17 +963,273 @@ impl App {
             });
             return;
         }
-        let check = match launcher.check(&self.launcher, project) {
-            Ok(check) => check,
-            Err(message) => {
-                // "Nada foi aberto." first: the error of the jail is long, and a short terminal
-                // cuts the end of the alert.
-                self.dialog = Some(Dialog::AgentError {
-                    message: format!("Nada foi aberto.\n\n{message}"),
+        match launcher.check(&self.launcher, project) {
+            Ok(precheck) => {
+                self.dialog = Some(Dialog::ChooseType {
+                    project: project.to_path_buf(),
+                    ticket: ticket.clone(),
+                    types: StageType::menu(precheck.jira, precheck.sentry),
+                    precheck,
+                    index: 0,
                 });
+            }
+            Err(message) => self.agent_failed(&message),
+        }
+    }
+
+    /// The alert of an agent not opened (a failing `--check` or `--render`), with `Nada foi
+    /// aberto.` first: the error of the jail is long, and a short terminal cuts the end of the
+    /// alert.
+    fn agent_failed(&mut self, message: &str) {
+        self.dialog = Some(Dialog::AgentError {
+            message: format!("Nada foi aberto.\n\n{message}"),
+        });
+    }
+
+    fn key_choose_type(
+        &mut self,
+        key: KeyEvent,
+        project: PathBuf,
+        ticket: Ticket,
+        precheck: Precheck,
+        types: Vec<StageType>,
+        mut index: usize,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => return Action::None,
+            KeyCode::Enter => {
+                if let Some(kind) = types.get(index).copied() {
+                    self.dialog = Some(Dialog::StageForm {
+                        values: kind.initial_values(&ticket.key),
+                        project,
+                        ticket,
+                        precheck,
+                        kind,
+                        focus: 0,
+                    });
+                    return Action::None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                index = (index + 1).min(types.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+        self.dialog = Some(Dialog::ChooseType {
+            project,
+            ticket,
+            precheck,
+            types,
+            index,
+        });
+        Action::None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn key_stage_form(
+        &mut self,
+        key: KeyEvent,
+        project: PathBuf,
+        ticket: Ticket,
+        precheck: Precheck,
+        kind: StageType,
+        mut values: Vec<String>,
+        mut focus: usize,
+    ) -> Action {
+        let fields = kind.fields();
+        let count = fields.len();
+        let mut action = Action::None;
+        match key.code {
+            KeyCode::Esc => {
+                // Nothing was written: the log only exists after --render.
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Tab | KeyCode::Down => focus = (focus + 1) % count,
+            KeyCode::BackTab | KeyCode::Up => focus = (focus + count - 1) % count,
+            KeyCode::Enter if fields[focus].input == Input::Editor => {
+                action = Action::EditDescription;
+            }
+            KeyCode::Enter => match stages::render_args(kind, &values) {
+                Ok(_) => {
+                    self.status = None;
+                    action = Action::RenderPrompt;
+                }
+                Err(refusal) => {
+                    self.status = Some(refusal.message);
+                    focus = refusal.field;
+                }
+            },
+            // An editor field is not typed into: Enter opens the editor.
+            _ if fields[focus].input == Input::Line => {
+                edit_text(&mut values[focus], key);
+            }
+            _ => {}
+        }
+        self.dialog = Some(Dialog::StageForm {
+            project,
+            ticket,
+            precheck,
+            kind,
+            values,
+            focus,
+        });
+        action
+    }
+
+    /// `Action::EditDescription`: the editor on the focused field of the form, with its current
+    /// text (plan D8 of NS-35). A text fills the field and the focus goes to the next one; an
+    /// empty file (or one with only line breaks) leaves it empty, with the message of
+    /// `read_via_editor`, and the operator decides (Enter opens it again, Esc gives up: unlike the
+    /// script, no loop); an editor that does not open says why.
+    pub fn edit_description(&mut self, runner: &mut dyn EditorRunner) {
+        let Some(Dialog::StageForm {
+            kind,
+            values,
+            focus,
+            ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        let fields = kind.fields();
+        let Some(field) = fields.get(*focus).filter(|f| f.input == Input::Editor) else {
+            return;
+        };
+        let label = stages::field_label(field, "");
+        match runner.edit(&label, &values[*focus]) {
+            EditorOutcome::Text(text) if !text.is_empty() => {
+                values[*focus] = text;
+                *focus = (*focus + 1) % fields.len();
+                self.status = None;
+            }
+            EditorOutcome::Text(_) | EditorOutcome::Empty => {
+                values[*focus].clear();
+                self.status = Some("Esse campo é obrigatório, tente de novo.".into());
+            }
+            EditorOutcome::Failed { editor, error } => {
+                self.status = Some(format!("Não consegui abrir o editor {editor}: {error}."));
+            }
+        }
+    }
+
+    /// `Action::RenderPrompt`: `bin/nick-agent --render` with the answers of the form (the
+    /// prompt is built by bash, into its log). A failure becomes the alert, with `Nada foi
+    /// aberto.` on top; a success opens the preview.
+    pub fn render_prompt(&mut self, launcher: &mut dyn AgentLauncher) {
+        let Some(Dialog::StageForm {
+            project,
+            ticket,
+            precheck,
+            kind,
+            values,
+            ..
+        }) = self.dialog.clone()
+        else {
+            return;
+        };
+        let answers = match stages::render_args(kind, &values) {
+            Ok(answers) => answers,
+            Err(refusal) => {
+                self.status = Some(refusal.message);
                 return;
             }
         };
+        let request = RenderRequest { kind, answers };
+        match launcher.render(&self.launcher, &project, &request) {
+            Ok(rendered) => {
+                self.dialog = Some(Dialog::ConfirmPrompt {
+                    project,
+                    ticket,
+                    precheck,
+                    kind,
+                    rendered,
+                    scroll: 0,
+                });
+            }
+            Err(message) => self.agent_failed(&message),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn key_confirm_prompt(
+        &mut self,
+        key: KeyEvent,
+        project: PathBuf,
+        ticket: Ticket,
+        precheck: Precheck,
+        kind: StageType,
+        rendered: Rendered,
+        mut scroll: usize,
+    ) -> Action {
+        if is_yes(key) {
+            return Action::OpenAgent {
+                project,
+                ticket,
+                kind,
+                log: rendered.log,
+                precheck,
+            };
+        }
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
+        ) {
+            // The text of auto_scrum.sh: the log stays where --render wrote it.
+            self.status = Some(format!(
+                "Cancelado. O prompt gerado continua salvo em: {}",
+                rendered.log.display()
+            ));
+            return Action::None;
+        }
+        let (rows, max) = self.prompt_window;
+        let page = rows.max(1);
+        scroll = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => scroll + 1,
+            KeyCode::PageUp => scroll.saturating_sub(page),
+            KeyCode::PageDown => scroll + page,
+            KeyCode::Home => 0,
+            KeyCode::End => max,
+            _ => scroll,
+        }
+        .min(max);
+        self.dialog = Some(Dialog::ConfirmPrompt {
+            project,
+            ticket,
+            precheck,
+            kind,
+            rendered,
+            scroll,
+        });
+        Action::None
+    }
+
+    fn key_agent_error(&mut self, key: KeyEvent, message: String) -> Action {
+        if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            self.dialog = Some(Dialog::AgentError { message });
+        }
+        Action::None
+    }
+
+    /// Opens an agent of `kind` for `ticket` with the cwd at `project`, with the prompt of `log`
+    /// (confirmed on the preview), and the jail and the warning of `precheck` (plan D9 of NS-33,
+    /// D7 of NS-35): the check is not run again (the launch repeats the checks in bash). It
+    /// generates the session ID and the name (the stage of the type and the ID of the ticket),
+    /// takes the lock and stores the `active` row (agents.rs), and only then starts the PTY. A
+    /// failing start ends the row and releases the lock. The agent joins the running ones, is
+    /// shown and gets the focus; the list stays on the same ticket.
+    pub fn open_agent(
+        &mut self,
+        project: &Path,
+        ticket: &Ticket,
+        kind: StageType,
+        log: &Path,
+        check: Precheck,
+        launcher: &mut dyn AgentLauncher,
+    ) {
+        let stage = kind.stage();
         let project_name = self.project.as_ref().map_or("", |p| p.name.as_str());
         let name = agents::agent_name(project_name, stage, &ticket.key);
         let session_id = match self.db.random_session_id() {
@@ -951,7 +1252,8 @@ impl App {
             }
         };
         let id = record.agent.id;
-        if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name) {
+        if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name, kind, log)
+        {
             let mut message = format!("Não consegui abrir o agente: {err}.");
             if let Err(db) = agents::end(&self.db, record) {
                 message = format!("{message} {db}");
@@ -2412,31 +2714,55 @@ mod tests {
         assert_eq!(f.app.handle_key(release), Action::None);
     }
 
-    // ---- agents (NS-33) ----
+    // ---- agents (NS-33; the flow of the stages, NS-35) ----
 
     use crate::agents::{self, Stage};
-    use crate::launch::{AgentLauncher, Precheck};
+    use crate::editor::{EditorOutcome, EditorRunner};
+    use crate::launch::{AgentLauncher, Precheck, RenderRequest, Rendered};
+    use crate::stages::StageType;
 
     /// A fake launcher: records the calls and returns the scripted results. `ids` are the
-    /// agent ids of the spawns (NS-34), apart so `spawns` keeps the shape of the NS-33.
+    /// agent ids of the spawns (NS-34), and `kinds` the type and the prompt file of each spawn
+    /// (NS-35), apart so `spawns` keeps the shape of the NS-33.
     struct FakeLauncher {
         checks: Vec<(PathBuf, PathBuf)>,
+        renders: Vec<(PathBuf, PathBuf, RenderRequest)>,
         spawns: Vec<(PathBuf, PathBuf, String, String)>,
         ids: Vec<i64>,
+        kinds: Vec<(StageType, PathBuf)>,
         check: Result<Precheck, String>,
+        render: Result<Rendered, String>,
         spawn: Result<(), String>,
+    }
+
+    /// The log of the fake render.
+    const LOG: &str = "/logs/po_discussion_20261119_120000.md";
+
+    /// A rendered prompt of `rows` lines (`linha 1`, `linha 2`, ...).
+    fn rendered(rows: usize) -> Rendered {
+        Rendered {
+            log: PathBuf::from(LOG),
+            prompt: (1..=rows).map(|i| format!("linha {i}\n")).collect(),
+            status: "Jail (ai-jail): desligada — o agente roda direto no seu shell.".into(),
+            warning: None,
+        }
     }
 
     impl FakeLauncher {
         fn new(jail: bool) -> FakeLauncher {
             FakeLauncher {
                 checks: Vec::new(),
+                renders: Vec::new(),
                 spawns: Vec::new(),
                 ids: Vec::new(),
+                kinds: Vec::new(),
                 check: Ok(Precheck {
                     jail,
+                    jira: false,
+                    sentry: false,
                     warning: None,
                 }),
+                render: Ok(rendered(3)),
                 spawn: Ok(()),
             }
         }
@@ -2449,6 +2775,20 @@ mod tests {
             self.check.clone()
         }
 
+        fn render(
+            &mut self,
+            launcher: &Path,
+            project: &Path,
+            request: &RenderRequest,
+        ) -> Result<Rendered, String> {
+            self.renders.push((
+                launcher.to_path_buf(),
+                project.to_path_buf(),
+                request.clone(),
+            ));
+            self.render.clone()
+        }
+
         fn spawn(
             &mut self,
             launcher: &Path,
@@ -2456,8 +2796,11 @@ mod tests {
             agent_id: i64,
             session_id: &str,
             name: &str,
+            kind: StageType,
+            prompt_file: &Path,
         ) -> Result<(), String> {
             self.ids.push(agent_id);
+            self.kinds.push((kind, prompt_file.to_path_buf()));
             self.spawns.push((
                 launcher.to_path_buf(),
                 project.to_path_buf(),
@@ -2465,6 +2808,28 @@ mod tests {
                 name.to_string(),
             ));
             self.spawn.clone()
+        }
+    }
+
+    /// A fake editor: records (label, text) of each call and returns the next outcome.
+    struct FakeEditor {
+        calls: Vec<(String, String)>,
+        outcomes: Vec<EditorOutcome>,
+    }
+
+    impl FakeEditor {
+        fn new(outcomes: Vec<EditorOutcome>) -> FakeEditor {
+            FakeEditor {
+                calls: Vec::new(),
+                outcomes,
+            }
+        }
+    }
+
+    impl EditorRunner for FakeEditor {
+        fn edit(&mut self, label: &str, text: &str) -> EditorOutcome {
+            self.calls.push((label.to_string(), text.to_string()));
+            self.outcomes.remove(0)
         }
     }
 
@@ -2481,6 +2846,17 @@ mod tests {
         f.key(KeyCode::Up);
         assert_eq!(f.keys(), ["NS-1", "NS-2"]);
         (f, p)
+    }
+
+    /// The type each stage of the NS-33/NS-34 tests opens with now: PO by its discussion (one
+    /// line), the others by their own type.
+    fn kind_of(stage: Stage) -> StageType {
+        match stage {
+            Stage::Po => StageType::PoDiscussion,
+            Stage::TechLeader => StageType::TechLeader,
+            Stage::Development => StageType::Development,
+            Stage::Review => StageType::Review,
+        }
     }
 
     impl Fixture {
@@ -2504,33 +2880,109 @@ mod tests {
             .collect()
         }
 
-        fn stage_index(&self) -> usize {
-            match &self.app.dialog {
-                Some(Dialog::ChooseStage { index, .. }) => *index,
-                other => panic!("not in the stage dialog: {other:?}"),
+        /// `g` and the check it asks for (`Action::CheckAgent`), carried out with `launcher`.
+        fn g(&mut self, launcher: &mut FakeLauncher) {
+            match self.ch('g') {
+                Action::CheckAgent { project, ticket } => {
+                    self.app.check_agent(&project, &ticket, launcher);
+                }
+                other => panic!("no CheckAgent: {other:?}"),
             }
         }
 
-        /// `g`, `Down` x `downs`, `Enter`: the OpenAgent action.
-        fn choose(&mut self, downs: usize) -> Action {
-            assert_eq!(self.ch('g'), Action::None);
-            for _ in 0..downs {
+        /// The types of the menu and the selected one.
+        fn menu(&self) -> (Vec<StageType>, usize) {
+            match &self.app.dialog {
+                Some(Dialog::ChooseType { types, index, .. }) => (types.clone(), *index),
+                other => panic!("not in the menu: {other:?}"),
+            }
+        }
+
+        /// The type, the values and the focus of the form.
+        fn form(&self) -> (StageType, Vec<String>, usize) {
+            match &self.app.dialog {
+                Some(Dialog::StageForm {
+                    kind,
+                    values,
+                    focus,
+                    ..
+                }) => (*kind, values.clone(), *focus),
+                other => panic!("not in the form: {other:?}"),
+            }
+        }
+
+        /// The scroll of the preview.
+        fn scroll(&self) -> usize {
+            match &self.app.dialog {
+                Some(Dialog::ConfirmPrompt { scroll, .. }) => *scroll,
+                other => panic!("not in the preview: {other:?}"),
+            }
+        }
+
+        /// From the menu, ↓ until `kind` and Enter: its form.
+        fn pick(&mut self, kind: StageType) {
+            let (types, _) = self.menu();
+            let at = types.iter().position(|t| *t == kind).expect("in the menu");
+            for _ in 0..at {
                 self.key(KeyCode::Down);
+            }
+            assert_eq!(self.key(KeyCode::Enter), Action::None);
+            assert_eq!(self.form().0, kind);
+        }
+
+        /// Fills the empty required fields of the form (a line: `Resposta`; the editor:
+        /// `Descrição longa`), going back to the first field, and Enter there: the action.
+        fn fill_and_enter(&mut self) -> Action {
+            let (kind, values, _) = self.form();
+            for (i, field) in kind.fields().iter().enumerate() {
+                while self.form().2 != i {
+                    self.key(KeyCode::Tab);
+                }
+                if !values[i].is_empty() || field.rule == crate::stages::Rule::Optional {
+                    continue;
+                }
+                match field.input {
+                    Input::Line if field.rule == crate::stages::Rule::Plan => {}
+                    Input::Line => self.type_text("Resposta"),
+                    Input::Editor => {
+                        assert_eq!(self.key(KeyCode::Enter), Action::EditDescription);
+                        let mut editor =
+                            FakeEditor::new(vec![EditorOutcome::Text("Descrição longa".into())]);
+                        self.app.edit_description(&mut editor);
+                    }
+                }
+            }
+            while self.form().2 != 0 {
+                self.key(KeyCode::Tab);
             }
             self.key(KeyCode::Enter)
         }
 
-        /// Chooses the stage and carries out the action with `launcher`.
+        /// The whole flow of the stage `downs` (in `Stage::ALL`, as in the NS-33): `g`, the
+        /// check, the type of the stage (`kind_of`), the form, the render, `s` on the preview
+        /// and the launch with `launcher`.
         fn open_agent(&mut self, downs: usize, launcher: &mut FakeLauncher) {
+            self.open_kind(kind_of(Stage::ALL[downs]), launcher);
+        }
+
+        /// `open_agent` of a type.
+        fn open_kind(&mut self, kind: StageType, launcher: &mut FakeLauncher) {
+            self.g(launcher);
+            self.pick(kind);
+            assert_eq!(self.fill_and_enter(), Action::RenderPrompt);
+            self.app.render_prompt(launcher);
             let Action::OpenAgent {
                 project,
                 ticket,
-                stage,
-            } = self.choose(downs)
+                kind,
+                log,
+                precheck,
+            } = self.ch('s')
             else {
-                panic!("no OpenAgent");
+                panic!("no OpenAgent: {:?}", self.app.dialog);
             };
-            self.app.open_agent(&project, &ticket, stage, launcher);
+            self.app
+                .open_agent(&project, &ticket, kind, &log, precheck, launcher);
         }
 
         fn alert(&self) -> String {
@@ -2546,56 +2998,468 @@ mod tests {
     }
 
     #[test]
-    fn g_on_a_visible_ticket_opens_the_stage_dialog_and_the_arrows_move() {
+    fn g_runs_the_check_before_the_menu() {
+        let (mut f, p) = with_agents();
+        let ticket = f.app.ticket_rows[0].clone();
+        assert_eq!(
+            f.ch('g'),
+            Action::CheckAgent {
+                project: p.clone(),
+                ticket: ticket.clone()
+            }
+        );
+        assert_eq!(f.app.dialog, None, "no menu before the check");
+        let mut launcher = FakeLauncher::new(false);
+        f.app.check_agent(&p, &ticket, &mut launcher);
+        assert_eq!(
+            launcher.checks,
+            [(f.root.join("bin/nick-agent"), p.clone())]
+        );
+        assert_eq!(f.menu().1, 0);
+        assert_eq!(f.agent_rows(), [], "nothing stored");
+    }
+
+    #[test]
+    fn the_menu_follows_the_flags_of_the_check_and_the_arrows_move() {
+        for (jira, sentry) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (mut f, _) = with_agents();
+            let mut launcher = FakeLauncher::new(false);
+            launcher.check = Ok(Precheck {
+                jail: false,
+                jira,
+                sentry,
+                warning: None,
+            });
+            f.g(&mut launcher);
+            assert_eq!(f.menu().0, StageType::menu(jira, sentry), "{jira} {sentry}");
+        }
         let (mut f, _) = with_agents();
-        assert_eq!(f.ch('g'), Action::None);
-        assert_eq!(f.stage_index(), 0);
+        f.g(&mut FakeLauncher::new(false));
         for (code, expected) in [
             (KeyCode::Down, 1),
             (KeyCode::Char('j'), 2),
             (KeyCode::Down, 3),
-            (KeyCode::Down, 3),
-            (KeyCode::Up, 2),
-            (KeyCode::Char('k'), 1),
+            (KeyCode::Down, 4),
+            (KeyCode::Down, 4),
+            (KeyCode::Up, 3),
+            (KeyCode::Char('k'), 2),
+            (KeyCode::Up, 1),
             (KeyCode::Up, 0),
             (KeyCode::Up, 0),
         ] {
             f.key(code);
-            assert_eq!(f.stage_index(), expected, "{code:?}");
+            assert_eq!(f.menu().1, expected, "{code:?}");
         }
     }
 
     #[test]
-    fn esc_cancels_the_stage_dialog_and_q_does_not_quit_it() {
+    fn esc_cancels_the_menu_and_q_does_not_quit_it() {
         let (mut f, _) = with_agents();
-        f.ch('g');
+        f.g(&mut FakeLauncher::new(false));
         assert_eq!(f.ch('q'), Action::None);
-        assert_eq!(f.stage_index(), 0, "q stays in the dialog");
+        assert_eq!(f.menu().1, 0, "q stays in the menu");
         assert_eq!(f.key(KeyCode::Esc), Action::None);
         assert_eq!(f.app.dialog, None);
         assert_eq!(f.app.screen, Screen::Tickets);
-        f.ch('g');
+        f.g(&mut FakeLauncher::new(false));
         assert_eq!(f.ctrl_c(), Action::Quit, "Ctrl+C quits, as in every dialog");
         assert_eq!(f.agent_rows(), []);
     }
 
     #[test]
-    fn enter_returns_open_agent_with_the_project_path_the_ticket_and_the_stage() {
-        for (downs, stage) in Stage::ALL.into_iter().enumerate() {
-            let (mut f, p) = with_agents();
-            f.key(KeyCode::Down);
-            let ticket = f.app.ticket_rows[1].clone();
-            assert_eq!(
-                f.choose(downs),
-                Action::OpenAgent {
-                    project: p,
-                    ticket,
-                    stage
-                }
-            );
-            assert_eq!(f.app.dialog, None);
-            assert_eq!(f.agent_rows(), [], "the action itself stores nothing");
+    fn the_id_comes_from_the_ticket_and_is_editable() {
+        let (mut f, _) = with_agents();
+        f.key(KeyCode::Down);
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::Development);
+        assert_eq!(
+            f.form(),
+            (
+                StageType::Development,
+                vec!["NS-2".into(), String::new()],
+                0
+            )
+        );
+        f.key(KeyCode::Backspace);
+        f.ch('9');
+        assert_eq!(f.form().1[0], "NS-9");
+        // q is typed in the form: it does not quit.
+        assert_eq!(f.ch('q'), Action::None);
+        assert_eq!(f.form().1[0], "NS-9q");
+    }
+
+    #[test]
+    fn tab_and_the_arrows_move_between_the_fields() {
+        let (mut f, _) = with_agents();
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::TechLeader);
+        for (code, expected) in [
+            (KeyCode::Tab, 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Tab, 0),
+            (KeyCode::BackTab, 2),
+            (KeyCode::Up, 1),
+        ] {
+            f.key(code);
+            assert_eq!(f.form().2, expected, "{code:?}");
         }
+    }
+
+    #[test]
+    fn each_refusal_goes_to_the_bar_with_the_focus_on_its_field() {
+        let (mut f, _) = with_agents();
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::TechLeader);
+        // The ID is filled; the title is not.
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("Esse campo é obrigatório: Título da tarefa.")
+        );
+        assert_eq!(f.form().2, 1);
+        // Only spaces count as empty (the trim of read).
+        f.type_text("   ");
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.form().2, 1);
+        f.type_text("Título");
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("Esse campo é obrigatório: Descrição / contexto.")
+        );
+        assert_eq!(f.form().2, 2, "the focus goes to the editor field");
+        // An invalid ID: the message of tickets.rs, and the focus on the ID.
+        f.key(KeyCode::Tab);
+        f.type_text("/x");
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.status(), Some(tickets::INVALID_ID_MESSAGE));
+        assert_eq!(f.form().2, 0);
+        // An empty ID is a required one.
+        for _ in 0.."NS-1/x".len() {
+            f.key(KeyCode::Backspace);
+        }
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("Esse campo é obrigatório: ID do Jira (ex: SC-123).")
+        );
+        // Esc closes without writing anything.
+        assert_eq!(f.key(KeyCode::Esc), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), None);
+    }
+
+    #[test]
+    fn the_editor_field_takes_no_typing_and_enter_opens_the_editor() {
+        let (mut f, _) = with_agents();
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::Po);
+        f.key(KeyCode::Tab);
+        f.ch('x');
+        assert_eq!(
+            f.form().1,
+            ["", ""],
+            "typing on the editor field does nothing"
+        );
+        assert_eq!(f.key(KeyCode::Enter), Action::EditDescription);
+        assert_eq!(f.form().2, 1, "the form stays for the editor");
+    }
+
+    #[test]
+    fn a_text_of_the_editor_fills_the_field_and_moves_the_focus() {
+        let (mut f, _) = with_agents();
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::TechLeader);
+        f.key(KeyCode::Tab);
+        f.key(KeyCode::Tab);
+        let mut editor = FakeEditor::new(vec![EditorOutcome::Text("  linha 1\nlinha 2".into())]);
+        f.app.edit_description(&mut editor);
+        assert_eq!(
+            editor.calls,
+            [("Descrição / contexto".to_string(), String::new())]
+        );
+        let (_, values, focus) = f.form();
+        assert_eq!(
+            values[2], "  linha 1\nlinha 2",
+            "kept as the editor left it"
+        );
+        assert_eq!(focus, 0, "the next field (wrapping to the first)");
+        assert_eq!(f.status(), None);
+    }
+
+    #[test]
+    fn an_empty_editor_leaves_the_field_empty_with_the_message_of_the_script() {
+        for outcome in [EditorOutcome::Empty, EditorOutcome::Text(String::new())] {
+            let (mut f, _) = with_agents();
+            f.g(&mut FakeLauncher::new(false));
+            f.pick(StageType::Po);
+            f.key(KeyCode::Tab);
+            let mut editor = FakeEditor::new(vec![outcome.clone()]);
+            f.app.edit_description(&mut editor);
+            assert_eq!(f.form().1[1], "");
+            assert_eq!(f.form().2, 1, "the focus stays: Enter opens it again");
+            assert_eq!(f.status(), Some("Esse campo é obrigatório, tente de novo."));
+        }
+    }
+
+    #[test]
+    fn reopening_the_editor_offers_the_current_text_and_an_empty_one_clears_it() {
+        let (mut f, _) = with_agents();
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::Po);
+        f.key(KeyCode::Tab);
+        let mut editor = FakeEditor::new(vec![
+            EditorOutcome::Text("primeira".into()),
+            EditorOutcome::Text("segunda".into()),
+            EditorOutcome::Empty,
+        ]);
+        f.app.edit_description(&mut editor);
+        f.key(KeyCode::Tab);
+        f.app.edit_description(&mut editor);
+        f.key(KeyCode::Tab);
+        f.app.edit_description(&mut editor);
+        assert_eq!(
+            editor.calls,
+            [
+                ("Descrição do pedido".to_string(), String::new()),
+                ("Descrição do pedido".to_string(), "primeira".to_string()),
+                ("Descrição do pedido".to_string(), "segunda".to_string())
+            ]
+        );
+        assert_eq!(f.form().1[1], "");
+    }
+
+    #[test]
+    fn an_editor_that_does_not_open_says_why_and_the_form_stays() {
+        let (mut f, _) = with_agents();
+        f.g(&mut FakeLauncher::new(false));
+        f.pick(StageType::Po);
+        f.key(KeyCode::Tab);
+        let mut editor = FakeEditor::new(vec![EditorOutcome::Failed {
+            editor: "vim".into(),
+            error: "comando não encontrado".into(),
+        }]);
+        f.app.edit_description(&mut editor);
+        assert_eq!(
+            f.status(),
+            Some("Não consegui abrir o editor vim: comando não encontrado.")
+        );
+        assert_eq!(
+            f.form(),
+            (StageType::Po, vec![String::new(), String::new()], 1)
+        );
+    }
+
+    #[test]
+    fn the_render_gets_the_answers_of_each_type() {
+        let flags = Precheck {
+            jail: false,
+            jira: true,
+            sentry: true,
+            warning: None,
+        };
+        for kind in StageType::ALL {
+            let (mut f, p) = with_agents();
+            let mut launcher = FakeLauncher::new(false);
+            launcher.check = Ok(flags.clone());
+            f.g(&mut launcher);
+            f.pick(kind);
+            assert_eq!(f.fill_and_enter(), Action::RenderPrompt, "{kind:?}");
+            f.app.render_prompt(&mut launcher);
+            let expected: Vec<(&str, String)> = kind
+                .fields()
+                .iter()
+                .filter_map(|field| match (field.rule, field.input) {
+                    (crate::stages::Rule::Optional | crate::stages::Rule::Plan, _) => None,
+                    (crate::stages::Rule::JiraId, _) => Some((field.flag, "NS-1".to_string())),
+                    (_, Input::Editor) => Some((field.flag, "Descrição longa".to_string())),
+                    (_, Input::Line) => Some((field.flag, "Resposta".to_string())),
+                })
+                .collect();
+            assert_eq!(
+                launcher.renders,
+                [(
+                    f.root.join("bin/nick-agent"),
+                    p.clone(),
+                    RenderRequest {
+                        kind,
+                        answers: expected
+                    }
+                )],
+                "{kind:?}"
+            );
+            assert_eq!(f.scroll(), 0, "{kind:?}: the preview opens at the top");
+        }
+    }
+
+    #[test]
+    fn the_answers_are_trimmed_and_the_optional_ones_go_when_filled() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.g(&mut launcher);
+        f.pick(StageType::Review);
+        f.key(KeyCode::Tab);
+        f.type_text("  outro.md\t");
+        f.key(KeyCode::Tab);
+        assert_eq!(f.key(KeyCode::Enter), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        assert_eq!(
+            launcher.renders[0].2.answers,
+            [
+                ("--jira-id", "NS-1".to_string()),
+                ("--plan-path", "outro.md".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_render_shows_the_alert_and_opens_nothing() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        launcher.render = Err("Erro: o tipo 'po_jira' não está disponível neste projeto.".into());
+        f.g(&mut launcher);
+        f.pick(StageType::PoDiscussion);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        assert_eq!(
+            f.alert(),
+            "Nada foi aberto.\n\nErro: o tipo 'po_jira' não está disponível neste projeto."
+        );
+        assert_eq!(launcher.spawns, []);
+        assert_eq!(f.agent_rows(), []);
+    }
+
+    #[test]
+    fn s_on_the_preview_launches_with_the_type_and_the_log_without_a_second_check() {
+        let (mut f, p) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.g(&mut launcher);
+        f.pick(StageType::Development);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        let action = f.mods(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        let Action::OpenAgent {
+            project,
+            ticket,
+            kind,
+            log,
+            precheck,
+        } = action.clone()
+        else {
+            panic!("{action:?}");
+        };
+        assert_eq!(
+            (project.clone(), kind, log.clone()),
+            (p, StageType::Development, PathBuf::from(LOG))
+        );
+        f.app
+            .open_agent(&project, &ticket, kind, &log, precheck, &mut launcher);
+        assert_eq!(launcher.checks.len(), 1, "no second check");
+        assert_eq!(
+            launcher.kinds,
+            [(StageType::Development, PathBuf::from(LOG))]
+        );
+        assert_eq!(f.agent_rows()[0].1, "development");
+        assert_eq!(f.agent_rows()[0].2, "proj · Dev · NS-1");
+    }
+
+    #[test]
+    fn the_name_keeps_the_id_of_the_ticket_when_the_id_typed_is_another() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.g(&mut launcher);
+        f.pick(StageType::Review);
+        f.key(KeyCode::Backspace);
+        f.ch('7');
+        assert_eq!(f.key(KeyCode::Enter), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        assert_eq!(
+            launcher.renders[0].2.answers[0],
+            ("--jira-id", "NS-7".to_string())
+        );
+        let Action::OpenAgent {
+            project,
+            ticket,
+            kind,
+            log,
+            precheck,
+        } = f.ch('s')
+        else {
+            panic!("no OpenAgent");
+        };
+        f.app
+            .open_agent(&project, &ticket, kind, &log, precheck, &mut launcher);
+        assert_eq!(f.agent_rows()[0].2, "proj · Review · NS-1");
+    }
+
+    #[test]
+    fn n_and_esc_cancel_the_preview_with_the_log_and_launch_nothing() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let (mut f, _) = with_agents();
+            let mut launcher = FakeLauncher::new(false);
+            f.g(&mut launcher);
+            f.pick(StageType::PoDiscussion);
+            f.fill_and_enter();
+            f.app.render_prompt(&mut launcher);
+            // Other keys are ignored: the preview stays.
+            assert_eq!(f.ch('x'), Action::None);
+            assert_eq!(f.ch('q'), Action::None);
+            assert_eq!(f.scroll(), 0);
+            assert_eq!(f.key(code), Action::None, "{code:?}");
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(
+                f.status(),
+                Some(format!("Cancelado. O prompt gerado continua salvo em: {LOG}").as_str())
+            );
+            assert_eq!(launcher.spawns, []);
+            assert_eq!(f.agent_rows(), []);
+        }
+    }
+
+    #[test]
+    fn the_scroll_of_the_preview_stays_inside_the_prompt() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        launcher.render = Ok(rendered(100));
+        f.g(&mut launcher);
+        f.pick(StageType::PoDiscussion);
+        f.fill_and_enter();
+        f.app.render_prompt(&mut launcher);
+        // The window the loop computes (ui::prompt_window) before each key.
+        let (rows, max) = (10, 90);
+        f.app.set_prompt_window(rows, max);
+        assert_eq!(
+            f.app
+                .prompt_preview()
+                .map(|(_, r)| r.prompt.lines().count()),
+            Some(100)
+        );
+        assert_eq!(f.key(KeyCode::Up), Action::None);
+        assert_eq!(f.scroll(), 0, "not above the top");
+        f.key(KeyCode::Down);
+        f.ch('j');
+        assert_eq!(f.scroll(), 2);
+        f.key(KeyCode::PageDown);
+        assert_eq!(f.scroll(), 2 + rows);
+        f.key(KeyCode::End);
+        assert_eq!(f.scroll(), max);
+        f.key(KeyCode::Down);
+        f.key(KeyCode::PageDown);
+        assert_eq!(f.scroll(), max, "not below the end");
+        f.key(KeyCode::PageUp);
+        assert_eq!(f.scroll(), max - rows);
+        f.key(KeyCode::Home);
+        assert_eq!(f.scroll(), 0);
+        // A prompt shorter than the window does not scroll.
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.g(&mut launcher);
+        f.pick(StageType::PoDiscussion);
+        f.fill_and_enter();
+        f.app.render_prompt(&mut launcher);
+        f.key(KeyCode::End);
+        f.key(KeyCode::Down);
+        assert_eq!(f.scroll(), 0);
     }
 
     #[test]
@@ -2691,12 +3555,13 @@ mod tests {
         let (mut f, _) = with_agents();
         let mut launcher = FakeLauncher::new(true);
         launcher.check = Err("Erro: a jail (ai-jail) não funciona nesta máquina.\nDetalhe".into());
-        f.open_agent(0, &mut launcher);
+        f.g(&mut launcher);
         assert_eq!(
             f.alert(),
             "Nada foi aberto.\n\nErro: a jail (ai-jail) não funciona nesta máquina.\nDetalhe"
         );
         assert_eq!(launcher.checks.len(), 1);
+        assert_eq!(launcher.renders, []);
         assert_eq!(launcher.spawns, []);
         assert_eq!(f.agent_rows(), []);
         assert_eq!(f.app.screen, Screen::Tickets);
@@ -2713,7 +3578,7 @@ mod tests {
         let bin = f.root.join("bin/nick-agent");
         fs::remove_file(&bin).unwrap();
         let mut launcher = FakeLauncher::new(false);
-        f.open_agent(0, &mut launcher);
+        f.g(&mut launcher);
         assert_eq!(
             f.alert(),
             format!(
@@ -2866,6 +3731,8 @@ mod tests {
         let mut launcher = FakeLauncher::new(false);
         launcher.check = Ok(Precheck {
             jail: false,
+            jira: false,
+            sentry: false,
             warning: Some("Aviso: falta chave.\n  X=\"\"".into()),
         });
         f.open_agent(0, &mut launcher);
@@ -2920,6 +3787,8 @@ mod tests {
         f.new_ticket("Beta", "B-1");
         launcher.check = Ok(Precheck {
             jail: false,
+            jira: false,
+            sentry: false,
             warning: None,
         });
         f.open_agent(2, &mut launcher);
@@ -3039,15 +3908,15 @@ mod tests {
     fn with_a_dialog_open_the_shortcut_is_ignored() {
         let (mut f, _) = running();
         f.shortcut();
-        f.ch('g');
-        assert!(matches!(f.app.dialog, Some(Dialog::ChooseStage { .. })));
+        f.g(&mut FakeLauncher::new(false));
+        assert!(matches!(f.app.dialog, Some(Dialog::ChooseType { .. })));
         assert_eq!(f.shortcut(), Action::None);
         assert_eq!(
             f.app.focus,
             Focus::List,
             "a pending question stays in front"
         );
-        assert!(matches!(f.app.dialog, Some(Dialog::ChooseStage { .. })));
+        assert!(matches!(f.app.dialog, Some(Dialog::ChooseType { .. })));
     }
 
     #[test]

@@ -19,6 +19,9 @@
 #   osc52    asks the terminal to copy "olá" (OSC 52, as claude does to copy), prints COPIADO
 #            and exits with 0;
 #   exit     prints BYE and exits with $FAKE_CLAUDE_EXIT (default 0);
+#   rules    draws, across the whole width of its terminal, a rule (─) and a box row (│caixa
+#            ... │), as the real claude does, then prints READY and waits until it is ended
+#            (NS-37: the panel of the nick keeps the ends of the program's rows);
 #   trigger  prints READY, waits for the file $FAKE_CLAUDE_TRIGGER.1, then rewrites the line of
 #            READY with another color (the same text) and creates $FAKE_CLAUDE_TRIGGER.1.done;
 #            waits for $FAKE_CLAUDE_TRIGGER.2, prints NOVO (new text) and creates
@@ -152,6 +155,15 @@ case "$mode" in
   osc52)
     printf '\033]52;c;b2zDoQ==\a'
     printf 'COPIADO\r\n'
+    ;;
+  rules)
+    cols="$(stty size | cut -d ' ' -f 2)"
+    printf '%*s\r\n' "$cols" '' | sed 's/ /─/g'
+    printf '│%-*s│\r\n' "$((cols - 2))" 'caixa'
+    printf 'READY\r\n'
+    while :; do
+      sleep 0.05
+    done
     ;;
   exit)
     printf 'BYE\r\n'

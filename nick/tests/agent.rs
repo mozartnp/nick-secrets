@@ -13,7 +13,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{DOWN, ENTER, ESC, Nick, TAB, World};
+use common::{DOWN, ENTER, ESC, Nick, PANEL_COL, TAB, World};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -705,13 +705,14 @@ fn a_resize_reaches_claude_below_the_header() {
     let mut nick = spawn(&world, "winsize", &[]);
     open_tickets(&mut nick, "proj");
     open_agent(&mut nick, 0);
-    // The panel beside the list (NS-34): 100 - 40 columns, and 30 rows less the header (two
-    // rows: the warning out of the jail wraps at 60 columns), the status and the help (two
-    // rows: the ones the help of the tickets needs, whatever the focus; review NS-34, P1).
-    nick.wait_for("SIZE 25 60");
-    // At 120 columns the list takes 40 and the header fits in one row: 40 - 1 - 1 - 2.
+    // The panel beside the list (NS-34): 100 - 40 columns less the 2 of its border (NS-37),
+    // and 30 rows less the 2 of the border, the header (two rows: the warning out of the jail
+    // wraps at 58 columns), the status and the help (two rows: the ones the help of the
+    // tickets needs, whatever the focus; review NS-34, P1): 30 - 2 - 2 - 1 - 2.
+    nick.wait_for("SIZE 23 58");
+    // At 120 columns the list takes 40 and the header fits in one row: 40 - 2 - 1 - 1 - 2.
     nick.resize(40, 120);
-    nick.wait_for("SIZE 36 80");
+    nick.wait_for("SIZE 34 78");
     // Ctrl+C goes to the program (cooked in this mode: it ends it).
     nick.send("\x03");
     nick.wait_for("O agente proj · PO · NS-1 terminou");
@@ -926,11 +927,16 @@ fn two_agents_of_two_projects_run_at_once_each_with_its_cwd_and_config() {
     nick.send("v");
     nick.wait_for("Agentes ativos");
     nick.wait_for("beta · Dev · NS-1  [FORA DA JAIL]");
+    // Only the list: on the same row, inside its border (NS-37), the panel shows the header
+    // of beta, out of the jail.
     let screen = nick.screen();
-    let alfa = screen
+    let alfa: String = screen
         .lines()
         .find(|l| l.contains("alfa · Tech Leader · NS-1"))
-        .unwrap_or_else(|| panic!("alfa on the view:\n{screen}"));
+        .unwrap_or_else(|| panic!("alfa on the view:\n{screen}"))
+        .chars()
+        .take(usize::from(PANEL_COL))
+        .collect();
     assert!(!alfa.contains("FORA DA JAIL"), "{alfa}");
     nick.send("q");
     nick.wait_for("Há 2 agentes ativos (alfa, beta). Encerrar todos e sair? (s/N)");
@@ -1055,6 +1061,90 @@ fn toggling_the_focus_neither_resizes_nor_marks_a_hidden_agent() {
     );
     nick.send("q");
     nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// The symbol at `row`, `col` of the screen and whether it is cyan (`ui::FOCUS_COLOR`, the
+/// border of the focused panel: SGR 36).
+fn border_at(nick: &Nick, row: u16, col: u16) -> (String, bool) {
+    let (symbol, color) = nick.cell(row, col);
+    (symbol, color == vt100::Color::Idx(6))
+}
+
+/// Waits until the focused panel is the agent's (`on_terminal`) or the list's: its corner is
+/// `┏` and cyan, the other one `┌` and without a color (NS-37).
+fn wait_for_focus_border(nick: &Nick, on_terminal: bool) {
+    let (focused, other) = if on_terminal {
+        (common::PANEL_COL, 0)
+    } else {
+        (0, common::PANEL_COL)
+    };
+    nick.wait_until(&format!("the thick border on column {focused}"), || {
+        border_at(nick, 0, focused) == ("┏".into(), true)
+            && border_at(nick, 0, other) == ("┌".into(), false)
+    });
+}
+
+/// NS-37: the shortcut moves the thick cyan border between the list and the panel at once.
+#[test]
+fn toggling_the_focus_moves_the_thick_border_at_once() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    // Without an agent, the list keeps its plain border.
+    assert_eq!(border_at(&nick, 0, 0), ("┌".into(), false));
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    wait_for_focus_border(&nick, true);
+    // The panel reads only the inside of the border: the header wrapped at 58 columns whole,
+    // and no piece of the border (its top, its bottom or a side).
+    let panel = nick.panel();
+    assert!(
+        panel.contains("FORA DA JAIL: o agente roda direto no seu shell."),
+        "{panel}"
+    );
+    assert!(
+        !panel.contains(['┏', '┓', '┗', '┛', '━', '┃', '│']),
+        "{panel}"
+    );
+    nick.keep_screen("NS-37: foco no terminal");
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, false);
+    nick.keep_screen("NS-37: foco na lista");
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, true);
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, false);
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// NS-37 (review, N2): `Nick::panel` cuts only the border of the panel. A rule and a box row the
+/// program draws across its whole width (as the real claude does) stay whole, ends included.
+#[test]
+fn the_panel_keeps_the_rules_the_program_draws_up_to_the_border() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "rules", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    // The terminal of the agent: 100 - 40 columns less the 2 of the border.
+    let width = usize::from(common::COLS - PANEL_COL - 2);
+    let rule = "─".repeat(width);
+    let boxed = format!("│{:<1$}│", "caixa", width - 2);
+    let panel = nick.panel();
+    assert!(panel.contains(&rule), "the rule whole:\n{panel}");
+    assert!(panel.contains(&boxed), "the box row whole:\n{panel}");
+    // And nothing of the border of the panel itself.
+    assert!(!panel.contains(['┃', '┏', '┓', '┗', '┛', '━']), "{panel}");
+    // Back to the list, so the q is the nick's and not the program's.
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, false);
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
     nick.send("s");
     assert_eq!(nick.wait_exit(), Some(0));
 }

@@ -2733,7 +2733,8 @@ lista.
 telas são as de antes, byte a byte (a lista em largura total, a barra e o rodapé), menos o rodapé de
 Módulos, que ganhou `c configurações`. Com pelo menos um agente vivo, a área acima da barra e do
 rodapé se divide: à esquerda a lista da tela atual, com `ui::LIST_WIDTH = 40` colunas, mas no
-máximo metade da janela; à direita o painel do agente exibido (o cabeçalho e o terminal). A barra
+máximo metade da janela; à direita o painel do agente exibido (desde o NS-37, uma borda em volta
+do cabeçalho e do terminal: seção "Rust no projeto: foco evidente no painel (NS-37)"). A barra
 e o rodapé continuam em largura total, com a quebra do NS-32, e os diálogos são centrados sobre a
 área inteira, por cima do painel (só abrem com o foco na lista). **A conta tem fonte única:**
 `ui::layout(app, area)` devolve as áreas, e o desenho, o mouse e o tamanho de cada PTY
@@ -3385,3 +3386,100 @@ etapa até Concluído, o plano lido do disco, o "Editar ID" com a pasta e com o 
 existente) e `agent.rs` (o agente vivo aberto da tela do ticket depois de mudar a etapa, o `i`
 recusado com agente vivo e o formulário do Dev sem plano). As sabotagens e as telas ficam em
 `.nick/docs/NS-36/`.
+
+## Rust no projeto: foco evidente no painel (NS-37)
+
+História filha do épico NS-28. No layout lado a lado (NS-34, com pelo menos um agente vivo), o
+painel com o foco fica evidente de relance, para o operador não mandar sem querer uma tecla para
+o `claude` quando queria navegar na lista.
+
+**A regra visual** (tipo e cor decididos pelo usuário no plano):
+- o painel com o foco, seja a lista ou o painel do agente, tem a borda `BorderType::Thick` em
+  `ui::FOCUS_COLOR` (`Color::Cyan`);
+- o painel sem o foco tem a borda `BorderType::Plain` com `Modifier::DIM`, sem cor;
+- **só com agente vivo.** Sem nenhum agente, a lista em largura total continua com o
+  `Block::bordered()` de antes, sem estilo, byte a byte (a garantia do NS-34). Um teste cobra o
+  canto `┌` sem DIM e sem cor, e nenhuma célula grossa ou ciano na tela;
+- os diálogos não mudaram: diálogo não é painel de foco.
+
+O ciano não se confunde com as outras cores da TUI: o vermelho (FORA DA JAIL), o amarelo (avisos
+de diálogo) e o verde (Concluído). **A cor não é a única pista, de propósito.** Num terminal de
+16 cores ou num tema claro, o ciano pode ficar fraco, e a espessura (`┏━┓` × `┌─┐`) continua
+mostrando o foco. Os prints da conferência estão em `.nick/docs/NS-37/prints/`.
+
+**Duas funções em `ui.rs`, sem widget nem módulo novo:** `pane_block(focused)` (o bloco de um
+painel ao lado de um agente) e `list_block(app)` (o `Block::bordered()` de antes sem agente vivo,
+`pane_block` com agente). Todos os `draw_*` das listas usam o `list_block`: Módulos, Agentes
+ativos, Configurações, Projetos, Tickets e Ticket, inclusive o bloco sem título de quando o
+detalhe do ticket não carregou.
+
+**A regra "foco no terminal" tem uma função só:** `App::on_terminal` (passou a ser `pub`, sem
+mudar o comportamento). O rodapé (`help_text`) e as bordas usam essa mesma função, então os dois
+nunca divergem.
+
+**O painel do agente ganhou borda** (decisão do usuário no plano). O ticket supunha uma borda de
+foco "discreta demais" e dizia que uma borda mais grossa não ocupa espaço. No código, a lista
+tinha sempre a borda simples, e o painel do agente não tinha borda nenhuma: só o cabeçalho e o
+terminal. A borda agora envolve o painel inteiro e tira 2 colunas e 2 linhas do PTY de cada
+agente. **O tamanho é o mesmo nos dois estados de foco**, porque `Thick` e `Plain` ocupam uma
+célula cada. Assim, trocar o foco não redimensiona nada, e a regra do review do NS-34 (P1)
+continua valendo. O tamanho muda uma vez só, na versão nova, e não a cada troca de foco.
+
+**O desconto da borda tem fonte única:** `ui::terminal_in_panel` calcula sobre
+`Block::bordered().inner(panel)`. Dali o tamanho chega a `layout` (o desenho e o mouse do
+`main.rs`), a `agent_area` (o tamanho de cada PTY) e ao spawn (`new_agent_panel` +
+`terminal_in_panel`, então o PTY de um agente novo continua nascendo com o tamanho final). Se o
+desconto ficasse só no desenho, o `claude` desenharia 2 colunas além do visível. `Areas::panel`
+é o retângulo externo, com a borda, e `Areas::header` e `Areas::terminal` ficam no interior. O
+`draw_agent` ganhou o parâmetro `focused`, desenha o `pane_block` e tira o retângulo do terminal
+do `terminal_in_panel`, sem refazer a conta. O `header_rows` não mudou de lógica e passou a
+receber o retângulo interno. Num painel de 1 ou 2 células, o interno sai vazio sem underflow. O
+mouse e o cursor do programa caem dentro da borda sem mudar código, porque o `encode_mouse` e o
+`area.contains` já descontam o `x`/`y` da área do terminal. Um clique ou a roda sobre a borda é
+descartado.
+
+**Helpers da integração** (`nick/tests/common/mod.rs`):
+- `Nick::panel()` lê só o interior da borda, pela geometria: entram as linhas com um lado da
+  borda (`┃`/`│`) na coluna `PANEL_COL` (o topo e o fundo ficam de fora), e delas só as colunas
+  de `PANEL_COL + 1` até a penúltima. Um cabeçalho quebrado não lê `seu ┃ ┃shell.`, e uma régua
+  ou caixa que o programa desenhe na ponta da linha (`────`, `│`) fica inteira (review do NS-37,
+  N2: a primeira versão tirava esses caracteres das pontas com um `trim_matches`, e uma régua
+  do `claude` real sumiria). Sem o lado da borda na coluna, a linha não entra;
+- `Nick::flat_screen()` tira o `┃` além do `│`, porque a lista com o foco tem a borda grossa;
+- `Nick::cell(row, col)` devolve o símbolo e a cor de uma célula do `vt100` (o ciano é o
+  `Idx(6)`), os dois da mesma célula e num parse só (review do NS-37, N1). A primeira versão
+  lia o símbolo do texto da tela e a cor da célula, e um caractere largo antes da coluna
+  desalinharia os dois.
+
+A adaptação dos helpers rodou verde sobre o código antigo antes de o layout mudar.
+
+**Testes adaptados, com o motivo:**
+- `nick/src/ui.rs`: a geometria do NS-34 (`with_an_agent_the_list_is_on_the_left_and_the_agent_on_the_right`,
+  `the_warning_out_of_the_jail_wraps_in_the_header_and_the_terminal_shrinks`, com a quebra em 58
+  colunas, e `a_long_status_takes_rows_from_the_panel_too`) e os do cabeçalho do NS-33
+  (`render_agent` com `focused`, o cabeçalho lido na linha 1 a partir da coluna 1). Em
+  `the_agents_of_the_ticket_show_their_state_and_the_selection` (NS-36), o `│` literal da borda
+  da lista com o foco virou `┃`.
+  `the_terminal_keeps_its_size_whatever_the_focus_the_marks_and_the_dialog` e
+  `a_new_agent_is_born_with_the_size_of_its_panel` passaram sem mudança;
+- `nick/tests/agent.rs`: `a_resize_reaches_claude_below_the_header` passou a esperar `SIZE 23 58`
+  e, a 40x120, `SIZE 34 78` (40 − 1 da barra − 2 do rodapé − 2 da borda − 1 do cabeçalho; o
+  plano dizia `SIZE 35 78`, porque contou o corpo com 38 linhas e esqueceu as 2 que o rodapé
+  reserva com agente vivo). Em `two_agents_of_two_projects_run_at_once_each_with_its_cwd_and_config`,
+  a linha do `alfa` na visão passou a ser lida só nas colunas da lista: com o cabeçalho na linha
+  1, dentro da borda, ele divide a linha da tela com o `[FORA DA JAIL]` do `beta` exibido no
+  painel. `toggling_the_focus_neither_resizes_nor_marks_a_hidden_agent` passou sem mudança.
+
+Os testes de desenho das telas sem agente e os do rodapé passaram sem edição. Nenhuma
+dependência nova, e o README não mudou (regra "README genérico").
+
+**Testes novos:** em `ui`, o estilo de `pane_block`, os dois estados de foco no painel e em
+todas as telas de lista (`LIST_SCREENS` e a tela do ticket com o detalhe), a regressão "sem
+agente nada muda", o terminal dentro da borda (com painéis de 0 a 3 células), o cursor do
+programa e o mouse sobre a borda. No PTY, em `agent.rs`, `toggling_the_focus_moves_the_thick_border_at_once`
+(o binário real, com o canto `┏` ciano indo e voltando entre a lista e o painel a cada atalho) e
+`the_panel_keeps_the_rules_the_program_draws_up_to_the_border` (review do NS-37, N2). Esse
+segundo usa o modo `rules` do `claude` falso, que desenha uma régua `─` e uma linha de caixa
+`│caixa … │` na largura inteira do terminal, encostadas na borda. O teste cobra as duas inteiras
+no `Nick::panel()`, sem nenhum pedaço da borda grossa. Com o `trim_matches` da primeira versão
+do helper ele cai, conforme a sabotagem registrada em `.nick/docs/NS-37/review_sabotagens.txt`.

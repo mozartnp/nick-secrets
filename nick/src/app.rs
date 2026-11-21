@@ -204,6 +204,41 @@ pub enum Dialog {
     },
 }
 
+impl Dialog {
+    /// Whether the dialog has a text field, which gets the keys as they were typed: the others
+    /// get them through `keys::shortcut_key`, where a capital letter is the small one (NS-43).
+    /// No `_`: a new dialog must say whether it takes text.
+    pub fn takes_text(&self) -> bool {
+        match self {
+            Dialog::AddPath { .. }
+            | Dialog::NewTicket { .. }
+            | Dialog::EditTitle { .. }
+            | Dialog::EditEpicTitle { .. }
+            | Dialog::EditEpicId { .. }
+            | Dialog::EditId { .. }
+            | Dialog::StageForm { .. } => true,
+            Dialog::NeedsConfig { .. }
+            | Dialog::ConfirmRemove { .. }
+            | Dialog::ConfirmHide { .. }
+            | Dialog::ConfirmHideEpic { .. }
+            | Dialog::ConfirmEditEpicId { .. }
+            | Dialog::MoveTicket { .. }
+            | Dialog::ChooseType { .. }
+            | Dialog::ConfirmPrompt { .. }
+            | Dialog::AgentError { .. }
+            | Dialog::ConfirmEndAgent { .. }
+            | Dialog::ConversationLost { .. }
+            | Dialog::ConfirmArchive { .. }
+            | Dialog::ConfirmQuit
+            | Dialog::ChooseTicketStage { .. }
+            | Dialog::ConfirmStageChange { .. }
+            | Dialog::ConfirmEditId { .. } => false,
+            // Taken by `App::handle_key` before the shortcuts: it never gets here.
+            Dialog::CaptureShortcut { .. } => false,
+        }
+    }
+}
+
 /// What the loop must do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -573,6 +608,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.quit();
         }
+        // The shortcuts don't tell a capital letter from the small one (NS-43); a text field
+        // gets the key as it was typed.
+        let key = if self.dialog.as_ref().is_some_and(Dialog::takes_text) {
+            key
+        } else {
+            keys::shortcut_key(key)
+        };
         let action = match self.dialog.take() {
             Some(Dialog::AddPath { input }) => self.key_add_path(key, input),
             Some(Dialog::NeedsConfig { dir, focus, note }) => {
@@ -2285,10 +2327,7 @@ impl App {
                 precheck,
             };
         }
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
-        ) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) {
             // The text of auto_scrum.sh: the log stays where --render wrote it.
             self.status = Some(format!(
                 "Cancelado. O prompt gerado continua salvo em: {}",
@@ -2918,9 +2957,10 @@ fn unknown_state_message(agent: &Agent) -> String {
     )
 }
 
-/// `s` or `S`: the "sim" of the `(s/N)` confirmations (of auto_scrum too); any other key is no.
+/// `s`: the "sim" of the `(s/N)` confirmations (of auto_scrum too); any other key is no. The key
+/// comes through `keys::shortcut_key`, so `S` (Caps Lock or Shift) is `s` (NS-43).
 fn is_yes(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+    key.code == KeyCode::Char('s')
 }
 
 /// The answer of an `(s/N)` confirmation: only s/S give `action`; any other key cancels.
@@ -2928,10 +2968,10 @@ fn confirmed(key: KeyEvent, action: Action) -> Action {
     if is_yes(key) { action } else { Action::None }
 }
 
-/// `q` or `Q` exactly (Shift is how `Q` is typed): the "Sair (q)" rule of the lists.
+/// `q` without modifiers: the "Sair (q)" rule of the lists. The key comes through
+/// `keys::shortcut_key`, so `Q` (Caps Lock or Shift) is `q`, and Ctrl+Q and Alt+Q don't quit.
 fn is_quit(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
-        && (key.modifiers - KeyModifiers::SHIFT).is_empty()
+    key.code == KeyCode::Char('q') && key.modifiers.is_empty()
 }
 
 #[cfg(test)]
@@ -8250,5 +8290,650 @@ mod tests {
             f.app.dialog,
             Some(Dialog::ConfirmRemove { epics: 0, .. })
         ));
+    }
+
+    // ---- the capital letters on the shortcuts (NS-43) ----
+
+    /// One dialog of each variant (`Dialog::takes_text`), with the values of a fixture with a
+    /// project, a ticket, an epic and a stopped agent.
+    fn one_of_each_dialog() -> Vec<Dialog> {
+        let (mut f, _, id) = stopped_agent();
+        assert_eq!(f.new_epic("Plano longo", "EPIC-1"), Action::None);
+        let project = f.app.rows[0].project.clone();
+        let path = project.path.clone();
+        let ticket = f.ticket_of("NS-1");
+        let epic = f.epic_of("EPIC-1");
+        let agent = f.app.agent_record(id).expect("the stopped agent").clone();
+        let holder: Holder = (&ticket).into();
+        let precheck = Precheck {
+            jail: false,
+            jira: false,
+            sentry: false,
+            warning: None,
+        };
+        let kind = StageType::PoDiscussion;
+        vec![
+            Dialog::AddPath {
+                input: String::new(),
+            },
+            Dialog::NeedsConfig {
+                dir: path.clone(),
+                focus: Button::CreateConfig,
+                note: None,
+            },
+            Dialog::ConfirmRemove {
+                project,
+                tickets: 2,
+                agents: 1,
+                live: 0,
+                epics: 1,
+            },
+            Dialog::NewTicket {
+                project_id: ticket.project_id,
+                item: NewItem::Epic,
+                title: String::new(),
+                jira_id: String::new(),
+                focus: TicketField::Title,
+            },
+            Dialog::EditTitle {
+                ticket: ticket.clone(),
+                input: String::new(),
+            },
+            Dialog::ConfirmHide {
+                ticket: ticket.clone(),
+            },
+            Dialog::EditEpicTitle {
+                epic: epic.clone(),
+                input: String::new(),
+            },
+            Dialog::ConfirmHideEpic {
+                epic: epic.clone(),
+                tickets: 0,
+            },
+            Dialog::EditEpicId {
+                epic: epic.clone(),
+                input: String::new(),
+            },
+            Dialog::ConfirmEditEpicId {
+                epic: epic.clone(),
+                new: "EPIC-2".into(),
+                moves: false,
+            },
+            Dialog::MoveTicket {
+                ticket: ticket.clone(),
+                choices: vec![None, Some(epic)],
+                index: 0,
+            },
+            Dialog::ChooseType {
+                project: path.clone(),
+                holder: holder.clone(),
+                precheck: precheck.clone(),
+                types: vec![kind],
+                index: 0,
+            },
+            Dialog::StageForm {
+                project: path.clone(),
+                holder: holder.clone(),
+                precheck: precheck.clone(),
+                kind,
+                values: kind.initial_values(&holder.key),
+                focus: 0,
+                plan_missing: false,
+            },
+            Dialog::ConfirmPrompt {
+                project: path.clone(),
+                holder: holder.clone(),
+                precheck: precheck.clone(),
+                kind,
+                rendered: rendered(1),
+                scroll: 0,
+            },
+            Dialog::AgentError {
+                message: "Nada foi aberto.".into(),
+            },
+            Dialog::ConfirmEndAgent {
+                id,
+                name: agent.name.clone(),
+            },
+            Dialog::ConversationLost {
+                project: path,
+                agent: agent.clone(),
+                holder,
+                precheck,
+            },
+            Dialog::ConfirmArchive { agent },
+            Dialog::ConfirmQuit,
+            Dialog::CaptureShortcut { first: None },
+            Dialog::ChooseTicketStage {
+                ticket: ticket.clone(),
+                index: 0,
+            },
+            Dialog::ConfirmStageChange {
+                ticket: ticket.clone(),
+                to: TicketStage::Done,
+            },
+            Dialog::EditId {
+                ticket: ticket.clone(),
+                input: String::new(),
+            },
+            Dialog::ConfirmEditId {
+                ticket,
+                new: "NS-10".into(),
+                moves: false,
+            },
+        ]
+    }
+
+    /// The name of the variant of a dialog (`AddPath`, `ConfirmQuit`, ...).
+    fn variant(dialog: &Dialog) -> String {
+        format!("{dialog:?}")
+            .split([' ', '{', '('])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn only_the_seven_dialogs_with_a_text_field_take_text() {
+        let dialogs = one_of_each_dialog();
+        let text: Vec<String> = dialogs
+            .iter()
+            .filter(|dialog| dialog.takes_text())
+            .map(variant)
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "AddPath",
+                "NewTicket",
+                "EditTitle",
+                "EditEpicTitle",
+                "EditEpicId",
+                "StageForm",
+                "EditId"
+            ]
+        );
+        // Every variant is in the list (the 24 of the enum), each once.
+        let mut names: Vec<String> = dialogs.iter().map(variant).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 24);
+        assert_eq!(dialogs.len(), 24);
+    }
+
+    /// A letter as the terminal sends it: Caps Lock gives the capital without modifiers, Shift
+    /// the capital with `SHIFT`.
+    fn letter(c: char, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), modifiers)
+    }
+
+    impl Fixture {
+        /// `text` as the terminal sends it with Shift: each capital letter with `SHIFT`.
+        fn type_shifted(&mut self, text: &str) {
+            for c in text.chars() {
+                let modifiers = if c.is_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                assert_eq!(self.mods(KeyCode::Char(c), modifiers), Action::None, "{c}");
+            }
+        }
+
+        /// `text` without what differs between two fixtures built the same way: the temporary
+        /// folder, the timestamps and the session ids.
+        fn scrub(&self, text: String) -> String {
+            let mut volatile = Vec::new();
+            let conn = self.app.db.connection();
+            for sql in [
+                "SELECT created_at FROM projects",
+                "SELECT created_at FROM tickets",
+                "SELECT hidden_at FROM tickets",
+                "SELECT created_at FROM epics",
+                "SELECT hidden_at FROM epics",
+                "SELECT session_id FROM agents",
+                "SELECT opened_at FROM agents",
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let values = stmt
+                    .query_map([], |row| row.get::<_, Option<String>>(0))
+                    .unwrap()
+                    .map(Result::unwrap);
+                volatile.extend(values.flatten());
+            }
+            let mut text = text.replace(self.root.to_str().unwrap(), "<root>");
+            for value in volatile {
+                text = text.replace(&value, "<v>");
+            }
+            text
+        }
+
+        /// What the keys of the panel change, as text (`scrub`): the dialog, the bar, the
+        /// screen, the selection, the focus and the filters of the tree.
+        fn state(&self) -> String {
+            let app = &self.app;
+            self.scrub(format!(
+                "{:?} | {:?} | {:?} | {:?} | {:?} | hidden {} | active {}",
+                app.dialog,
+                app.status,
+                app.screen,
+                app.selected,
+                app.focus,
+                app.tree.show_hidden,
+                app.tree.only_active
+            ))
+        }
+
+        /// The action of `key` and the `state` after it.
+        fn outcome(&mut self, key: KeyEvent) -> String {
+            let action = self.app.handle_key(key);
+            format!("{} | {}", self.scrub(format!("{action:?}")), self.state())
+        }
+
+        /// The text field being typed in.
+        fn field(&self) -> String {
+            match &self.app.dialog {
+                Some(
+                    Dialog::AddPath { input }
+                    | Dialog::EditTitle { input, .. }
+                    | Dialog::EditEpicTitle { input, .. }
+                    | Dialog::EditEpicId { input, .. }
+                    | Dialog::EditId { input, .. },
+                ) => input.clone(),
+                Some(Dialog::NewTicket {
+                    title,
+                    jira_id,
+                    focus,
+                    ..
+                }) => match focus {
+                    TicketField::Title => title.clone(),
+                    TicketField::JiraId => jira_id.clone(),
+                },
+                Some(Dialog::StageForm { values, focus, .. }) => values[*focus].clone(),
+                other => panic!("not in a text field: {other:?}"),
+            }
+        }
+    }
+
+    /// On fixtures built by `setup` (the focus on the list), the capital of `small` with Caps
+    /// Lock (no modifier) and with Shift does what `small` does, and `small` does something (the
+    /// action or the state changes): two keys that do nothing don't pass. Returns the outcome.
+    fn assert_capital_does_the_same(setup: fn() -> Fixture, small: char) -> String {
+        let capital = small.to_ascii_uppercase();
+        let mut f = setup();
+        assert_eq!(f.app.focus, Focus::List, "the keys are the list's");
+        let before = format!("{:?} | {}", Action::None, f.state());
+        let expected = f.outcome(letter(small, KeyModifiers::NONE));
+        assert_ne!(expected, before, "{small} does nothing here");
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let mut f = setup();
+            assert_eq!(
+                f.outcome(letter(capital, modifiers)),
+                expected,
+                "{capital} with {modifiers:?}"
+            );
+        }
+        expected
+    }
+
+    /// An agent running (`running`), the focus back on the list and its node selected.
+    fn live_agent() -> Fixture {
+        let (mut f, launcher) = running();
+        f.shortcut();
+        f.select(Fixture::anode(launcher.ids[0]));
+        f
+    }
+
+    #[test]
+    fn capital_letters_do_on_the_tree_what_the_small_ones_do() {
+        let module: fn() -> Fixture = fixture;
+        // NS-1 selected, between the project and NS-2; no agent running.
+        let global: fn() -> Fixture = || with_agents().0;
+        let project: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.on_project();
+            f
+        };
+        let epic: fn() -> Fixture = || with_epic().0;
+        let ticket: fn() -> Fixture = || {
+            let (mut f, _) = with_epic();
+            f.select_key("NS-1");
+            f
+        };
+        let stopped: fn() -> Fixture = || stopped_agent().0;
+        for (setup, letters) in [
+            (global, "jkfvq"),
+            (module, "ac"),
+            (project, "anr"),
+            (epic, "aeogi"),
+            (ticket, "eogpmi"),
+            (live_agent as fn() -> Fixture, "x"),
+            (stopped, "ro"),
+        ] {
+            for small in letters.chars() {
+                assert_capital_does_the_same(setup, small);
+            }
+        }
+        // Some of the outcomes, so the comparison is not of two wrong ones.
+        let mut f = global();
+        assert_eq!(f.ch('Q'), Action::Quit);
+        let mut f = module();
+        f.ch('A');
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::AddPath {
+                input: String::new()
+            })
+        );
+        let mut f = global();
+        f.mods(KeyCode::Char('J'), KeyModifiers::SHIFT);
+        assert_eq!(f.selected_key().as_deref(), Some("NS-2"));
+    }
+
+    #[test]
+    fn capital_letters_do_on_the_lists_of_choice_and_the_settings_what_the_small_ones_do() {
+        // Each list with its second item selected, so j and k both move.
+        let menu: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.g(&mut FakeLauncher::new(false));
+            f.key(KeyCode::Down);
+            f
+        };
+        let stage: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.ch('m');
+            f.key(KeyCode::Down);
+            assert!(matches!(
+                f.app.dialog,
+                Some(Dialog::ChooseTicketStage { index: 1, .. })
+            ));
+            f
+        };
+        let mover: fn() -> Fixture = || {
+            let (mut f, _) = with_epic();
+            assert_eq!(f.new_epic("Outro plano", "EPIC-2"), Action::None);
+            f.select_key("NS-1");
+            f.ch('p');
+            f.key(KeyCode::Down);
+            assert!(matches!(
+                f.app.dialog,
+                Some(Dialog::MoveTicket { index: 1, .. })
+            ));
+            f
+        };
+        let preview: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            let mut launcher = FakeLauncher::new(false);
+            launcher.render = Ok(rendered(100));
+            f.g(&mut launcher);
+            f.pick(StageType::PoDiscussion);
+            f.fill_and_enter();
+            f.app.render_prompt(&mut launcher);
+            f.app.set_prompt_window(10, 90);
+            f.key(KeyCode::Down);
+            assert_eq!(f.scroll(), 1);
+            f
+        };
+        let settings: fn() -> Fixture = || {
+            let mut f = fixture();
+            f.ch('c');
+            assert_eq!(f.app.screen, Screen::Settings);
+            f
+        };
+        let lost: fn() -> Fixture = || {
+            let (mut f, mut launcher, _) = stopped_agent();
+            launcher.conversation = Ok(false);
+            assert!(f.r(&mut launcher));
+            assert!(matches!(
+                f.app.dialog,
+                Some(Dialog::ConversationLost { .. })
+            ));
+            f
+        };
+        for (setup, letters) in [
+            (menu, "jk"),
+            (stage, "jk"),
+            (mover, "jk"),
+            (preview, "jksn"),
+            (settings, "tp"),
+            (lost, "an"),
+        ] {
+            for small in letters.chars() {
+                assert_capital_does_the_same(setup, small);
+            }
+        }
+        let mut f = menu();
+        f.ch('J');
+        assert_eq!(f.menu().1, 2);
+        let mut f = preview();
+        f.ch('K');
+        assert_eq!(f.scroll(), 0);
+        assert!(matches!(f.ch('S'), Action::OpenAgent { .. }));
+    }
+
+    #[test]
+    fn capital_s_confirms_and_capital_n_cancels_every_confirmation() {
+        let hide: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.ch('o');
+            f
+        };
+        let hide_epic: fn() -> Fixture = || {
+            let (mut f, _) = with_epic();
+            f.ch('o');
+            f
+        };
+        let remove: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.on_project();
+            f.ch('r');
+            f
+        };
+        let end_agent: fn() -> Fixture = || {
+            let mut f = live_agent();
+            f.ch('x');
+            f
+        };
+        let archive: fn() -> Fixture = || {
+            let mut f = stopped_agent().0;
+            f.ch('o');
+            f
+        };
+        let stage_change: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.choose_ticket_stage(TicketStage::Done);
+            f
+        };
+        let edit_id: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.ch('i');
+            f.ch('0');
+            f.key(KeyCode::Enter);
+            f
+        };
+        let edit_epic_id: fn() -> Fixture = || {
+            let (mut f, _) = with_epic();
+            f.ch('i');
+            f.ch('0');
+            f.key(KeyCode::Enter);
+            f
+        };
+        let quit: fn() -> Fixture = || {
+            let mut f = live_agent();
+            f.ch('q');
+            f
+        };
+        for (setup, dialog) in [
+            (hide, "ConfirmHide"),
+            (hide_epic, "ConfirmHideEpic"),
+            (remove, "ConfirmRemove"),
+            (end_agent, "ConfirmEndAgent"),
+            (archive, "ConfirmArchive"),
+            (stage_change, "ConfirmStageChange"),
+            (edit_id, "ConfirmEditId"),
+            (edit_epic_id, "ConfirmEditEpicId"),
+            (quit, "ConfirmQuit"),
+        ] {
+            let f = setup();
+            assert_eq!(f.app.dialog.as_ref().map(variant).as_deref(), Some(dialog));
+            let yes = assert_capital_does_the_same(setup, 's');
+            let no = assert_capital_does_the_same(setup, 'n');
+            assert_ne!(yes, no, "{dialog}: s confirms, n cancels");
+        }
+    }
+
+    /// The text of the tests of the text fields, with the letters of the shortcuts of the
+    /// confirmations (`S`, `N`), of quitting (`Q`) and of the lists (`J`, `K`).
+    const SHOUT: &str = "TÍTULO EM MAIÚSCULAS QSNJK";
+
+    #[test]
+    fn capital_letters_are_typed_as_they_are_in_the_text_fields() {
+        let add_path: fn() -> Fixture = || {
+            let mut f = fixture();
+            f.ch('a');
+            f
+        };
+        let title: fn() -> Fixture = || {
+            let (mut f, _) = with_tickets("proj");
+            f.ch('a');
+            f
+        };
+        let jira_id: fn() -> Fixture = || {
+            let (mut f, _) = with_tickets("proj");
+            f.ch('a');
+            f.key(KeyCode::Tab);
+            f
+        };
+        let edit_title: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.ch('e');
+            f
+        };
+        let epic_title: fn() -> Fixture = || {
+            let (mut f, _) = with_epic();
+            f.ch('e');
+            f
+        };
+        let epic_id: fn() -> Fixture = || {
+            let (mut f, _) = with_epic();
+            f.ch('i');
+            f
+        };
+        let edit_id: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.ch('i');
+            f
+        };
+        let form_line: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.g(&mut FakeLauncher::new(false));
+            f.pick(StageType::PoDiscussion);
+            let line = StageType::PoDiscussion
+                .fields()
+                .iter()
+                .position(|field| field.input == Input::Line)
+                .expect("a line field");
+            while f.form().2 != line {
+                f.key(KeyCode::Tab);
+            }
+            f
+        };
+        let typings: [fn(&mut Fixture, &str); 2] = [Fixture::type_text, Fixture::type_shifted];
+        for (setup, dialog) in [
+            (add_path, "AddPath"),
+            (title, "NewTicket"),
+            (jira_id, "NewTicket"),
+            (edit_title, "EditTitle"),
+            (epic_title, "EditEpicTitle"),
+            (epic_id, "EditEpicId"),
+            (edit_id, "EditId"),
+            (form_line, "StageForm"),
+        ] {
+            for typing in typings {
+                let mut f = setup();
+                let before = f.field();
+                // Each key returns Action::None: no Q quits.
+                typing(&mut f, SHOUT);
+                assert_eq!(f.field(), format!("{before}{SHOUT}"), "{dialog}");
+                assert_eq!(
+                    f.app.dialog.as_ref().map(variant).as_deref(),
+                    Some(dialog),
+                    "no S confirms nor N cancels"
+                );
+            }
+        }
+        // The title and the ID typed in capitals are stored so.
+        for typing in typings {
+            let (mut f, _) = with_tickets("proj");
+            f.ch('a');
+            typing(&mut f, SHOUT);
+            f.key(KeyCode::Tab);
+            typing(&mut f, "NS-99");
+            assert_eq!(f.key(KeyCode::Enter), Action::None);
+            assert_eq!(f.app.dialog, None);
+            let stored: Vec<(String, String)> = f
+                .all_tickets()
+                .into_iter()
+                .map(|t| (t.key, t.title))
+                .collect();
+            assert_eq!(stored, [("NS-99".to_string(), SHOUT.to_string())]);
+        }
+    }
+
+    #[test]
+    fn ctrl_or_alt_with_a_capital_s_does_not_confirm_and_with_a_small_s_still_does() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        for (key, hides) in [
+            (letter('S', ctrl_shift), false),
+            (letter('S', alt_shift), false),
+            (letter('s', KeyModifiers::CONTROL), true),
+            (letter('s', KeyModifiers::ALT), true),
+        ] {
+            let (mut f, _) = with_agents();
+            f.ch('o');
+            assert!(matches!(f.app.dialog, Some(Dialog::ConfirmHide { .. })));
+            assert_eq!(f.app.handle_key(key), Action::None, "{key:?}");
+            assert_eq!(f.app.dialog, None, "any key closes it");
+            let hidden = f
+                .all_tickets()
+                .iter()
+                .any(|t| t.key == "NS-1" && t.hidden_at.is_some());
+            assert_eq!(hidden, hides, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn on_the_terminal_the_capital_letters_go_to_the_program_as_they_are() {
+        let (mut f, _) = running();
+        assert_eq!(
+            f.mods(KeyCode::Char('J'), KeyModifiers::SHIFT),
+            Action::Send(b"J".to_vec())
+        );
+        assert_eq!(f.ch('Q'), Action::Send(b"Q".to_vec()));
+        assert_eq!(f.ch('S'), Action::Send(b"S".to_vec()));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn the_capture_of_the_shortcut_gets_the_capital_letters_as_they_are() {
+        let mut f = fixture();
+        f.ch('c');
+        f.ch('t');
+        // A letter alone is refused, as before, with Caps Lock and with Shift.
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(f.mods(KeyCode::Char('J'), modifiers), Action::None);
+            assert_eq!(
+                f.status(),
+                Some("Use uma tecla com Ctrl ou Alt (ou uma tecla de função, F1–F12).")
+            );
+            assert_eq!(f.first(), None);
+        }
+        // With Alt and Caps Lock the capital is Alt+Shift+J, not Alt+J.
+        f.mods(KeyCode::Char('J'), KeyModifiers::ALT);
+        assert_eq!(f.first(), Shortcut::from_db("alt+shift+j"));
+        f.mods(KeyCode::Char('j'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(f.stored_shortcut().as_deref(), Some("alt+shift+j"));
     }
 }

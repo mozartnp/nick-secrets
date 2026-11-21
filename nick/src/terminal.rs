@@ -2,7 +2,9 @@
 //! program on the normal terminal (bin/nick-init, and `$EDITOR` since the NS-35:
 //! `run_suspended`, immune to Ctrl+C and Ctrl+\\ meanwhile), the modes of the agent screen
 //! (mouse capture and bracketed paste, only while an agent is on screen), the gate that pauses
-//! the input thread and the panic hook.
+//! the input thread and the panic hook. Also the keyboard mode of the kitty protocol (flag 1,
+//! disambiguate, NS-49): turned on when the terminal supports it, on the whole time the TUI is
+//! (the list included), off while suspended and when leaving, so the Shift+Enter arrives.
 
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,10 +13,12 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -23,11 +27,14 @@ use signal_hook::consts::{SIGINT, SIGQUIT};
 /// The terminal of the TUI.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-/// Turns off the mouse capture and the bracketed paste (always: turning off what is not on is
-/// harmless), leaves the alternate screen, shows the cursor and leaves raw mode, ignoring errors
-/// (there is nothing better to do with them while leaving; after a SIGHUP the terminal may be
-/// gone). Safe to call more than once.
+/// Turns off the keyboard mode first, only if it is on (`pop_keyboard_enhancement`), then the
+/// mouse capture and the bracketed paste (always: turning off what is not on is harmless),
+/// leaves the alternate screen, shows the cursor and leaves raw mode, ignoring errors (there is
+/// nothing better to do with them while leaving; after a SIGHUP the terminal may be gone). Safe
+/// to call more than once. The single exit point of the drop of the guard (`q`, error, signal),
+/// of the panic hook and of `suspend` (init and editor).
 pub fn restore() {
+    pop_keyboard_enhancement();
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
@@ -49,6 +56,42 @@ pub fn enter_agent_modes() -> io::Result<()> {
 /// Back from the agent screen: both modes off.
 pub fn leave_agent_modes() -> io::Result<()> {
     execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste)
+}
+
+/// Whether the keyboard mode of the kitty protocol is on (NS-49). Global, like `PANICKING`,
+/// because the panic hook has no access to the guard.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+/// Turns on the keyboard mode of the kitty protocol, only the flag 1 (`ESC[>1u`, disambiguate):
+/// the Shift+Enter arrives as `ESC[13;2u`, and crossterm parses it and the other keys into the
+/// same `KeyEvent`s of the legacy mode. Only when the terminal supports it
+/// (`TerminalGuard::enter`). Errors are ignored: without it the keys are the legacy ones.
+pub fn push_keyboard_enhancement() {
+    let mut stdout = io::stdout();
+    push_keyboard_enhancement_to(&mut stdout);
+}
+
+/// Turns off the keyboard mode (`ESC[<1u`), only if `push_keyboard_enhancement` turned it on:
+/// a terminal without support never gets it, and a second call writes nothing.
+pub fn pop_keyboard_enhancement() {
+    let mut stdout = io::stdout();
+    pop_keyboard_enhancement_to(&mut stdout);
+}
+
+/// `push_keyboard_enhancement` on `out` (testable without a terminal).
+fn push_keyboard_enhancement_to(out: &mut impl Write) {
+    KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+    let _ = execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+}
+
+/// `pop_keyboard_enhancement` on `out` (testable without a terminal).
+fn pop_keyboard_enhancement_to(out: &mut impl Write) {
+    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
 }
 
 /// Set by the panic hook: from then on the main loop handles no event (it would draw over the
@@ -134,13 +177,21 @@ impl InputGate {
     }
 }
 
-/// RAII guard of the TUI: entering puts the terminal in raw mode and on the alternate screen,
-/// and dropping it restores both and shows the cursor, also when `run` returns an error.
+/// RAII guard of the TUI: entering puts the terminal in raw mode and on the alternate screen
+/// (and in the keyboard mode, if supported), and dropping it restores all and shows the cursor,
+/// also when `run` returns an error.
 pub struct TerminalGuard {
     terminal: Tui,
+    /// Whether the terminal supports the kitty keyboard protocol (asked once, in `enter`).
+    keyboard_enhancement: bool,
 }
 
 impl TerminalGuard {
+    /// Enters raw mode and the alternate screen, then asks the terminal once whether it
+    /// supports the kitty keyboard protocol (`ESC[?u` + DA1, up to 2 s) and, if it does, turns
+    /// the keyboard mode on. No answer or an error counts as no support, silently: nothing
+    /// changes. Must run before the input thread exists (main.rs, `spawn_input`): the query
+    /// reads the input and would compete with it for the bytes.
     pub fn enter() -> io::Result<TerminalGuard> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -148,8 +199,15 @@ impl TerminalGuard {
             restore();
             return Err(err);
         }
+        let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+        if keyboard_enhancement {
+            push_keyboard_enhancement();
+        }
         match Terminal::new(CrosstermBackend::new(stdout)) {
-            Ok(terminal) => Ok(TerminalGuard { terminal }),
+            Ok(terminal) => Ok(TerminalGuard {
+                terminal,
+                keyboard_enhancement,
+            }),
             Err(err) => {
                 restore();
                 Err(err)
@@ -161,13 +219,18 @@ impl TerminalGuard {
         &mut self.terminal
     }
 
-    /// Runs `f` on the normal terminal: leaves the alternate screen and raw mode, shows the
-    /// cursor, runs it, and then enters both again with a full redraw, whatever `f` did.
+    /// Runs `f` on the normal terminal: turns the keyboard mode off, leaves the alternate
+    /// screen and raw mode, shows the cursor (`restore`), runs it, and then enters both again
+    /// (and the keyboard mode, if supported, without asking again) with a full redraw,
+    /// whatever `f` did.
     pub fn suspend<T>(&mut self, f: impl FnOnce() -> T) -> io::Result<T> {
         restore();
         let result = f();
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
+        if self.keyboard_enhancement {
+            push_keyboard_enhancement();
+        }
         self.terminal.clear()?;
         Ok(result)
     }
@@ -291,6 +354,32 @@ mod tests {
         assert!(held, "the reader waits while the part runs");
         reader.join().unwrap();
         assert!(entered.load(Ordering::SeqCst), "the gate is open after");
+    }
+
+    /// Every case in one test: `KEYBOARD_ENHANCED` is global to the test process. It ends
+    /// `false`.
+    #[test]
+    fn the_keyboard_mode_is_popped_only_when_pushed() {
+        let written = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut out = Vec::new();
+            f(&mut out);
+            String::from_utf8(out).unwrap()
+        };
+        let push = |out: &mut Vec<u8>| push_keyboard_enhancement_to(out);
+        let pop = |out: &mut Vec<u8>| pop_keyboard_enhancement_to(out);
+        assert_eq!(written(&pop), "", "no pop without a push");
+        assert_eq!(written(&push), "\x1b[>1u");
+        assert_eq!(written(&pop), "\x1b[<1u");
+        assert_eq!(written(&pop), "", "a second pop writes nothing");
+        let cycle = |out: &mut Vec<u8>| {
+            push_keyboard_enhancement_to(out);
+            pop_keyboard_enhancement_to(out);
+            push_keyboard_enhancement_to(out);
+            pop_keyboard_enhancement_to(out);
+            pop_keyboard_enhancement_to(out);
+        };
+        assert_eq!(written(&cycle), "\x1b[>1u\x1b[<1u\x1b[>1u\x1b[<1u");
+        assert!(!KEYBOARD_ENHANCED.load(Ordering::SeqCst));
     }
 
     #[test]

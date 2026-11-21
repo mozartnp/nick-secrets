@@ -182,6 +182,8 @@ fn spawn_signals(tx: Sender<LoopEvent>) -> io::Result<()> {
 
 /// The loop of the TUI. Returns the signal that ended it, if any.
 fn run(app: App, editor: Option<OsString>) -> io::Result<Option<i32>> {
+    // `enter` asks the terminal about the kitty keyboard protocol and reads the answer
+    // (NS-49): it must come before `spawn_input`, or the input thread would take the bytes.
     let mut guard = TerminalGuard::enter()?;
     let (tx, rx) = mpsc::channel::<LoopEvent>();
     let gate = Arc::new(InputGate::default());

@@ -8,7 +8,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use common::{DOWN, ENTER, ESC, LEFT, TAB, World};
+use std::time::{Duration, Instant};
+
+use common::{
+    DOWN, ENTER, ESC, KITTY_OFF, KITTY_ON, KITTY_QUERY, LEFT, TAB, World, assert_in_order,
+};
 
 const ALT_ON: &str = "\x1b[?1049h";
 const ALT_OFF: &str = "\x1b[?1049l";
@@ -205,6 +209,109 @@ fn a_panic_in_the_main_thread_restores_and_exits_with_101() {
 #[test]
 fn a_panic_in_a_secondary_thread_restores_and_exits_with_101() {
     assert_clean_panic("thread");
+}
+
+// ---- the keyboard mode of the kitty protocol (NS-49) ----
+
+#[test]
+fn without_keyboard_enhancement_the_nick_sends_no_keyboard_mode() {
+    let world = World::new();
+    let start = Instant::now();
+    let mut nick = world.spawn(&world.root, &[]);
+    nick.wait_for(" Navegação ");
+    let opened = start.elapsed();
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    let raw = nick.raw();
+    assert!(raw.contains(KITTY_QUERY), "the nick asked: {raw:?}");
+    assert!(!raw.contains(KITTY_ON), "{raw:?}");
+    assert!(!raw.contains(KITTY_OFF), "{raw:?}");
+    assert!(
+        opened < Duration::from_millis(1500),
+        "the opening did not wait for the query: {opened:?}"
+    );
+}
+
+#[test]
+fn with_keyboard_enhancement_the_mode_is_on_and_off_on_quit() {
+    let world = World::new();
+    let mut nick = world.spawn_kitty(&world.root, &[]);
+    nick.wait_for(" Navegação ");
+    nick.wait_for_raw(KITTY_ON);
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    let raw = nick.raw();
+    let last_on = raw.rfind(KITTY_ON).unwrap();
+    assert_in_order(&raw, last_on, &[KITTY_ON, KITTY_OFF, ALT_OFF]);
+    assert_eq!(raw.matches(KITTY_ON).count(), 1, "{raw:?}");
+    assert_eq!(raw.matches(KITTY_OFF).count(), 1, "a single pop: {raw:?}");
+    assert_restored_at_the_end(&raw);
+}
+
+#[test]
+fn with_keyboard_enhancement_an_error_turns_the_mode_off_before_the_message() {
+    let world = World::new();
+    let mut nick = world.spawn_kitty(&world.root, &[("NICK_TEST_PANIC", "error")]);
+    assert_eq!(nick.wait_exit(), Some(1));
+    let raw = nick.raw();
+    assert_in_order(
+        &raw,
+        0,
+        &[KITTY_ON, KITTY_OFF, "nick: NICK_TEST_PANIC: erro de teste"],
+    );
+}
+
+fn assert_panic_turns_the_mode_off(trigger: &str) {
+    let world = World::new();
+    let mut nick = world.spawn_kitty(&world.root, &[("NICK_TEST_PANIC", trigger)]);
+    assert_eq!(nick.wait_exit(), Some(101), "{trigger}");
+    let raw = nick.raw();
+    assert_in_order(
+        &raw,
+        0,
+        &[KITTY_ON, KITTY_OFF, "NICK_TEST_PANIC: panic de teste"],
+    );
+}
+
+#[test]
+fn with_keyboard_enhancement_a_panic_in_the_main_thread_turns_the_mode_off() {
+    assert_panic_turns_the_mode_off("main");
+}
+
+#[test]
+fn with_keyboard_enhancement_a_panic_in_a_secondary_thread_turns_the_mode_off() {
+    assert_panic_turns_the_mode_off("thread");
+}
+
+/// Off while the init runs on the normal terminal, on again when the TUI is back, without a
+/// second query.
+#[test]
+fn with_keyboard_enhancement_the_mode_is_off_during_the_init_and_on_after() {
+    let world = World::new();
+    let bare = world.dir("bare", false);
+    let mut nick = world.spawn_kitty(&world.root, &[("FAKE_INIT_MODE", "create")]);
+    press_create(&mut nick, &bare);
+    nick.wait_for("Criar a configuração? (s/N)");
+    nick.send("s\r");
+    nick.wait_for("Pressione Enter para voltar ao nick.");
+    nick.send(ENTER);
+    nick.wait_for(&format!("Projeto cadastrado: bare ({}).", bare.display()));
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    let raw = nick.raw();
+    assert_in_order(
+        &raw,
+        0,
+        &[
+            KITTY_ON,
+            KITTY_OFF,
+            "init falso: configuração criada",
+            KITTY_ON,
+            KITTY_OFF,
+        ],
+    );
+    assert_eq!(raw.matches(KITTY_QUERY).count(), 1, "asked once: {raw:?}");
+    assert_restored_at_the_end(&raw);
 }
 
 // ---- adding through the TUI ----

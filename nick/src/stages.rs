@@ -10,6 +10,12 @@ use crate::agents::Stage;
 use crate::docs;
 use crate::tickets::{INVALID_ID_MESSAGE, jira_id_valid};
 
+/// The stages of the agents of an epic (NS-40): only PO and Tech Leader, the long conversations
+/// of a plan that outlives a ticket. The only source of the rule: the menu of an epic
+/// (`StageType::epic_menu`), `agents::open` and the test that compares it with the CHECK of the
+/// migration 7.
+pub const EPIC_STAGES: [Stage; 2] = [Stage::Po, Stage::TechLeader];
+
 /// A type of conversation of the auto_scrum menu (`$TYPE` of the script).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageType {
@@ -191,6 +197,15 @@ impl StageType {
                 StageType::PoSentry => sentry,
                 _ => true,
             })
+            .collect()
+    }
+
+    /// The menu of an epic (NS-40): `menu` with only the types of `EPIC_STAGES` (PO and Tech
+    /// Leader). Only of the nick: auto_scrum.sh has no epic.
+    pub fn epic_menu(jira: bool, sentry: bool) -> Vec<StageType> {
+        StageType::menu(jira, sentry)
+            .into_iter()
+            .filter(|kind| EPIC_STAGES.contains(&kind.stage()))
             .collect()
     }
 
@@ -608,5 +623,56 @@ mod tests {
         }
         // Positive control: a made-up label is not found.
         assert!(!script.contains("\"Título inventado"));
+    }
+
+    // ---- the menu of an epic (NS-40) ----
+
+    #[test]
+    fn the_menu_of_an_epic_has_only_the_types_of_po_and_tech_leader() {
+        use StageType::*;
+        assert_eq!(EPIC_STAGES, [Stage::Po, Stage::TechLeader]);
+        assert_eq!(
+            StageType::epic_menu(true, true),
+            [
+                Po,
+                PoDiscussion,
+                PoJira,
+                PoSentry,
+                TechLeader,
+                TechLeaderJira
+            ]
+        );
+        assert_eq!(
+            StageType::epic_menu(true, false),
+            [Po, PoDiscussion, PoJira, TechLeader, TechLeaderJira]
+        );
+        assert_eq!(
+            StageType::epic_menu(false, true),
+            [Po, PoDiscussion, PoSentry, TechLeader]
+        );
+        assert_eq!(
+            StageType::epic_menu(false, false),
+            [Po, PoDiscussion, TechLeader]
+        );
+        for (jira, sentry) in [(true, true), (true, false), (false, true), (false, false)] {
+            let ticket = StageType::menu(jira, sentry);
+            let epic = StageType::epic_menu(jira, sentry);
+            let expected: Vec<StageType> = ticket
+                .into_iter()
+                .filter(|kind| !matches!(kind, Development | Review))
+                .collect();
+            assert_eq!(
+                epic, expected,
+                "{jira} {sentry}: the menu filtered, in its order"
+            );
+        }
+    }
+
+    #[test]
+    fn the_form_of_an_epic_starts_with_its_key() {
+        assert_eq!(
+            StageType::TechLeader.initial_values("EPIC-1"),
+            ["EPIC-1", "", ""]
+        );
     }
 }

@@ -38,7 +38,7 @@ BASH_BIN="$(command -v bash)"
 # Um UUID e um nome de exemplo, como a casca passa.
 SESSION_ID="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60"
 AGENT_NAME="proj · Dev · NS-1"
-USAGE="Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id> | --has-conversation <uuid>"
+USAGE="Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>"
 # Os 8 tipos do choose_type do auto_scrum.sh, na ordem do menu com tudo ligado.
 ALL_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
 # O texto que o EDITOR falso grava (po e tech_leader) e a DESCRIPTION que sai dele ($(cat), sem
@@ -940,6 +940,85 @@ rm -f "$case_dir/order"
 run_agent "$case_dir" "$proj" -- --ticket-id NS-2 --stage review --opened-id NS-1 --name "$AGENT_NAME" --resume "$SESSION_ID"
 assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: os argumentos da retomada em qualquer ordem também valem"
 assert_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/NS-2/" "controle positivo: em qualquer ordem, o aviso do ID novo"
+
+echo
+echo "== --resume com --epic-id: o agente de um épico (NS-40) =="
+# O aviso do ID novo de um épico, escrito aqui à mão (o texto é do bash, auto_scrum/prompt.sh).
+epic_id_notice() {
+  printf 'O ID deste épico mudou de %s para %s depois que esta conversa começou. A pasta do épico agora é .nick/docs/%s/ (antes era .nick/docs/%s/): use o caminho novo para o plano e os artefatos.' "$1" "$2" "$2" "$1"
+}
+# resume_epic <case_dir> <cwd> <stage> <opened> <epic> [VAR=valor...]: o resume com --epic-id.
+resume_epic() {
+  local case_dir="$1" cwd="$2" stage="$3" opened="$4" epic="$5" args
+  shift 5
+  args=(--resume "$SESSION_ID" --name "$AGENT_NAME" --stage "$stage")
+  [ -n "$opened" ] && args+=(--opened-id "$opened")
+  args+=(--epic-id "$epic")
+  run_agent "$case_dir" "$cwd" "$@" -- "${args[@]}"
+}
+# Jail ligada, o ID do épico mudou: o aviso da jail e o do épico num --append-system-prompt só.
+case_dir="$TEST_TMP/resume_epic_jail_on_id"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+resume_epic "$case_dir" "$proj" tech_leader EPIC-1 EPIC-2
+hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
+assert_eq "0" "$(file_of "$case_dir/rc")" "--epic-id com a jail ligada: sai com 0$(file_of "$case_dir/err")"
+assert_eq "$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" tech_leader "$(epic_id_notice EPIC-1 EPIC-2)")" "$(file_of "$case_dir/claude.argv")" \
+  "--epic-id, ID mudou: o aviso da jail, uma linha em branco e o aviso do épico, num --append-system-prompt só"
+assert_eq "1" "$(grep -cx -- '--append-system-prompt' "$case_dir/claude.argv" || true)" "--epic-id: um único --append-system-prompt"
+assert_contains "$(file_of "$case_dir/claude.argv")" "O ID deste épico mudou" "--epic-id: o texto do épico"
+assert_not_contains "$(file_of "$case_dir/claude.argv")" "O ID deste ticket" "--epic-id: não o texto do ticket"
+# Jail desligada: só o aviso do épico, ou nenhum com o mesmo ID (ou sem --opened-id).
+case_dir="$TEST_TMP/resume_epic_jail_off_id"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+resume_epic "$case_dir" "$proj" po 3f9a0c7e NS-28
+assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "$(epic_id_notice 3f9a0c7e NS-28)")" "$(file_of "$case_dir/claude.argv")" \
+  "--epic-id com a jail desligada, ID mudou: só o aviso do épico"
+for same_case in "EPIC-1|EPIC-1" "|EPIC-1"; do
+  IFS='|' read -r same_opened same_epic <<< "$same_case"
+  case_dir="$TEST_TMP/resume_epic_same_${same_opened:-sem}"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+  resume_epic "$case_dir" "$proj" po "$same_opened" "$same_epic"
+  assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "")" "$(file_of "$case_dir/claude.argv")" \
+    "--epic-id $same_epic, --opened-id '${same_opened}': nenhum aviso"
+done
+# Recusas: os dois juntos, nenhum, repetido, sem valor, inválido e vazio.
+case_dir="$TEST_TMP/resume_epic_args"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+r="--resume $SESSION_ID --name x --stage po"
+for args in "$r --ticket-id NS-1 --epic-id E-1" "$r --epic-id E-1 --ticket-id NS-1" "$r" "$r --epic-id E-1 --epic-id E-2" \
+  "$r --epic-id" "$r --epic-id a/b" "$r --epic-id .." "$r --opened-id a/b --epic-id E-1"; do
+  rm -f "$case_dir/order"
+  # Lista de propósito: cada palavra é um argumento.
+  # shellcheck disable=SC2086
+  run_agent "$case_dir" "$proj" -- $args
+  assert_eq "1" "$(file_of "$case_dir/rc")" "argumentos '$args': sai com 1"
+  assert_contains "$(file_of "$case_dir/err")" "$USAGE" "argumentos '$args': o uso no stderr"
+  assert_eq "" "$(file_of "$case_dir/order")" "argumentos '$args': nada é chamado"
+done
+run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name x --stage po --ticket-id NS-1 --epic-id E-1
+assert_contains "$(file_of "$case_dir/err")" "informe só um dos dois: --ticket-id ou --epic-id." "os dois juntos: a recusa diz por quê"
+run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name x --stage po
+assert_contains "$(file_of "$case_dir/err")" "informe o --ticket-id <id> ou o --epic-id <id>." "nenhum dos dois: a recusa diz por quê"
+rm -f "$case_dir/order"
+run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name x --stage po --epic-id ""
+assert_eq "1" "$(file_of "$case_dir/rc")" "--epic-id vazio: sai com 1"
+assert_eq "" "$(file_of "$case_dir/order")" "--epic-id vazio: nada é chamado"
+assert_not_exists "$proj/.nick/.gitignore" "argumentos inválidos do --epic-id: nada criado no projeto"
+run_agent "$case_dir" "$proj" -- --epic-id E-2 --stage po --opened-id E-1 --name "$AGENT_NAME" --resume "$SESSION_ID"
+assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: --epic-id em qualquer ordem também vale"
+assert_contains "$(file_of "$case_dir/claude.argv")" "A pasta do épico agora é .nick/docs/E-2/" "controle positivo: o aviso do épico"
+
+echo
+echo "== resume_id_notice: o texto do ticket byte a byte, e o do épico (NS-40) =="
+# notice_of <args...>: a saída de resume_id_notice do prompt.sh real com <args>.
+notice_of() {
+  # Aspas simples intencionais: os $1/$@ são do bash -c, não daqui.
+  # shellcheck disable=SC2016
+  "$BASH_BIN" -c 'source "$1"; source "$2"; shift 2; resume_id_notice "$@"' _ "$ROOT_DIR/lib/config/config.sh" "$ROOT_DIR/auto_scrum/prompt.sh" "$@"
+}
+assert_eq "$(id_notice NS-1 NS-9)" "$(notice_of NS-1 NS-9)" "sem o terceiro argumento: o texto do ticket de hoje, byte a byte"
+assert_eq "$(id_notice NS-1 NS-9)" "$(notice_of NS-1 NS-9 ticket)" "com ticket: o mesmo texto"
+assert_eq "$(epic_id_notice E-1 E-2)" "$(notice_of E-1 E-2 epic)" "com epic: o texto do épico"
 
 echo
 echo "== estrutura do launcher =="

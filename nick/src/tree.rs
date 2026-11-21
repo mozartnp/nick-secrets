@@ -1,15 +1,17 @@
-//! The tree of the panel (NS-38): Module > Project > Ticket > Agent, as a pure model, with no
-//! database, no screen and no disk. The App fills a `TreeData` from the database and its running
-//! agents; here are the nodes by identity (`NodeId`, the selection survives a refresh), the
-//! open/closed state of the branches, the flattening into the visible rows with their depth, the
-//! two filters (the hidden tickets, `show_hidden`; only the live agents, `only_active`), the "saída
-//! nova" mark that goes up to the closed ancestors, and where the selection goes when its node is
-//! gone (`reselect`). ui.rs draws the rows; app.rs moves on them.
+//! The tree of the panel (NS-38): Module > Project > [Epic >] Ticket > Agent (the optional epic
+//! since the NS-40), as a pure model, with no database, no screen and no disk. The App fills a
+//! `TreeData` from the database and its running agents; here are the nodes by identity (`NodeId`,
+//! the selection survives a refresh), the open/closed state of the branches, the flattening into
+//! the visible rows with their depth, the two filters (the hidden tickets and epics,
+//! `show_hidden`; only the live agents, `only_active`), the "saída nova" mark that goes up to the
+//! closed ancestors, and where the selection goes when its node is gone (`reselect`). ui.rs draws
+//! the rows; app.rs moves on them.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agents::{Agent, AgentState};
+use crate::agents::{Agent, AgentState, Owner};
 use crate::app::Row;
+use crate::db::Epic;
 use crate::modules::ModuleKind;
 use crate::projects::Availability;
 use crate::tickets::Ticket;
@@ -19,16 +21,30 @@ use crate::tickets::Ticket;
 pub enum NodeId {
     Module(ModuleKind),
     Project(i64),
+    Epic(i64),
     Ticket(i64),
     Agent(i64),
 }
 
+impl From<Owner> for NodeId {
+    /// The node of the owner of an agent: its parent on the tree.
+    fn from(owner: Owner) -> NodeId {
+        match owner {
+            Owner::Ticket(id) => NodeId::Ticket(id),
+            Owner::Epic(id) => NodeId::Epic(id),
+        }
+    }
+}
+
 /// A live agent of this nick: where it is in the tree and whether it is marked "● saída nova".
+/// `epic_id` is the epic of its branch (NS-40): its owner, when an epic, or the epic of its
+/// ticket; the mark and the filter `v` go up through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveAgent {
     pub id: i64,
-    pub ticket_id: i64,
+    pub owner: Owner,
     pub project_id: i64,
+    pub epic_id: Option<i64>,
     pub unseen: bool,
 }
 
@@ -40,9 +56,11 @@ pub struct TreeData<'a> {
     pub projects: &'a [Row],
     /// The tickets of each project (by project id), the hidden ones included.
     pub tickets: &'a HashMap<i64, Vec<Ticket>>,
-    /// The agents of each ticket (by ticket id), of every stage and state, in the order they were
-    /// opened.
-    pub agents: &'a HashMap<i64, Vec<Agent>>,
+    /// The epics of each project (by project id), the hidden ones included (NS-40).
+    pub epics: &'a HashMap<i64, Vec<Epic>>,
+    /// The agents of each ticket and epic (by owner), of every stage and state, in the order they
+    /// were opened.
+    pub agents: &'a HashMap<Owner, Vec<Agent>>,
     /// The agents this nick runs.
     pub live: &'a [LiveAgent],
 }
@@ -51,13 +69,13 @@ pub struct TreeData<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     open: HashSet<NodeId>,
-    /// The hidden tickets are listed too, and the archived agents (`f`; NS-39).
+    /// The hidden tickets and epics are listed too, and the archived agents (`f`; NS-39).
     pub show_hidden: bool,
     /// Only the branches with a live agent of this nick, all open (`v`).
     pub only_active: bool,
 }
 
-/// A visible row: the node, its depth (0..=3), whether it can open, whether it is open, and
+/// A visible row: the node, its depth (0..=4), whether it can open, whether it is open, and
 /// whether a live agent below it has new output (only when it is closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Visible {
@@ -70,12 +88,14 @@ pub struct Visible {
 
 impl Tree {
     /// The rows on the screen, in order: each module (the root, even alone); its projects (an
-    /// unavailable one does not open, but for one with a live agent); the tickets of an open
-    /// project, without the hidden ones unless `show_hidden` or one of its agents is live (decision
-    /// 7); the agents of an open ticket, in the order they were opened, without the archived ones
-    /// unless `show_hidden` (NS-39; a ticket with only archived agents is then a leaf). With
-    /// `only_active`, only the branches with a live agent and only the live agents, every branch
-    /// open, whatever the state kept.
+    /// unavailable one does not open, but for one with a live agent); in an open project, first
+    /// its epics (NS-40, decision 3), then its tickets without epic; in an open epic, first its
+    /// agents, then its tickets. A hidden ticket or epic shows only with `show_hidden` or with a
+    /// live agent of this nick in it (decision 7 of NS-38, decision 9 of NS-40). The agents of an
+    /// open ticket or epic, in the order they were opened, without the archived ones unless
+    /// `show_hidden` (NS-39; a node with only archived agents is then a leaf). With `only_active`,
+    /// only the branches with a live agent and only the live agents, every branch open, whatever
+    /// the state kept.
     pub fn visible(&self, data: &TreeData) -> Vec<Visible> {
         let live_in = |test: &dyn Fn(&LiveAgent) -> bool| data.live.iter().any(test);
         let unseen_in = |test: &dyn Fn(&LiveAgent) -> bool| {
@@ -123,53 +143,106 @@ impl Tree {
                 if !open {
                     continue;
                 }
-                for ticket in data.tickets.get(&project).map_or(&[][..], Vec::as_slice) {
-                    let has_live = live_in(&|a| a.ticket_id == ticket.id);
-                    let shown = if self.only_active {
-                        has_live
-                    } else {
-                        ticket.hidden_at.is_none() || self.show_hidden || has_live
-                    };
-                    if !shown {
-                        continue;
-                    }
-                    let agents: Vec<&Agent> = data
-                        .agents
-                        .get(&ticket.id)
-                        .map_or(&[][..], Vec::as_slice)
-                        .iter()
-                        .filter(|agent| !self.only_active || live_in(&|a| a.id == agent.id))
-                        // An archived agent only with the hidden ones (`f`, NS-39).
-                        .filter(|agent| {
-                            self.show_hidden || agent.state != AgentState::Archived.key()
-                        })
-                        .collect();
-                    let expandable = !agents.is_empty();
-                    let open =
-                        expandable && (self.only_active || self.is_open(NodeId::Ticket(ticket.id)));
-                    rows.push(Visible {
-                        id: NodeId::Ticket(ticket.id),
-                        depth: 2,
-                        expandable,
-                        open,
-                        unseen_below: !open && unseen_in(&|a| a.ticket_id == ticket.id),
-                    });
-                    if !open {
-                        continue;
-                    }
-                    for agent in agents {
-                        rows.push(Visible {
-                            id: NodeId::Agent(agent.id),
-                            depth: 3,
-                            expandable: false,
-                            open: false,
-                            unseen_below: false,
-                        });
+                let epics = data.epics.get(&project).map_or(&[][..], Vec::as_slice);
+                let tickets = data.tickets.get(&project).map_or(&[][..], Vec::as_slice);
+                for epic in epics {
+                    self.push_epic(&mut rows, data, epic, tickets);
+                }
+                // The tickets without epic (or of an epic this data does not know).
+                for ticket in tickets {
+                    let in_epic = ticket
+                        .epic_id
+                        .is_some_and(|e| epics.iter().any(|epic| epic.id == e));
+                    if !in_epic {
+                        self.push_ticket(&mut rows, data, ticket, 2);
                     }
                 }
             }
         }
         rows
+    }
+
+    /// The agents of `owner` that show (the filters `v` and `f`).
+    fn agents_of<'a>(&self, data: &'a TreeData, owner: Owner) -> Vec<&'a Agent> {
+        data.agents
+            .get(&owner)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter(|agent| !self.only_active || data.live.iter().any(|a| a.id == agent.id))
+            // An archived agent only with the hidden ones (`f`, NS-39).
+            .filter(|agent| self.show_hidden || agent.state != AgentState::Archived.key())
+            .collect()
+    }
+
+    /// Whether a ticket or an epic with `hidden_at` shows, `live` telling whether a live agent of
+    /// this nick is below it.
+    fn shows(&self, hidden: bool, live: bool) -> bool {
+        if self.only_active {
+            live
+        } else {
+            !hidden || self.show_hidden || live
+        }
+    }
+
+    fn push_agents(rows: &mut Vec<Visible>, agents: &[&Agent], depth: u16) {
+        for agent in agents {
+            rows.push(Visible {
+                id: NodeId::Agent(agent.id),
+                depth,
+                expandable: false,
+                open: false,
+                unseen_below: false,
+            });
+        }
+    }
+
+    /// A ticket at `depth` (2 under the project, 3 under an epic) and, open, its agents.
+    fn push_ticket(&self, rows: &mut Vec<Visible>, data: &TreeData, ticket: &Ticket, depth: u16) {
+        let owner = Owner::Ticket(ticket.id);
+        let has_live = data.live.iter().any(|a| a.owner == owner);
+        if !self.shows(ticket.hidden_at.is_some(), has_live) {
+            return;
+        }
+        let agents = self.agents_of(data, owner);
+        let expandable = !agents.is_empty();
+        let open = expandable && (self.only_active || self.is_open(NodeId::Ticket(ticket.id)));
+        rows.push(Visible {
+            id: NodeId::Ticket(ticket.id),
+            depth,
+            expandable,
+            open,
+            unseen_below: !open && data.live.iter().any(|a| a.unseen && a.owner == owner),
+        });
+        if open {
+            Tree::push_agents(rows, &agents, depth + 1);
+        }
+    }
+
+    /// An epic (depth 2) and, open, its agents (depth 3) and then its tickets (depth 3).
+    fn push_epic(&self, rows: &mut Vec<Visible>, data: &TreeData, epic: &Epic, tickets: &[Ticket]) {
+        let in_branch = |a: &LiveAgent| a.epic_id == Some(epic.id);
+        let has_live = data.live.iter().any(in_branch);
+        if !self.shows(epic.hidden_at.is_some(), has_live) {
+            return;
+        }
+        let agents = self.agents_of(data, Owner::Epic(epic.id));
+        let mut children = Vec::new();
+        Tree::push_agents(&mut children, &agents, 3);
+        for ticket in tickets.iter().filter(|t| t.epic_id == Some(epic.id)) {
+            self.push_ticket(&mut children, data, ticket, 3);
+        }
+        let expandable = !children.is_empty();
+        let open = expandable && (self.only_active || self.is_open(NodeId::Epic(epic.id)));
+        rows.push(Visible {
+            id: NodeId::Epic(epic.id),
+            depth: 2,
+            expandable,
+            open,
+            unseen_below: !open && data.live.iter().any(|a| a.unseen && in_branch(a)),
+        });
+        if open {
+            rows.extend(children);
+        }
     }
 
     /// Whether `id` is open in the state kept (the filter `v` shows every branch open without
@@ -186,8 +259,9 @@ impl Tree {
         self.open.remove(&id);
     }
 
-    /// The parent of `id`, as far as `data` knows it.
-    /// A live agent's ticket comes from the running ones (it may not be read from the database
+    /// The parent of `id`, as far as `data` knows it: a ticket in an epic is under the epic, an
+    /// epic and a ticket without epic under the project, and an agent under its owner (NS-40).
+    /// A live agent's owner comes from the running ones (it may not be read from the database
     /// yet).
     pub fn parent(&self, id: NodeId, data: &TreeData) -> Option<NodeId> {
         match id {
@@ -197,25 +271,33 @@ impl Tree {
                 .iter()
                 .any(|row| row.project.id == project)
                 .then_some(NodeId::Module(data.module)),
-            NodeId::Ticket(ticket) => data
-                .tickets
+            NodeId::Epic(epic) => data
+                .epics
                 .values()
                 .flatten()
-                .find(|t| t.id == ticket)
-                .map(|t| NodeId::Project(t.project_id)),
+                .find(|e| e.id == epic)
+                .map(|e| NodeId::Project(e.project_id)),
+            NodeId::Ticket(ticket) => {
+                let ticket = data.tickets.values().flatten().find(|t| t.id == ticket)?;
+                let known = |epic: i64| data.epics.values().flatten().any(|e| e.id == epic);
+                Some(match ticket.epic_id.filter(|epic| known(*epic)) {
+                    Some(epic) => NodeId::Epic(epic),
+                    None => NodeId::Project(ticket.project_id),
+                })
+            }
             NodeId::Agent(agent) => data
                 .live
                 .iter()
                 .find(|a| a.id == agent)
-                .map(|a| a.ticket_id)
+                .map(|a| a.owner)
                 .or_else(|| {
                     data.agents
                         .values()
                         .flatten()
                         .find(|a| a.id == agent)
-                        .map(|a| a.ticket_id)
+                        .map(|a| a.owner)
                 })
-                .map(NodeId::Ticket),
+                .map(NodeId::from),
         }
     }
 
@@ -299,13 +381,14 @@ mod tests {
             created_at: String::new(),
             hidden_at: hidden.then(|| "2026-11-20T00:00:00Z".to_string()),
             stage: "po".into(),
+            epic_id: None,
         }
     }
 
     fn agent(id: i64, ticket_id: i64) -> Agent {
         Agent {
             id,
-            ticket_id,
+            owner: Owner::Ticket(ticket_id),
             stage: "po".into(),
             session_id: format!("s{id}"),
             name: format!("a{id}"),
@@ -320,7 +403,8 @@ mod tests {
     struct Data {
         projects: Vec<Row>,
         tickets: HashMap<i64, Vec<Ticket>>,
-        agents: HashMap<i64, Vec<Agent>>,
+        epics: HashMap<i64, Vec<Epic>>,
+        agents: HashMap<Owner, Vec<Agent>>,
         live: Vec<LiveAgent>,
     }
 
@@ -339,10 +423,11 @@ mod tests {
                     ),
                     (2, vec![ticket(20, 2, false)]),
                 ]),
+                epics: HashMap::new(),
                 agents: HashMap::from([
-                    (10, vec![agent(100, 10), agent(101, 10)]),
-                    (11, vec![agent(110, 11)]),
-                    (20, vec![agent(200, 20)]),
+                    (Owner::Ticket(10), vec![agent(100, 10), agent(101, 10)]),
+                    (Owner::Ticket(11), vec![agent(110, 11)]),
+                    (Owner::Ticket(20), vec![agent(200, 20)]),
                 ]),
                 live: Vec::new(),
             }
@@ -353,6 +438,7 @@ mod tests {
                 module: ModuleKind::AutoScrum,
                 projects: &self.projects,
                 tickets: &self.tickets,
+                epics: &self.epics,
                 agents: &self.agents,
                 live: &self.live,
             }
@@ -361,8 +447,9 @@ mod tests {
         fn live(mut self, id: i64, ticket_id: i64, project_id: i64, unseen: bool) -> Data {
             self.live.push(LiveAgent {
                 id,
-                ticket_id,
+                owner: Owner::Ticket(ticket_id),
                 project_id,
+                epic_id: None,
                 unseen,
             });
             self
@@ -622,9 +709,9 @@ mod tests {
     #[test]
     fn an_archived_agent_shows_only_with_the_filter_of_the_hidden_ones() {
         let mut data = Data::new();
-        data.agents.get_mut(&10).unwrap()[0].state = "archived".into();
-        data.agents.insert(12, vec![agent(120, 12)]);
-        data.agents.get_mut(&12).unwrap()[0].state = "archived".into();
+        data.agents.get_mut(&Owner::Ticket(10)).unwrap()[0].state = "archived".into();
+        data.agents.insert(Owner::Ticket(12), vec![agent(120, 12)]);
+        data.agents.get_mut(&Owner::Ticket(12)).unwrap()[0].state = "archived".into();
         let mut tree = Tree::default();
         tree.open(M);
         tree.open(NodeId::Project(1));
@@ -674,5 +761,257 @@ mod tests {
                 (NodeId::Agent(101), 3),
             ]
         );
+    }
+
+    // ---- the epics (NS-40) ----
+
+    fn epic(id: i64, project_id: i64, hidden: bool) -> Epic {
+        Epic {
+            id,
+            project_id,
+            key: format!("E-{id}"),
+            is_provisional: false,
+            title: String::new(),
+            created_at: String::new(),
+            hidden_at: hidden.then(|| "2026-11-20T00:00:00Z".to_string()),
+        }
+    }
+
+    fn epic_agent(id: i64, epic_id: i64) -> Agent {
+        Agent {
+            owner: Owner::Epic(epic_id),
+            ..agent(id, 0)
+        }
+    }
+
+    const E5: NodeId = NodeId::Epic(5);
+    const E6: NodeId = NodeId::Epic(6);
+    const P1: NodeId = NodeId::Project(1);
+
+    /// `Data::new` plus, in project 1, the epics 5 (with the agents 500 and 501, and the tickets
+    /// 13 and 14, which has the agent 140) and 6 (hidden, with the ticket 15), created after the
+    /// tickets 10, 11 and 12 (which have no epic).
+    fn with_epics() -> Data {
+        let mut data = Data::new();
+        let tickets = data.tickets.get_mut(&1).unwrap();
+        for (id, epic) in [(13, 5), (14, 5), (15, 6)] {
+            tickets.push(Ticket {
+                epic_id: Some(epic),
+                ..ticket(id, 1, false)
+            });
+        }
+        data.epics = HashMap::from([(1, vec![epic(5, 1, false), epic(6, 1, true)])]);
+        data.agents
+            .insert(Owner::Epic(5), vec![epic_agent(500, 5), epic_agent(501, 5)]);
+        data.agents.insert(Owner::Ticket(14), vec![agent(140, 14)]);
+        data
+    }
+
+    fn live_of_epic(mut data: Data, id: i64, owner: Owner, epic: i64, unseen: bool) -> Data {
+        data.live.push(LiveAgent {
+            id,
+            owner,
+            project_id: 1,
+            epic_id: Some(epic),
+            unseen,
+        });
+        data
+    }
+
+    #[test]
+    fn the_epics_come_before_the_tickets_and_the_agents_of_an_epic_before_its_tickets() {
+        let data = with_epics();
+        let mut tree = Tree::default();
+        tree.open(M);
+        tree.open(P1);
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (P1, 1),
+                (E5, 2),
+                (NodeId::Ticket(10), 2),
+                (NodeId::Ticket(12), 2),
+                (NodeId::Project(2), 1)
+            ],
+            "the epics first (by creation), then the tickets without epic; the hidden epic 6 out"
+        );
+        assert!(find(&tree, &data, E5).expandable);
+        tree.open(E5);
+        tree.open(NodeId::Ticket(14));
+        assert_eq!(
+            rows(&tree, &data)[2..8],
+            [
+                (E5, 2),
+                (NodeId::Agent(500), 3),
+                (NodeId::Agent(501), 3),
+                (NodeId::Ticket(13), 3),
+                (NodeId::Ticket(14), 3),
+                (NodeId::Agent(140), 4),
+            ],
+            "the depths 2, 3 and 4"
+        );
+    }
+
+    #[test]
+    fn a_project_without_epics_gives_the_rows_of_before() {
+        // The same rows as `opening_shows_the_children_with_their_depth`, with the map of the
+        // epics present and empty for the project.
+        let mut data = Data::new();
+        data.epics.insert(1, Vec::new());
+        let mut tree = Tree::default();
+        tree.open(M);
+        tree.open(P1);
+        tree.open(NodeId::Ticket(10));
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (P1, 1),
+                (NodeId::Ticket(10), 2),
+                (NodeId::Agent(100), 3),
+                (NodeId::Agent(101), 3),
+                (NodeId::Ticket(12), 2),
+                (NodeId::Project(2), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_epic_takes_its_branch_and_shows_with_f_or_with_a_live_agent() {
+        let data = with_epics();
+        let mut tree = Tree::default();
+        tree.open(M);
+        tree.open(P1);
+        tree.open(E6);
+        let ids = |tree: &Tree, data: &Data| -> Vec<NodeId> {
+            rows(tree, data).into_iter().map(|(id, _)| id).collect()
+        };
+        assert!(!ids(&tree, &data).contains(&E6));
+        assert!(
+            !ids(&tree, &data).contains(&NodeId::Ticket(15)),
+            "its ticket goes with it"
+        );
+        tree.show_hidden = true;
+        let shown = ids(&tree, &data);
+        assert!(shown.contains(&E6) && shown.contains(&NodeId::Ticket(15)));
+        tree.show_hidden = false;
+        // A live agent of this nick in a ticket of the hidden epic: the epic stays (decision 9).
+        let live = live_of_epic(with_epics(), 150, Owner::Ticket(15), 6, false);
+        let shown = ids(&tree, &live);
+        assert!(
+            shown.contains(&E6) && shown.contains(&NodeId::Ticket(15)),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn only_active_shows_the_epics_with_a_live_agent_in_their_branch_open() {
+        let tree = Tree {
+            only_active: true,
+            ..Tree::default()
+        };
+        // A live agent of a ticket of the epic.
+        let mut data = live_of_epic(with_epics(), 140, Owner::Ticket(14), 5, false);
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (P1, 1),
+                (E5, 2),
+                (NodeId::Ticket(14), 3),
+                (NodeId::Agent(140), 4)
+            ]
+        );
+        // A live agent of the epic itself.
+        data.live.clear();
+        let data = live_of_epic(data, 501, Owner::Epic(5), 5, false);
+        assert_eq!(
+            rows(&tree, &data),
+            [(M, 0), (P1, 1), (E5, 2), (NodeId::Agent(501), 3)]
+        );
+    }
+
+    #[test]
+    fn the_mark_goes_up_through_a_closed_epic() {
+        let data = live_of_epic(with_epics(), 140, Owner::Ticket(14), 5, true);
+        let mut tree = Tree::default();
+        tree.open(M);
+        tree.open(P1);
+        assert!(find(&tree, &data, E5).unseen_below, "the closed epic");
+        assert!(
+            !find(&tree, &data, P1).unseen_below,
+            "the open project does not repeat it"
+        );
+        tree.open(E5);
+        assert!(!find(&tree, &data, E5).unseen_below);
+        assert!(
+            find(&tree, &data, NodeId::Ticket(14)).unseen_below,
+            "the closed ticket"
+        );
+        let data = live_of_epic(with_epics(), 500, Owner::Epic(5), 5, true);
+        tree.close(E5);
+        assert!(
+            find(&tree, &data, E5).unseen_below,
+            "an agent of the epic itself"
+        );
+    }
+
+    #[test]
+    fn parent_and_reveal_go_through_the_epic() {
+        let data = with_epics();
+        let tree = Tree::default();
+        let d = data.data();
+        assert_eq!(
+            tree.parent(NodeId::Agent(140), &d),
+            Some(NodeId::Ticket(14))
+        );
+        assert_eq!(tree.parent(NodeId::Ticket(14), &d), Some(E5));
+        assert_eq!(tree.parent(NodeId::Agent(500), &d), Some(E5));
+        assert_eq!(tree.parent(E5, &d), Some(P1));
+        assert_eq!(tree.parent(NodeId::Ticket(10), &d), Some(P1), "no epic");
+        let mut tree = Tree::default();
+        tree.reveal(NodeId::Agent(140), &d);
+        for id in [M, P1, E5, NodeId::Ticket(14)] {
+            assert!(tree.is_open(id), "{id:?}");
+        }
+        assert!(rows(&tree, &data).contains(&(NodeId::Agent(140), 4)));
+    }
+
+    #[test]
+    fn reselect_leaves_a_node_of_depth_4() {
+        let data = with_epics();
+        let mut tree = Tree::default();
+        tree.reveal(NodeId::Agent(140), &data.data());
+        let before = tree.visible(&data.data());
+        // The agent 140 is archived meanwhile: its ticket is the closest node left.
+        let mut after_data = with_epics();
+        after_data.agents.get_mut(&Owner::Ticket(14)).unwrap()[0].state = "archived".into();
+        let after = tree.visible(&after_data.data());
+        assert_eq!(
+            Tree::reselect(&before, &after, NodeId::Agent(140)),
+            NodeId::Ticket(14)
+        );
+        // The ticket 14 moves out of the epic: its agent is still there, now at depth 3.
+        let mut moved = with_epics();
+        moved.tickets.get_mut(&1).unwrap()[4].epic_id = None;
+        let after = tree.visible(&moved.data());
+        assert!(after.contains(&Visible {
+            id: NodeId::Agent(140),
+            depth: 3,
+            expandable: false,
+            open: false,
+            unseen_below: false
+        }));
+        assert_eq!(
+            Tree::reselect(&before, &after, NodeId::Agent(140)),
+            NodeId::Agent(140)
+        );
+        // The epic hidden meanwhile (by another nick): its branch goes, and the selection goes
+        // to the closest ancestor, the project.
+        let mut hidden = with_epics();
+        hidden.epics.get_mut(&1).unwrap()[0].hidden_at = Some("x".into());
+        let after = tree.visible(&hidden.data());
+        assert_eq!(Tree::reselect(&before, &after, NodeId::Agent(140)), P1);
     }
 }

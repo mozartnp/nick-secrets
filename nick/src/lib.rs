@@ -12,6 +12,7 @@ pub mod app;
 pub mod db;
 pub mod docs;
 pub mod editor;
+pub mod epics;
 pub mod init;
 pub mod keys;
 pub mod launch;

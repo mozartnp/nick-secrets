@@ -490,9 +490,9 @@ impl Shell {
                 }
                 self.app.after_init(outcome);
             }
-            Action::CheckAgent { project, ticket } => {
+            Action::CheckAgent { project, holder } => {
                 let mut launcher = self.offline_launcher();
-                self.app.check_agent(&project, &ticket, &mut launcher);
+                self.app.check_agent(&project, &holder, &mut launcher);
             }
             Action::EditDescription => {
                 let mut runner = TerminalEditorRunner::new(guard, gate, self.editor.as_deref());
@@ -507,14 +507,14 @@ impl Shell {
             }
             Action::OpenAgent {
                 project,
-                ticket,
+                holder,
                 kind,
                 log,
                 precheck,
             } => {
                 let mut launcher = self.pty_launcher(guard)?.with_jail(precheck.jail);
                 self.app
-                    .open_agent(&project, &ticket, kind, &log, precheck, &mut launcher);
+                    .open_agent(&project, &holder, kind, &log, precheck, &mut launcher);
                 self.adopt_session(&mut launcher);
             }
             Action::CheckResume { project, agent } => {

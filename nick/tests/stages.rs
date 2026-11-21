@@ -5,19 +5,23 @@
 //! the script, but for `--session-id <uuid> --name <name>`. It covers the mapping field →
 //! argument that the bash differential (bin/tests/test_nick_agent.sh) does not see. The fake
 //! claude of bin/tests/fixtures/bin records the argv; nothing real is launched, and no log goes
-//! to auto_scrum/logs/ (NICK_PROMPT_LOGS_DIR).
+//! to auto_scrum/logs/ (NICK_PROMPT_LOGS_DIR). Since the NS-40 it covers the epic too: the 6
+//! types of PO and Tech Leader with the ID of an epic, as the App fills it.
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use nick::agent_session::{AgentEvent, AgentSession};
 use nick::launch::{self, Launch, RenderRequest};
 use nick::stages::{self, Input, Rule, StageType};
+
+/// The tests of this binary change and read the environment: one at a time.
+static ENV: Mutex<()> = Mutex::new(());
 
 const SESSION_ID: &str = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60";
 const NAME: &str = "proj · Etapa · NS-1";
@@ -133,6 +137,7 @@ fn without_session(argv: &str) -> String {
 
 #[test]
 fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
+    let _env = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
     let project = root.join("proj");
@@ -158,9 +163,10 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
         repo("bin/tests/fixtures/bin").display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    // SAFETY: the only test of this binary, before any thread of its own: the launcher (run by
-    // run_render and by the PTY of AgentSession) inherits the fake claude in the PATH, its log
-    // and the dir of the logs of the prompts.
+    // SAFETY: the other test of this binary waits for the lock of ENV (taken above), and this
+    // one has no thread of its own yet: the launcher (run by run_render and by the PTY of
+    // AgentSession) inherits the fake claude in the PATH, its log and the dir of the logs of the
+    // prompts.
     unsafe {
         std::env::set_var("PATH", &path);
         std::env::set_var("FAKE_CLAUDE_LOG", &agent_argv);
@@ -249,4 +255,91 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
         StageType::ALL.len(),
         "one log per type, in the dir of the test"
     );
+    // The epic (NS-40): for the 6 types of PO and Tech Leader, the answers the App builds from
+    // `initial_values("EPIC-1")` (the ID of the epic in the field of the Jira ID, as the App fills
+    // it) give the log of `main()` of the script with `EPIC-1` typed, byte for byte.
+    let epic_root = root.join("epic");
+    fs::create_dir_all(&epic_root).unwrap();
+    for kind in StageType::epic_menu(true, true) {
+        let initial = kind.initial_values("EPIC-1");
+        let values: Vec<String> = raw_values(kind)
+            .into_iter()
+            .zip(kind.fields())
+            .zip(initial)
+            .map(|((raw, field), initial)| match field.rule {
+                Rule::JiraId => initial,
+                _ => raw,
+            })
+            .collect();
+        let answers = stages::render_args(kind, &values).expect("the answers pass");
+        let rendered = launch::run_render(
+            &launch::launcher_path(),
+            &project,
+            &RenderRequest { kind, answers },
+        )
+        .unwrap_or_else(|err| panic!("{} of an epic: {err}", kind.key()));
+        let (script_log, _) = run_script(&project, kind, &values, &epic_root);
+        assert_eq!(
+            fs::read(&rendered.log).unwrap(),
+            fs::read(&script_log).unwrap(),
+            "{} of an epic: the log of the shell is the log of the script, byte for byte",
+            kind.key()
+        );
+        if kind == StageType::TechLeader {
+            assert!(
+                rendered.prompt.contains(".nick/docs/EPIC-1/plan.md"),
+                "the plan of the epic in its folder: {}",
+                rendered.prompt
+            );
+        }
+    }
+}
+
+/// The menu of an epic is only of the nick (NS-40): the script has no epic, and its menu with
+/// Jira and Sentry on has the 8 types (`choose_type`, run for real), while `epic_menu` has only
+/// the 6 of PO and Tech Leader.
+#[test]
+fn the_menu_of_an_epic_is_only_of_the_nick() {
+    let _env = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "source '{}'; JIRA_ENABLED=true; SENTRY_ENABLED=true; \
+             for n in 1 2 3 4 5 6 7 8 9; do choose_type <<< \"$n\" > /dev/null 2>&1 && \
+             printf '%s\\n' \"$TYPE\"; done",
+            repo("auto_scrum/auto_scrum.sh").display()
+        ))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let script: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let all: Vec<String> = StageType::menu(true, true)
+        .iter()
+        .map(|kind| kind.key().to_string())
+        .collect();
+    assert_eq!(script, all, "the 8 types of the script, in its order");
+    assert_eq!(script.len(), 8);
+    let epic: Vec<&str> = StageType::epic_menu(true, true)
+        .iter()
+        .map(|kind| kind.key())
+        .collect();
+    assert_eq!(
+        epic,
+        [
+            "po",
+            "po_discussion",
+            "po_jira",
+            "po_sentry",
+            "tech_leader",
+            "tech_leader_jira"
+        ]
+    );
+    assert!(
+        script.iter().any(|key| key == "development"),
+        "the script offers Dev"
+    );
+    assert!(!epic.contains(&"development") && !epic.contains(&"review"));
 }

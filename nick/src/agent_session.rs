@@ -352,6 +352,7 @@ pub fn terminate_registered() {
 mod tests {
     use super::*;
     use crate::agents::Stage;
+    use crate::launch::HolderKey;
     use crate::stages::StageType;
     use std::fs;
     use std::path::PathBuf;
@@ -891,7 +892,7 @@ mod tests {
         let launch = Launch::Resume {
             stage: Stage::Development,
             opened_key: Some("NS-1"),
-            ticket_key: "NS-9",
+            holder_key: HolderKey::Ticket("NS-9"),
         };
         let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
         assert_eq!(wait_exit(&session), 0);
@@ -925,7 +926,7 @@ mod tests {
         let launch = Launch::Resume {
             stage: Stage::Po,
             opened_key: None,
-            ticket_key: "NS-9",
+            holder_key: HolderKey::Ticket("NS-9"),
         };
         let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
         assert_eq!(wait_exit(&session), 0);
@@ -935,6 +936,32 @@ mod tests {
         assert!(
             !argv.contains("\nauto\n"),
             "no auto mode out of the Dev stage: {argv}"
+        );
+    }
+
+    /// NS-40: the resume of an agent of an epic, by the real launcher: `--epic-id`, and the notice
+    /// of the new ID of an epic.
+    #[test]
+    fn a_resume_of_an_epic_agent_tells_the_new_folder_of_the_epic() {
+        let case = Case::new();
+        let (tx, _rx) = mpsc::channel();
+        let launch = Launch::Resume {
+            stage: Stage::TechLeader,
+            opened_key: Some("EPIC-1"),
+            holder_key: HolderKey::Epic("EPIC-2"),
+        };
+        let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
+        assert_eq!(wait_exit(&session), 0);
+        session.wait();
+        let argv = fs::read_to_string(case.path("claude.argv")).unwrap();
+        assert!(
+            argv.contains("A pasta do épico agora é .nick/docs/EPIC-2/"),
+            "{argv}"
+        );
+        assert!(!argv.contains("deste ticket"), "{argv}");
+        assert!(
+            argv.ends_with("--name\nproj · Dev · NS-1\n"),
+            "no prompt: {argv}"
         );
     }
 }

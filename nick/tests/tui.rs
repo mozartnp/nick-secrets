@@ -739,7 +739,7 @@ fn the_operator_changes_the_stage_and_done_stays_on_the_list() {
     nick.wait_for("NS-7  [PO]  Corrigir o login");
     nick.keep_screen("árvore com a etapa do ticket");
     // The new ticket is selected: its panel on the right (NS-38; before, Enter opened it).
-    nick.wait_for_flat("m mudar etapa");
+    nick.wait_for_flat("p épico");
     nick.wait_for("Etapa atual: PO");
     nick.wait_for("Nenhuma mudança: o ticket começou em PO.");
     nick.keep_screen("painel do ticket sem histórico");
@@ -830,12 +830,12 @@ fn editing_the_id_renames_only_the_docs_folder() {
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "proj");
     nick.select(&uuid);
-    nick.wait_for_flat("m mudar etapa");
+    nick.wait_for_flat("p épico");
     nick.send("i");
     nick.wait_for("Novo ID do ticket (ex: SC-123):");
     nick.keep_screen("diálogo de editar ID");
     nick.send(ESC);
-    nick.wait_for_flat("m mudar etapa");
+    nick.wait_for_flat("p épico");
     type_new_id(&mut nick, &uuid, "NS-99");
     let flat = nick.flat_screen();
     assert!(
@@ -880,7 +880,7 @@ fn editing_the_id_onto_an_existing_folder_is_refused_and_changes_nothing() {
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "proj");
     nick.select("NS-1");
-    nick.wait_for_flat("m mudar etapa");
+    nick.wait_for_flat("p épico");
     type_new_id(&mut nick, "NS-1", "NS-99");
     nick.send("s");
     nick.wait_for("Já existe a pasta .nick/docs/NS-99/ no projeto. Nada foi mudado.");

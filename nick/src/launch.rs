@@ -49,15 +49,22 @@ pub enum Launch<'a> {
         kind: StageType,
         prompt_file: &'a Path,
     },
-    /// `--stage <stage> [--opened-id <opened_key>] --ticket-id <ticket_key>`: the stage of the
-    /// agent (its type is not stored), the ticket key it was opened with, when known
-    /// (`agents::opened_key`), and the key of its ticket now; when they differ, the launcher
-    /// tells the agent the new folder of the ticket.
+    /// `--stage <stage> [--opened-id <opened_key>] --ticket-id <key>` (or `--epic-id <key>`, an
+    /// agent of an epic: NS-40): the stage of the agent (its type is not stored), the key it was
+    /// opened with, when known (`agents::opened_key`), and the key of its ticket or epic now; when
+    /// they differ, the launcher tells the agent the new folder.
     Resume {
         stage: Stage,
         opened_key: Option<&'a str>,
-        ticket_key: &'a str,
+        holder_key: HolderKey<'a>,
     },
+}
+
+/// The key now of the ticket or of the epic of a resumed agent (NS-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderKey<'a> {
+    Ticket(&'a str),
+    Epic(&'a str),
 }
 
 impl Launch<'_> {
@@ -75,7 +82,7 @@ impl Launch<'_> {
             Launch::Resume {
                 stage,
                 opened_key,
-                ticket_key,
+                holder_key,
             } => {
                 push(&["--resume".as_ref(), session_id.as_ref()]);
                 push(&["--name".as_ref(), name.as_ref()]);
@@ -83,7 +90,10 @@ impl Launch<'_> {
                 if let Some(key) = opened_key {
                     push(&["--opened-id".as_ref(), key.as_ref()]);
                 }
-                push(&["--ticket-id".as_ref(), ticket_key.as_ref()]);
+                match holder_key {
+                    HolderKey::Ticket(key) => push(&["--ticket-id".as_ref(), key.as_ref()]),
+                    HolderKey::Epic(key) => push(&["--epic-id".as_ref(), key.as_ref()]),
+                }
             }
         }
         args
@@ -461,6 +471,7 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::Stage;
     use std::fs;
     use std::path::Component;
 
@@ -881,5 +892,38 @@ mod tests {
         );
         let err = run_has_conversation_with_env(&launcher_path(), &proj, "", &env).unwrap_err();
         assert!(err.starts_with("Erro: "), "{err}");
+    }
+
+    /// NS-40: the resume of an agent of an epic gives `--epic-id` in the place of `--ticket-id`;
+    /// the one of a ticket is the argv of the NS-39.
+    #[test]
+    fn the_args_of_a_resume_name_the_ticket_or_the_epic() {
+        let args = |holder_key| {
+            Launch::Resume {
+                stage: Stage::TechLeader,
+                opened_key: Some("E-1"),
+                holder_key,
+            }
+            .args("s-1", "p · Tech Leader · E-1")
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>()
+        };
+        let head = [
+            "--resume",
+            "s-1",
+            "--name",
+            "p · Tech Leader · E-1",
+            "--stage",
+            "tech_leader",
+            "--opened-id",
+            "E-1",
+        ];
+        let mut ticket = head.to_vec();
+        ticket.extend(["--ticket-id", "NS-9"]);
+        assert_eq!(args(HolderKey::Ticket("NS-9")), ticket);
+        let mut epic = head.to_vec();
+        epic.extend(["--epic-id", "E-2"]);
+        assert_eq!(args(HolderKey::Epic("E-2")), epic);
     }
 }

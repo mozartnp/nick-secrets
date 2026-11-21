@@ -2931,16 +2931,16 @@ tamanho só para todas, como o plano previa. Na lista de 40 colunas, um nome lon
 `agents` (na ordem de abertura) e `shown`, o `id` do agente exibido. Abrir um agente o acrescenta,
 o exibe e põe o foco no terminal, e a lista continua nos tickets, com o mesmo ticket. Com o foco no
 terminal, toda tecla vai para o `claude` (inclusive `Ctrl+C`, `Esc` e `q`), menos o atalho, que
-devolve o foco à lista. A colagem e o mouse também vão para o terminal. Com o foco na lista, as
-teclas são as da tela, e nada vai para o `claude`. A captura do mouse e o bracketed paste ligam com
-o foco no terminal e desligam na lista, onde o operador seleciona texto do jeito nativo. O atalho é
-testado antes de tudo, menos da captura de um atalho novo. Só o `Press` alterna: um `Repeat` é
-engolido, para segurar a tecla não piscar o foco. **Com um diálogo aberto, o atalho é ignorado**,
-porque o diálogo é uma pergunta pendente. O `keys::encode_key` não mudou: com o atalho trocado, o
-`Ctrl+\` volta a ir para o `claude` como 0x1c. Quando o `claude` de um agente termina, a linha
-fica `ended`, a trava sai e a barra mostra a mensagem do NS-33. Se ele era o exibido, passa a ser
-exibido o agente vivo aberto mais recentemente, e o foco vai para a lista. Se não era, nada muda. A
-tela da esquerda não muda.
+devolve o foco à lista, e o Ctrl+Z, descartado (NS-44). A colagem e o mouse também vão para o
+terminal. Com o foco na lista, as teclas são as da tela, e nada vai para o `claude`. A captura do
+mouse e o bracketed paste ligam com o foco no terminal e desligam na lista, onde o operador
+seleciona texto do jeito nativo. O atalho é testado antes de tudo, menos da captura de um atalho
+novo. Só o `Press` alterna: um `Repeat` é engolido, para segurar a tecla não piscar o foco. **Com um
+diálogo aberto, o atalho é ignorado**, porque o diálogo é uma pergunta pendente. O
+`keys::encode_key` não mudou: com o atalho trocado, o `Ctrl+\` volta a ir para o `claude` como 0x1c.
+Quando o `claude` de um agente termina, a linha fica `ended`, a trava sai e a barra mostra a
+mensagem do NS-33. Se ele era o exibido, passa a ser exibido o agente vivo aberto mais recentemente,
+e o foco vai para a lista. Se não era, nada muda. A tela da esquerda não muda.
 
 **`Shortcut` e a forma canônica** (`keys.rs`). O atalho é guardado e comparado numa forma que bate
 com a tecla do jeito que o crossterm a entregar:
@@ -4353,7 +4353,8 @@ cancelamento do preview `Esc | Char('n')`. Fora do `mod tests`, o `app.rs` não 
 - os campos de texto, os sete diálogos de `takes_text() == true`: `AddPath`, `NewTicket` (título
   e ID do Jira), `EditTitle`, `EditEpicTitle`, `EditEpicId`, `EditId` e `StageForm`. Um `Q`, `S`
   ou `N` digitado neles é texto, não sai, não confirma e não cancela;
-- o terminal do agente (`key_agent`), atendido antes: os bytes vão ao programa como vieram;
+- o terminal do agente (`key_agent`), atendido antes: os bytes vão ao programa como vieram, menos
+  o Ctrl+Z (NS-44);
 - a captura do atalho reservado (`Dialog::CaptureShortcut`) e o próprio atalho reservado
   (`Shortcut::matches`), atendidos antes. O `Shortcut::from_key` já tinha a sua forma canônica
   (NS-34);
@@ -4399,3 +4400,54 @@ passaram sem edição.
 
 **Fora de escopo:** atalhos configuráveis além do reservado, e atalhos diferentes para maiúscula e
 minúscula (proibidos acima).
+
+## Rust no projeto: Ctrl+Z descartado no terminal do agente (NS-44)
+
+Um bug filho do épico NS-28. Com o foco no terminal de um agente, o Ctrl+Z ia para o `claude`
+como o byte `0x1A` (SUSP). O `claude` se suspendia e esperava um `fg`, e o painel desse agente
+ficava travado até o agente ser encerrado. O Ctrl+Z fica ao lado do atalho reservado padrão
+(`Ctrl+\`), então é fácil apertá-lo por engano.
+
+**A regra: com o foco no terminal do agente, o nick descarta o Ctrl+Z**, sem escrever nada no PTY,
+e a barra de status mostra `O Ctrl+Z não tem efeito dentro do nick.`. O foco continua no terminal.
+- **Descartado:** `z` ou `Z` (Caps Lock) com Ctrl, com ou sem Shift e com ou sem Super. É tudo o
+  que o `encode_key` mandaria como `0x1A` puro, porque ele ignora o Shift e o Super numa letra com
+  Ctrl. A tecla segurada (`Repeat`) também é descartada. O `Release` já era descartado antes, em
+  `handle_key`.
+- **Não descartado:** o Alt+Ctrl+Z, que continua indo ao `claude` como `ESC 0x1A`; o `0x1A` dentro
+  de texto colado (`encode_paste` não mudou); as outras letras com Ctrl, inclusive o Ctrl+C e o
+  Ctrl+D; e o Ctrl+\ quando ele não é o atalho.
+- **Com o foco na lista, nada mudou.** O Ctrl+Z continua sem efeito ali e não mostra a mensagem.
+
+**Onde fica.** O predicado puro `keys::is_suspend_key(&KeyEvent)` fica no `keys.rs`, ao lado do
+`shortcut_key`, separado do `encode_key`. O `encode_key` não mudou e continua sem regra de atalho.
+O descarte é a primeira regra de `App::key_agent`, antes do Shift+PageUp/PageDown e do
+`encode_key`. Ele devolve `Action::None` e grava a mensagem no `status`. A regra é fixa e não usa
+`Shortcut`, de propósito: um `Shortcut` só criaria a dúvida de qual dos dois ganha. O
+`CLAUDE_SHORTCUTS` não mudou, e o Ctrl+Z continua recusado como atalho reservado, na captura e no
+valor lido do banco.
+
+**A mensagem é curta de propósito.** Ela é a constante `CTRL_Z_IGNORED` do `app.rs`, com 39
+caracteres, e cabe na linha que a barra sempre ocupa. Uma mensagem de duas linhas mudaria a altura
+do painel e redimensionaria **todos** os PTYs, com SIGWINCH e falsos `● saída nova` em todo
+`claude` (o problema registrado no NS-34). Não aumente o texto sem conferir isso. A mensagem fica
+até outra ação limpar a barra, como as outras mensagens: as teclas mandadas ao programa não limpam
+o `status`. Um segundo Ctrl+Z grava o mesmo texto.
+
+**Por quê:** dentro do nick não há shell com controle de jobs para dar `fg` no `claude`
+suspenso, e o painel do agente travava até ele ser encerrado.
+
+**Quando rever:** se o `claude` passar a usar o Ctrl+Z para outra coisa (hoje a doc dele lista o
+Ctrl+Z como suspender), ou se o nick ganhar um jeito de retomar um processo suspenso.
+
+**Testes:** `keys.rs` (`is_suspend_key_is_ctrl_z_with_or_without_shift_and_caps_lock`, uma tabela
+com Shift, Caps Lock, Super, `Repeat`, Alt e as outras 25 letras com Ctrl); `app.rs`
+(`on_the_terminal_ctrl_z_is_dropped_and_the_status_says_so`, com o texto literal da mensagem;
+`on_the_terminal_the_other_ctrl_keys_and_alt_ctrl_z_still_go_to_the_program`;
+`on_the_list_ctrl_z_does_nothing_and_shows_no_message`); `ui.rs`
+(`the_ctrl_z_message_fits_one_row_and_keeps_the_panel_size`, a 100 e a 60 colunas); e, no PTY
+(`nick/tests/agent.rs`), `ctrl_z_never_reaches_claude_and_the_status_says_so`. Nele, depois de
+`\x1a` e `x`, o `claude` falso recebe só `78`. Os testes que já existiam passaram sem edição,
+inclusive o `Ctrl+Z → \x1a` do `encode_key`.
+
+**Fora de escopo:** retomar um agente que já está travado, e as outras teclas de sinal.

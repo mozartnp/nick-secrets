@@ -2858,6 +2858,34 @@ mod tests {
         );
     }
 
+    /// NS-44: the message of the dropped Ctrl+Z fits the one row the status always takes, so
+    /// it resizes no PTY (a second row would, NS-34).
+    #[test]
+    fn the_ctrl_z_message_fits_one_row_and_keeps_the_panel_size() {
+        let (mut f, _) = with_running(&["proj"]);
+        assert_eq!(f.app.focus, Focus::Terminal);
+        let message = "O Ctrl+Z não tem efeito dentro do nick.";
+        for width in [100, 60] {
+            let area = Rect::new(0, 0, width, 30);
+            f.app.status = None;
+            let without = layout(&f.app, area);
+            f.app.status = Some(message.into());
+            let with = layout(&f.app, area);
+            assert_eq!(without.status.height, 1, "{width}");
+            assert_eq!(with.status.height, 1, "{width}");
+            assert_eq!(with.terminal, without.terminal, "{width}");
+            let agent = f.app.shown_agent().unwrap();
+            assert_eq!(agent_area(&f.app, area, agent), with.terminal, "{width}");
+            let buffer = render_at(&f.app, width, 30, None);
+            let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
+            assert_eq!(
+                lines[usize::from(with.status.y)].trim(),
+                message,
+                "{width}: {lines:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_settings_show_the_shortcut_and_whether_it_is_the_default() {
         let mut f = fixture();

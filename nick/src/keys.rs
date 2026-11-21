@@ -6,6 +6,8 @@
 //! included (0x1c). The reserved shortcut that toggles the focus between the list and the
 //! terminal (NS-34) is a `Shortcut`, tested by the app before a key reaches `encode_key`, with
 //! the refusal of the keys the operator can't choose (`shortcut_refusal`).
+//! The Ctrl+Z is dropped by the app before `encode_key` (`is_suspend_key`, NS-44), and
+//! `encode_key` still knows no shortcut rule.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
@@ -321,6 +323,18 @@ pub fn shortcut_key(key: KeyEvent) -> KeyEvent {
         }
         _ => key,
     }
+}
+
+/// Whether the key is the Ctrl+Z that would reach the program as a bare 0x1a (SUSP), which
+/// the terminal of an agent drops (NS-44): the `claude` suspends itself on it and waits for a
+/// `fg`, and inside the nick there's no shell with job control to resume it, so its panel
+/// would be stuck until the agent ended. `z` or `Z` (Caps Lock) with Ctrl; Shift and Super
+/// don't matter, as `encode_key` ignores them on a letter with Ctrl. With Alt it isn't (ESC
+/// 0x1a still goes to the program). The kind doesn't matter: a Repeat would be 0x1a too.
+pub fn is_suspend_key(event: &KeyEvent) -> bool {
+    matches!(event.code, KeyCode::Char('z' | 'Z'))
+        && event.modifiers.contains(KeyModifiers::CONTROL)
+        && !event.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// A cursor key (arrows, Home, End): CSI or SS3 by DECCKM, CSI 1;m with modifiers.
@@ -1251,6 +1265,43 @@ mod tests {
                 ..event
             };
             assert_eq!(raw(shortcut_key(event)), raw(expected), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn is_suspend_key_is_ctrl_z_with_or_without_shift_and_caps_lock() {
+        let ctrl = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        let alt = KeyModifiers::ALT;
+        let none = KeyModifiers::NONE;
+        let mut cases = vec![
+            (key(KeyCode::Char('z'), ctrl), true),
+            (key(KeyCode::Char('Z'), ctrl), true),
+            (key(KeyCode::Char('Z'), ctrl | shift), true),
+            (key(KeyCode::Char('z'), ctrl | shift), true),
+            (key(KeyCode::Char('z'), ctrl | KeyModifiers::SUPER), true),
+            (
+                KeyEvent::new_with_kind(KeyCode::Char('z'), ctrl, KeyEventKind::Repeat),
+                true,
+            ),
+            (key(KeyCode::Char('z'), none), false),
+            (key(KeyCode::Char('Z'), none), false),
+            (key(KeyCode::Char('z'), shift), false),
+            (key(KeyCode::Char('Z'), shift), false),
+            (key(KeyCode::Char('z'), ctrl | alt), false),
+            (key(KeyCode::Char('Z'), ctrl | alt | shift), false),
+            (key(KeyCode::Char('z'), alt), false),
+            (key(KeyCode::Char('\\'), ctrl), false),
+            (key(KeyCode::Char('4'), ctrl), false),
+            (key(KeyCode::Char('c'), ctrl), false),
+            (key(KeyCode::F(1), none), false),
+        ];
+        for (small, capital) in ('a'..='y').zip('A'..='Y') {
+            cases.push((key(KeyCode::Char(small), ctrl), false));
+            cases.push((key(KeyCode::Char(capital), ctrl), false));
+        }
+        for (event, expected) in cases {
+            assert_eq!(is_suspend_key(&event), expected, "{event:?}");
         }
     }
 }

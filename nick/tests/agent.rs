@@ -293,6 +293,28 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
     assert_restored_at_the_end(&nick.raw());
 }
 
+/// NS-44: the Ctrl+Z (0x1a in raw mode) never reaches claude, which would suspend itself
+/// with no shell to resume it; the status says so, and the next key still goes to claude.
+#[test]
+fn ctrl_z_never_reaches_claude_and_the_status_says_so() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.send("\x1a");
+    wait_flat(&nick, "O Ctrl+Z não tem efeito dentro do nick.");
+    nick.keep_screen("Ctrl+Z descartado no terminal do agente");
+    assert!(!nick.screen().contains("GOT"), "{}", nick.screen());
+    // Had the 0x1a reached it, claude would show GOT 1a.
+    nick.send("x");
+    nick.wait_for("GOT 78");
+    nick.keep_screen("depois do x: o claude falso recebeu só 78");
+    wait_flat(&nick, "O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
 #[test]
 fn an_agent_in_the_jail_goes_through_ai_jail() {
     let (world, _) = world_with(&["JAIL_ENABLED=\"true\""]);

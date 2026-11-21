@@ -296,6 +296,11 @@ pub enum Action {
     },
 }
 
+/// The status when the terminal of an agent drops a Ctrl+Z (NS-44). Short on purpose: it fits
+/// one row of the status bar, so it doesn't change the height of the panel (a second row would
+/// resize every PTY, NS-34).
+const CTRL_Z_IGNORED: &str = "O Ctrl+Z não tem efeito dentro do nick.";
+
 /// Lines scrolled by one step of the mouse wheel, when the wheel scrolls the history.
 pub const WHEEL_LINES: i32 = 3;
 
@@ -599,7 +604,8 @@ impl App {
             }
             return Action::None;
         }
-        // With the focus on the terminal every other key is the program's, Ctrl+C included.
+        // With the focus on the terminal every other key is the program's, Ctrl+C included
+        // (`key_agent` drops only the Ctrl+Z, NS-44).
         if self.focus == Focus::Terminal {
             return self.key_agent(key);
         }
@@ -2531,9 +2537,14 @@ impl App {
         first
     }
 
-    /// A key with the focus on the terminal: Shift+PageUp/PageDown scroll the history;
-    /// everything else is encoded as an xterm would and sent to the program.
+    /// A key with the focus on the terminal: the Ctrl+Z is dropped, with a status
+    /// (`keys::is_suspend_key`, NS-44); Shift+PageUp/PageDown scroll the history; everything
+    /// else is encoded as an xterm would and sent to the program.
     fn key_agent(&mut self, key: KeyEvent) -> Action {
+        if keys::is_suspend_key(&key) {
+            self.status = Some(CTRL_Z_IGNORED.into());
+            return Action::None;
+        }
         if key.modifiers.contains(KeyModifiers::SHIFT) {
             match key.code {
                 KeyCode::PageUp => return Action::ScrollPageUp,
@@ -5055,6 +5066,81 @@ mod tests {
         assert_eq!(f.key(KeyCode::Up), send(b"\x1bOA"));
         assert_eq!(f.app.focus, Focus::Terminal);
         assert_eq!(f.app.dialog, None);
+    }
+
+    /// NS-44: the Ctrl+Z would suspend the `claude` with no shell to resume it, so the
+    /// terminal drops it (no 0x1a to the PTY) and the status says so.
+    #[test]
+    fn on_the_terminal_ctrl_z_is_dropped_and_the_status_says_so() {
+        let (mut f, _) = running();
+        let shown = f.app.shown;
+        let ctrl = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        let events = [
+            KeyEvent::new(KeyCode::Char('z'), ctrl),
+            KeyEvent::new(KeyCode::Char('Z'), ctrl),
+            KeyEvent::new(KeyCode::Char('Z'), ctrl | shift),
+            KeyEvent::new(KeyCode::Char('z'), ctrl | shift),
+            KeyEvent::new_with_kind(KeyCode::Char('z'), ctrl, KeyEventKind::Repeat),
+        ];
+        for event in events {
+            f.app.status = None;
+            assert_eq!(f.app.handle_key(event), Action::None, "{event:?}");
+            assert_eq!(
+                f.status(),
+                Some("O Ctrl+Z não tem efeito dentro do nick."),
+                "{event:?}"
+            );
+            assert_eq!(f.app.focus, Focus::Terminal);
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(f.app.shown, shown);
+        }
+    }
+
+    #[test]
+    fn on_the_terminal_the_other_ctrl_keys_and_alt_ctrl_z_still_go_to_the_program() {
+        let (mut f, _) = running();
+        let ctrl = KeyModifiers::CONTROL;
+        f.app.status = None;
+        for c in 'a'..='y' {
+            assert_eq!(
+                f.mods(KeyCode::Char(c), ctrl),
+                Action::Send(vec![(c as u8) & 0x1f]),
+                "Ctrl+{c}"
+            );
+        }
+        f.app.shortcut = Shortcut::from_db("ctrl+]").unwrap();
+        assert_eq!(
+            f.mods(KeyCode::Char('\\'), ctrl),
+            Action::Send(b"\x1c".to_vec())
+        );
+        assert_eq!(
+            f.mods(KeyCode::Char('z'), ctrl | KeyModifiers::ALT),
+            Action::Send(b"\x1b\x1a".to_vec())
+        );
+        assert_eq!(f.status(), None);
+        assert_eq!(f.app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn on_the_list_ctrl_z_does_nothing_and_shows_no_message() {
+        let (mut f, _) = running();
+        f.shortcut();
+        assert_eq!(f.app.focus, Focus::List);
+        let status = f.status().map(str::to_owned);
+        let selected = f.app.selected;
+        let agents = f.app.agents.len();
+        for c in ['z', 'Z'] {
+            assert_eq!(
+                f.mods(KeyCode::Char(c), KeyModifiers::CONTROL),
+                Action::None
+            );
+            assert_eq!(f.status(), status.as_deref());
+            assert_eq!(f.app.focus, Focus::List);
+            assert_eq!(f.app.selected, selected);
+            assert_eq!(f.app.dialog, None);
+            assert_eq!(f.app.agents.len(), agents);
+        }
     }
 
     #[test]

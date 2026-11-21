@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -32,6 +33,7 @@ use crate::epics;
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
 use crate::launch::{self, AgentLauncher, HolderKey, Launch, Precheck, RenderRequest, Rendered};
+use crate::mascot::{Mascot, Palette, SystemDice};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
@@ -416,6 +418,12 @@ pub struct App {
     pub(crate) visible: Vec<Visible>,
     /// The last agent shown (decision 2 of NS-38): where the shortcut goes from another node.
     pub(crate) last_shown: Option<i64>,
+    /// The cat Nick at the bottom of the column on the left (NS-51), and whether the terminal
+    /// shows her in truecolor (else in the 256 palette). Only `tick_mascot` moves her.
+    mascot: Mascot,
+    truecolor: bool,
+    /// The colors of the cat for `truecolor`, resolved once (review NS-51, problem 1).
+    palette: Palette,
 }
 
 impl App {
@@ -450,9 +458,49 @@ impl App {
             owner_agents: HashMap::new(),
             visible: Vec::new(),
             last_shown: None,
+            mascot: Mascot::new(Instant::now(), SystemDice::new()),
+            truecolor: false,
+            palette: Palette::new(false),
         };
         app.refresh_tree();
         app
+    }
+
+    /// The cat Nick (NS-51).
+    pub fn mascot(&self) -> &Mascot {
+        &self.mascot
+    }
+
+    /// Replaces the cat (the loop, by the test hook NICK_TEST_MASCOT).
+    pub fn set_mascot(&mut self, mascot: Mascot) {
+        self.mascot = mascot;
+    }
+
+    /// Moves the clock of the cat to `now`. True when she shows another frame (a redraw). It
+    /// touches nothing else: not the focus, the selection, the dialog, the status nor the agents.
+    pub fn tick_mascot(&mut self, now: Instant) -> bool {
+        self.mascot.tick(now)
+    }
+
+    /// When the cat changes next (None: never): where the idle loop wakes.
+    pub fn mascot_wake(&self) -> Option<Instant> {
+        self.mascot.next_wake()
+    }
+
+    /// Whether the terminal has truecolor (COLORTERM, read by the loop).
+    pub fn truecolor(&self) -> bool {
+        self.truecolor
+    }
+
+    /// Sets whether the terminal has truecolor, and resolves the colors of the cat for it.
+    pub fn set_truecolor(&mut self, truecolor: bool) {
+        self.truecolor = truecolor;
+        self.palette = Palette::new(truecolor);
+    }
+
+    /// The colors of the cat on this terminal.
+    pub fn palette(&self) -> &Palette {
+        &self.palette
     }
 
     /// The window of the preview of the prompt (rows shown, largest scroll), set by the loop
@@ -5067,6 +5115,86 @@ mod tests {
         f.open_agent(1, &mut launcher);
         assert_eq!(f.app.focus, Focus::Terminal);
         (f, launcher)
+    }
+
+    /// NS-51: the cat of a new App is the one of production (still, no bubble), drawn in the
+    /// 256 palette until the loop says the terminal has truecolor.
+    #[test]
+    fn a_new_app_has_the_cat_still_and_without_truecolor() {
+        let mut f = fixture();
+        assert_eq!(
+            f.app.mascot().frame(),
+            crate::mascot::Frame {
+                pose: crate::mascot::Pose::Rest,
+                meowing: false
+            }
+        );
+        assert!(f.app.mascot_wake().is_some(), "she wakes some day");
+        assert!(!f.app.truecolor());
+        assert_eq!(*f.app.palette(), crate::mascot::Palette::new(false));
+        f.app.set_truecolor(true);
+        assert!(f.app.truecolor());
+        assert_eq!(*f.app.palette(), crate::mascot::Palette::new(true));
+        let t0 = std::time::Instant::now();
+        f.app.set_mascot(crate::mascot::Mascot::still(t0));
+        assert_eq!(f.app.mascot_wake(), None);
+        assert!(!f.app.tick_mascot(t0 + std::time::Duration::from_secs(3600)));
+    }
+
+    /// NS-51, criterion 5: the blink and the meow touch nothing but the cat: not the focus, the
+    /// selection, the dialog (nor the text typed in it), the status nor the agents.
+    #[test]
+    fn ticking_the_cat_changes_nothing_but_the_cat() {
+        use crate::mascot::Mascot;
+        use std::time::{Duration, Instant};
+        // Every change of the fast cat in one second, checked against `state`.
+        fn tick_a_second(f: &mut Fixture) {
+            let t0 = Instant::now();
+            f.app.set_mascot(Mascot::fast(t0));
+            let mut changed = 0;
+            let mut now = t0;
+            while now < t0 + Duration::from_secs(1) {
+                now = f.app.mascot_wake().expect("the fast cat wakes");
+                changed += usize::from(f.app.tick_mascot(now));
+            }
+            assert!(changed > 10, "the cat changed only {changed} times");
+        }
+        fn state(f: &Fixture) -> String {
+            format!(
+                "{:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                f.app.focus(),
+                f.app.selected(),
+                f.app.dialog,
+                f.app.status,
+                f.app.shown(),
+                f.app.agents.len(),
+                f.app.screen,
+            )
+        }
+
+        // An agent running, the focus on its terminal.
+        let (mut f, _) = running();
+        f.app.set_status("uma mensagem".into());
+        let before = state(&f);
+        tick_a_second(&mut f);
+        assert_eq!(state(&f), before);
+        assert_eq!(f.app.focus(), Focus::Terminal);
+
+        // A text field open with something typed.
+        let mut f = fixture();
+        f.app
+            .select(crate::tree::NodeId::Module(ModuleKind::AutoScrum));
+        f.ch('a');
+        f.type_text("/um/cami");
+        let before = state(&f);
+        tick_a_second(&mut f);
+        assert_eq!(state(&f), before);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::AddPath {
+                input: "/um/cami".into()
+            })
+        );
     }
 
     /// With the focus on the terminal, every key but the reserved shortcut goes to the program

@@ -3143,3 +3143,68 @@ fn with_the_keyboard_mode_on_sigterm_turns_it_off() {
     assert_in_order(&raw, last_on, &[KITTY_ON, KITTY_OFF, ALT_OFF]);
     assert_restored_at_the_end(&raw);
 }
+
+// ---- the cat Nick does not get in the way (NS-51) ----
+
+/// Criterion 5: with the cat blinking and meowing fast, a text typed on the terminal of the
+/// agent reaches claude whole, and the focus stays on the terminal.
+#[test]
+fn the_fast_cat_neither_takes_the_focus_nor_breaks_the_typing_on_the_terminal() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    // At most 18 bytes: the `GOT` line (3 columns a byte) fits in the 58 columns of the terminal.
+    let typed = "gata miando";
+    let bytes = typed.len().to_string();
+    let mut nick = spawn(
+        &world,
+        "echo",
+        &[
+            ("FAKE_CLAUDE_READ_BYTES", bytes.as_str()),
+            ("NICK_TEST_MASCOT", "fast"),
+        ],
+    );
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 2);
+    nick.wait_for_panel("READY");
+    wait_for_focus_border(&nick, true);
+    let (half, rest) = typed.split_at(typed.len() / 2);
+    for chunk in half.as_bytes().chunks(2) {
+        nick.send(std::str::from_utf8(chunk).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    // Some blinks and meows later, the focus is still on the terminal.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(border_at(&nick, 0, PANEL_COL), ("┏".into(), true));
+    assert_eq!(border_at(&nick, 0, 0), ("┌".into(), false));
+    nick.send(rest);
+    let hex: String = typed.bytes().map(|b| format!(" {b:02x}")).collect();
+    nick.wait_for(&format!("GOT{hex}"));
+    nick.wait_for("O agente proj · Dev · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Criterion 5: the cat never resizes the PTY of the agent: no SIGWINCH reaches claude while
+/// she blinks and meows fast.
+#[test]
+fn the_fast_cat_sends_no_sigwinch_to_claude() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "winsize", &[("NICK_TEST_MASCOT", "fast")]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("SIZE 23 58");
+    // A few seconds of animation (a blink every 60 ms, a meow every 180 ms).
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(
+        nick.panel().matches("SIZE").count(),
+        1,
+        "only the SIZE of the start: {}",
+        nick.panel()
+    );
+    // Control: a real resize does reach it.
+    nick.resize(40, 120);
+    nick.wait_for("SIZE 34 78");
+    nick.send("\x03");
+    nick.wait_for("O agente proj · PO · NS-1 terminou");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}

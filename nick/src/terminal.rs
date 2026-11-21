@@ -6,9 +6,11 @@
 //! disambiguate, NS-49): turned on when the terminal supports it, on the whole time the TUI is
 //! (the list included), off while suspended and when leaving, so the Shift+Enter arrives.
 
+use std::ffi::OsStr;
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -26,6 +28,20 @@ use signal_hook::consts::{SIGINT, SIGQUIT};
 
 /// The terminal of the TUI.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+/// How long the idle loop (nothing to draw) waits for an event: with no deadline (None)
+/// without a `wake`, else until the `wake` of the cat Nick (NS-51), zero when it passed.
+pub fn idle_wait(wake: Option<Instant>, now: Instant) -> Option<Duration> {
+    wake.map(|at| at.saturating_duration_since(now))
+}
+
+/// Whether the terminal has truecolor, by the convention of `COLORTERM` (`truecolor` or
+/// `24bit`, any case); any other value, or none, is the 256 palette (NS-51).
+pub fn is_truecolor(colorterm: Option<&OsStr>) -> bool {
+    colorterm.and_then(OsStr::to_str).is_some_and(|value| {
+        value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+    })
+}
 
 /// Turns off the keyboard mode first, only if it is on (`pop_keyboard_enhancement`), then the
 /// mouse capture and the bracketed paste (always: turning off what is not on is harmless),
@@ -302,6 +318,37 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// NS-51: the idle loop blocks with no deadline without a wake of the cat, and else waits
+    /// until it (zero when it already passed).
+    #[test]
+    fn the_idle_wait_goes_until_the_wake_of_the_cat() {
+        let now = std::time::Instant::now();
+        assert_eq!(idle_wait(None, now), None);
+        assert_eq!(
+            idle_wait(Some(now + Duration::from_millis(150)), now),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(idle_wait(Some(now), now), Some(Duration::ZERO));
+        assert_eq!(
+            idle_wait(Some(now), now + Duration::from_secs(5)),
+            Some(Duration::ZERO),
+            "in the past"
+        );
+    }
+
+    /// NS-51: truecolor by the convention of COLORTERM (`truecolor` or `24bit`, any case).
+    #[test]
+    fn truecolor_comes_from_colorterm() {
+        use std::ffi::OsStr;
+        for yes in ["truecolor", "24bit", "TrueColor", "24BIT"] {
+            assert!(is_truecolor(Some(OsStr::new(yes))), "{yes}");
+        }
+        for no in ["", "256", "yes", "truecolour", " truecolor"] {
+            assert!(!is_truecolor(Some(OsStr::new(no))), "{no:?}");
+        }
+        assert!(!is_truecolor(None));
+    }
 
     #[test]
     fn close_waits_for_the_reader_and_holds_it_until_open() {

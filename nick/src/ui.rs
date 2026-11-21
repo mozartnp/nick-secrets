@@ -19,6 +19,9 @@ use crate::app::{
 use crate::db::Epic;
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
+use crate::mascot::{
+    self, BUBBLE_COLS, BUBBLE_ROWS, MASCOT_COLS, MASCOT_ROWS, MEOW_TEXT, TREE_MIN_ROWS,
+};
 use crate::paths::printable;
 use crate::projects;
 use crate::stages::{self, Input, Rule};
@@ -51,6 +54,99 @@ fn pane_block(focused: bool) -> Block<'static> {
 /// (`App::on_terminal`, the same rule as the help).
 fn list_block(app: &App) -> Block<'static> {
     pane_block(!app.on_terminal())
+}
+
+/// Where the cat Nick goes inside the column on the left (`inner`, inside its border; NS-51):
+/// its last `MASCOT_ROWS` rows, against the left. None when the inside has fewer than
+/// `MASCOT_ROWS + TREE_MIN_ROWS` rows or `MASCOT_COLS` columns: a fixed rule, so opening or
+/// closing a node never shows nor hides her, and she is never drawn cut.
+pub fn mascot_area(inner: Rect) -> Option<Rect> {
+    (inner.height >= MASCOT_ROWS + TREE_MIN_ROWS && inner.width >= MASCOT_COLS).then(|| Rect {
+        x: inner.x,
+        y: inner.bottom() - MASCOT_ROWS,
+        width: MASCOT_COLS,
+        height: MASCOT_ROWS,
+    })
+}
+
+/// What is left of `inner` for the tree (or the settings): all of it without the cat, the rows
+/// above her with her.
+pub fn content_area(inner: Rect) -> Rect {
+    match mascot_area(inner) {
+        Some(cat) => Rect {
+            height: cat.y - inner.y,
+            ..inner
+        },
+        None => inner,
+    }
+}
+
+/// Where the "Miau!" bubble goes: on the right of the cat after one column of space, on her
+/// last `BUBBLE_ROWS` rows. None without the cat or without the `MASCOT_COLS + 1 + BUBBLE_COLS`
+/// columns: a cut bubble would not be read.
+pub fn bubble_area(inner: Rect) -> Option<Rect> {
+    let cat = mascot_area(inner)?;
+    (inner.width >= MASCOT_COLS + 1 + BUBBLE_COLS).then(|| Rect {
+        x: cat.right() + 1,
+        y: cat.bottom() - BUBBLE_ROWS,
+        width: BUBBLE_COLS,
+        height: BUBBLE_ROWS,
+    })
+}
+
+/// The column on the left (the tree or the settings): its block with `title`, the cat at its
+/// bottom when she fits (`mascot_area`), and the area left for the content. The cat is not in
+/// `Areas`: she changes nothing the loop and the mouse use.
+fn left_column(frame: &mut Frame, app: &App, area: Rect, title: impl Into<Line<'static>>) -> Rect {
+    let block = list_block(app).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_mascot(frame, app, inner);
+    content_area(inner)
+}
+
+/// The cat inside `inner`, when she fits: each cell two pixels of her pose (`mascot::cells`),
+/// in truecolor or in the 256 palette (`App::truecolor`); a transparent cell is not touched.
+/// With the bubble open and room for it, the bubble.
+fn draw_mascot(frame: &mut Frame, app: &App, inner: Rect) {
+    let Some(cat) = mascot_area(inner) else {
+        return;
+    };
+    let shown = app.mascot().frame();
+    let palette = app.palette();
+    let color = |letter: Option<char>| letter.and_then(|c| palette.color(c));
+    let buffer = frame.buffer_mut();
+    for (y, row) in (cat.y..).zip(mascot::cells(shown.pose)) {
+        for (x, art) in (cat.x..).zip(row) {
+            let Some(symbol) = art.symbol else {
+                continue;
+            };
+            let cell = &mut buffer[(x, y)];
+            cell.set_char(symbol);
+            if symbol == '▀' {
+                if let Some(fg) = color(art.top) {
+                    cell.set_fg(fg);
+                }
+                if let Some(bg) = color(art.bottom) {
+                    cell.set_bg(bg);
+                }
+            } else if let Some(fg) = color(art.bottom) {
+                cell.set_fg(fg);
+            }
+        }
+    }
+    if shown.meowing
+        && let Some(bubble) = bubble_area(inner)
+    {
+        let inside = usize::from(BUBBLE_COLS - 2);
+        let edge = "─".repeat(inside);
+        let lines = vec![
+            Line::from(format!("╭{edge}╮")),
+            Line::from(format!("│{MEOW_TEXT:<inside$}│")),
+            Line::from(format!("╰{edge}╯")),
+        ];
+        frame.render_widget(Paragraph::new(lines), bubble);
+    }
 }
 
 /// Where each part of the screen goes.
@@ -573,12 +669,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         "Atalho para alternar entre a lista e o terminal: {}{default}",
         app.shortcut().label()
     );
-    frame.render_widget(
-        Paragraph::new(line)
-            .block(list_block(app).title(" Configurações "))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let content = left_column(frame, app, area, " Configurações ");
+    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), content);
 }
 
 /// The mark of a stage on the tree and on the panel of a ticket: `[<label>]`, and `[✓ Concluído]`
@@ -753,12 +845,12 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .visible()
         .iter()
         .position(|row| row.id == app.selected());
+    let content = left_column(frame, app, area, title);
     let list = List::new(items)
-        .block(list_block(app).title(title))
         .highlight_symbol("> ")
         .highlight_style(selected_style());
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, content, &mut state);
 }
 
 /// The label of a visible row and its style.
@@ -4554,5 +4646,255 @@ mod tests {
         let (y, _) = find(&buffer, "Tech Leader").expect("the row of the agent");
         let row = list_row(&buffer, y);
         assert!(row.contains("Tech Leader  ● saída nova"), "{row:?}");
+    }
+
+    // ----- NS-51: the cat Nick at the bottom of the column on the left -----
+
+    use crate::mascot::tests::{APPROVED_BLINK, APPROVED_PALETTE, APPROVED_REST, showing};
+    use crate::mascot::{MASCOT_COLS, MASCOT_ROWS, Pose};
+
+    /// The index of the 256 palette of each letter (the table of D8 of the plan), independent
+    /// of `nearest_256`.
+    const APPROVED_INDEXED: [(char, u8); 7] = [
+        ('D', 235),
+        ('B', 240),
+        ('C', 180),
+        ('W', 255),
+        ('E', 74),
+        ('K', 233),
+        ('P', 181),
+    ];
+
+    fn approved_color(letter: char, truecolor: bool) -> Option<Color> {
+        if truecolor {
+            APPROVED_PALETTE
+                .iter()
+                .find(|(key, _)| *key == letter)
+                .map(|(_, (r, g, b))| Color::Rgb(*r, *g, *b))
+        } else {
+            APPROVED_INDEXED
+                .iter()
+                .find(|(key, _)| *key == letter)
+                .map(|(_, index)| Color::Indexed(*index))
+        }
+    }
+
+    /// The inside of the column on the left of `app` on a screen `width` x `height`.
+    fn column_inner(app: &App, width: u16, height: u16) -> Rect {
+        Block::bordered().inner(layout(app, Rect::new(0, 0, width, height)).list)
+    }
+
+    /// The fixture with `n` projects, the module open (more nodes than rows at 30 rows).
+    fn with_projects(n: usize) -> Fixture {
+        let mut f = fixture();
+        let root = std::fs::canonicalize(f._tmp.path()).unwrap();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        for i in 0..n {
+            let dir = root.join(format!("p{i:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            db.insert_project("auto_scrum", &format!("p{i:02}"), dir.to_str().unwrap())
+                .unwrap();
+        }
+        f.app.refresh_tree();
+        f.app
+            .tree
+            .open(NodeId::Module(crate::modules::ModuleKind::AutoScrum));
+        f.app.refresh_tree();
+        f
+    }
+
+    /// The cells of `rect` with a half block (`▀`/`▄`).
+    fn half_blocks(buffer: &Buffer, rect: Rect) -> usize {
+        rect.positions()
+            .filter(|p| ["▀", "▄"].contains(&buffer[(p.x, p.y)].symbol()))
+            .count()
+    }
+
+    #[test]
+    fn the_cat_needs_15_rows_and_17_columns_inside_the_column() {
+        let inner = |width, height| Rect::new(1, 1, width, height);
+        assert_eq!(mascot_area(inner(38, 14)), None);
+        assert_eq!(content_area(inner(38, 14)), inner(38, 14));
+        for height in [15, 16] {
+            assert_eq!(
+                mascot_area(inner(38, height)),
+                Some(Rect::new(1, 1 + height - 7, MASCOT_COLS, MASCOT_ROWS)),
+                "{height}"
+            );
+            assert_eq!(
+                content_area(inner(38, height)),
+                Rect::new(1, 1, 38, height - 7),
+                "{height}"
+            );
+        }
+        assert_eq!(mascot_area(inner(16, 20)), None);
+        assert_eq!(content_area(inner(16, 20)), inner(16, 20));
+        assert_eq!(mascot_area(inner(17, 20)), Some(Rect::new(1, 14, 17, 7)));
+        // The bubble: 17 + 1 + 17 columns.
+        assert_eq!(bubble_area(inner(34, 20)), None);
+        assert_eq!(bubble_area(inner(35, 20)), Some(Rect::new(19, 18, 17, 3)));
+        assert_eq!(bubble_area(inner(38, 14)), None, "no cat, no bubble");
+    }
+
+    /// Criterion 1: every cell of the cat is the one the literal copy of the approved art
+    /// says (symbol, fg, bg), in both poses, with and without truecolor, on the tree and on the
+    /// settings; the transparent ones are the background of the column, inside its border.
+    #[test]
+    fn the_cat_is_drawn_pixel_by_pixel_inside_the_border() {
+        let mut f = fixture();
+        for screen in [Screen::Tree, Screen::Settings] {
+            for (pose, pixels) in [(Pose::Rest, APPROVED_REST), (Pose::Blink, APPROVED_BLINK)] {
+                for truecolor in [true, false] {
+                    f.app.screen = screen;
+                    f.app.set_mascot(showing(pose, false));
+                    f.app.set_truecolor(truecolor);
+                    let buffer = render(&f.app);
+                    let inner = column_inner(&f.app, 100, 30);
+                    let cat = mascot_area(inner).expect("room for the cat");
+                    assert_eq!((cat.x, cat.y + cat.height), (inner.x, inner.bottom()));
+                    let case = format!("{screen:?} {pose:?} truecolor={truecolor}");
+                    for row in 0..MASCOT_ROWS {
+                        for col in 0..MASCOT_COLS {
+                            let top = pixels[usize::from(2 * row)].chars().nth(col.into());
+                            let bottom = pixels[usize::from(2 * row + 1)].chars().nth(col.into());
+                            let (top, bottom) = (
+                                top.and_then(|c| approved_color(c, truecolor)),
+                                bottom.and_then(|c| approved_color(c, truecolor)),
+                            );
+                            let (symbol, fg, bg) = match (top, bottom) {
+                                (Some(t), Some(b)) => ("▀", t, b),
+                                (Some(t), None) => ("▀", t, Color::Reset),
+                                (None, Some(b)) => ("▄", b, Color::Reset),
+                                (None, None) => (" ", Color::Reset, Color::Reset),
+                            };
+                            let cell = &buffer[(cat.x + col, cat.y + row)];
+                            assert_eq!(
+                                (cell.symbol(), cell.fg, cell.bg),
+                                (symbol, fg, bg),
+                                "{case}: row {row}, column {col}"
+                            );
+                        }
+                    }
+                    // The border stays: the left side on her rows and the bottom under her.
+                    let list = layout(&f.app, Rect::new(0, 0, 100, 30)).list;
+                    for y in cat.y..cat.bottom() {
+                        assert_eq!(buffer[(list.x, y)].symbol(), "┃", "{case}: {y}");
+                    }
+                    assert_eq!(buffer[(list.x, list.bottom() - 1)].symbol(), "┗", "{case}");
+                    for x in cat.x..cat.right() {
+                        assert_eq!(buffer[(x, list.bottom() - 1)].symbol(), "━", "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Criterion 3: below 15 rows (or 17 columns) inside the column, no cat, and the tree takes
+    /// the whole inside; at 15 the cat on the last 7 and the tree on the 8 above.
+    #[test]
+    fn the_cat_goes_away_when_the_column_is_too_short_or_narrow() {
+        let f = with_projects(30);
+        let height_for = |rows: u16| {
+            (5..80)
+                .find(|h| column_inner(&f.app, 100, *h).height == rows)
+                .expect("a height with that inside")
+        };
+        for rows in [14, 15, 16] {
+            let height = height_for(rows);
+            let buffer = render_at(&f.app, 100, height, None);
+            let inner = column_inner(&f.app, 100, height);
+            let tree_rows = if rows >= 15 { rows - 7 } else { rows };
+            // The tree, more nodes than rows, down to its last row.
+            for y in inner.y..inner.y + tree_rows {
+                assert!(
+                    !list_row(&buffer, y).trim().is_empty(),
+                    "{rows}: row {y} empty\n{}",
+                    text(&buffer)
+                );
+            }
+            if rows >= 15 {
+                let cat = Rect::new(inner.x, inner.y + tree_rows, MASCOT_COLS, 7);
+                assert!(half_blocks(&buffer, cat) > 50, "{rows}: the cat");
+                assert_eq!(half_blocks(&buffer, inner), half_blocks(&buffer, cat));
+                // Nothing of the tree under the tree's last row, but the cat.
+                for y in cat.y..cat.bottom() {
+                    let rest: String = (cat.right()..inner.right())
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect();
+                    assert_eq!(rest.trim(), "", "{rows}: row {y}");
+                }
+            } else {
+                assert_eq!(half_blocks(&buffer, inner), 0, "{rows}: no cat");
+            }
+        }
+        // A narrow window: the column of 18 columns outside, 16 inside.
+        let buffer = render_at(&f.app, 36, 30, None);
+        let inner = column_inner(&f.app, 36, 30);
+        assert_eq!(inner.width, 16);
+        assert_eq!(half_blocks(&buffer, inner), 0, "narrow: no cat");
+        let buffer = render_at(&f.app, 38, 30, None);
+        let inner = column_inner(&f.app, 38, 30);
+        assert_eq!(inner.width, 17);
+        assert!(half_blocks(&buffer, inner) > 50, "17 columns: the cat");
+    }
+
+    /// Criterion 4: with the bubble open, its three rows byte by byte on her right, one column
+    /// away; on a column too narrow for it, the cat without the bubble.
+    #[test]
+    fn the_bubble_is_on_the_right_of_the_cat_when_it_fits() {
+        let mut f = fixture();
+        for pose in [Pose::Rest, Pose::Blink] {
+            f.app.set_mascot(showing(pose, true));
+            let buffer = render(&f.app);
+            let inner = column_inner(&f.app, 100, 30);
+            let cat = mascot_area(inner).unwrap();
+            let row = |y: u16, from: u16, width: u16| -> String {
+                (from..from + width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            };
+            let x = cat.right() + 1;
+            assert_eq!(row(cat.y + 4, x, 17), "╭───────────────╮", "{pose:?}");
+            assert_eq!(row(cat.y + 5, x, 17), "│Miau!          │", "{pose:?}");
+            assert_eq!(row(cat.y + 6, x, 17), "╰───────────────╯", "{pose:?}");
+            assert_eq!(row(cat.y + 4, cat.right(), 1), " ", "one column of space");
+            for y in cat.y..cat.y + 4 {
+                assert_eq!(row(y, x, 17).trim(), "", "{pose:?}: above the bubble");
+            }
+        }
+        // 66 columns: the column of 33 outside, 31 inside: no room for the bubble.
+        let buffer = render_at(&f.app, 66, 30, None);
+        let inner = column_inner(&f.app, 66, 30);
+        assert!(inner.width < 35);
+        assert!(half_blocks(&buffer, inner) > 50, "the cat is there");
+        assert!(!text(&buffer).contains("Miau!"), "{}", text(&buffer));
+        assert!(!text(&buffer).contains('╭'));
+        // Without the bubble open, no bubble.
+        f.app.set_mascot(showing(Pose::Rest, false));
+        assert!(!text(&render(&f.app)).contains("Miau!"));
+    }
+
+    /// Criterion 5: the cat changes nothing of the layout: the areas of the loop (the PTY of each
+    /// agent, the header, the mouse) are the same whatever the pose and the bubble.
+    #[test]
+    fn the_cat_changes_neither_the_layout_nor_the_size_of_the_terminals() {
+        let (mut f, _) = with_running(&["proj", "fora"]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut seen = Vec::new();
+        for pose in [Pose::Rest, Pose::Blink] {
+            for meowing in [false, true] {
+                f.app.set_mascot(showing(pose, meowing));
+                let areas = layout(&f.app, area);
+                let terminals: Vec<Rect> = f
+                    .app
+                    .agents()
+                    .iter()
+                    .map(|agent| agent_area(&f.app, area, agent))
+                    .collect();
+                render_at(&f.app, 100, 30, None);
+                seen.push((areas, terminals));
+            }
+        }
+        assert!(seen.iter().all(|s| *s == seen[0]), "{seen:?}");
     }
 }

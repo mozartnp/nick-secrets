@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use common::{
     DOWN, ENTER, ESC, KITTY_OFF, KITTY_ON, KITTY_QUERY, LEFT, TAB, World, assert_in_order,
 };
+use nick::mascot::MASCOT_ROWS;
 
 const ALT_ON: &str = "\x1b[?1049h";
 const ALT_OFF: &str = "\x1b[?1049l";
@@ -1037,5 +1038,172 @@ fn capital_letters_work_as_shortcuts_and_are_typed_as_they_are() {
     );
 
     nick.send("Q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- the cat Nick at the bottom of the column on the left (NS-51) ----
+
+/// The row of the bottom border of the column on the left (None while it is not drawn).
+fn column_bottom(nick: &common::Nick) -> Option<u16> {
+    (0..nick.size().rows)
+        .rev()
+        .find(|row| ["┗", "└"].contains(&nick.cell(*row, 0).0.as_str()))
+}
+
+/// Waits for the cat on the last `MASCOT_ROWS` rows inside the column, against its left border,
+/// and returns the row of her top.
+fn wait_for_cat(nick: &common::Nick) -> u16 {
+    nick.wait_until("the cat at the bottom of the column", || {
+        column_bottom(nick).is_some_and(|bottom| {
+            nick.cat_rows() == (bottom - MASCOT_ROWS..bottom).collect::<Vec<_>>()
+        })
+    });
+    let top = column_bottom(nick).unwrap() - MASCOT_ROWS;
+    for row in top..top + MASCOT_ROWS {
+        assert!(
+            ["┃", "│"].contains(&nick.cell(row, 0).0.as_str()),
+            "the border at the row {row}"
+        );
+    }
+    top
+}
+
+/// The cell of the eye on the left: `▀` with the blue of the eyes (`E`) on top (her cell row 4,
+/// column 2), or the pupil (`K`) blinking.
+fn eye(nick: &common::Nick, top: u16) -> (String, vt100::Color) {
+    nick.cell(top + 4, 1 + 2)
+}
+
+/// Criterion 2: the cat at the bottom of the column, inside the border, on the tree and on the
+/// settings; without COLORTERM (the env of the PTY is clean), in the 256 palette.
+#[test]
+fn the_cat_is_at_the_bottom_of_the_column_on_the_tree_and_on_the_settings() {
+    let world = World::new();
+    let mut nick = world.spawn(&world.root, &[]);
+    nick.wait_for(" Navegação ");
+    let top = wait_for_cat(&nick);
+    assert_eq!(eye(&nick, top), ("▀".into(), vt100::Color::Idx(74)));
+    assert_eq!(nick.cell(top, 2).0, "▀", "the tip of the ear");
+    assert!(!nick.screen().contains("Miau!"), "still: no bubble");
+    nick.keep_screen("NS-51 parada (árvore, paleta de 256)");
+    nick.send("c");
+    nick.wait_for(" Configurações ");
+    let top = wait_for_cat(&nick);
+    assert_eq!(eye(&nick, top), ("▀".into(), vt100::Color::Idx(74)));
+    nick.keep_when("NS-51 parada (Configurações)", "the settings", |screen| {
+        screen.contents().contains(" Configurações ")
+    });
+    nick.send(ESC);
+    nick.wait_for(" Navegação ");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Criterion 6: with COLORTERM=truecolor (or 24bit), the exact RGB of the approved art.
+#[test]
+fn with_truecolor_the_cat_has_the_exact_colors() {
+    let world = World::new();
+    for colorterm in ["truecolor", "24bit"] {
+        let mut nick = world.spawn(&world.root, &[("COLORTERM", colorterm)]);
+        nick.wait_for(" Navegação ");
+        let top = wait_for_cat(&nick);
+        assert_eq!(
+            eye(&nick, top),
+            ("▀".into(), vt100::Color::Rgb(110, 170, 225)),
+            "{colorterm}"
+        );
+        nick.keep_when(
+            &format!("NS-51 parada (truecolor, COLORTERM={colorterm})"),
+            "the cat",
+            |screen| !common::cat_rows(screen).is_empty(),
+        );
+        nick.send("q");
+        assert_eq!(nick.wait_exit(), Some(0));
+    }
+}
+
+/// Criterion 3: a window too short hides the cat, and a tall one brings her back.
+#[test]
+fn a_short_window_hides_the_cat_and_a_tall_one_brings_her_back() {
+    let world = World::new();
+    let mut nick = world.spawn(&world.root, &[]);
+    nick.wait_for(" Navegação ");
+    wait_for_cat(&nick);
+    // 19 rows: 1 of the status, 2 of the help and 2 of the border leave 14 inside.
+    nick.resize(19, common::COLS);
+    nick.wait_until("the column of 19 rows", || column_bottom(&nick) == Some(15));
+    nick.wait_until("the cat gone", || nick.cat_rows().is_empty());
+    nick.keep_when("NS-51 sumida (janela de 19 linhas)", "no cat", |screen| {
+        common::cat_rows(screen).is_empty()
+    });
+    // 20 rows: 15 inside, the least she needs.
+    nick.resize(20, common::COLS);
+    nick.wait_until("the column of 20 rows", || column_bottom(&nick) == Some(16));
+    wait_for_cat(&nick);
+    nick.resize(common::ROWS, common::COLS);
+    wait_for_cat(&nick);
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Criterion 4, in the real binary: with NICK_TEST_MASCOT=fast she blinks and the "Miau!" shows
+/// up on her right and goes away.
+#[test]
+fn the_fast_cat_blinks_and_meows_and_the_bubble_goes_away() {
+    let world = World::new();
+    let mut nick = world.spawn(&world.root, &[("NICK_TEST_MASCOT", "fast")]);
+    nick.wait_for(" Navegação ");
+    let top = wait_for_cat(&nick);
+    let eye_color = |screen: &vt100::Screen| screen.cell(top + 4, 3).map(|cell| cell.fgcolor());
+    nick.keep_when("NS-51 piscando", "a blink", |screen| {
+        eye_color(screen) == Some(vt100::Color::Idx(233))
+    });
+    nick.keep_when("NS-51 de olhos abertos", "the eyes open again", |screen| {
+        eye_color(screen) == Some(vt100::Color::Idx(74))
+    });
+    nick.keep_when("NS-51 miando", "the bubble", |screen| {
+        screen.contents().contains("│Miau!          │")
+    });
+    let row = nick
+        .screen()
+        .lines()
+        .nth(usize::from(top + 5))
+        .unwrap()
+        .to_string();
+    assert!(
+        row.contains("│Miau!          │"),
+        "on the row of the cat: {row:?}"
+    );
+    nick.wait_until("the bubble gone", || !nick.screen().contains("Miau!"));
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Criterion 5: the fast cat does not break the typing in a text field.
+#[test]
+fn the_fast_cat_does_not_break_the_typing_in_a_text_field() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    world.ticket(&proj, "NS-7", "Título");
+    let mut nick = world.spawn(&world.root, &[("NICK_TEST_MASCOT", "fast")]);
+    nick.open_project("proj");
+    nick.select("NS-7");
+    nick.send("e");
+    nick.wait_for("Editar título");
+    let typed = " com a gata piscando e miando sem parar";
+    for chunk in typed.as_bytes().chunks(3) {
+        nick.send(std::str::from_utf8(chunk).unwrap());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    nick.wait_for_flat(&format!("Título{typed}"));
+    nick.send(ENTER);
+    nick.wait_for("Título atualizado: NS-7.");
+    assert_eq!(
+        world.tickets(Some(&proj))[0].1,
+        format!("Título{typed}"),
+        "the whole text reached the database"
+    );
+    nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }

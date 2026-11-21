@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nick::mascot::MASCOT_COLS;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 pub mod snapshot;
@@ -38,6 +39,9 @@ pub const RIGHT: &str = "\x1b[C";
 pub const TAB: &str = "\t";
 /// The columns inside the border of the column on the left (the tree, NS-38: `LIST_WIDTH`).
 const TREE_COLS: usize = 38;
+/// The half blocks the cat Nick is drawn with, at the bottom of the column on the left (NS-51):
+/// taken out of `tree_rows` and `flat_screen`, so her rows read as empty ones.
+const MASCOT_BLOCKS: [char; 2] = ['▀', '▄'];
 
 /// The keyboard mode of the kitty protocol on (flag 1) and off (NS-49).
 pub const KITTY_ON: &str = "\x1b[>1u";
@@ -347,8 +351,10 @@ pub struct Nick {
 }
 
 impl Nick {
-    /// Starts the binary at `cwd` with only PATH, TERM and `env` in the environment, on a
-    /// terminal without the kitty keyboard protocol.
+    /// Starts the binary at `cwd` with only PATH, TERM, `NICK_TEST_MASCOT=still` (the cat Nick
+    /// drawn still, NS-51: no blink nor "Miau!" in the middle of a reading of the screen) and
+    /// `env` in the environment (a `NICK_TEST_MASCOT` of `env` replaces it), on a terminal
+    /// without the kitty keyboard protocol.
     pub fn spawn(cwd: &Path, env: &[(String, String)]) -> Nick {
         Nick::spawn_as(cwd, env, Keyboard::Legacy)
     }
@@ -368,6 +374,7 @@ impl Nick {
         command.cwd(cwd);
         command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
         command.env("TERM", "xterm-256color");
+        command.env("NICK_TEST_MASCOT", "still");
         for (key, value) in env {
             command.env(key, value);
         }
@@ -441,24 +448,42 @@ impl Nick {
     /// Appends the screen now, under `label`, to the file named by `NICK_TEST_SCREENS`, when it
     /// is set (NS-36: the screens of the validation of a ticket); otherwise does nothing.
     pub fn keep_screen(&self, label: &str) {
-        let Some(path) = std::env::var_os("NICK_TEST_SCREENS") else {
-            return;
-        };
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap();
-        writeln!(file, "===== {label} =====\n{}\n", self.screen()).unwrap();
+        keep(label, self.parser().screen());
+    }
+
+    /// Waits until `cond` holds on the screen (`what` in the panic), and keeps that same screen
+    /// (`keep`, so a screen that changes fast, as the cat Nick blinking, is kept as it was seen).
+    pub fn keep_when(&self, label: &str, what: &str, cond: impl Fn(&vt100::Screen) -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            let parser = self.parser();
+            if cond(parser.screen()) {
+                keep(label, parser.screen());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("{what} never happened. Screen:\n{}", self.screen());
+    }
+
+    /// The rows of the screen with a half block of the cat Nick (NS-51) in her columns of the
+    /// column on the left (1 to 17), from the top.
+    pub fn cat_rows(&self) -> Vec<u16> {
+        cat_rows(self.parser().screen())
     }
 
     /// The screen as one line: the dialog borders (and the thick one of the focused list,
-    /// NS-37) taken out and the non-empty rows joined by a space, so a text wrapped inside a
-    /// dialog can be checked whole.
+    /// NS-37) and the half blocks of the cat Nick (NS-51) taken out and the non-empty rows
+    /// joined by a space, so a text wrapped inside a dialog can be checked whole.
     pub fn flat_screen(&self) -> String {
         self.screen()
             .lines()
-            .map(|l| l.replace(['│', '┃'], "").trim().to_string())
+            .map(|l| {
+                l.replace(['│', '┃'], "")
+                    .replace(MASCOT_BLOCKS, " ")
+                    .trim()
+                    .to_string()
+            })
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
@@ -600,7 +625,8 @@ impl Nick {
     }
 
     /// The rows of the tree (NS-38): the columns inside the border of the column on the left,
-    /// from the first row under the top of the border.
+    /// from the first row under the top of the border; the half blocks of the cat Nick (NS-51)
+    /// taken out, so her rows are empty ones (the end of the tree for `select`).
     pub fn tree_rows(&self) -> Vec<String> {
         self.screen()
             .lines()
@@ -609,6 +635,7 @@ impl Nick {
                 line.chars()
                     .skip(1)
                     .take(TREE_COLS)
+                    .map(|c| if MASCOT_BLOCKS.contains(&c) { ' ' } else { c })
                     .collect::<String>()
                     .trim_end()
                     .to_string()
@@ -694,6 +721,42 @@ impl Nick {
             std::thread::sleep(Duration::from_millis(30));
         }
         panic!("{what} never happened. Screen:\n{}", self.screen());
+    }
+}
+
+/// The rows of `screen` with a half block of the cat Nick in her columns (NS-51).
+pub fn cat_rows(screen: &vt100::Screen) -> Vec<u16> {
+    let (rows, _) = screen.size();
+    (0..rows)
+        .filter(|row| {
+            (1..=MASCOT_COLS).any(|col| {
+                screen.cell(*row, col).is_some_and(|cell| {
+                    MASCOT_BLOCKS
+                        .iter()
+                        .any(|block| cell.contents() == block.to_string())
+                })
+            })
+        })
+        .collect()
+}
+
+/// Keeps `screen` under `label` for the validation of a ticket: its text appended to the file
+/// named by `NICK_TEST_SCREENS` (NS-36) and, with its colors (ANSI: `cat` it on a terminal), in
+/// `<label>.ansi` in the directory named by `NICK_TEST_SCREENS_ANSI` (NS-51), when they are
+/// set; otherwise does nothing.
+fn keep(label: &str, screen: &vt100::Screen) {
+    if let Some(path) = std::env::var_os("NICK_TEST_SCREENS") {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "===== {label} =====\n{}\n", screen.contents()).unwrap();
+    }
+    if let Some(dir) = std::env::var_os("NICK_TEST_SCREENS_ANSI") {
+        let mut bytes = screen.contents_formatted();
+        bytes.extend_from_slice(b"\x1b[0m\r\n");
+        fs::write(Path::new(&dir).join(format!("{label}.ansi")), bytes).unwrap();
     }
 }
 

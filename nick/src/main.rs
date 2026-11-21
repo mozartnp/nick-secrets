@@ -1,13 +1,16 @@
 //! Entry point of `nick`: the command line, the state directory and the database (before the
 //! TUI: an error there is printed on the normal terminal), the cleanup of the agents left by a
 //! dead nick, the panic hook, and the loop of the TUI. Only this file reads the environment
-//! (HOME, XDG_STATE_HOME, NICK_INIT_BIN, EDITOR and the test hook NICK_TEST_PANIC).
+//! (HOME, XDG_STATE_HOME, NICK_INIT_BIN, EDITOR, COLORTERM and the test hooks NICK_TEST_PANIC
+//! and NICK_TEST_MASCOT).
 //!
 //! The loop is driven by a channel (finding of NS-29): an input thread reads the terminal
 //! (paused by its gate while bin/nick-init runs), a signal thread turns SIGTERM and SIGHUP into
 //! events, and the threads of each agent send its output, its copies (OSC 52) and its end,
 //! with the id of the agent (NS-34: several run at once). The main thread blocks on the channel
-//! and redraws only after something changed, at most once a frame.
+//! and redraws only after something changed, at most once a frame; with nothing to draw it
+//! waits on the channel only until the next change of the cat Nick (NS-51: a blink, the
+//! bubble), and then redraws too.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -28,6 +31,7 @@ use nick::editor::TerminalEditorRunner;
 use nick::init::{self, TerminalInitRunner};
 use nick::keys::TermModes;
 use nick::launch::{self, TerminalAgentLauncher};
+use nick::mascot::Mascot;
 use nick::paths::{self, DB_FILE_NAME};
 use nick::terminal::{self, InputGate, TerminalGuard};
 use nick::ui;
@@ -103,6 +107,11 @@ fn main() -> ExitCode {
     if !messages.is_empty() {
         app.set_status(messages.join(" "));
     }
+    // The cat Nick (NS-51): in truecolor by COLORTERM, else in the 256 palette.
+    app.set_truecolor(terminal::is_truecolor(
+        std::env::var_os("COLORTERM").as_deref(),
+    ));
+    mascot_hook(&mut app);
 
     // The editor of the long texts of the stage forms (NS-35): ${EDITOR:-nano}.
     let editor = std::env::var_os("EDITOR");
@@ -239,6 +248,9 @@ impl Shell {
         let mut dirty = true;
         let mut last_draw = Instant::now() - FRAME;
         loop {
+            // The cat Nick (NS-51) only redraws: no PTY changes size, no mode of the outer
+            // terminal changes, so no `after_change`.
+            dirty |= self.app.tick_mascot(Instant::now());
             let event = if dirty && !terminal::panicking() {
                 let wait = (last_draw + FRAME).saturating_duration_since(Instant::now());
                 if wait.is_zero() {
@@ -253,9 +265,16 @@ impl Shell {
                     Err(RecvTimeoutError::Disconnected) => return Ok(None),
                 }
             } else {
-                match rx.recv() {
-                    Ok(event) => event,
-                    Err(_) => return Ok(None),
+                match terminal::idle_wait(self.app.mascot_wake(), Instant::now()) {
+                    Some(wait) => match rx.recv_timeout(wait) {
+                        Ok(event) => event,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => return Ok(None),
+                    },
+                    None => match rx.recv() {
+                        Ok(event) => event,
+                        Err(_) => return Ok(None),
+                    },
                 }
             };
             // A panic in another thread: its hook restores the terminal, ends the agents and
@@ -643,6 +662,19 @@ fn test_hook() -> io::Result<()> {
         }
         Ok("error") => Err(io::Error::other("NICK_TEST_PANIC: erro de teste")),
         _ => Ok(()),
+    }
+}
+
+/// Test hook (ABOUT.md, tests/common/mod.rs), only for the tests: NICK_TEST_MASCOT=still draws
+/// the cat Nick still (she never blinks nor meows, and the idle loop blocks with no deadline, as
+/// before the NS-51), =fast makes her blink and meow on short fixed intervals. Any other value,
+/// or none, is the cat of production. It never hides her: the ticket forbids a way to turn her
+/// off.
+fn mascot_hook(app: &mut App) {
+    match std::env::var("NICK_TEST_MASCOT").as_deref() {
+        Ok("still") => app.set_mascot(Mascot::still(Instant::now())),
+        Ok("fast") => app.set_mascot(Mascot::fast(Instant::now())),
+        _ => {}
     }
 }
 

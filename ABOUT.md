@@ -4820,3 +4820,156 @@ As três observações do review que não pediam mudança ficam registradas: as 
 conteúdo como ele é); o `UNIQUE` da migração 8 não cruza o `resume_session_id` de um agente com o
 `session_id` de outro (exigiria o `claude` continuar numa sessão criada pelo nick, o que não é
 realista); e a validação do UUID faz um `grep` por salto (custo desprezível com o limite de 50).
+
+## Rust no projeto: a gata Nick no painel (NS-51)
+
+História filha do épico NS-28. A Nick, a gata do operador, aparece desenhada em pixel art na base
+da coluna da esquerda do `nick` (a árvore e as Configurações), dentro da borda e encostada à
+esquerda. Ela pisca de vez em quando e, raramente, mostra um balão "Miau!" ao lado.
+
+**Sempre visível, sem opção de desligar. Ela some só por falta de espaço.** A regra é fixa
+(decisão do analista no plano): ela aparece se o **interior** da coluna tiver altura ≥
+`MASCOT_ROWS + TREE_MIN_ROWS` = 7 + 8 = **15 linhas** e largura ≥ `MASCOT_COLS` = **17 colunas**.
+Abaixo disso ela não é desenhada, e a árvore (ou as Configurações) usa o interior todo. A regra
+**não depende de quantos nós estão visíveis**, para a gata não aparecer e sumir enquanto o
+operador abre e fecha ramos. Uma árvore maior que o espaço rola como antes (`ListState`). A regra
+da largura evita desenhar a gata cortada: com a coluna em `min(40, largura/2)`, uma janela de menos
+de 38 colunas não comporta a gata. Com ela, a árvore fica com as `interior − 7` linhas de cima, e
+ela com as 7 de baixo.
+
+**A arte de referência:** o original aprovado (variante B, "patinhas na borda") fica em
+`.nick/docs/NS-51/nick_sprite.py`, não versionado, como tudo em `.nick/docs/`
+(`python3 .nick/docs/NS-51/nick_sprite.py` mostra as três poses). No repositório, a fonte é
+`REST`/`BLINK`/`PALETTE` em `nick/src/mascot.rs`: um pixel por caractere, `.` transparente. Cada
+célula do terminal junta 2 pixels na vertical: os dois coloridos → `▀`, com o de cima no `fg` e o
+de baixo no `bg`; só o de cima → `▀`, só com `fg`; só o de baixo → `▄`, só com `fg`; nenhum → a
+célula não é tocada (fica o fundo da coluna). Os testes de `mascot.rs` têm uma **cópia literal
+independente** das linhas aprovadas (`APPROVED_REST`, `APPROVED_BLINK`, `APPROVED_PALETTE`), no
+estilo do `migration_1_is_pinned`. O teste de `ui.rs` confere, a partir dessa cópia, o símbolo, o
+`fg` e o `bg` de cada célula na tela, nas duas poses, com e sem truecolor, na árvore e nas
+Configurações. **Mudar a arte exige mudar os dois, de propósito.** A `OPEN` do `.py` não entrou no
+código: ela é só a base de onde a `PAWS` saiu.
+
+**O balão é o lugar futuro dos avisos da "Nick assistente"** (outro ticket). Ele fica à direita da
+gata, com 1 coluna de espaço, nas 3 últimas linhas dela (17 colunas, como no `.py`), e precisa de
+`17 + 1 + 17 = 35` colunas no interior (o padrão tem 38). Se não couber, o balão não é desenhado,
+mas o relógio do miado segue normalmente: um balão cortado não seria legível. **Regra a definir
+naquele ticket: o aviso tem prioridade sobre o miado.**
+
+**Intervalos** (constantes em `mascot.rs`): piscar a cada 6 a 20 s sorteados (`BLINK_EVERY`), por
+150 ms (`BLINK_FOR`); miar a cada 3 a 10 min sorteados (`MEOW_EVERY`), por 3 s (`MEOW_FOR`). O
+próximo intervalo é sorteado quando o evento anterior termina (e, na criação, a partir do instante
+inicial: primeiro o do piscar, depois o do miado). Os dois são independentes: ela pode piscar com o
+balão aberto.
+
+**Relógio e sorteio injetáveis, numa máquina de estados pura.** `nick/src/mascot.rs` não tem I/O,
+banco nem tela, no molde de `tree.rs` e `stages.rs`. O relógio entra por parâmetro
+(`Mascot::new(now, dice)`, `tick(now) -> bool`, `next_wake() -> Option<Instant>`,
+`frame() -> Frame { pose, meowing }`), e nenhuma chamada a `Instant::now()` fica dentro do módulo.
+O sorteio é o trait `Dice` (`pick(min, max)`). O de produção (`SystemDice`) é um xorshift64* com a
+semente tirada do `RandomState` da std. **Nenhuma dependência nova:** o projeto não usa crate de
+aleatoriedade, e a gata não precisa de qualidade criptográfica. Os testes usam um `Dice`
+roteirizado, que devolve uma sequência fixa e grava os limites pedidos. O `tick` aplica **no máximo
+uma transição por evento** e conta o próximo prazo a partir do `now`. Um `tick` muito atrasado (o
+laço ficou parado, ex: o `bin/nick-init` com a TUI suspensa) não recupera eventos perdidos: no
+máximo uma piscada e um miado começam.
+
+**O estado fica no `App`** (`mascot`, `truecolor`), e a assinatura de `App::new` não mudou (ele cria
+a gata de produção e começa sem truecolor). O `tick_mascot` só mexe na gata: não mexe em foco,
+seleção, diálogo, texto digitado, barra de status nem agentes (teste em `app.rs`). Em `ui.rs`, a
+geometria tem fonte única nas funções puras `mascot_area`, `content_area` e `bubble_area`, e o
+`left_column` desenha o bloco da coluna, a gata e devolve o retângulo do conteúdo. O `draw_tree` e
+o `draw_settings` desenham o `List`/`Paragraph` sem bloco nesse retângulo. **A gata não entra em
+`Areas`/`layout`:** ela não muda o tamanho de nenhum PTY, o cabeçalho nem o mouse (teste com
+`layout`/`agent_area` em todas as poses, com e sem balão).
+
+**O laço acorda pelo relógio da gata** (`main.rs`). No topo de cada volta,
+`dirty |= app.tick_mascot(Instant::now())`. No ramo ocioso, no lugar do `rx.recv()` de antes, o
+laço espera até o `next_wake` (`terminal::idle_wait`, uma função pura testada: `None` bloqueia sem
+prazo, um instante passado dá zero), e um `Timeout` só volta ao topo. A gata **não** chama o
+`after_change`: ela não muda PTY, modo do terminal de fora nem o texto guardado do agente
+escondido. Ela só marca `dirty`, e o desenho sai pelo `draw` de sempre, com o limite de um quadro
+a cada `FRAME`. **Custo ocioso aceito no ticket:** antes, zero redesenhos. Agora, cerca de 2 a
+cada 6–20 s (começo e fim da piscada), mais 2 a cada 3–10 min (o balão).
+
+**Cores: truecolor ou a paleta de 256.** Só o `main.rs` lê o ambiente (regra do NS-31). Com
+`COLORTERM` igual a `truecolor` ou `24bit`, sem diferença de maiúscula (`terminal::is_truecolor`),
+a gata sai com o `Color::Rgb` exato do `.py`. Com qualquer outro valor, ou sem a variável, ela sai
+com `Color::Indexed(nearest_256(...))`: distância euclidiana em RGB sobre o cubo 6×6×6 (16–231,
+níveis `0, 95, 135, 175, 215, 255`) e a rampa de cinzas (232–255, `8 + 10·i`). As 16 primeiras
+cores ficam de fora, porque o tema do terminal as redefine. No empate, vale o menor índice.
+
+| Letra | RGB | Índice 256 |
+|---|---|---|
+| D marrom escuro | (52, 36, 30) | 235 |
+| B marrom médio | (110, 78, 62) | 240 |
+| C creme | (196, 170, 140) | 180 |
+| W branco | (242, 240, 234) | 255 |
+| E azul dos olhos | (110, 170, 225) | 74 |
+| K pupila | (20, 20, 24) | 233 |
+| P nariz | (232, 160, 168) | 181 |
+
+**Ressalva:** os dois marrons viram cinza na paleta de 256, porque o cubo não tem marrom escuro. É a
+aproximação que o ticket aceita. Se ficar ruim, a troca é uma tabela fixa por letra no lugar do
+`nearest_256`.
+
+**O gancho só de teste `NICK_TEST_MASCOT`**, lido no `main.rs` ao lado do `NICK_TEST_PANIC`
+(`mascot_hook`):
+- `still`: a gata parada, que nunca pisca nem mia (`next_wake` = `None`, e o laço ocioso volta a
+  bloquear sem prazo, como antes do NS-51). É o padrão do `Nick::spawn` dos testes de PTY
+  (`tests/common/mod.rs`; um `NICK_TEST_MASCOT` do caso substitui). Assim um "Miau!" sorteado não
+  aparece no meio de uma leitura de tela;
+- `fast`: intervalos curtos fixos (pisca a cada 40 ms por 20 ms, mia a cada 120 ms por 60 ms), sem
+  sorteio, para os testes de PTY provarem que a animação não atrapalha a digitação nem o terminal
+  do agente;
+- qualquer outro valor, ou vazio: a gata de produção. **O gancho não esconde a gata**, porque o
+  ticket proíbe uma opção de desligar.
+
+**Helpers da integração** (`nick/tests/common/mod.rs`): o `tree_rows` e o `flat_screen` tiram os
+`▀`/`▄` (`MASCOT_BLOCKS`). Assim as linhas da gata viram linhas vazias em `tree_rows`, e o `select`
+("o fim da árvore é a linha antes de uma vazia") continua certo. **A adaptação rodou verde sobre o
+código sem a gata antes da mudança** (o `make test` inteiro; log em
+`.nick/docs/NS-51/baseline_helpers_sem_nick.log`). Novos: `Nick::cat_rows` (as linhas com meio-bloco
+nas colunas da gata), `Nick::keep_when` (espera uma condição e guarda **a mesma** tela em que ela
+valeu, porque a piscada dura 20 ms no modo `fast`) e, além do texto em `NICK_TEST_SCREENS`, a tela
+com as cores (ANSI, para dar `cat` num terminal) em `<rótulo>.ansi`, no diretório de
+`NICK_TEST_SCREENS_ANSI`, quando definido.
+
+**Testes adaptados:** nenhum. Os testes de `ui.rs`, `app.rs` e do PTY que já existiam passaram
+sem edição com a gata no lugar. O rodapé, o `HELP_STATES`, o tamanho de cada PTY e as bordas de
+foco (NS-37) não mudaram. Também não entrou dependência nova nem migração nova, e o README não
+mudou (regra "README genérico").
+
+**Testes novos:** em `mascot` (as cores da tabela, as pontas `(0,0,0)→16`, `(255,255,255)→231` e
+`(128,128,128)→244`, a arte fixada, a forma, os 4 casos de pixel→célula, a piscada só nas células 3
+e 4, a máquina de estados com o `Dice` roteirizado, inclusive o `tick` atrasado, o `SystemDice`
+dentro dos limites, o `still` e o `fast`); em `app` (a gata nova e o `tick_mascot` sem mexer no
+resto, com agente vivo e com um campo de texto aberto); em `terminal` (`idle_wait` e
+`is_truecolor`); em `ui` (a geometria com interior de 14, 15 e 16 linhas e de 16 e 17 colunas, o
+desenho pixel a pixel, a gata que some com 14 linhas e numa janela estreita, o balão byte a byte e
+sem espaço, e o layout que não muda); no PTY, em `tests/tui.rs` (a gata na árvore e nas
+Configurações com `Idx(74)` no olho, `Rgb(110,170,225)` com `COLORTERM=truecolor`/`24bit`, o resize
+para 19 linhas que a esconde e a volta, o `fast` piscando e miando com o balão que some, e a
+digitação num campo de texto) e em `tests/agent.rs` (com o `fast` e o `claude` falso: o texto
+digitado chega inteiro, o foco fica no terminal, e nenhum SIGWINCH em 3 s de animação, com
+controle positivo do resize). As telas da validação (parada, piscando, miando, sumida, com e sem
+truecolor) ficam em `.nick/docs/NS-51/prints/`, em texto, ANSI e PNG.
+
+**Ajustes do review do NS-51** (`.nick/docs/NS-51/review.md`):
+- **a paleta é resolvida uma vez** (problema 1): sem truecolor, o `color_of` roda o `nearest_256`
+  sobre 240 candidatos, e o desenho fazia isso para o pixel de cima e o de baixo de cada célula, a
+  cada quadro (até um a cada 16 ms enquanto um agente escreve), para chegar sempre às mesmas 7
+  cores. Agora `mascot::Palette::new(truecolor)` resolve as 7 cores, o `App` a guarda e só a
+  recalcula no `set_truecolor`, e o `draw_mascot` só procura a letra nela. O `nearest_256` continua
+  sendo a fonte da regra (`color_of` e `Palette` usam a mesma função privada `resolve`). Testes:
+  `the_palette_resolved_once_has_the_colors_of_color_of` (`mascot`) e a paleta do `App` antes e
+  depois do `set_truecolor`;
+- **a geometria dos helpers vem da lib** (problema 2): `tests/common/mod.rs` usa
+  `nick::mascot::MASCOT_COLS`, e o `wait_for_cat` de `tests/tui.rs` usa `MASCOT_ROWS`, no lugar de
+  uma cópia da constante e do `7` literal. A cópia independente vale para a arte e a paleta (a
+  referência aprovada), não para a geometria que o helper usa para achar a gata;
+- **`BUBBLE_ROWS`** (nit): as 3 linhas do balão viraram constante em `mascot.rs`, ao lado do
+  `BUBBLE_COLS`;
+- o nit do `main.rs` (com `terminal::panicking()`, o ramo ocioso acorda no `next_wake` e volta ao
+  topo, em vez de ficar no `recv()`) ficou como está, como o review propôs: o laço não desenha nada
+  e o hook do panic encerra o processo.

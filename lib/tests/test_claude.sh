@@ -24,6 +24,10 @@ trap 'chmod -R u+rwx "$TEST_TMP" 2>/dev/null || true; rm -rf "$TEST_TMP"' EXIT
 # shellcheck source=SCRIPTDIR/assert.sh
 source "$SCRIPT_DIR/assert.sh"
 
+# Variáveis que o próprio bash cria ou mexe entre dois retratos do compgen -v (não são da
+# biblioteca): um padrão só, usado pelo retrato da claude_conversation_latest e pela carga limpa.
+clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
+
 # code_lines <file>: imprime as linhas de <file> que não são comentário de linha inteira.
 code_lines() {
   grep -vE '^[[:space:]]*#' "$1" || true
@@ -94,11 +98,14 @@ json_valid() {
 }
 
 # json_shape_ok <tool> <file>: código 0 se <file> é exatamente {"permissions": {"deny": [...],
-# "ask": [...]}}, com as duas listas de strings e nenhuma outra chave.
+# "ask": [...]}, "disableAgentView": true}, com as duas listas de strings e nenhuma outra chave.
+# O disableAgentView entrou no NS-50: desliga o segundo plano do claude (/background, o ← no
+# prompt vazio), que faz a conversa continuar noutra sessão (ABOUT.md, seção do NS-50).
 json_shape_ok() {
   case "$1" in
     jq)
-      jq -e '(type == "object") and (keys == ["permissions"])
+      jq -e '(type == "object") and (keys == ["disableAgentView", "permissions"])
+        and (.disableAgentView == true)
         and (.permissions | type == "object") and (.permissions | keys == ["ask", "deny"])
         and (.permissions.deny | type == "array") and (.permissions.ask | type == "array")
         and all(.permissions.deny[], .permissions.ask[]; type == "string")' "$2" > /dev/null 2>&1
@@ -108,7 +115,8 @@ json_shape_ok() {
 import json, sys
 d = json.load(open(sys.argv[1]))
 p = d.get("permissions") if isinstance(d, dict) else None
-ok = (isinstance(d, dict) and set(d) == {"permissions"} and isinstance(p, dict)
+ok = (isinstance(d, dict) and set(d) == {"permissions", "disableAgentView"} and isinstance(p, dict)
+      and d["disableAgentView"] is True
       and set(p) == {"deny", "ask"}
       and all(isinstance(p[k], list) and all(isinstance(r, str) for r in p[k]) for k in p))
 sys.exit(0 if ok else 1)' "$2" > /dev/null 2>&1
@@ -124,7 +132,7 @@ json_rules() {
   esac
 }
 
-echo "== permissions.json: existe, é JSON válido e tem só permissions.deny/permissions.ask =="
+echo "== permissions.json: existe, é JSON válido e tem só permissions.deny/permissions.ask e disableAgentView =="
 assert_exists "$PERMISSIONS_JSON" "lib/claude/permissions.json existe"
 if [ "${#JSON_TOOLS[@]}" -eq 0 ]; then
   echo "  FAIL: nenhum validador de JSON (instale jq ou python3)"
@@ -132,20 +140,25 @@ if [ "${#JSON_TOOLS[@]}" -eq 0 ]; then
 fi
 for json_tool in "${JSON_TOOLS[@]}"; do
   assert_eq "0" "$(json_valid "$json_tool" "$PERMISSIONS_JSON" && echo 0 || echo 1)" "$json_tool: permissions.json é JSON válido"
-  assert_eq "0" "$(json_shape_ok "$json_tool" "$PERMISSIONS_JSON" && echo 0 || echo 1)" "$json_tool: só permissions.deny e permissions.ask, ambas arrays de strings, sem outras chaves"
+  assert_eq "0" "$(json_shape_ok "$json_tool" "$PERMISSIONS_JSON" && echo 0 || echo 1)" "$json_tool: só permissions.deny e permissions.ask (arrays de strings) e disableAgentView true, sem outras chaves"
 done
 
 echo
 echo "== validadores do teste: recusam JSON inválido e formato com chave a mais (controle) =="
 bad_dir="$(new_case bad_json)"
 printf '%s\n' '{"permissions": {"deny": ["Bash(sudo *)"], "ask": []' > "$bad_dir/invalid.json"
-printf '%s\n' '{"permissions": {"deny": [], "ask": [], "allow": []}}' > "$bad_dir/allow.json"
-printf '%s\n' '{"permissions": {"deny": [], "ask": []}, "defaultMode": "auto"}' > "$bad_dir/mode.json"
-printf '%s\n' '{"permissions": {"deny": [1], "ask": []}}' > "$bad_dir/number.json"
-printf '%s\n' '{"permissions": {"deny": []}}' > "$bad_dir/no_ask.json"
+printf '%s\n' '{"permissions": {"deny": [], "ask": [], "allow": []}, "disableAgentView": true}' > "$bad_dir/allow.json"
+printf '%s\n' '{"permissions": {"deny": [], "ask": []}, "disableAgentView": true, "defaultMode": "auto"}' > "$bad_dir/mode.json"
+printf '%s\n' '{"permissions": {"deny": [1], "ask": []}, "disableAgentView": true}' > "$bad_dir/number.json"
+printf '%s\n' '{"permissions": {"deny": []}, "disableAgentView": true}' > "$bad_dir/no_ask.json"
+printf '%s\n' '{"permissions": {"deny": [], "ask": []}}' > "$bad_dir/no_agent_view.json"
+printf '%s\n' '{"permissions": {"deny": [], "ask": []}, "disableAgentView": false}' > "$bad_dir/agent_view_false.json"
+printf '%s\n' '{"permissions": {"deny": [], "ask": []}, "disableAgentView": "true"}' > "$bad_dir/agent_view_string.json"
+printf '%s\n' '{"permissions": {"deny": [], "ask": []}, "disableAgentView": true}' > "$bad_dir/good.json"
 for json_tool in "${JSON_TOOLS[@]}"; do
   assert_eq "1" "$(json_valid "$json_tool" "$bad_dir/invalid.json" && echo 0 || echo 1)" "$json_tool: JSON truncado é recusado"
-  for bad in allow mode number no_ask; do
+  assert_eq "0" "$(json_shape_ok "$json_tool" "$bad_dir/good.json" && echo 0 || echo 1)" "$json_tool: controle: o formato certo, com listas vazias, é aceito"
+  for bad in allow mode number no_ask no_agent_view agent_view_false agent_view_string; do
     assert_eq "1" "$(json_shape_ok "$json_tool" "$bad_dir/$bad.json" && echo 0 || echo 1)" "$json_tool: formato '$bad' é recusado"
   done
 done
@@ -268,6 +281,186 @@ run_claude "$conv_dir" "file=intacto; other=x; claude_conversation_file /c /d s 
 assert_eq "/c/projects/-d/s.jsonl|x" "$(file_of "$conv_dir/out")" "grava só na variável pedida (printf -v)"
 
 echo
+echo "== claude_conversation_latest: segue os continued-in até a última sessão (NS-50) =="
+# chain_uuid <n>: um UUID minúsculo (8-4-4-4-12) diferente para cada <n>.
+chain_uuid() {
+  printf '%08x-0000-4000-8000-%012x' "$1" "$1"
+}
+CHAIN_A="$(chain_uuid 10)"
+CHAIN_B="$(chain_uuid 11)"
+CHAIN_C="$(chain_uuid 12)"
+CHAIN_D="$(chain_uuid 13)"
+# chain_file <case_dir> <sessão>: o arquivo da conversa <sessão> com o cwd em /proj, sob
+# <case_dir>/cfg (o mesmo layout da claude_conversation_file: a pasta é "-proj").
+chain_file() {
+  printf '%s/cfg/projects/-proj/%s.jsonl' "$1" "$2"
+}
+# continued_line <sessão> <próxima>: o registro que o claude grava ao trocar de sessão, no formato
+# real (claude 2.1.328, seção 1 do plano do NS-50).
+continued_line() {
+  printf '{"type":"continued-in","timestamp":"2026-11-21T14:41:33.908Z","sessionId":"%s","continuedInSessionId":"%s"}\n' "$1" "$2"
+}
+# talk_line <sessão> <texto>: uma linha de conversa (mensagem do usuário).
+talk_line() {
+  printf '{"parentUuid":null,"type":"user","message":{"role":"user","content":"%s"},"sessionId":"%s"}\n' "$2" "$1"
+}
+# chain_write <case_dir> <sessão> [linhas...]: cria o arquivo de <sessão> com uma linha de conversa
+# e depois as [linhas] dadas.
+chain_write() {
+  local case_dir="$1" session="$2" file
+  shift 2
+  file="$(chain_file "$case_dir" "$session")"
+  mkdir -p "$(dirname "$file")"
+  talk_line "$session" "oi" > "$file"
+  if [ "$#" -gt 0 ]; then
+    printf '%s\n' "$@" >> "$file"
+  fi
+}
+# chain_latest <case_dir> <sessão> [errexit]: roda a função com o cwd do caso e grava a resposta
+# em out (rc e err como no run_claude).
+chain_latest() {
+  run_claude "$1" "claude_conversation_latest '$1/cfg' /proj '$2' latest; printf '%s' \"\$latest\"" ":" "${3:-on}"
+}
+# chain_check <case_dir> <esperado> <descrição>: a resposta, o código 0 e o stderr vazio.
+chain_check() {
+  assert_eq "0|$2" "$(file_of "$1/rc")|$(file_of "$1/out")" "$3"
+  assert_eq "" "$(file_of "$1/err")" "$3: nada no stderr"
+}
+
+chain_dir="$(new_case chain_none)"
+chain_write "$chain_dir" "$CHAIN_A"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_A" "arquivo sem continued-in: a própria sessão"
+
+chain_dir="$(new_case chain_one)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+chain_write "$chain_dir" "$CHAIN_B"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_B" "um salto (A → B)"
+
+chain_dir="$(new_case chain_two)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+chain_write "$chain_dir" "$CHAIN_B" "$(continued_line "$CHAIN_B" "$CHAIN_C")"
+chain_write "$chain_dir" "$CHAIN_C"
+for chain_mode in on off; do
+  chain_latest "$chain_dir" "$CHAIN_A" "$chain_mode"
+  chain_check "$chain_dir" "$CHAIN_C" "dois saltos (A → B → C), set -euo pipefail $chain_mode"
+done
+chain_latest "$chain_dir" "$CHAIN_B"
+chain_check "$chain_dir" "$CHAIN_C" "começando do meio (B → C)"
+
+chain_dir="$(new_case chain_missing)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+chain_write "$chain_dir" "$CHAIN_B" "$(continued_line "$CHAIN_B" "$CHAIN_C")"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_B" "o salto para um arquivo que não existe (C): para antes dele, em B"
+# O arquivo seguinte numa outra pasta de projeto não conta: só a mesma pasta.
+mkdir -p "$chain_dir/cfg/projects/-outro"
+talk_line "$CHAIN_C" "oi" > "$chain_dir/cfg/projects/-outro/$CHAIN_C.jsonl"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_B" "o arquivo seguinte em outra pasta de projeto não conta"
+
+chain_dir="$(new_case chain_last)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")" "$(talk_line "$CHAIN_A" "mais")" \
+  "$(continued_line "$CHAIN_A" "$CHAIN_C")"
+chain_write "$chain_dir" "$CHAIN_B"
+chain_write "$chain_dir" "$CHAIN_C"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_C" "vários continued-in no mesmo arquivo: vale o último (C, não B)"
+
+chain_dir="$(new_case chain_after)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")" "$(talk_line "$CHAIN_A" "Deu certo")" \
+  "$(talk_line "$CHAIN_A" "mais uma")"
+chain_write "$chain_dir" "$CHAIN_B"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_B" "conversa depois do continued-in: segue mesmo assim (D2, item 6)"
+
+# Registros malformados: o último registro é ignorado e a cadeia para em A (o B existe, então
+# seguir seria o erro). O B com "/" tenta sair da pasta.
+chain_dir="$(new_case chain_bad)"
+chain_write "$chain_dir" "$CHAIN_B"
+mkdir -p "$chain_dir/cfg/projects/x"
+talk_line "$CHAIN_B" "oi" > "$chain_dir/cfg/projects/x/$CHAIN_B.jsonl"
+chain_upper="$(printf '%s' "$CHAIN_B" | tr 'a-f' 'A-F')"
+chain_write "$chain_dir" "$chain_upper"
+for chain_bad in absent empty upper strange slash short other_session; do
+  case "$chain_bad" in
+    absent) chain_record="{\"type\":\"continued-in\",\"timestamp\":\"2026-11-21T14:41:33.908Z\",\"sessionId\":\"$CHAIN_A\"}" ;;
+    empty) chain_record="$(continued_line "$CHAIN_A" "")" ;;
+    upper) chain_record="$(continued_line "$CHAIN_A" "$chain_upper")" ;;
+    strange) chain_record="$(continued_line "$CHAIN_A" "${CHAIN_B%?}g")" ;;
+    slash) chain_record="$(continued_line "$CHAIN_A" "../x/$CHAIN_B")" ;;
+    short) chain_record="$(continued_line "$CHAIN_A" "${CHAIN_B%?}")" ;;
+    other_session) chain_record="$(continued_line "$CHAIN_D" "$CHAIN_B")" ;;
+  esac
+  # Antes do registro ruim, um bom: o último é o que vale, então o bom não salva a cadeia.
+  chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")" "$chain_record"
+  chain_latest "$chain_dir" "$CHAIN_A"
+  chain_check "$chain_dir" "$CHAIN_A" "último registro malformado ($chain_bad): ignorado, a cadeia para em A"
+done
+# Controle positivo: o mesmo arquivo com o registro bom por último segue para B.
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_B" "controle: com o registro bom por último, segue para B"
+
+chain_dir="$(new_case chain_cycle)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+chain_write "$chain_dir" "$CHAIN_B" "$(continued_line "$CHAIN_B" "$CHAIN_A")"
+chain_latest "$chain_dir" "$CHAIN_A"
+chain_check "$chain_dir" "$CHAIN_B" "ciclo A → B → A: para em B, sem voltar a A"
+chain_write "$chain_dir" "$CHAIN_C" "$(continued_line "$CHAIN_C" "$CHAIN_C")"
+chain_latest "$chain_dir" "$CHAIN_C"
+chain_check "$chain_dir" "$CHAIN_C" "ciclo C → C: a própria sessão"
+
+# O limite de saltos (50): uma cadeia de 60 sessões para na 50ª depois da inicial.
+chain_dir="$(new_case chain_limit)"
+for chain_n in $(seq 100 159); do
+  chain_write "$chain_dir" "$(chain_uuid "$chain_n")" "$(continued_line "$(chain_uuid "$chain_n")" "$(chain_uuid $((chain_n + 1)))")"
+done
+chain_write "$chain_dir" "$(chain_uuid 160)"
+chain_latest "$chain_dir" "$(chain_uuid 100)"
+chain_check "$chain_dir" "$(chain_uuid 150)" "uma cadeia de 60 saltos para no limite de 50"
+chain_latest "$chain_dir" "$(chain_uuid 120)"
+chain_check "$chain_dir" "$(chain_uuid 160)" "controle: uma cadeia de 40 saltos chega ao fim"
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  PULADO: arquivos ilegíveis (rodando como root, que lê mesmo com chmod 000)"
+else
+  chain_dir="$(new_case chain_unreadable_next)"
+  chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+  chain_write "$chain_dir" "$CHAIN_B"
+  chmod 000 "$(chain_file "$chain_dir" "$CHAIN_B")"
+  for chain_mode in on off; do
+    chain_latest "$chain_dir" "$CHAIN_A" "$chain_mode"
+    chain_check "$chain_dir" "$CHAIN_B" "arquivo seguinte ilegível: a resposta é ele (o arquivo existe), set -e $chain_mode"
+  done
+  chain_dir="$(new_case chain_unreadable_middle)"
+  chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+  chain_write "$chain_dir" "$CHAIN_B" "$(continued_line "$CHAIN_B" "$CHAIN_C")"
+  chain_write "$chain_dir" "$CHAIN_C"
+  chmod 000 "$(chain_file "$chain_dir" "$CHAIN_B")"
+  chain_latest "$chain_dir" "$CHAIN_A"
+  chain_check "$chain_dir" "$CHAIN_B" "arquivo do meio ilegível com um continued-in: a cadeia para nele (B, não C)"
+  chain_dir="$(new_case chain_unreadable_first)"
+  chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+  chain_write "$chain_dir" "$CHAIN_B"
+  chmod 000 "$(chain_file "$chain_dir" "$CHAIN_A")"
+  chain_latest "$chain_dir" "$CHAIN_A"
+  chain_check "$chain_dir" "$CHAIN_A" "arquivo inicial ilegível: a própria sessão"
+fi
+
+chain_dir="$(new_case chain_vars)"
+chain_write "$chain_dir" "$CHAIN_A" "$(continued_line "$CHAIN_A" "$CHAIN_B")"
+chain_write "$chain_dir" "$CHAIN_B"
+run_claude "$chain_dir" "file=intacto; other=x; compgen -v | grep -vxE '$clean_bash_vars' | sort > '$chain_dir/before'; claude_conversation_latest '$chain_dir/cfg' /proj '$CHAIN_A' file; compgen -v | grep -vxE '$clean_bash_vars' | sort > '$chain_dir/after'; printf '%s|%s' \"\$file\" \"\$other\""
+assert_eq "$CHAIN_B|x" "$(file_of "$chain_dir/out")" "grava só na variável pedida (printf -v)"
+assert_eq "" "$(comm -3 "$chain_dir/before" "$chain_dir/after" 2> /dev/null || echo 'sem retrato')" "nenhuma variável nova nem apagada no chamador"
+# A leitura é só das linhas do registro (grep), sem jq nem carregar o arquivo inteiro.
+chain_body="$(sed -n '/^claude_conversation_latest()/,/^}/p' "$CLAUDE_SH" 2> /dev/null || true)"
+assert_contains "$chain_body" "grep -F" "a função filtra as linhas do registro com grep -F"
+assert_eq "" "$(grep -nE '\$\(cat|mapfile|readarray|while[^#]*read' <<< "$chain_body" || true)" "a função não carrega o arquivo inteiro (sem cat, mapfile nem laço de read)"
+
+echo
 echo "== claude_permission_notice: a instrução de não contornar uma recusa (NS-41) =="
 notice_dir="$(new_case notice)"
 for notice_mode in on off; do
@@ -334,8 +527,6 @@ clean_rc=0
 timeout 2 bash --norc --noprofile -c "compgen -v | sort > '$clean_dir/vars_before'; declare -F | sort > '$clean_dir/funcs_before'; source '$CLAUDE_SH' > '$clean_dir/out' 2>&1; compgen -v | sort > '$clean_dir/vars_after'; declare -F | sort > '$clean_dir/funcs_after'" < /dev/null || clean_rc=$?
 assert_eq "0" "$clean_rc" "source lib/claude/claude.sh num bash limpo termina com código 0"
 assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/claude/claude.sh não imprime nada (stdout nem stderr)"
-# Variáveis que o próprio bash cria ou mexe entre os retratos (não são da biblioteca).
-clean_bash_vars='_|BASH_.*|COLUMNS|LINES|FUNCNAME|LINENO|PIPESTATUS'
 clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
 clean_new_funcs="$(comm -13 "$clean_dir/funcs_before" "$clean_dir/funcs_after" 2>/dev/null | sed 's/^declare -f //' || true)"
 # Num terminal com tamanho, o bash atualiza COLUMNS e LINES (checkwinsize) depois de cada comando
@@ -351,7 +542,7 @@ else
 fi
 assert_eq "NICK_CLAUDE_PERMISSIONS_FILE" "$clean_new_vars" "a única variável nova é NICK_CLAUDE_PERMISSIONS_FILE"
 assert_eq "" "$(grep -vE '^claude_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com claude_"
-for clean_func in claude_settings_load claude_print_settings_error claude_conversation_file claude_permission_notice; do
+for clean_func in claude_settings_load claude_print_settings_error claude_conversation_file claude_conversation_latest claude_permission_notice; do
   assert_contains "$clean_new_funcs" "$clean_func" "source lib/claude/claude.sh define $clean_func"
 done
 

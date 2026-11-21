@@ -883,8 +883,16 @@ fn draw_node_panel(frame: &mut Frame, app: &App, area: Rect) {
                     _ => format!("Estado: {state}"),
                 }),
                 Line::from(format!("Aberto em: {}", short_date(&agent.opened_at))),
-                Line::from(format!("Sessão: {}", printable(&agent.session_id))),
+                // NS-50: the session a resume uses; the one of the opening (the key of its lock)
+                // only when the resume follows another session.
+                Line::from(format!("Sessão: {}", printable(agent.effective_session()))),
             ];
+            if agent.resume_session_id.is_some() {
+                lines.push(Line::from(format!(
+                    "Sessão na abertura: {}",
+                    printable(&agent.session_id)
+                )));
+            }
             // The ID it was opened with, when it is not the one of its ticket now (NS-39: the
             // resume tells it the new folder), or unknown (before the NS-39, a name without it).
             let now = match agent.owner {
@@ -2673,7 +2681,12 @@ mod tests {
             unreachable!("open_agent does not render")
         }
 
-        fn has_conversation(&mut self, _: &Path, _: &Path, _: &str) -> Result<bool, String> {
+        fn has_conversation(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            _: &str,
+        ) -> Result<Option<String>, String> {
             unreachable!("open_agent does not check the conversation")
         }
 
@@ -4089,6 +4102,43 @@ mod tests {
             &render_at(&f.app, 140, 30, None),
             "ID na abertura: desconhecido",
         );
+    }
+
+    /// NS-50: the panel shows the effective session and, when the resume follows another one, the
+    /// session of the opening (the key of the lock) too.
+    #[test]
+    fn the_panel_shows_the_effective_session_and_the_one_of_the_opening() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let dev = ns1_agents(&f)[0].id;
+        f.app.select(NodeId::Agent(dev));
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Sessão: s-1");
+        assert!(
+            !text(&buffer).contains("Sessão na abertura"),
+            "no swap: no line"
+        );
+        db.connection()
+            .execute(
+                "UPDATE agents SET resume_session_id = 's-b' WHERE id = ?1",
+                [dev],
+            )
+            .unwrap();
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Sessão: s-b");
+        assert_has(&buffer, "Sessão na abertura: s-1");
+        assert!(!text(&buffer).contains("Sessão: s-1"), "{}", text(&buffer));
+        assert_has(&buffer, "r retomar esta conversa · o arquivar");
+        // Its control characters do not reach the terminal.
+        db.connection()
+            .execute(
+                "UPDATE agents SET resume_session_id = 's\x1bb' WHERE id = ?1",
+                [dev],
+            )
+            .unwrap();
+        f.app.refresh_tree();
+        assert_has(&render_at(&f.app, 140, 30, None), "Sessão: s?b");
     }
 
     #[test]

@@ -44,9 +44,12 @@
 #       not the type, because the type of an agent is not stored. An agent of an epic (NS-40) gets
 #       --epic-id in the place of --ticket-id (exactly one of the two), and the notice of an epic.
 #   nick-agent --has-conversation <uuid>
-#       (NS-39) prints exactly conversation=true or conversation=false and exits with 0: whether
-#       claude keeps the conversation <uuid> of a session run with the cwd at this project
-#       (claude_conversation_file of lib/claude/, under ${CLAUDE_CONFIG_DIR:-$HOME/.claude}). It
+#       (NS-39) whether claude keeps the conversation <uuid> of a session run with the cwd at this
+#       project (claude_conversation_file of lib/claude/, under ${CLAUDE_CONFIG_DIR:-$HOME/.claude}),
+#       always with exit 0: without the file, exactly one line, conversation=false; with it,
+#       conversation=true and then session=<the last session of the chain> (NS-50: claude may go on
+#       with the conversation in another session, and claude_conversation_latest follows the
+#       continued-in records; <uuid> itself when there is no chain or the file is unreadable). It
 #       needs no config, launches nothing and writes nothing.
 # The UUID format is not checked here (claude checks it; the nick always generates a valid one).
 # There is no variable that swaps this script nor any part of the launch: the shell finds it by a
@@ -363,12 +366,20 @@ resume_mode() {
 # here (C.UTF-8, whatever the one of the nick), so an accented letter of the cwd is one "-", as
 # claude does (lib/claude/claude.sh: claude_conversation_file).
 has_conversation_mode() {
-  local LC_ALL=C.UTF-8 file=""
+  local LC_ALL=C.UTF-8 file="" config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" dir="" latest=""
   if [ "$#" -ne 1 ] || [ -z "$1" ]; then
     usage_error "informe o --has-conversation <uuid> (não vazio), sem outros argumentos."
   fi
-  claude_conversation_file "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$(pwd -P)" "$1" file
-  if [ -f "$file" ]; then echo "conversation=true"; else echo "conversation=false"; fi
+  dir="$(pwd -P)"
+  claude_conversation_file "$config_dir" "$dir" "$1" file
+  if [ ! -f "$file" ]; then
+    echo "conversation=false"
+    return 0
+  fi
+  # NS-50: the session the conversation went on in (the chain of continued-in records).
+  claude_conversation_latest "$config_dir" "$dir" "$1" latest
+  echo "conversation=true"
+  echo "session=$latest"
 }
 
 # launch_kind <args...>: "resume" when --resume is one of the options (the values of the options

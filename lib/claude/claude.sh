@@ -2,10 +2,12 @@
 #
 # claude.sh: the Claude Code permission rules (deny/ask) that every session opened by a nick
 # tool gets — auto_scrum and bin/nick-agent use it. The rules live in permissions.json, next to
-# this file, the single source of them ({"permissions": {"deny": [...], "ask": [...]}}, nothing
+# this file, the single source of them ({"permissions": {"deny": [...], "ask": [...]}} and, since
+# the NS-50, "disableAgentView": true, which turns off the background sessions of claude; nothing
 # else); this library only finds that file and reads it (claude_settings_load), and prints the error
 # when it can't (claude_print_settings_error); since the NS-39 it also says where claude keeps the
-# conversation of a session (claude_conversation_file), and since the NS-41 it holds the system
+# conversation of a session (claude_conversation_file), since the NS-50 which session that
+# conversation went on in (claude_conversation_latest), and since the NS-41 it holds the system
 # instruction not to work around a command those rules refused (claude_permission_notice), which
 # every session gets first in its single --append-system-prompt. The tool passes the content
 # inline to the agent, as 'claude --settings "<content>" ...': never as a path (inside the jail a
@@ -74,6 +76,46 @@ claude_settings_load() {
 claude_conversation_file() {
   local __claude_dir="$2"
   printf -v "$4" '%s/projects/%s/%s.jsonl' "$1" "${__claude_dir//[!A-Za-z0-9]/-}" "$3"
+}
+
+# claude_conversation_latest <config_dir> <dir> <session_id> <variable>: stores in <variable>, with
+# printf -v, the last session of the chain that starts at <session_id> (NS-50): claude may go on
+# with a conversation in another session, and then it appends to the file of the old one a record
+# {"type":"continued-in",...,"sessionId":"<old>","continuedInSessionId":"<new>"} (claude 2.1.328).
+# The parameters are the ones of claude_conversation_file, which builds the file of each hop, and
+# the file of <session_id> must exist (the caller checked). The rules: in the file of the current
+# session only the last line with "type":"continued-in" counts, read with grep -F (only those
+# lines, never the whole conversation), even when there is conversation after it; its sessionId
+# must be the current session and its continuedInSessionId a lowercase UUID (8-4-4-4-12 hex),
+# otherwise the record is ignored and the chain stops; the next hop needs its file in the same
+# project folder; an unreadable file, a session already visited (a cycle) or 50 hops also stop the
+# chain. It never fails: no record at all gives <session_id> back, and nothing goes to stderr.
+# Like claude_conversation_file, this is a claude internal detail (accepted in the NS-50): a new
+# claude may change the record, and then the chain just stops at the session given (ABOUT.md,
+# "Rust no projeto: retomada segue a troca de sessão do claude (NS-50)").
+claude_conversation_latest() {
+  local __claude_current="$3" __claude_seen="" __claude_left=50 __claude_file="" __claude_line=""
+  local __claude_owner="" __claude_next="" __claude_next_file=""
+  __claude_seen=" $3 "
+  while [ "$__claude_left" -gt 0 ]; do
+    __claude_left=$((__claude_left - 1))
+    claude_conversation_file "$1" "$2" "$__claude_current" __claude_file
+    # grep exits with 1 with no record and with 2 on an unreadable file: both stop the chain.
+    __claude_line="$(grep -F '"type":"continued-in"' -- "$__claude_file" 2> /dev/null | tail -n 1)" || __claude_line=""
+    [ -n "$__claude_line" ] || break
+    __claude_owner="$(printf '%s\n' "$__claude_line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')"
+    __claude_next="$(printf '%s\n' "$__claude_line" | sed -n 's/.*"continuedInSessionId":"\([^"]*\)".*/\1/p')"
+    [ "$__claude_owner" = "$__claude_current" ] || break
+    printf '%s\n' "$__claude_next" | LC_ALL=C grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || break
+    case "$__claude_seen" in
+      *" $__claude_next "*) break ;;
+    esac
+    claude_conversation_file "$1" "$2" "$__claude_next" __claude_next_file
+    [ -f "$__claude_next_file" ] || break
+    __claude_seen="$__claude_seen$__claude_next "
+    __claude_current="$__claude_next"
+  done
+  printf -v "$4" '%s' "$__claude_current"
 }
 
 # claude_permission_notice: prints (stdout) the fixed instruction, in PT-BR, that every session

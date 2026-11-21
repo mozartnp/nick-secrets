@@ -2006,7 +2006,9 @@ Com a jail: `ai-jail <opções> -- claude --settings ...`. `--settings` vem semp
 antes do `--permission-mode`.
 
 **Como funciona:** `lib/claude/permissions.json` é `{"permissions": {"deny": [...], "ask":
-[...]}}`, sem `allow`, `defaultMode` nem outra chave. `claude_settings_load NICK_CLAUDE_SETTINGS
+[...]}}`, sem `allow`, `defaultMode` nem outra chave, além de `"disableAgentView": true`, que
+desliga o segundo plano do `claude` (desde o NS-50: seção "Rust no projeto: retomada segue a
+troca de sessão do claude (NS-50)"). `claude_settings_load NICK_CLAUDE_SETTINGS
 || exit 1` roda em `main()` logo depois de `jail_check` (antes de `jail_print_status`, dos
 `build_*`, do menu e do `mkdir -p "$LOGS_DIR"`): lê o arquivo dentro da função (`cat`, sem
 `jq`) e grava o conteúdo na global com `printf -v`. Arquivo ausente, ilegível ou vazio (só
@@ -2703,6 +2705,12 @@ a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
   rodapé), nunca um texto que já estava na tela.
 
 ## Rust no projeto: agentes na casca `nick` (NS-33)
+
+> **Mudou no NS-50** (seção "Rust no projeto: retomada segue a troca de sessão do claude
+> (NS-50)"): o ID de sessão "escolhido pelo nick e único" continua valendo para o `session_id`,
+> que fica fixo e continua sendo a chave da trava (`<session_id>.lock`). Mas a retomada pode usar
+> outra sessão, a `agents.resume_session_id` (migração 8), quando o `claude` continuou a conversa
+> noutra sessão.
 
 > **Mudou no NS-39** (seção "Rust no projeto: retomar e arquivar agentes (NS-39)"): o estado
 > `ended` virou `stopped` (parado, retomável), e entrou o `archived`, pela migração 6, que também
@@ -3891,6 +3899,12 @@ estão em `.nick/docs/NS-38/telas/`.
 
 ## Rust no projeto: retomar e arquivar agentes (NS-39)
 
+> **Mudou no NS-50** (seção "Rust no projeto: retomada segue a troca de sessão do claude
+> (NS-50)"): o `--has-conversation` segue a cadeia de registros `continued-in` e, com o arquivo,
+> imprime duas linhas (`conversation=true` e `session=<última sessão>`). O `conversation=false`
+> não mudou. A retomada usa a sessão efetiva (`resume_session_id`, ou o `session_id` sem ela) no
+> `--has-conversation` e no `--resume`, e a trava continua a do `session_id`.
+
 > **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): o `--resume` aceita
 > `--epic-id <id>` no lugar de `--ticket-id` (exatamente um dos dois), para um agente de épico, e o
 > `resume_id_notice <antigo> <novo> [ticket|epic]` ganhou o texto do épico (o do ticket não mudou,
@@ -4589,3 +4603,220 @@ nunca com o trap. Um modo novo do `claude` falso que precise terminar no Ctrl+C 
 
 **Fora de escopo:** outras combinações com Shift além do Enter, configurar o terminal do usuário,
 as flags do kitty além da 1, um protocolo de teclado no terminal embutido e o `modifyOtherKeys`.
+
+## Rust no projeto: retomada segue a troca de sessão do claude (NS-50)
+
+Bug do épico NS-28. O nick retomava um agente por `claude --resume <session_id>` (NS-39), mas o
+`claude` pode continuar a conversa **noutra sessão**, e aí a retomada abria a conversa antiga.
+Quando troca, o `claude` acrescenta ao arquivo da sessão antiga um registro como este (formato
+real, `claude` 2.1.328):
+
+```json
+{"type":"continued-in","timestamp":"2026-11-21T14:41:33.908Z","sessionId":"<antiga>","continuedInSessionId":"<nova>"}
+```
+
+O arquivo da sessão nova fica **na mesma pasta de projeto** e começa com um `derived-from` (`"via":
+"fork"`). **O nick passa a depender desse detalhe interno do `claude`** (impacto aceito no
+ticket, no molde do layout do NS-39). Se uma versão nova mudar o registro, a cadeia para na
+sessão guardada, e a retomada volta a ser a de antes do NS-50.
+
+**A cadeia** (`claude_conversation_latest <config_dir> <dir> <session_id> <var>`, em
+`lib/claude/claude.sh`, com os mesmos parâmetros da `claude_conversation_file`, que monta o
+caminho de cada salto):
+1. começa pela **sessão efetiva** do agente, cujo arquivo precisa existir. Sem ele, a resposta é a
+   "conversa que não existe mais" do NS-39 (`conversation=false`);
+2. no arquivo da sessão atual vale só o **último** registro com `"type":"continued-in"`, lido com
+   `grep -F` (só as linhas do registro, sem carregar a conversa). O `sessionId` dele precisa ser o
+   da sessão atual, e o `continuedInSessionId`, um UUID minúsculo (`8-4-4-4-12` hexadecimal,
+   conferido com `grep -Eqx` em `LC_ALL=C`). Se algum falhar, o registro é ignorado e a cadeia
+   para. Um registro bom anterior não salva a cadeia;
+3. o salto só vale se o arquivo da sessão seguinte existir na mesma pasta de projeto. A
+   validação do UUID impede um `/` ou um `..` de sair dela;
+4. a cadeia também para num ciclo (sessão já visitada) e em 50 saltos (literal dentro da função:
+   uma global nova quebraria a "carga limpa" da lib);
+5. um arquivo ilegível para a cadeia nele, sem nada no stderr (o status 2 do `grep` é tratado). O
+   arquivo inicial ilegível dá a própria sessão: a conversa existe, e a retomada usa a sessão
+   guardada, como antes;
+6. **segue sempre**, mesmo com conversa depois do registro (decisão do analista no plano).
+   Consequência aceita: um agente que já tinha sido retomado errado antes do NS-50 pula para a
+   sessão nova, e o que foi feito na retomada errada fica só no arquivo antigo, que o operador
+   ainda pode abrir à mão.
+
+A função segue as regras da lib sem exceção: `local __claude_*` em tudo, `[ ]`, `printf -v`, sem
+global do chamador, sem `CLAUDE_*`, funciona com e sem `set -euo pipefail`, e o `grep` sem
+resultado ou com arquivo ilegível não derruba o chamador (`|| __claude_line=""`).
+
+**`bin/nick-agent --has-conversation <uuid>`:** o `<uuid>` é a sessão efetiva, que o Rust passa.
+Sem o arquivo, a saída continua a de antes, uma linha só, `conversation=false`. Com o arquivo, são
+duas linhas: `conversation=true` e `session=<última sessão da cadeia>` (o próprio `<uuid>` sem
+cadeia). O código de saída é 0 nos dois casos, e o modo continua sem gravar nada e sem depender da
+configuração. O `launch::parse_has_conversation` devolve `Result<Option<String>, String>` (`None`:
+perdida; `Some(sessão)`) e recusa, com a mensagem de antes (`O bin/nick-agent respondeu algo
+inesperado na verificação da conversa.`), qualquer outra saída com código 0: `conversation=true`
+sem `session=`, `session=` vazio, maiúsculo, curto ou com outro caractere, linhas a mais, ordem
+trocada ou `conversation=false` com `session=`.
+
+**`agents.resume_session_id` (migração 8):** `ALTER TABLE agents ADD COLUMN resume_session_id
+TEXT` e `CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id)` (no SQLite,
+vários `NULL` não violam o índice). O **`session_id` fica fixo** (decisão do analista): continua
+sendo o `--session-id` da abertura, o `UNIQUE` de antes e **a chave do lock**
+(`<estado>/agents/<session_id>.lock`). A **sessão efetiva** (`Agent::effective_session`) é o
+`resume_session_id` ou, se ele for `NULL`, o `session_id`. O critério do ticket pedia "atualizar o
+`session_id`", e foi reescrito no plano: o que muda é a sessão de retomada.
+
+**Por que o lock continua no `session_id`:** abrir, retomar, a limpeza da abertura do nick e o
+`held_elsewhere` continuam travando o mesmo arquivo. Assim dois nicks, inclusive um de versão
+anterior aberto ao mesmo tempo (que só conhece o `session_id`), disputam a mesma trava, e nenhum
+agente é retomado duas vezes. Um teste segura o `flock` de `<session_id>.lock` num processo filho
+depois da troca para a sessão B, e a retomada é recusada. A sabotagem que trava pela sessão
+efetiva faz esse teste falhar.
+
+**A troca é gravada sob o lock, junto com o `active`.** O `check_resume` pergunta pela sessão
+efetiva (`--has-conversation`), o `agents::resume(db, dir, agent, latest)` pega o lock do
+`session_id` e só então o `Db::resume_agent(id, latest)` faz um único `UPDATE` condicionado ao
+estado, com `state = 'active'` e, só quando `latest` difere da efetiva, `resume_session_id =
+latest` (`SessionSwap::Swapped`). A efetiva é lida antes do `UPDATE`: só quem tem o lock grava a
+coluna, então ela não muda nesse meio-tempo. Se o `UPDATE` bater no `UNIQUE` (outro agente já
+aponta para essa sessão), só a mudança de estado é feita (`SessionSwap::Taken`), e a retomada
+segue pela efetiva. As recusas de antes (`Gone`, `Archived`, a releitura que falha) não mudaram:
+o lock sai e nada é gravado. O PTY abre com a sessão efetiva da linha **relida**.
+
+**A barra** soma ao `O agente <nome> foi retomado.`, antes do aviso da pasta do NS-39, quando há:
+- troca feita: ` A conversa tinha continuado em outra sessão do claude (<nova>), e o nick passou
+  a usá-la.`;
+- troca recusada pelo `UNIQUE`: ` A conversa continuou na sessão <nova> do claude, mas outro
+  agente deste nick já usa essa sessão: a retomada seguiu pela sessão guardada.`
+
+O ID passa por `printable`. Sem cadeia, a barra é a de antes, byte a byte. O painel do agente
+mostra `Sessão: <efetiva>` e, quando há `resume_session_id`, a linha `Sessão na abertura:
+<session_id>`.
+
+**O que dispara a troca e como evitar (D5).** Fontes:
+- `claude --help` (2.1.328): `--bg, --background` ("With --resume <session-id>, continues that
+  session in the background under the same ID, or starts a copy and says so when the session is
+  already running") e `--fork-session`. O nick não passa nenhum dos dois;
+- <https://code.claude.com/docs/en/agent-view>: o `/background` (ou `/bg`) "move the current
+  conversation into a background session", e o `←` num prompt vazio "backgrounds it and opens
+  agent view". Se uma ferramenta estiver rodando, o `claude` espera ela terminar ("If a tool is
+  running when you press `←`, Claude Code waits for it to finish before backgrounding"). Isso bate
+  com o aviso visto pelo usuário, `Backgrounding after the current tool finishes…`, e com o
+  `"via":"fork"` do arquivo novo. A mesma página diz como desligar: "set the `disableAgentView`
+  setting to `true` or set the `CLAUDE_CODE_DISABLE_AGENT_VIEW` environment variable";
+- <https://code.claude.com/docs/en/settings-reference>, `disableAgentView` (escopo "Any file",
+  booleano): "`true`: Claude Code turns off `claude agents`, `--bg`, `/background`, and the
+  on-demand supervisor". O `leftArrowOpensAgents` (o `←`) é "Global config": só vale no
+  `~/.claude.json` ("Claude Code ignores this key in `settings.json`"), que o nick não grava. Ele
+  "Appears in `/config` as **← opens agents** when agent view is available";
+- <https://code.claude.com/docs/en/env-vars>: `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` é outra
+  coisa (o `Ctrl+B` e o `run_in_background` das ferramentas), e não desliga as sessões em segundo
+  plano. Ele **não** foi posto: comandos e subagentes em segundo plano dentro da sessão continuam.
+
+Nenhuma fonte diz com todas as letras que o segundo plano é o que gera o `continued-in`, nem que
+o `disableAgentView` desliga o `←`. A conferência fica no roteiro manual
+(`.nick/docs/NS-50/verificacao_manual.md`), porque o `claude` real não roda na jail do nick.
+**Decisão do usuário na execução:** `"disableAgentView": true` entrou no
+`lib/claude/permissions.json`, que já é o `--settings` de toda sessão do nick e do `auto_scrum`.
+O diferencial `auto_scrum` × `nick-agent` do NS-33 continua valendo sem exceção. O que se perde
+nessas sessões: o `/background`/`/bg`, o `←` que manda para segundo plano, o "Move to background
+and exit", o `claude --bg`/`claude agents` pelo próprio agente, e o `/fork` passa a abrir um
+subagente em vez de copiar a sessão (agent-view: "When agent view is turned off, `/fork` starts
+a forked subagent instead of copying the session"). As sessões abertas à mão, fora do nick e do
+`auto_scrum`, não mudam. A cadeia do `continued-in` continua como rede de segurança: para um
+agente que já trocou de sessão, para uma versão do `claude` que ignore a chave e para outro
+gatilho da troca, se houver.
+
+**Mudou a regra do `permissions.json`:** até o NS-49 ele era só `{"permissions": {"deny": [...],
+"ask": [...]}}`, sem nenhuma outra chave. Desde o NS-50 tem também, e só, `"disableAgentView":
+true`. O teste de forma (`json_shape_ok` de `lib/tests/test_claude.sh`) exige exatamente isso. Os
+controles dele ganharam a chave, e três casos novos são recusados (sem a chave, `false` e
+`"true"`). Um controle positivo mostra que o formato certo, com listas vazias, é aceito.
+
+**Testes adaptados, com o motivo:**
+- `lib/tests/test_claude.sh`: o `json_shape_ok`, o título e a descrição do teste de forma, e os
+  arquivos de controle (`allow`, `mode`, `number`, `no_ask`), que ganharam a chave
+  `disableAgentView` para continuar recusados só pelo defeito de cada um (a regra do
+  `permissions.json` mudou, acima). A lista do `clean_func` ganhou a `claude_conversation_latest`;
+- `bin/tests/test_nick_agent.sh`: as quatro asserções de `conversation=true` do NS-39
+  (`CLAUDE_CONFIG_DIR`, `$HOME/.claude`, os três locales e o link simbólico) passaram a esperar
+  também a linha `session=<uuid>` (a saída nova do `--has-conversation`). O
+  `conversation=false` não mudou;
+- `nick/src/launch.rs`: o `the_conversation_check_is_exactly_one_line` foi substituído por
+  `the_conversation_check_is_false_or_true_with_the_session` e
+  `the_conversation_check_refuses_anything_else` (o formato novo; as saídas recusadas de antes
+  continuam na lista). No `run_has_conversation_runs_the_real_launcher_in_the_project`,
+  `Ok(false)`/`Ok(true)` viraram `Ok(None)`/`Ok(Some(<sessão>))` (o tipo novo);
+- `nick/src/db/mod.rs`: os testes de versão (7 → 8: `a_new_database_gets_version_8_...`, que
+  trocou o número no nome, `opening_twice_duplicates_nothing`, e 8 → 9 no banco "mais novo" de
+  `a_newer_database_is_refused_without_being_written` e
+  `a_database_one_version_newer_is_refused_too`); o `migration_1_is_pinned` (8 migrações e o
+  texto da 8); o `a_version_6_database_with_agents_migrates_to_7_keeping_every_row`, que passou a
+  abrir só com as migrações 1 a 7 (o teste da 8 é o dele), sem mudar asserção; e as cinco
+  chamadas `db.resume_agent(a.id)` de `resume_agent_makes_a_stopped_or_active_one_active_...` e
+  `an_unknown_state_is_not_resumed_archived_nor_unarchived`, que viraram
+  `db.resume_agent(a.id, "s-1").unwrap().0` (só sintaxe: a sessão efetiva, sem troca). No PTY,
+  o `a_real_version_6_database_opens_migrated_with_the_tree_of_before` (`nick/tests/agent.rs`)
+  passou a esperar a versão 8 depois da abertura (a mais nova). Os testes
+  de migração antiga já gravavam e liam os agentes por SQL cru (NS-39/NS-40), então nenhum
+  precisou passar a usar os helpers;
+- `nick/src/agents.rs`: as chamadas de `resume`/`resume_with` de
+  `resuming_takes_the_lock_before_the_update`,
+  `a_lock_held_by_another_nick_refuses_to_resume_and_changes_nothing`,
+  `an_active_agent_whose_lock_is_free_is_resumed`,
+  `a_gone_or_archived_agent_is_not_resumed_and_the_lock_goes` e
+  `a_resume_whose_row_cant_be_read_again_stops_it_and_releases_the_lock` (só sintaxe: a sessão
+  `"s-1"` e o par `(OpenAgent, SessionSwap)`), e o helper `named` (o campo novo do `Agent`);
+- `nick/src/tree.rs` (helper `agent`, o campo novo), `nick/src/ui.rs` (a assinatura do falso do
+  launcher, que não é chamada) e `nick/src/app.rs` (o `FakeLauncher` devolve o tipo novo e ganhou
+  `latest`; os testes do NS-39 que configuram `conversation = Ok(false)` não mudaram).
+
+Os testes da conversa perdida, abrir agente, a limpeza da abertura, o `held_elsewhere`,
+arquivar/desarquivar, o aviso do ID novo e o diferencial `auto_scrum` × `nick-agent` passaram sem
+mudar asserção.
+
+**Testes novos:** `lib/tests/test_claude.sh` (`claude_conversation_latest`: sem registro, um
+salto, dois saltos com e sem `set -euo pipefail`, começando do meio, salto para arquivo inexistente
+e para outra pasta de projeto, vários registros (vale o último), conversa depois do registro, sete
+registros malformados (`continuedInSessionId` ausente, vazio, maiúsculo, com caractere estranho,
+com `../`, curto e `sessionId` de outra sessão) com controle positivo, ciclo A → B → A e C → C,
+limite de 50 saltos com controle, arquivo seguinte, do meio e inicial ilegíveis, só a variável de
+destino muda (retrato `compgen -v`), a leitura por `grep -F` sem carregar o arquivo inteiro; e o
+`disableAgentView` no formato do JSON); `bin/tests/test_nick_agent.sh` (a cadeia de dois saltos
+via `CLAUDE_CONFIG_DIR` e via `$HOME/.claude`, o salto para arquivo inexistente, o arquivo
+inicial ilegível, o "sem arquivo" com uma linha só mesmo com B e C na pasta, os retratos
+recursivos do projeto e da pasta do `claude`, e o `"disableAgentView": true` no `--settings` do
+lançamento e da retomada); `launch` (cada recusa do formato novo, o launcher real com cadeia);
+`db` (v7 → v8 com dados, o `UNIQUE` com vários `NULL`, troca feita, mesma sessão, `Archived`,
+`Gone` e estado desconhecido sem gravar, `Taken`); `agents` (o lock do `session_id` durante o
+`update` e nenhum da sessão nova, o lock depois da troca com um processo filho segurando o
+`flock`, com `flock -o` para que o `sleep` não herde a trava, e o `Taken`); `app` (a sessão
+efetiva no `has_conversation`, a sessão nova no `spawn` e no banco, a retomada seguinte partindo
+dela com a barra de antes, o `Taken`, a soma com o aviso da pasta e o `printable`); `ui` (o
+painel com e sem `resume_session_id`); e no PTY (`nick/tests/agent.rs`):
+`a_resume_follows_the_chain_of_sessions_and_the_next_one_starts_from_its_end` (`--resume <C>`, a
+barra, o banco, o lock e, depois de fechar e reabrir o nick sem os arquivos de A e B,
+`--resume <C>` direto) e `a_resume_without_the_record_resumes_the_session_stored`. As
+sabotagens ficam em `.nick/docs/NS-50/sabotagens.md`, as telas em `.nick/docs/NS-50/telas.txt`, e
+a verificação com o `claude` real em `.nick/docs/NS-50/verificacao_manual.md`.
+
+**Ajustes do review do NS-50** (`.nick/docs/NS-50/review.md`; só código de teste, sem mudar
+asserção):
+- **um `hold_lock` só** (ponto 1): o processo filho que segura o `flock` de uma trava ("outro
+  nick") existia em `app.rs` (NS-39) e foi copiado para `agents.rs`, e as cópias já divergiam.
+  Ele virou `agents::test_support::hold_lock` (`#[cfg(test)] pub(crate)`), usado pelos testes dos
+  dois módulos, e a cópia de `app.rs` saiu. O de `app.rs` **ganhou o `flock -o`**: sem ele, o
+  `sleep 30` herda a trava, e o `child.kill()` mata só o `flock`, deixando um `sleep` órfão
+  segurando a trava. Não quebrava nada (cada teste tem o seu tempdir), mas um teste que
+  retomasse depois do `kill` ficaria preso, como aconteceu com o
+  `after_the_swap_the_lock_is_still_the_one_of_the_opening`. A espera também mudou: antes, o
+  `app.rs` esperava pelo `held_elsewhere`, que cria e apaga o arquivo da trava e podia disputar
+  com o `flock` que o estava abrindo. Agora ela abre o arquivo sem criar e só tenta a trava;
+- **um padrão só das variáveis do bash** (ponto 2): o `clean_bash_vars` de
+  `lib/tests/test_claude.sh` foi para o topo da suíte e é usado pelo retrato da
+  `claude_conversation_latest` e pela carga limpa. O `chain_bash_vars`, que era uma cópia do
+  mesmo literal, saiu.
+
+As três observações do review que não pediam mudança ficam registradas: as asserções
+`'"disableAgentView": true'` dependem da formatação do `permissions.json` (o `--settings` leva o
+conteúdo como ele é); o `UNIQUE` da migração 8 não cruza o `resume_session_id` de um agente com o
+`session_id` de outro (exigiria o `claude` continuar numa sessão criada pelo nick, o que não é
+realista); e a validação do UUID faz um `grep` por salto (custo desprezível com o limite de 50).

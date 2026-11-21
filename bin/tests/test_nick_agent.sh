@@ -255,6 +255,8 @@ assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): ativa" "o aviso de
 assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "o claude roda com o cwd no projeto"
 assert_eq "$PROMPT_ARG" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "o último argumento do claude é o prompt (o conteúdo do --prompt-file sem os \\n do fim)"
 assert_not_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode" "po_discussion: o claude não recebe --permission-mode"
+# NS-50: o --settings desliga o segundo plano do claude (a troca de sessão no meio da conversa).
+assert_contains "$(file_of "$case_dir/claude.argv")" '"disableAgentView": true' "o --settings leva \"disableAgentView\": true (NS-50)"
 
 echo
 echo "== lançamento com a jail desligada: o ai-jail não é chamado =="
@@ -772,7 +774,7 @@ expected_conv="$(conv_file "$case_dir/cfg" "$proj")"
 mkdir -p "$(dirname "$expected_conv")"
 : > "$expected_conv"
 has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
-assert_eq "0|conversation=true" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "com <CLAUDE_CONFIG_DIR>/projects/<cwd>/<uuid>.jsonl: conversation=true"
+assert_eq "0|conversation=true"$'\n'"session=$SESSION_ID" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "com <CLAUDE_CONFIG_DIR>/projects/<cwd>/<uuid>.jsonl: conversation=true e session=<o próprio uuid> (sem cadeia)"
 assert_eq "" "$(file_of "$case_dir/order")" "--has-conversation: nem o ai-jail nem o claude"
 assert_eq "$before" "$(tree_snapshot "$proj")" "--has-conversation: nada muda no projeto (retrato recursivo)"
 assert_not_exists "$proj/.nick" "--has-conversation: sem .nick/ criado"
@@ -787,7 +789,7 @@ home_conv="$(conv_file "$case_dir/home/.claude" "$proj")"
 mkdir -p "$(dirname "$home_conv")"
 : > "$home_conv"
 has_conv "$case_dir" "$proj"
-assert_eq "0|conversation=true" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "sem CLAUDE_CONFIG_DIR: o \$HOME/.claude/projects/"
+assert_eq "0|conversation=true"$'\n'"session=$SESSION_ID" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "sem CLAUDE_CONFIG_DIR: o \$HOME/.claude/projects/"
 has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/outro"
 assert_eq "conversation=false" "$(file_of "$case_dir/out")" "controle: com CLAUDE_CONFIG_DIR, o \$HOME/.claude não é olhado"
 # Um cwd com _, ., espaço e acento: cada caractere vira um "-" (o é também, como o claude faz),
@@ -801,7 +803,7 @@ mkdir -p "$(dirname "$chars_conv")"
 : > "$chars_conv"
 for locale_value in C.UTF-8 C POSIX; do
   has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg" LC_ALL="$locale_value" LANG="$locale_value"
-  assert_eq "0|conversation=true" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "cwd com _, ., espaço e acento, LC_ALL=$locale_value: achada"
+  assert_eq "0|conversation=true"$'\n'"session=$SESSION_ID" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "cwd com _, ., espaço e acento, LC_ALL=$locale_value: achada"
 done
 # O caminho físico (pwd -P), e não o do link.
 case_dir="$TEST_TMP/conv_link"
@@ -811,7 +813,71 @@ link_conv="$(conv_file "$case_dir/cfg" "$case_dir/real/proj")"
 mkdir -p "$(dirname "$link_conv")"
 : > "$link_conv"
 has_conv "$case_dir" "$case_dir/link/proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
-assert_eq "conversation=true" "$(file_of "$case_dir/out")" "cwd por um link: vale o caminho físico (pwd -P)"
+assert_eq "conversation=true"$'\n'"session=$SESSION_ID" "$(file_of "$case_dir/out")" "cwd por um link: vale o caminho físico (pwd -P)"
+# A cadeia de continued-in (NS-50): o claude continuou a conversa noutra sessão, e o arquivo da
+# antiga ganhou o registro, no formato real (claude 2.1.328). As sessões B e C, com o SESSION_ID
+# como A.
+CHAIN_B="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a61"
+CHAIN_C="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a62"
+# continued_record <sessão> <próxima>: o registro que o claude grava ao trocar de sessão.
+continued_record() {
+  printf '{"type":"continued-in","timestamp":"2026-11-21T14:41:33.908Z","sessionId":"%s","continuedInSessionId":"%s"}\n' "$1" "$2"
+}
+# chain_files <config_dir> <dir>: grava a cadeia SESSION_ID → B → C na pasta do projeto <dir>,
+# com conversa depois do registro no arquivo de A.
+chain_files() {
+  local folder
+  folder="$(dirname "$(conv_file "$1" "$2")")"
+  mkdir -p "$folder"
+  { printf '{"type":"user","sessionId":"%s"}\n' "$SESSION_ID"; continued_record "$SESSION_ID" "$CHAIN_B"
+    printf '{"type":"user","sessionId":"%s","message":"Deu certo"}\n' "$SESSION_ID"; } > "$folder/$SESSION_ID.jsonl"
+  continued_record "$CHAIN_B" "$CHAIN_C" > "$folder/$CHAIN_B.jsonl"
+  printf '{"type":"derived-from","sessions":[{"type":"claude_code_session","id":"%s","via":"fork"}]}\n' "$CHAIN_B" > "$folder/$CHAIN_C.jsonl"
+}
+case_dir="$TEST_TMP/conv_chain_cfg"
+proj="$case_dir/proj"
+mkdir -p "$proj"
+chain_files "$case_dir/cfg" "$proj"
+before="$(tree_snapshot "$proj")"
+cfg_before="$(tree_snapshot "$case_dir/cfg")"
+has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
+assert_eq "0|conversation=true"$'\n'"session=$CHAIN_C" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "cadeia de dois saltos via CLAUDE_CONFIG_DIR: session=<C>"
+assert_eq "" "$(file_of "$case_dir/err")" "cadeia: nada no stderr"
+assert_eq "" "$(file_of "$case_dir/order")" "cadeia: nem o ai-jail nem o claude"
+assert_eq "$before" "$(tree_snapshot "$proj")" "cadeia: nada muda no projeto (retrato recursivo)"
+assert_eq "$cfg_before" "$(tree_snapshot "$case_dir/cfg")" "cadeia: nada muda na pasta do claude (retrato recursivo)"
+case_dir="$TEST_TMP/conv_chain_home"
+proj="$case_dir/proj"
+mkdir -p "$proj"
+chain_files "$case_dir/home/.claude" "$proj"
+has_conv "$case_dir" "$proj"
+assert_eq "0|conversation=true"$'\n'"session=$CHAIN_C" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "cadeia de dois saltos via \$HOME/.claude: session=<C>"
+# A sessão seguinte sem arquivo: a resposta é a última que existe.
+rm -f "$(dirname "$(conv_file "$case_dir/home/.claude" "$proj")")/$CHAIN_C.jsonl"
+has_conv "$case_dir" "$proj"
+assert_eq "0|conversation=true"$'\n'"session=$CHAIN_B" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "o salto para um arquivo que não existe: para antes dele (B)"
+# O arquivo inicial ilegível: a conversa existe, e a retomada usa a sessão guardada.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  PULADO: arquivo inicial ilegível (rodando como root, que lê mesmo com chmod 000)"
+else
+  case_dir="$TEST_TMP/conv_chain_unreadable"
+  proj="$case_dir/proj"
+  mkdir -p "$proj"
+  chain_files "$case_dir/cfg" "$proj"
+  chmod 000 "$(conv_file "$case_dir/cfg" "$proj")"
+  has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
+  chmod 600 "$(conv_file "$case_dir/cfg" "$proj")"
+  assert_eq "0|conversation=true"$'\n'"session=$SESSION_ID" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "arquivo inicial ilegível: conversation=true e session=<o próprio>"
+  assert_eq "" "$(file_of "$case_dir/err")" "arquivo inicial ilegível: nada no stderr"
+fi
+# Sem o arquivo, a resposta continua uma linha só, mesmo com os arquivos da cadeia na pasta.
+case_dir="$TEST_TMP/conv_chain_lost"
+proj="$case_dir/proj"
+mkdir -p "$proj"
+chain_files "$case_dir/cfg" "$proj"
+rm -f "$(conv_file "$case_dir/cfg" "$proj")"
+has_conv "$case_dir" "$proj" CLAUDE_CONFIG_DIR="$case_dir/cfg"
+assert_eq "0|conversation=false" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "sem o arquivo da sessão: conversation=false, uma linha só (mesmo com B e C na pasta)"
 # Argumentos inválidos.
 case_dir="$TEST_TMP/conv_args"
 mkdir -p "$case_dir/proj"
@@ -874,6 +940,7 @@ assert_eq "ai-jail -- true"$'\n'"ai-jail"$'\n'"claude" "$(file_of "$case_dir/ord
 assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): ativa" "jail ligada: o jail_print_status no terminal"
 assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "a retomada roda com o cwd no projeto"
 assert_eq "--name"$'\n'"$AGENT_NAME" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "sem prompt posicional: o último argumento é o nome"
+assert_contains "$(file_of "$case_dir/claude.argv")" '"disableAgentView": true' "a retomada: o --settings leva \"disableAgentView\": true (NS-50)"
 assert_exists "$proj/.nick/.gitignore" "a retomada roda o config_dir_prepare, como o lançamento"
 # Diferencial: as opções do ai-jail até o -- são as do lançamento normal com a mesma configuração.
 diff_launch="$TEST_TMP/resume_jail_on_launch"

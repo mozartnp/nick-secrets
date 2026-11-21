@@ -180,6 +180,18 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
     BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
 ";
 
+/// Migration 8 (NS-50): the session a stopped agent is resumed by. claude may go on with a
+/// conversation in another session (a `continued-in` record in the file of the old one, followed by
+/// `bin/nick-agent --has-conversation`); the resume then stores that session here. `session_id`
+/// never changes: it is the `--session-id` of the opening, its UNIQUE and the key of the lock. The
+/// effective session of an agent is `resume_session_id`, or `session_id` when NULL (every row of
+/// before). The UNIQUE index keeps two agents from resuming the same conversation; in SQLite many
+/// NULLs don't break it.
+pub const MIGRATION_8: &str = "\
+ALTER TABLE agents ADD COLUMN resume_session_id TEXT;  -- the session of the resume; NULL: session_id
+CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
 pub const MIGRATIONS: &[&str] = &[
     MIGRATION_1,
@@ -189,4 +201,5 @@ pub const MIGRATIONS: &[&str] = &[
     MIGRATION_5,
     MIGRATION_6,
     MIGRATION_7,
+    MIGRATION_8,
 ];

@@ -13,7 +13,10 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{DOWN, ENTER, ESC, LEFT, Nick, PANEL_COL, RIGHT, TAB, World};
+use common::{
+    DOWN, ENTER, ESC, KITTY_OFF, KITTY_ON, Keyboard, LEFT, Nick, PANEL_COL, RIGHT, TAB, World,
+    assert_in_order,
+};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -55,6 +58,16 @@ fn fake_editor() -> PathBuf {
 /// Runs the nick with the fakes first in the PATH, their logs in the world, the fake EDITOR, the
 /// logs of the prompts in the world, the claude mode and `extra`.
 fn spawn(world: &World, mode: &str, extra: &[(&str, &str)]) -> Nick {
+    spawn_as(world, mode, extra, Keyboard::Legacy)
+}
+
+/// `spawn` on a terminal with the kitty keyboard protocol (NS-49).
+fn spawn_kitty(world: &World, mode: &str, extra: &[(&str, &str)]) -> Nick {
+    spawn_as(world, mode, extra, Keyboard::Kitty)
+}
+
+/// `spawn` on a terminal with the `keyboard`.
+fn spawn_as(world: &World, mode: &str, extra: &[(&str, &str)], keyboard: Keyboard) -> Nick {
     let l = logs(world);
     let path = common::fake_path();
     let (claude, env, jail, pids) = (
@@ -76,7 +89,10 @@ fn spawn(world: &World, mode: &str, extra: &[(&str, &str)]) -> Nick {
         ("EDITOR", editor.as_str()),
     ];
     all.extend_from_slice(extra);
-    world.spawn(&world.root, &all)
+    match keyboard {
+        Keyboard::Legacy => world.spawn(&world.root, &all),
+        Keyboard::Kitty => world.spawn_kitty(&world.root, &all),
+    }
 }
 
 /// A world with the project `proj` (the config `lines`) registered with the ticket NS-1.
@@ -2799,4 +2815,201 @@ fn only_move_ticket_moves_a_ticket_between_epics() {
         epic_moves("db.set_ticket_epic(1, None); \"UPDATE tickets SET epic_id = 1\""),
         (1, 1)
     );
+}
+
+// ---- the keyboard mode of the kitty protocol (NS-49), with the sequences of the Konsole ----
+
+/// The Shift+Enter of the Konsole with the keyboard mode on.
+const KITTY_SHIFT_ENTER: &str = "\x1b[13;2u";
+
+/// An agent of the PO open in the echo mode of the fake claude, reading `bytes` bytes, on a
+/// terminal with the `keyboard`.
+fn echo_agent(keyboard: Keyboard, bytes: &str) -> (World, Nick) {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn_as(
+        &world,
+        "echo",
+        &[("FAKE_CLAUDE_READ_BYTES", bytes)],
+        keyboard,
+    );
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    (world, nick)
+}
+
+/// Sends `keys` to the echo agent and waits for the fake claude to get exactly `bytes`, then
+/// quits.
+fn assert_claude_gets(keyboard: Keyboard, keys: &str, bytes: &[u8]) {
+    let (_world, mut nick) = echo_agent(keyboard, &bytes.len().to_string());
+    nick.send(keys);
+    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    nick.wait_for(&format!("GOT {}", hex.join(" ")));
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0), "{keys:?}");
+}
+
+#[test]
+fn shift_enter_reaches_claude_as_alt_enter() {
+    let (_world, mut nick) = echo_agent(Keyboard::Kitty, "2");
+    nick.wait_for("Ctrl+\\ voltar à lista · Alt+Enter nova linha");
+    nick.keep_screen("modo kitty: o terminal do agente, com o Alt+Enter na ajuda");
+    nick.send(KITTY_SHIFT_ENTER);
+    nick.wait_for("GOT 1b 0d");
+    nick.keep_screen("Shift+Enter (ESC[13;2u) chega ao claude falso como ESC CR (1b 0d)");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// The Alt+Enter as it is today, with and without the keyboard mode (and in the form of the
+/// kitty protocol, `ESC[13;3u`).
+#[test]
+fn alt_enter_still_reaches_claude_as_alt_enter() {
+    assert_claude_gets(Keyboard::Kitty, "\x1b\r", &[0x1b, 0x0d]);
+    assert_claude_gets(Keyboard::Kitty, "\x1b[13;3u", &[0x1b, 0x0d]);
+    assert_claude_gets(Keyboard::Legacy, "\x1b\r", &[0x1b, 0x0d]);
+}
+
+#[test]
+fn enter_still_sends() {
+    assert_claude_gets(Keyboard::Kitty, ENTER, &[0x0d]);
+}
+
+#[test]
+fn with_the_keyboard_mode_on_ctrl_c_reaches_claude() {
+    assert_claude_gets(Keyboard::Kitty, "\x1b[99;5u", &[0x03]);
+}
+
+/// Review NS-49, P1, with the sequences of the Konsole (probe of 2026-11-21): Alt+Shift+a is
+/// `ESC[97;4u` (the small letter) and reaches claude as `ESC A`, as in the legacy mode;
+/// Alt+Shift+1 is `ESC[33;4u` (the `!` itself) and reaches it as `ESC !`.
+#[test]
+fn with_the_keyboard_mode_on_alt_shift_keys_reach_claude_as_before() {
+    assert_claude_gets(Keyboard::Kitty, "\x1b[97;4u", b"\x1bA");
+    assert_claude_gets(Keyboard::Kitty, "\x1b[33;4u", b"\x1b!");
+    // The legacy forms, unchanged.
+    assert_claude_gets(Keyboard::Legacy, "\x1bA", b"\x1bA");
+    assert_claude_gets(Keyboard::Legacy, "\x1b!", b"\x1b!");
+}
+
+#[test]
+fn with_the_keyboard_mode_on_the_default_shortcut_toggles_the_focus() {
+    let (_world, mut nick) = echo_agent(Keyboard::Kitty, "1");
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    nick.send("\x1b[92;5u");
+    wait_flat(&nick, "v agentes ativos (1)");
+    nick.send("\x1b[92;5u");
+    nick.wait_for("Ctrl+\\ voltar à lista");
+    // The shortcut never reached claude: its first byte is the x.
+    nick.send("x");
+    nick.wait_for("GOT 78");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn with_the_keyboard_mode_on_a_shortcut_of_the_settings_toggles_the_focus() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    nick::db::Db::open(&world.db_path())
+        .unwrap()
+        .set_setting("reserved_shortcut", "ctrl+]")
+        .unwrap();
+    let mut nick = spawn_kitty(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.wait_for("Ctrl+] voltar à lista");
+    nick.send("\x1b[93;5u");
+    wait_flat(&nick, "v agentes ativos (1)");
+    nick.send("\x1b[93;5u");
+    nick.wait_for("Ctrl+] voltar à lista");
+    nick.send("x");
+    nick.wait_for("GOT 78");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Esc closes a dialog, and `a`, `A` (Caps Lock) and `a` with the mark of the Caps Lock
+/// (`ESC[97;65u`) open the same one (NS-43), on the list.
+#[test]
+fn with_the_keyboard_mode_on_esc_and_the_letters_work_on_the_list() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn_kitty(&world, "echo", &[]);
+    nick.wait_for(" Navegação ");
+    nick.open_node("auto_scrum");
+    for key in ["a", "A", "\x1b[97;65u"] {
+        nick.send(key);
+        nick.wait_for("Caminho da pasta do projeto:");
+        nick.send(ESC);
+        nick.wait_until(&format!("the dialog of {key:?} closed"), || {
+            !nick.screen().contains("Caminho da pasta do projeto:")
+        });
+    }
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn with_the_keyboard_mode_on_ctrl_z_never_reaches_claude() {
+    let (_world, mut nick) = echo_agent(Keyboard::Kitty, "1");
+    nick.send("\x1b[122;5u");
+    wait_flat(&nick, "O Ctrl+Z não tem efeito dentro do nick.");
+    assert!(!nick.screen().contains("GOT"), "{}", nick.screen());
+    nick.send("x");
+    nick.wait_for("GOT 78");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Off while the editor runs on the normal terminal, on again when the form is back.
+#[test]
+fn with_the_keyboard_mode_on_it_is_off_during_the_editor_and_on_after() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn_kitty(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "PO - Criar ticket");
+    nick.send("Título do pedido PTY");
+    nick.send(TAB);
+    nick.wait_for("(vazio — Enter abre o editor)");
+    nick.send(ENTER);
+    nick.wait_for("Descrição do editor falso (2 linhas; Enter edita)");
+    assert!(nick.on_alternate_screen(), "the TUI is back");
+    let raw = nick.raw();
+    assert_in_order(
+        &raw,
+        0,
+        &[
+            KITTY_ON,
+            KITTY_OFF,
+            "Descrição do pedido — abrindo ",
+            KITTY_ON,
+        ],
+    );
+    nick.send(ESC);
+    nick.wait_for("g abrir agente");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_restored_at_the_end(&nick.raw());
+}
+
+/// The SIGTERM leaves by the same drop of the guard as the `q`: the mode is turned off.
+#[test]
+fn with_the_keyboard_mode_on_sigterm_turns_it_off() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn_kitty(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    kill(Pid::from_raw(nick.pid()), Signal::SIGTERM).unwrap();
+    assert_eq!(nick.wait_exit(), Some(143));
+    let raw = nick.raw();
+    let last_on = raw.rfind(KITTY_ON).expect("the mode was on");
+    assert_in_order(&raw, last_on, &[KITTY_ON, KITTY_OFF, ALT_OFF]);
+    assert_restored_at_the_end(&raw);
 }

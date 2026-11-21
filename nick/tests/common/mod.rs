@@ -39,6 +39,26 @@ pub const TAB: &str = "\t";
 /// The columns inside the border of the column on the left (the tree, NS-38: `LIST_WIDTH`).
 const TREE_COLS: usize = 38;
 
+/// The keyboard mode of the kitty protocol on (flag 1) and off (NS-49).
+pub const KITTY_ON: &str = "\x1b[>1u";
+pub const KITTY_OFF: &str = "\x1b[<1u";
+/// The query of the kitty keyboard protocol that the nick sends when it opens (NS-49).
+pub const KITTY_QUERY: &str = "\x1b[?u";
+
+/// Asserts that `seq` appears in `raw` in this order, from the byte `from` on, each one after
+/// the end of the one before; returns where the last one ends.
+pub fn assert_in_order(raw: &str, from: usize, seq: &[&str]) -> usize {
+    let mut at = from;
+    for needle in seq {
+        let found = raw
+            .get(at..)
+            .and_then(|rest| rest.find(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not after the byte {at} in {seq:?}: {raw:?}"));
+        at += found + needle.len();
+    }
+    at
+}
+
 /// The fake bin/nick-init (tests/fixtures/bin/nick-init).
 pub fn fake_init() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin/nick-init")
@@ -284,13 +304,35 @@ impl World {
 
     /// Runs the nick with the default environment, plus `extra`, at `cwd`.
     pub fn spawn(&self, cwd: &Path, extra: &[(&str, &str)]) -> Nick {
+        Nick::spawn(cwd, &self.env_with(extra))
+    }
+
+    /// `spawn` on a PTY that answers like a terminal with the kitty keyboard protocol (the
+    /// Konsole, NS-49): the nick turns the keyboard mode on.
+    pub fn spawn_kitty(&self, cwd: &Path, extra: &[(&str, &str)]) -> Nick {
+        Nick::spawn_as(cwd, &self.env_with(extra), Keyboard::Kitty)
+    }
+
+    /// The default environment plus `extra` (a key of `extra` replaces the default).
+    fn env_with(&self, extra: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut env = self.env();
         for (key, value) in extra {
             env.retain(|(k, _)| k != key);
             env.push(((*key).into(), (*value).into()));
         }
-        Nick::spawn(cwd, &env)
+        env
     }
+}
+
+/// The keyboard of the terminal the PTY plays (NS-49).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Keyboard {
+    /// Without the kitty keyboard protocol: only the DA1 is answered, so crossterm sees no
+    /// support at once (without the answer, every opening would wait 2 s).
+    Legacy,
+    /// With the kitty keyboard protocol: the `ESC[?u` is answered with `ESC[?0u`, before the
+    /// DA1, like the Konsole.
+    Kitty,
 }
 
 /// The nick running in a PTY.
@@ -305,8 +347,14 @@ pub struct Nick {
 }
 
 impl Nick {
-    /// Starts the binary at `cwd` with only PATH, TERM and `env` in the environment.
+    /// Starts the binary at `cwd` with only PATH, TERM and `env` in the environment, on a
+    /// terminal without the kitty keyboard protocol.
     pub fn spawn(cwd: &Path, env: &[(String, String)]) -> Nick {
+        Nick::spawn_as(cwd, env, Keyboard::Legacy)
+    }
+
+    /// `spawn` on a terminal with the `keyboard`.
+    pub fn spawn_as(cwd: &Path, env: &[(String, String)], keyboard: Keyboard) -> Nick {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -334,21 +382,34 @@ impl Nick {
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut answered = 0;
+            let mut answered_flags = 0;
+            let mut answered_da1 = 0;
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
                 let mut out = sink.lock().unwrap();
                 out.extend_from_slice(&buf[..n]);
-                // Like a terminal, answer each cursor position request (ESC[6n): ratatui's
-                // Terminal::clear asks for it when the TUI comes back from the init.
-                let asked = out.windows(4).filter(|w| w == b"\x1b[6n").count();
-                while answered < asked {
-                    let mut writer = answer.lock().unwrap();
-                    let _ = writer.write_all(b"\x1b[1;1R");
-                    let _ = writer.flush();
-                    answered += 1;
+                // Like a terminal, answer each `query` in the output once with `reply`.
+                let answer_each = |query: &[u8], reply: &[u8], answered: &mut usize| {
+                    let asked = out.windows(query.len()).filter(|w| *w == query).count();
+                    while *answered < asked {
+                        let mut writer = answer.lock().unwrap();
+                        let _ = writer.write_all(reply);
+                        let _ = writer.flush();
+                        *answered += 1;
+                    }
+                };
+                // The cursor position request (ESC[6n): ratatui's Terminal::clear asks for it
+                // when the TUI comes back from the init.
+                answer_each(b"\x1b[6n", b"\x1b[1;1R", &mut answered);
+                // The query of the kitty keyboard protocol (ESC[?u, NS-49): answered only by a
+                // kitty terminal, and before the DA1 of the same query.
+                if keyboard == Keyboard::Kitty {
+                    answer_each(KITTY_QUERY.as_bytes(), b"\x1b[?0u", &mut answered_flags);
                 }
+                // The primary device attributes (DA1, ESC[c): always, like any terminal.
+                answer_each(b"\x1b[c", b"\x1b[?62c", &mut answered_da1);
             }
         });
         Nick {

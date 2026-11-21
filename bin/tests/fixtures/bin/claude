@@ -101,6 +101,10 @@ case "$mode" in
     sleep 0.5
     ;;
   winsize)
+    # Ends on the Ctrl+C (cooked mode) for sure: without the trap, a SIGINT that arrives as
+    # a sleep ends normally is taken by the bash as handled by the child, and the loop goes on
+    # (review NS-49, O1: ~1 in 100 in a probe).
+    trap 'exit 130' INT
     trap 'echo "SIZE $(stty size)"' WINCH
     echo "SIZE $(stty size)"
     while :; do

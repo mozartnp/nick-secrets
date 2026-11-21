@@ -8,6 +8,11 @@
 //! the refusal of the keys the operator can't choose (`shortcut_refusal`).
 //! The Ctrl+Z is dropped by the app before `encode_key` (`is_suspend_key`, NS-44), and
 //! `encode_key` still knows no shortcut rule.
+//! The Shift+Enter is sent as the Alt+Enter (`ESC CR`, the new line of the `claude`, NS-49): it
+//! only arrives with the kitty keyboard protocol on (terminal.rs), since the legacy `ESC O M`
+//! is dropped by crossterm. The Ctrl+Enter is still a bare `CR`. With that protocol on, a
+//! small letter with Shift (the Konsole's Alt+Shift+a, `ESC[97;4u`) is sent capital, as the
+//! legacy mode sent it (`capital`).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
@@ -356,6 +361,19 @@ fn tilde_key(number: u8, modifiers: KeyModifiers) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The capital of a small letter typed with Shift (review NS-49, P1): with the kitty keyboard
+/// mode on, the Konsole sends Alt+Shift+a as `ESC[97;4u`, the small letter, where the legacy
+/// mode sent `ESC A`. A letter whose capital is not one char (`ß`), and any other char, stays
+/// as it is: the legacy mode never sends a small letter with Shift, and the symbols already
+/// come shifted (`ESC[33;4u` is the `!`).
+fn capital(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
 /// ESC before `bytes` when Alt is held.
 fn with_alt(mut bytes: Vec<u8>, modifiers: KeyModifiers) -> Vec<u8> {
     if modifiers.contains(KeyModifiers::ALT) {
@@ -377,10 +395,20 @@ pub fn encode_key(event: &KeyEvent, modes: TermModes) -> Option<Vec<u8>> {
                 .contains(KeyModifiers::CONTROL)
                 .then(|| ctrl_byte(c))
                 .flatten();
+            let c = if mods.contains(KeyModifiers::SHIFT) && !mods.contains(KeyModifiers::CONTROL) {
+                capital(c)
+            } else {
+                c
+            };
             let raw = control.map_or_else(|| c.to_string().into_bytes(), |b| vec![b]);
             with_alt(raw, mods)
         }
-        KeyCode::Enter => with_alt(b"\r".to_vec(), mods),
+        // Shift+Enter (only with the kitty keyboard protocol on, NS-49) is sent as Alt+Enter,
+        // the new line of the `claude`; with both, a single ESC.
+        KeyCode::Enter if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            b"\x1b\r".to_vec()
+        }
+        KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => with_alt(b"\t".to_vec(), mods),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace if mods.contains(KeyModifiers::CONTROL) => vec![0x08],
@@ -1303,5 +1331,90 @@ mod tests {
         for (event, expected) in cases {
             assert_eq!(is_suspend_key(&event), expected, "{event:?}");
         }
+    }
+
+    #[test]
+    fn shift_enter_is_sent_as_alt_enter() {
+        let shift = KeyModifiers::SHIFT;
+        let alt = KeyModifiers::ALT;
+        assert_eq!(with(KeyCode::Enter, shift), bytes("\x1b\r"));
+        assert_eq!(with(KeyCode::Enter, shift | alt), bytes("\x1b\r"));
+        assert_eq!(with(KeyCode::Enter, shift), with(KeyCode::Enter, alt));
+        // Unchanged.
+        assert_eq!(plain(KeyCode::Enter), bytes("\r"));
+        assert_eq!(with(KeyCode::Enter, alt), bytes("\x1b\r"));
+        assert_eq!(with(KeyCode::Enter, KeyModifiers::CONTROL), bytes("\r"));
+        let repeat = KeyEvent::new_with_kind(KeyCode::Enter, shift, KeyEventKind::Repeat);
+        assert_eq!(encode_key(&repeat, TermModes::default()), bytes("\x1b\r"));
+        let release = KeyEvent::new_with_kind(KeyCode::Enter, shift, KeyEventKind::Release);
+        assert_eq!(encode_key(&release, TermModes::default()), None);
+    }
+
+    /// The keys as crossterm 0.29 parses the sequences of the kitty keyboard protocol (flag 1)
+    /// that the Konsole sends (`parse_csi_u_encoded_key_code`), NS-49: they do what the legacy
+    /// ones did. The default shortcut with `Char('\\')`+Ctrl is
+    /// `the_default_matches_ctrl_4_and_ctrl_backslash_of_crossterm`.
+    #[test]
+    fn kitty_keys_encode_like_the_legacy_ones() {
+        let ctrl = KeyModifiers::CONTROL;
+        // ESC[92;5u and the legacy 0x1c (Ctrl+4 for crossterm).
+        assert_eq!(with(KeyCode::Char('\\'), ctrl), Some(vec![0x1c]));
+        assert_eq!(with(KeyCode::Char('4'), ctrl), Some(vec![0x1c]));
+        // ESC[99;5u.
+        assert_eq!(with(KeyCode::Char('c'), ctrl), Some(vec![0x03]));
+        // ESC[122;6u.
+        assert!(is_suspend_key(&key(
+            KeyCode::Char('z'),
+            ctrl | KeyModifiers::SHIFT
+        )));
+        // ESC[97;65u: `a` with the Caps Lock bit (64) of the modifier.
+        let caps = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::CAPS_LOCK,
+        );
+        let expected = (
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::CAPS_LOCK,
+        );
+        assert_eq!(raw(shortcut_key(caps)), expected);
+        let caps_capital = KeyEvent {
+            code: KeyCode::Char('A'),
+            ..caps
+        };
+        assert_eq!(raw(shortcut_key(caps_capital)), expected);
+    }
+
+    /// Review NS-49, P1: with the kitty keyboard mode on, the Konsole sends Alt+Shift+a as
+    /// `ESC[97;4u`, the small letter with Shift (crossterm: `Char('a')`+ALT|SHIFT); the legacy
+    /// mode sent `ESC A` (`Char('A')`+ALT|SHIFT). A small letter with Shift and without Ctrl goes
+    /// as the capital, as before. Alt+Shift+1 comes as `ESC[33;4u`, the `!` itself.
+    #[test]
+    fn a_small_letter_with_shift_is_sent_capital() {
+        let shift = KeyModifiers::SHIFT;
+        let alt = KeyModifiers::ALT;
+        let ctrl = KeyModifiers::CONTROL;
+        // The kitty forms.
+        assert_eq!(with(KeyCode::Char('a'), alt | shift), bytes("\x1bA"));
+        assert_eq!(with(KeyCode::Char('a'), shift), bytes("A"));
+        assert_eq!(with(KeyCode::Char('ç'), alt | shift), bytes("\x1bÇ"));
+        assert_eq!(with(KeyCode::Char('!'), alt | shift), bytes("\x1b!"));
+        // The same bytes of the legacy forms, unchanged.
+        assert_eq!(with(KeyCode::Char('A'), alt | shift), bytes("\x1bA"));
+        assert_eq!(with(KeyCode::Char('A'), shift), bytes("A"));
+        assert_eq!(with(KeyCode::Char('!'), alt), bytes("\x1b!"));
+        // Without Shift, or with Ctrl, as before.
+        assert_eq!(with(KeyCode::Char('a'), alt), bytes("\x1ba"));
+        assert_eq!(with(KeyCode::Char('a'), ctrl | shift), Some(vec![0x01]));
+        assert_eq!(
+            with(KeyCode::Char('a'), ctrl | alt | shift),
+            bytes("\x1b\x01")
+        );
+        assert_eq!(with(KeyCode::Char('ç'), ctrl | shift), bytes("ç"));
+        // A letter whose capital is not one char stays as it is.
+        assert_eq!(with(KeyCode::Char('ß'), shift), bytes("ß"));
     }
 }

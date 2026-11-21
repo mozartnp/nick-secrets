@@ -4451,3 +4451,141 @@ com Shift, Caps Lock, Super, `Repeat`, Alt e as outras 25 letras com Ctrl); `app
 inclusive o `Ctrl+Z → \x1a` do `encode_key`.
 
 **Fora de escopo:** retomar um agente que já está travado, e as outras teclas de sinal.
+
+## Rust no projeto: Shift+Enter no terminal do agente (NS-49)
+
+Um bug filho do épico NS-28. No Konsole, o Shift+Enter quebra a linha no `claude` aberto direto,
+mas dentro do nick enviava a mensagem incompleta. Só o Alt+Enter quebrava a linha. Eram duas
+causas. O nick não pedia ao terminal de verdade o modo de teclado que distingue o Shift+Enter (o
+pedido que o `claude` faz fica preso no terminal embutido, o `vt100`). E o `encode_key` descartava
+o Shift do Enter.
+
+**O mecanismo do Konsole** (sondagem do Tech Leader em 2026-11-21, `KONSOLE_VERSION=260803`,
+`TERM=xterm-256color`, fora do tmux):
+
+| Situação | Bytes recebidos |
+|---|---|
+| Pergunta `CSI ? u` + DA1 (`CSI c`) | `ESC[?0u` e depois `ESC[?62;1;4c`: **suporta o protocolo de teclado do kitty** e responde na hora |
+| Modo legado, Shift+Enter | `ESC O M` (SS3 M, o Enter do teclado numérico) |
+| Modo legado, Alt+Enter | `ESC` + Enter |
+| Kitty flag 1, Shift+Enter | `ESC[13;2u` |
+| Kitty flag 1, Esc | `ESC` (igual ao legado) |
+| Kitty flag 1, `Ctrl+\` | `ESC[92;5u` |
+| Kitty flag 1, Ctrl+C | `ESC[99;5u` |
+| `modifyOtherKeys` nível 2 (`CSI > 4;2 m`), Shift+Enter | `ESC O M`: **o Konsole ignora esse modo** |
+
+O Konsole distingue o Shift+Enter pelo **protocolo de teclado do kitty**. No modo legado, o
+`ESC O M` não serve: o parser do crossterm 0.29 (`event/sys/unix/parse.rs`, ramo `b'O'`) só aceita
+`A B C D H F P..S`, e a sequência que ele não entende é descartada (`source/unix/mio.rs`,
+`Err(_) => buffer.clear()`). Com o protocolo kitty, o crossterm entrega `KeyCode::Enter` com
+`SHIFT`. O `modifyOtherKeys` não serve: o Konsole o ignora, e o crossterm também não decodificaria
+o `CSI 27;2;13~`.
+
+**A regra:**
+- **só a flag 1 do kitty** (`DISAMBIGUATE_ESCAPE_CODES`, `ESC[>1u`). As outras flags (eventos de
+  soltar, todas as teclas como escape, texto associado) mudariam muito mais teclas e trariam
+  eventos `Release`/`Repeat` que hoje não chegam. O crossterm já decodifica o `CSI u` nos mesmos
+  `KeyEvent` do modo legado: não há parser nem dependência nova;
+- **detecção uma vez, ao abrir**, com `crossterm::terminal::supports_keyboard_enhancement()`
+  (`ESC[?u` + `ESC[c`, até 2 s). Sem suporte, ou com erro (o terminal não respondeu), **nada muda**:
+  o nick não manda o `ESC[>1u` nem o `ESC[<1u`, e não há mensagem;
+- no `encode_key`, o **Shift+Enter vira `ESC CR`**, a mesma sequência do Alt+Enter, que o `claude`
+  entende como quebra de linha. Shift+Alt+Enter também, com um ESC só. A regra não depende do modo:
+  no legado o crossterm nunca entrega Enter com Shift. **O Ctrl+Enter continua `CR`**, e as outras
+  combinações com Shift (ex: Shift+Tab) não mudam;
+- no `encode_key`, uma **letra minúscula com Shift e sem Ctrl vai como maiúscula** (`capital`,
+  review do NS-49, P1). Com o modo ligado, o Konsole manda o Alt+Shift+a como `ESC[97;4u`, com a
+  letra minúscula, e o `claude` recebia `ESC a`, quando no legado recebia `ESC A`. Agora volta a
+  receber `ESC A`. Uma letra cuja maiúscula tem mais de um caractere (o `ß`) fica como está. No
+  legado nada muda, porque o crossterm nunca entrega minúscula com Shift. Os atalhos do nick já
+  tratavam as duas formas (`Shortcut::from_key`);
+- o modo é **desligado** (`ESC[<1u`) ao sair (`q`, erro, SIGTERM, SIGHUP, panic) e enquanto o
+  `bin/nick-init` ou o `$EDITOR` rodam, e **religado** na volta, sem perguntar de novo;
+- sem variável de ambiente para desligar: a detecção já deixa como hoje o terminal sem suporte.
+
+**Onde fica.** `terminal.rs`: o `static KEYBOARD_ENHANCED: AtomicBool` (global como o `PANICKING`,
+porque o panic hook não tem acesso ao guard), `push_keyboard_enhancement()` (manda o Push e marca
+`true`) e `pop_keyboard_enhancement()` (manda o Pop **só se** estava ligado, com `swap(false)`), com
+as versões `_to(out)` testáveis sem terminal. O `restore()` chama o pop como **primeira** sequência,
+e ele é o ponto único do `Drop` do `TerminalGuard`, do panic hook e do `suspend`: todos os caminhos
+de saída ficam cobertos sem código em cada um, e dois `restore()` não mandam dois pops.
+`TerminalGuard::enter` detecta (campo `keyboard_enhancement`) depois do `enable_raw_mode` e do
+`EnterAlternateScreen`, e **antes do `spawn_input`** (`main.rs`, com comentário): a consulta lê a
+entrada e disputaria os bytes com a thread de entrada. `suspend` religa depois do
+`EnterAlternateScreen` e antes do `clear`. `keys.rs`: o braço do `KeyCode::Enter` do `encode_key`
+e a função `capital`, que o braço do `KeyCode::Char` chama.
+
+**Alt+Shift no Konsole e por que só a flag 1** (sondagem do review, 2026-11-21, com o script
+`.nick/docs/NS-49/ns49_sonda_alt_shift.sh` e o resultado no `.txt` ao lado):
+
+| Tecla | Legado | Kitty flag 1 | Kitty flags 1 e 4 (`ESC[>5u`) |
+|---|---|---|---|
+| Alt+Shift+a | `ESC A` | `ESC[97;4u` (o `a` minúsculo) | `ESC[97;4u`, igual |
+| Alt+Shift+1 | `ESC !` | `ESC[33;4u` (o próprio `!`) | `ESC[33::49;4u` |
+| `Ctrl+\` | — | `ESC[92;5u` | `ESC[92::60;5u` |
+
+O Konsole manda o símbolo já com o Shift (o `!`, e não o `1` que a especificação do kitty pede),
+então o Alt+Shift+símbolo e os atalhos `alt+<símbolo>` não mudaram. Na letra ele manda a
+minúscula, e é isso que o `capital` corrige. A flag 4 (`REPORT_ALTERNATE_KEYS`) não ajuda: o
+Konsole não manda a maiúscula como alternativa da letra e só acrescenta o código da tecla do
+layout (o terceiro campo), que o crossterm não usa. Ela traria risco sem ganho.
+
+**Ligado também na lista.** O modo não entra nos modos da tela do agente
+(`enter_agent_modes`/`leave_agent_modes`, mouse e colagem): fica ligado o tempo todo na TUI, para
+as teclas chegarem na mesma forma em qualquer foco. Se ligasse e desligasse a cada troca de foco,
+cada `Ctrl+\` mudaria a forma das teclas seguintes.
+
+**O harness de PTY responde ao DA1.** O nick manda `ESC[?u` + `ESC[c` ao abrir. Sem resposta, cada
+abertura de todo teste de PTY esperaria 2 s. O `Nick::spawn` (`tests/common/mod.rs`) responde
+**sempre** ao `ESC[c` com `ESC[?62c`, então o crossterm conclui na hora que não há suporte e os
+testes que já existiam continuam no modo legado. O modo kitty do harness (`World::spawn_kitty`,
+`Nick::spawn_as(.., Keyboard::Kitty)`) responde também ao `ESC[?u` com `ESC[?0u`, antes do DA1,
+como o Konsole. Cada pergunta é respondida uma vez, como o `ESC[6n`, cuja resposta não mudou.
+
+**A ajuda**, com o foco no terminal, é `"{atalho} voltar à lista · Alt+Enter nova linha"`, sempre,
+com ou sem suporte. O Alt+Enter funciona em qualquer terminal; mostrar o Shift+Enter exigiria
+passar o suporte até a UI só por um rótulo, e quem tem o Shift+Enter já o usa por hábito. O texto
+cabe nas linhas que o `help_rows` reserva: a troca de foco não redimensiona os PTYs (NS-34).
+
+**Por quê:** o operador usa o Shift+Enter o tempo todo e mandava mensagens incompletas ao `claude`.
+
+**Quando rever:** se outro terminal com suporte ao protocolo kitty quebrar alguma tecla (o teste
+manual só cobriu o Konsole; um terminal que siga a especificação à risca mandaria o Alt+Shift+1
+como `1`, e o `claude` receberia `ESC 1`), se o crossterm passar a entender o `ESC O M`, ou se o nick ganhar um
+protocolo de teclado no terminal embutido (hoje o `claude` continua no modo legado dentro do nick).
+
+**Testes:** `keys.rs` (`shift_enter_is_sent_as_alt_enter`, com Shift+Alt, Ctrl+Enter, `Repeat` e
+`Release`; `kitty_keys_encode_like_the_legacy_ones`, com os `KeyEvent` que o crossterm produz para
+`ESC[92;5u`, `ESC[99;5u`, `ESC[122;6u` e `ESC[97;65u`, e o atalho padrão coberto por
+`the_default_matches_ctrl_4_and_ctrl_backslash_of_crossterm`;
+`a_small_letter_with_shift_is_sent_capital`, com as formas do kitty e do legado, Ctrl e o `ß`); `terminal.rs`
+(`the_keyboard_mode_is_popped_only_when_pushed`); `ui.rs`
+(`the_terminal_help_shows_alt_enter_for_a_new_line`, `the_terminal_help_keeps_the_reserved_help_rows`);
+no PTY, `nick/tests/tui.rs` (`without_keyboard_enhancement_the_nick_sends_no_keyboard_mode`, com a
+abertura em menos de 1,5 s; `with_keyboard_enhancement_the_mode_is_on_and_off_on_quit`;
+`with_keyboard_enhancement_an_error_turns_the_mode_off_before_the_message`;
+`with_keyboard_enhancement_a_panic_in_the_main_thread_turns_the_mode_off` e `..._in_a_secondary_thread_...`;
+`with_keyboard_enhancement_the_mode_is_off_during_the_init_and_on_after`, com uma pergunta só) e
+`nick/tests/agent.rs` (`shift_enter_reaches_claude_as_alt_enter`;
+`alt_enter_still_reaches_claude_as_alt_enter`, com `ESC CR` nos dois modos e `ESC[13;3u` no kitty;
+`enter_still_sends`; `with_the_keyboard_mode_on_ctrl_c_reaches_claude`;
+`with_the_keyboard_mode_on_alt_shift_keys_reach_claude_as_before`, com `ESC[97;4u` → `ESC A` e
+`ESC[33;4u` → `ESC !`, as sequências do Konsole, e as formas do legado;
+`with_the_keyboard_mode_on_the_default_shortcut_toggles_the_focus`;
+`with_the_keyboard_mode_on_a_shortcut_of_the_settings_toggles_the_focus`, com `ctrl+]` no banco;
+`with_the_keyboard_mode_on_esc_and_the_letters_work_on_the_list`;
+`with_the_keyboard_mode_on_ctrl_z_never_reaches_claude`;
+`with_the_keyboard_mode_on_it_is_off_during_the_editor_and_on_after`;
+`with_the_keyboard_mode_on_sigterm_turns_it_off`). A ordem das sequências no `raw()` é conferida
+por `common::assert_in_order`. Os testes que já existiam passaram sem edição, menos os dois de
+`ui.rs` que fixavam o texto antigo da ajuda do terminal.
+
+**O `claude` falso do modo `winsize` sai no Ctrl+C com `trap 'exit 130' INT`** (review do NS-49,
+O1). Sem o trap, o `a_resize_reaches_claude_below_the_header` falhava de vez em quando: quando o
+SIGINT chega no instante em que um `sleep` do laço termina normalmente, o bash conclui que o filho
+tratou o sinal e continua no laço. Numa sonda fora do nick (um laço `sleep 0.05` que recebe o
+SIGINT no grupo de processos, como o terminal faz), isso aconteceu em cerca de 1 vez a cada 100, e
+nunca com o trap. Um modo novo do `claude` falso que precise terminar no Ctrl+C usa o mesmo trap.
+
+**Fora de escopo:** outras combinações com Shift além do Enter, configurar o terminal do usuário,
+as flags do kitty além da 1, um protocolo de teclado no terminal embutido e o `modifyOtherKeys`.

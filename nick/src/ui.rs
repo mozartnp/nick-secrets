@@ -367,7 +367,9 @@ fn help_text_for(
 ) -> String {
     let shortcut = app.shortcut().label();
     if on_terminal {
-        return format!("{shortcut} voltar à lista");
+        // The Alt+Enter, always (NS-49): the new line of the `claude` on any terminal; the
+        // Shift+Enter only works with the kitty keyboard protocol, and isn't shown.
+        return format!("{shortcut} voltar à lista · Alt+Enter nova linha");
     }
     if let Some(dialog) = dialog {
         return dialog_keys(dialog).to_string();
@@ -2766,7 +2768,7 @@ mod tests {
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
         assert_eq!(
             lines[28].trim(),
-            "Ctrl+\\ voltar à lista",
+            "Ctrl+\\ voltar à lista · Alt+Enter nova linha",
             "in the first row"
         );
     }
@@ -3791,11 +3793,49 @@ mod tests {
             help_text(&f.app),
             "t trocar · p voltar ao padrão · Esc voltar · q sair"
         );
-        // With the focus on the terminal: only the way back.
+        // With the focus on the terminal: only the way back and the new line (NS-49).
         f.app.screen = Screen::Tree;
         f.app.select(live);
         f.app.focus = Focus::Terminal;
-        assert_eq!(help_text(&f.app), "Ctrl+\\ voltar à lista");
+        assert_eq!(
+            help_text(&f.app),
+            "Ctrl+\\ voltar à lista · Alt+Enter nova linha"
+        );
+    }
+
+    /// NS-49: with the focus on the terminal, the help shows the Alt+Enter, the new line that
+    /// works on any terminal; with another shortcut only the shortcut changes.
+    #[test]
+    fn the_terminal_help_shows_alt_enter_for_a_new_line() {
+        let (mut f, _) = with_running(&["proj"]);
+        f.app.focus = Focus::Terminal;
+        assert!(f.app.on_terminal());
+        assert_eq!(
+            help_text(&f.app),
+            "Ctrl+\\ voltar à lista · Alt+Enter nova linha"
+        );
+        f.app.shortcut = Shortcut::from_db("ctrl+]").unwrap();
+        assert_eq!(
+            help_text(&f.app),
+            "Ctrl+] voltar à lista · Alt+Enter nova linha"
+        );
+    }
+
+    /// NS-49: the longer help of the terminal still fits the rows `help_rows` keeps, so the
+    /// toggle of the focus resizes no PTY (NS-34).
+    #[test]
+    fn the_terminal_help_keeps_the_reserved_help_rows() {
+        let (mut f, _) = with_running(&["proj"]);
+        for width in [100, 60] {
+            let area = Rect::new(0, 0, width, 30);
+            f.app.focus = Focus::List;
+            let list = layout(&f.app, area);
+            f.app.focus = Focus::Terminal;
+            assert!(f.app.on_terminal());
+            let terminal = layout(&f.app, area);
+            assert_eq!(list.help.height, terminal.help.height, "{width}");
+            assert_eq!(list.terminal, terminal.terminal, "{width}");
+        }
     }
 
     /// Every place of the help is in `HELP_STATES`, with both filters (the rows of the help

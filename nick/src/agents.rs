@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 pub use crate::db::{Agent, Owner};
 
-use crate::db::{AgentChange, Db, Epic, Ticket};
+use crate::db::{AgentChange, Db, Epic, SessionSwap, Ticket};
 use crate::projects::db_error_message;
 use crate::stages::EPIC_STAGES;
 use crate::tickets::jira_id_valid;
@@ -269,8 +269,22 @@ pub fn open_with(
 /// (`Db::resume_agent`: only from `stopped`, or from an `active` row whose nick died, since its
 /// lock was free). An agent gone or archived meanwhile is refused, and the lock goes. Returns the
 /// row read again, with the lock.
-pub fn resume(db: &Db, agents_dir: &Path, agent: &Agent) -> Result<OpenAgent, String> {
-    resume_with(db, agents_dir, agent, &mut || db.resume_agent(agent.id))
+///
+/// NS-50: `latest` is the session the conversation went on in (`--has-conversation`); the same
+/// UPDATE stores it as the session of the resume when it is new, and the `SessionSwap` says what
+/// happened (`Taken`: another agent has it, so the effective session is kept). The lock is always
+/// the one of `session_id`, the session of the opening, whatever the session of the resume: the
+/// cleanup at the opening of the nick, `held_elsewhere` and another nick (even of a version before
+/// the NS-50) fight for the same file.
+pub fn resume(
+    db: &Db,
+    agents_dir: &Path,
+    agent: &Agent,
+    latest: &str,
+) -> Result<(OpenAgent, SessionSwap), String> {
+    resume_with(db, agents_dir, agent, &mut || {
+        db.resume_agent(agent.id, latest)
+    })
 }
 
 /// `resume` with the update received by parameter (the tests check the lock at that moment).
@@ -278,21 +292,24 @@ pub fn resume_with(
     db: &Db,
     agents_dir: &Path,
     agent: &Agent,
-    update: &mut dyn FnMut() -> rusqlite::Result<AgentChange>,
-) -> Result<OpenAgent, String> {
+    update: &mut dyn FnMut() -> rusqlite::Result<(AgentChange, SessionSwap)>,
+) -> Result<(OpenAgent, SessionSwap), String> {
     let (lock, lock_path) = match take_lock(agents_dir, &agent.session_id) {
         Ok(taken) => taken,
         Err(LockError::Held) => return Err(elsewhere_message(agent)),
         Err(LockError::Failed(message)) => return Err(message),
     };
     let refusal = match update() {
-        Ok(AgentChange::Done) => match db.get_agent(agent.id) {
+        Ok((AgentChange::Done, swap)) => match db.get_agent(agent.id) {
             Ok(Some(row)) => {
-                return Ok(OpenAgent {
-                    agent: row,
-                    lock,
-                    lock_path,
-                });
+                return Ok((
+                    OpenAgent {
+                        agent: row,
+                        lock,
+                        lock_path,
+                    },
+                    swap,
+                ));
             }
             // The row is `active` now: back to `stopped` before the lock goes, or it would look
             // alive in another nick until the next opening (review of the NS-39, point 1).
@@ -305,7 +322,7 @@ pub fn resume_with(
                 db_error_message(&err)
             }
         },
-        Ok(AgentChange::Archived) => format!(
+        Ok((AgentChange::Archived, _)) => format!(
             "O agente {} está arquivado. Desarquive (o) antes de retomar.",
             agent.name
         ),
@@ -446,6 +463,44 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .truncate(false)
         .write(true)
         .open(path)
+}
+
+/// Helpers shared by the tests of more than one module (review of the NS-50: a single
+/// `hold_lock`, used by agents.rs and app.rs).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Whether some process holds the flock of `path` now. It never creates nor removes the
+    /// file (`held_elsewhere` does both, and could race with the child that is opening it).
+    fn locked(path: &Path) -> bool {
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(TryLockError::WouldBlock))
+    }
+
+    /// A child process holding the flock of `path` (another nick) until it is killed, through
+    /// bash (the only program the nick runs with Command: structural of the NS-33). With `-o`
+    /// the lock stays with flock only, so killing it releases the lock: without it, the `sleep`
+    /// would inherit the lock and keep it after the kill.
+    pub(crate) fn hold_lock(path: &Path) -> std::process::Child {
+        create_agents_dir(path.parent().unwrap()).unwrap();
+        let child = std::process::Command::new("bash")
+            .args(["-c", "exec flock -o \"$0\" sleep 30"])
+            .arg(path)
+            .spawn()
+            .expect("flock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !locked(path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never took the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child
+    }
 }
 
 #[cfg(test)]
@@ -841,9 +896,9 @@ mod tests {
         let agent = stopped(&f, "s-1");
         let lock = lock_path(&f.dir, "s-1");
         let mut held_at_update = None;
-        let open = resume_with(&f.db, &f.dir, &agent, &mut || {
+        let (open, _) = resume_with(&f.db, &f.dir, &agent, &mut || {
             held_at_update = Some(!lock_is_free(&lock));
-            f.db.resume_agent(agent.id)
+            f.db.resume_agent(agent.id, "s-1")
         })
         .unwrap();
         assert_eq!(held_at_update, Some(true), "the lock is held at the update");
@@ -868,7 +923,7 @@ mod tests {
             )
             .unwrap();
         let _other = held_by_another(&f, "s-1");
-        let err = resume(&f.db, &f.dir, &agent).unwrap_err();
+        let err = resume(&f.db, &f.dir, &agent, "s-1").unwrap_err();
         assert_eq!(
             err,
             "O agente proj · PO · NS-1 está ativo em outro nick e não pode ser retomado aqui."
@@ -889,7 +944,7 @@ mod tests {
                 "NS-1",
             )
             .unwrap();
-        let open = resume(&f.db, &f.dir, &agent).unwrap();
+        let (open, _) = resume(&f.db, &f.dir, &agent, "s-1").unwrap();
         assert_eq!(open.agent.state, "active");
         assert!(!lock_is_free(&lock_path(&f.dir, "s-1")));
     }
@@ -899,7 +954,7 @@ mod tests {
         let f = fixture();
         let agent = stopped(&f, "s-1");
         f.db.archive_agent(agent.id).unwrap();
-        let err = resume(&f.db, &f.dir, &agent).unwrap_err();
+        let err = resume(&f.db, &f.dir, &agent, "s-1").unwrap_err();
         assert_eq!(
             err,
             "O agente proj · PO · NS-1 está arquivado. Desarquive (o) antes de retomar."
@@ -907,7 +962,7 @@ mod tests {
         assert!(!lock_path(&f.dir, "s-1").exists(), "the lock went");
         assert_eq!(states(&f.db), pairs(&[("s-1", "archived")]));
         f.db.connection().execute("DELETE FROM agents", []).unwrap();
-        let err = resume(&f.db, &f.dir, &agent).unwrap_err();
+        let err = resume(&f.db, &f.dir, &agent, "s-1").unwrap_err();
         assert_eq!(err, "O agente proj · PO · NS-1 não existe mais no banco.");
         assert!(!lock_path(&f.dir, "s-1").exists(), "the lock went");
     }
@@ -969,6 +1024,7 @@ mod tests {
             opened_at: "2026-11-20T10:00:00Z".into(),
             state: "stopped".into(),
             opened_key: key.map(str::to_string),
+            resume_session_id: None,
         }
     }
 
@@ -1005,7 +1061,7 @@ mod tests {
         let f = fixture();
         let agent = stopped(&f, "s-1");
         let err = resume_with(&f.db, &f.dir, &agent, &mut || {
-            let change = f.db.resume_agent(agent.id);
+            let change = f.db.resume_agent(agent.id, "s-1");
             // The SELECT of the row fails after the UPDATE (a column it reads is gone).
             f.db.connection()
                 .execute_batch("ALTER TABLE agents RENAME COLUMN opened_key TO gone")
@@ -1122,5 +1178,89 @@ mod tests {
             ("E", "um épico")
         );
         assert_eq!(from_epic.noun(), "épico");
+    }
+
+    // ---- NS-50: the resume follows the session the conversation went on in ----
+
+    #[test]
+    fn a_resume_in_a_new_session_locks_the_session_of_the_opening() {
+        let f = fixture();
+        let agent = stopped(&f, "s-1");
+        let lock = lock_path(&f.dir, "s-1");
+        let mut held_at_update = None;
+        let (open, swap) = resume_with(&f.db, &f.dir, &agent, &mut || {
+            held_at_update = Some((!lock_is_free(&lock), lock_path(&f.dir, "s-b").exists()));
+            f.db.resume_agent(agent.id, "s-b")
+        })
+        .unwrap();
+        assert_eq!(
+            held_at_update,
+            Some((true, false)),
+            "the lock of the opening is held at the update, and none of the new session"
+        );
+        assert_eq!(swap, SessionSwap::Swapped);
+        assert_eq!(open.agent.resume_session_id.as_deref(), Some("s-b"));
+        assert_eq!(open.agent.effective_session(), "s-b");
+        assert_eq!(open.agent.session_id, "s-1");
+        assert!(!lock_is_free(&lock));
+        assert!(!lock_path(&f.dir, "s-b").exists());
+        end(&f.db, open).unwrap();
+        assert!(!lock.exists(), "the lock of the opening goes at the end");
+        // The real resume does the same.
+        let agent = f.db.get_agent(agent.id).unwrap().unwrap();
+        let (open, swap) = resume(&f.db, &f.dir, &agent, "s-c").unwrap();
+        assert_eq!(swap, SessionSwap::Swapped);
+        assert_eq!(open.agent.effective_session(), "s-c");
+        assert!(!lock_is_free(&lock));
+        assert!(!lock_path(&f.dir, "s-c").exists());
+    }
+
+    /// The lock after the swap: another nick (a child process) holds the flock of the session of
+    /// the opening of an agent already resumed in session B. The resume is refused, and
+    /// held_elsewhere says so; a nick that locked by the effective session would resume it.
+    #[test]
+    fn after_the_swap_the_lock_is_still_the_one_of_the_opening() {
+        let f = fixture();
+        let agent = stopped(&f, "s-1");
+        assert_eq!(
+            f.db.resume_agent(agent.id, "s-b").unwrap(),
+            (AgentChange::Done, SessionSwap::Swapped)
+        );
+        f.db.stop_agent(agent.id).unwrap();
+        let agent = f.db.get_agent(agent.id).unwrap().unwrap();
+        assert_eq!(agent.effective_session(), "s-b");
+        let mut child = test_support::hold_lock(&lock_path(&f.dir, "s-1"));
+        let err = resume(&f.db, &f.dir, &agent, "s-b").unwrap_err();
+        assert_eq!(err, elsewhere_message(&agent));
+        assert!(held_elsewhere(&f.dir, &agent.session_id));
+        assert_eq!(
+            states(&f.db),
+            pairs(&[("s-1", "stopped")]),
+            "nothing written"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (open, swap) = resume(&f.db, &f.dir, &agent, "s-b").unwrap();
+        assert_eq!(swap, SessionSwap::Same);
+        assert_eq!(
+            open.agent.state, "active",
+            "resumed once the other nick is gone"
+        );
+    }
+
+    /// D4 of the NS-50: another agent resumes by the latest session already (the UNIQUE): the
+    /// resume goes on by the session it had, and says so.
+    #[test]
+    fn a_session_another_agent_has_is_not_taken() {
+        let f = fixture();
+        let other = stopped(&f, "s-2");
+        f.db.resume_agent(other.id, "s-9").unwrap();
+        let agent = stopped(&f, "s-1");
+        let (open, swap) = resume(&f.db, &f.dir, &agent, "s-9").unwrap();
+        assert_eq!(swap, SessionSwap::Taken);
+        assert_eq!(open.agent.state, "active");
+        assert_eq!(open.agent.resume_session_id, None);
+        assert_eq!(open.agent.effective_session(), "s-1");
+        assert!(!lock_is_free(&lock_path(&f.dir, "s-1")));
     }
 }

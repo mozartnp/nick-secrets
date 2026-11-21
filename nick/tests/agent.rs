@@ -2322,6 +2322,136 @@ fn a_stopped_agent_is_resumed_in_its_conversation() {
     assert_eq!(nick.wait_exit(), Some(0));
 }
 
+// ---- the resume follows the session the conversation went on in (NS-50) ----
+
+/// The record claude appends to the file of a session when it goes on with the conversation in
+/// another one (the real format, claude 2.1.328).
+fn continued_record(from: &str, to: &str) -> String {
+    format!(
+        "{{\"type\":\"continued-in\",\"timestamp\":\"2026-11-21T14:41:33.908Z\",\
+         \"sessionId\":\"{from}\",\"continuedInSessionId\":\"{to}\"}}\n"
+    )
+}
+
+/// The `resume_session_id` of every agent, by id.
+fn resume_sessions(world: &World) -> Vec<Option<String>> {
+    let db = nick::db::Db::open(&world.db_path()).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT resume_session_id FROM agents ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn a_resume_follows_the_chain_of_sessions_and_the_next_one_starts_from_its_end() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    // The chain under CLAUDE_CONFIG_DIR (not the HOME of the world).
+    let config = world.home().join("outra config");
+    let config_env = config.display().to_string();
+    let env = [
+        ("FAKE_CLAUDE_READ_BYTES", "1"),
+        ("CLAUDE_CONFIG_DIR", config_env.as_str()),
+    ];
+    let name = "proj · PO · NS-1";
+    let mut nick = spawn(&world, "echo", &env);
+    let session = open_and_stop(&mut nick, &world);
+    let b = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a61";
+    let c = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a62";
+    let file = |s: &str| {
+        let home_file = conversation_file(&world, &proj, s);
+        config
+            .join("projects")
+            .join(home_file.parent().unwrap().file_name().unwrap())
+            .join(format!("{s}.jsonl"))
+    };
+    fs::create_dir_all(file(&session).parent().unwrap()).unwrap();
+    // A → B, with conversation after the record (it is followed anyway); B → C.
+    fs::write(
+        file(&session),
+        format!(
+            "{{}}\n{}{{\"type\":\"user\"}}\n",
+            continued_record(&session, b)
+        ),
+    )
+    .unwrap();
+    fs::write(file(b), continued_record(b, c)).unwrap();
+    fs::write(file(c), "{}\n").unwrap();
+    fs::remove_file(logs(&world).claude).unwrap();
+    nick.send("r");
+    nick.wait_for("READY");
+    nick.wait_for_flat(&format!(
+        "O agente {name} foi retomado. A conversa tinha continuado em outra sessão do claude \
+         ({c}), e o nick passou a usá-la."
+    ));
+    nick.keep_screen("retomada que seguiu a cadeia de sessões (A → B → C)");
+    assert_resumed(&world, c, name);
+    assert_eq!(
+        world.agents()[0].0,
+        session,
+        "the session of the opening stays"
+    );
+    assert_eq!(world.agents()[0].3, "active");
+    assert_eq!(resume_sessions(&world), [Some(c.to_string())]);
+    assert!(
+        lock_of(&world, &session).is_file(),
+        "the lock of the opening"
+    );
+    assert!(!lock_of(&world, c).exists());
+    nick.send("z");
+    nick.wait_for(&format!("O agente {name} terminou."));
+    nick.wait_for_flat("Sessão na abertura");
+    nick.keep_screen("painel do agente parado, com a sessão nova e a da abertura");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    // Closing and opening the nick again: the resume starts from C, without the chain (the files
+    // of A and B are gone, so following it again would find nothing).
+    fs::remove_file(file(&session)).unwrap();
+    fs::remove_file(file(b)).unwrap();
+    fs::remove_file(logs(&world).claude).unwrap();
+    let mut again = spawn(&world, "echo", &env);
+    open_tickets(&mut again, "proj");
+    again.open_node("NS-1");
+    again.select("PO  parado");
+    again.send("r");
+    again.wait_for("READY");
+    again.wait_for_flat(&format!("O agente {name} foi retomado."));
+    assert!(
+        !again.flat_screen().contains("outra sessão"),
+        "{}",
+        again.flat_screen()
+    );
+    assert_resumed(&world, c, name);
+    assert_eq!(resume_sessions(&world), [Some(c.to_string())]);
+    again.send("z");
+    again.wait_for(&format!("O agente {name} terminou."));
+    again.send("q");
+    assert_eq!(again.wait_exit(), Some(0));
+}
+
+/// Without the record, the resume is the one of before: `--resume <the session stored>`.
+#[test]
+fn a_resume_without_the_record_resumes_the_session_stored() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    let session = open_and_stop(&mut nick, &world);
+    keep_conversation(&world, &proj, &session);
+    fs::remove_file(logs(&world).claude).unwrap();
+    nick.send("r");
+    nick.wait_for("READY");
+    nick.wait_for_flat("O agente proj · PO · NS-1 foi retomado.");
+    assert!(!nick.flat_screen().contains("outra sessão"));
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    assert_eq!(resume_sessions(&world), [None]);
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
 #[test]
 fn closing_and_opening_the_nick_resumes_nothing_until_r() {
     let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
@@ -2752,7 +2882,7 @@ fn a_real_version_6_database_opens_migrated_with_the_tree_of_before() {
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(world.agents()[0].3, "stopped");
 }
 

@@ -395,6 +395,7 @@ mod tests {
             opened_at: String::new(),
             state: "stopped".into(),
             opened_key: None,
+            resume_session_id: None,
         }
     }
 

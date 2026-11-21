@@ -25,7 +25,7 @@ use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::agents::{self, Agent, AgentState, Holder, OpenAgent, Owner};
-use crate::db::{Db, Epic, SETTING_RESERVED_SHORTCUT, StageChangeRow};
+use crate::db::{Db, Epic, SETTING_RESERVED_SHORTCUT, SessionSwap, StageChangeRow};
 use crate::docs::{self, Artifacts};
 use crate::editor::{EditorOutcome, EditorRunner};
 use crate::epics;
@@ -1956,7 +1956,9 @@ impl App {
     /// `Action::CheckResume` (NS-39): the `--check` (a failure is the alert "Agente não aberto",
     /// as for `g`), then whether claude still keeps the conversation (`--has-conversation`, out of
     /// the PTY): a missing one opens the warning of the lost conversation and nothing is opened;
-    /// a found one is resumed (`resume_agent`), with the jail and the warning of this check.
+    /// a found one is resumed (`resume_agent`), with the jail and the warning of this check, and
+    /// the session the conversation went on in (NS-50). The check asks by the effective session
+    /// of the agent (`Agent::effective_session`).
     pub fn check_resume(
         &mut self,
         project: &Path,
@@ -1970,10 +1972,10 @@ impl App {
             Ok(precheck) => precheck,
             Err(message) => return self.agent_failed(&message),
         };
-        match launcher.has_conversation(&self.launcher, project, &agent.session_id) {
+        match launcher.has_conversation(&self.launcher, project, agent.effective_session()) {
             Err(message) => self.agent_failed(&message),
-            Ok(true) => self.resume_agent(project, agent, precheck, launcher),
-            Ok(false) => {
+            Ok(Some(latest)) => self.resume_agent(project, agent, &latest, precheck, launcher),
+            Ok(None) => {
                 if let Some(holder) = self.holder_of_agent(agent) {
                     self.dialog = Some(Dialog::ConversationLost {
                         project: project.to_path_buf(),
@@ -2019,11 +2021,15 @@ impl App {
     /// (`agents::opened_key`) and the key of its ticket now, so the launcher tells it when the
     /// folder of the ticket changed. Its name is the one stored. A failing start stops it again
     /// and releases the lock, as `open_agent`; a started one runs as an opened one
-    /// (`start_running`).
+    /// (`start_running`). NS-50: `latest` is the session the conversation went on in; the resume
+    /// stores it (the lock stays the one of the session of the opening) and the PTY resumes the
+    /// effective session of the row read again. The bar says when it changed, or when another
+    /// agent has it already.
     pub fn resume_agent(
         &mut self,
         project: &Path,
         agent: &Agent,
+        latest: &str,
         check: Precheck,
         launcher: &mut dyn AgentLauncher,
     ) {
@@ -2042,8 +2048,8 @@ impl App {
             self.status = Some("Não consegui abrir o agente: sem a pasta das travas.".into());
             return;
         };
-        let record = match agents::resume(&self.db, agents_dir, agent) {
-            Ok(record) => record,
+        let (record, swap) = match agents::resume(&self.db, agents_dir, agent, latest) {
+            Ok(resumed) => resumed,
             Err(message) => {
                 self.status = Some(message);
                 return;
@@ -2060,7 +2066,7 @@ impl App {
         };
         let id = record.agent.id;
         let name = record.agent.name.clone();
-        let session_id = record.agent.session_id.clone();
+        let session_id = record.agent.effective_session().to_string();
         if let Err(err) = launcher.spawn(&self.launcher, project, id, &session_id, &name, launch) {
             let mut message = format!("Não consegui abrir o agente: {err}.");
             if let Err(db) = agents::end(&self.db, record) {
@@ -2071,6 +2077,19 @@ impl App {
         }
         self.start_running(record, name.clone(), &holder, check);
         let mut message = format!("O agente {name} foi retomado.");
+        match swap {
+            SessionSwap::Same => {}
+            SessionSwap::Swapped => message.push_str(&format!(
+                " A conversa tinha continuado em outra sessão do claude ({}), e o nick passou a \
+                 usá-la.",
+                printable(latest)
+            )),
+            SessionSwap::Taken => message.push_str(&format!(
+                " A conversa continuou na sessão {} do claude, mas outro agente deste nick já usa \
+                 essa sessão: a retomada seguiu pela sessão guardada.",
+                printable(latest)
+            )),
+        }
         if opened.as_deref().is_some_and(|key| key != holder.key) {
             message.push_str(&format!(
                 " Ele foi avisado de que a pasta agora é {}.",
@@ -4113,6 +4132,8 @@ mod tests {
         check: Result<Precheck, String>,
         render: Result<Rendered, String>,
         conversation: Result<bool, String>,
+        /// The session the conversation went on in (NS-50), when found; None: the session asked.
+        latest: Option<String>,
         spawn: Result<(), String>,
     }
 
@@ -4148,6 +4169,7 @@ mod tests {
                 }),
                 render: Ok(rendered(3)),
                 conversation: Ok(true),
+                latest: None,
                 spawn: Ok(()),
             }
         }
@@ -4179,9 +4201,14 @@ mod tests {
             _: &Path,
             _: &Path,
             session_id: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<Option<String>, String> {
             self.conversations.push(session_id.to_string());
-            self.conversation.clone()
+            let found = self.conversation.clone()?;
+            Ok(found.then(|| {
+                self.latest
+                    .clone()
+                    .unwrap_or_else(|| session_id.to_string())
+            }))
         }
 
         fn spawn(
@@ -7218,6 +7245,129 @@ mod tests {
         assert_eq!(f.state_of(id), "stopped");
     }
 
+    // ---- NS-50: the resume follows the session the conversation went on in ----
+
+    /// The B session of the tests of the NS-50: where claude went on with the conversation.
+    const SESSION_B: &str = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a61";
+
+    fn resume_session_of(f: &Fixture, id: i64) -> Option<String> {
+        f.app.db.get_agent(id).unwrap().unwrap().resume_session_id
+    }
+
+    #[test]
+    fn a_resume_follows_the_latest_session_and_stores_it() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let opening = f.session_of(id);
+        launcher.latest = Some(SESSION_B.to_string());
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            launcher.conversations,
+            std::slice::from_ref(&opening),
+            "the effective session is asked: the one of the opening"
+        );
+        assert_eq!(launcher.spawns[1].2, SESSION_B, "--resume <B>");
+        assert_eq!(resume_session_of(&f, id).as_deref(), Some(SESSION_B));
+        assert_eq!(
+            f.session_of(id),
+            opening,
+            "the session of the opening stays"
+        );
+        assert_eq!(f.state_of(id), "active");
+        assert_eq!(
+            f.status(),
+            Some(
+                format!(
+                    "O agente {TL_NAME} foi retomado. A conversa tinha continuado em outra sessão \
+                     do claude ({SESSION_B}), e o nick passou a usá-la."
+                )
+                .as_str()
+            )
+        );
+        assert!(
+            f.agents_dir().join(format!("{opening}.lock")).exists(),
+            "the lock of the opening"
+        );
+        assert!(!f.agents_dir().join(format!("{SESSION_B}.lock")).exists());
+        // The next resume starts from B, and the bar is the one of before, byte by byte.
+        f.app.agent_ended(id, 0);
+        f.app.status = None;
+        launcher.latest = None;
+        assert!(f.r(&mut launcher));
+        assert_eq!(launcher.conversations[1], SESSION_B);
+        assert_eq!(launcher.spawns[2].2, SESSION_B);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado.")
+        );
+        assert_eq!(resume_session_of(&f, id).as_deref(), Some(SESSION_B));
+    }
+
+    #[test]
+    fn a_latest_session_another_agent_has_is_not_taken_and_the_bar_says_so() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let opening = f.session_of(id);
+        let ticket = owner_ticket(f.app.agent_record(id).unwrap().owner);
+        let other = f
+            .app
+            .db
+            .insert_agent(Owner::Ticket(ticket), "po", "outra", "outro", "NS-2")
+            .unwrap();
+        f.app.db.resume_agent(other.id, SESSION_B).unwrap();
+        launcher.latest = Some(SESSION_B.to_string());
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            launcher.spawns[1].2, opening,
+            "--resume <the session stored>"
+        );
+        assert_eq!(resume_session_of(&f, id), None);
+        assert_eq!(f.state_of(id), "active");
+        assert_eq!(
+            f.status(),
+            Some(
+                format!(
+                    "O agente {TL_NAME} foi retomado. A conversa continuou na sessão {SESSION_B} \
+                     do claude, mas outro agente deste nick já usa essa sessão: a retomada \
+                     seguiu pela sessão guardada."
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn the_swap_comes_before_the_warning_of_the_folder() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let ticket = owner_ticket(f.app.agent_record(id).unwrap().owner);
+        let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
+        let p = f.app.selected_project().unwrap().path.clone();
+        tickets::edit_id(&f.app.db, &p, &t, "NS-9").unwrap();
+        f.app.refresh_tree();
+        launcher.latest = Some(SESSION_B.to_string());
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            f.status(),
+            Some(
+                format!(
+                    "O agente {TL_NAME} foi retomado. A conversa tinha continuado em outra sessão \
+                     do claude ({SESSION_B}), e o nick passou a usá-la. Ele foi avisado de que a \
+                     pasta agora é .nick/docs/NS-9/."
+                )
+                .as_str()
+            )
+        );
+    }
+
+    /// The ids of the bar go through `printable` (a control character from the launcher would
+    /// reach the terminal).
+    #[test]
+    fn the_session_in_the_bar_is_printable() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        launcher.latest = Some("b\x1b[2J".to_string());
+        assert!(f.r(&mut launcher));
+        assert!(!f.status().unwrap().contains('\x1b'), "{:?}", f.status());
+        assert_eq!(f.state_of(id), "active");
+    }
+
     #[test]
     fn a_failing_check_or_conversation_check_shows_the_alert_and_changes_nothing() {
         let (mut f, mut launcher, id) = stopped_agent();
@@ -7431,35 +7581,12 @@ mod tests {
         assert_eq!(f.app.focus, Focus::Terminal);
     }
 
-    /// A child process holding the flock of `path` (another nick), until it is killed.
-    fn hold_lock(path: &Path) -> std::process::Child {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Through bash, the only program the nick runs with Command (structural of the NS-33).
-        let child = std::process::Command::new("bash")
-            .args(["-c", "exec flock \"$0\" sleep 30"])
-            .arg(path)
-            .spawn()
-            .expect("flock");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !agents::held_elsewhere(
-            path.parent().unwrap(),
-            path.file_stem().unwrap().to_str().unwrap(),
-        ) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the child never took the lock"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        child
-    }
-
     #[test]
     fn an_agent_active_in_another_nick_is_refused_without_the_check() {
         let (mut f, _) = with_agents();
         let id = f.foreign_agent("NS-1", "outro-1");
         let lock = f.agents_dir().join("outro-1.lock");
-        let mut child = hold_lock(&lock);
+        let mut child = agents::test_support::hold_lock(&lock);
         let mut launcher = FakeLauncher::new(false);
         assert!(!f.r(&mut launcher), "refused at the key");
         assert_eq!(
@@ -7705,7 +7832,8 @@ mod tests {
             .execute("UPDATE agents SET state = 'active' WHERE id = ?1", [id])
             .unwrap();
         let session = f.session_of(id);
-        let mut child = hold_lock(&f.agents_dir().join(format!("{session}.lock")));
+        let mut child =
+            agents::test_support::hold_lock(&f.agents_dir().join(format!("{session}.lock")));
         assert!(!f.r(&mut launcher), "refused at the key");
         assert_eq!(
             f.status(),

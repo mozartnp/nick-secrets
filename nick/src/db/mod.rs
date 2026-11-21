@@ -214,7 +214,19 @@ pub enum AgentChange {
     Archived,
 }
 
-/// An agent of a ticket or of an epic, as stored (migrations 3, 6 and 7). `stage` and `state` are
+/// How `Db::resume_agent` left the session of the resume (NS-50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSwap {
+    /// The latest session is the effective one: nothing to change.
+    Same,
+    /// The latest session is now the session of the resume.
+    Swapped,
+    /// Another agent already resumes by the latest session (the UNIQUE of the migration 8): the
+    /// session was kept.
+    Taken,
+}
+
+/// An agent of a ticket or of an epic, as stored (migrations 3, 6, 7 and 8). `stage` and `state` are
 /// the raw keys of the columns (agents.rs: `Stage`, `AgentState`; the state is only written from
 /// the enum).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,11 +244,24 @@ pub struct Agent {
     /// The key of its ticket or epic when it was opened (migration 6); None when opened before
     /// the NS-39.
     pub opened_key: Option<String>,
+    /// The session the conversation went on in, found at a resume (migration 8, NS-50); None
+    /// while it is `session_id`.
+    pub resume_session_id: Option<String>,
+}
+
+impl Agent {
+    /// The session a resume uses (NS-50): `resume_session_id`, or `session_id` without one. The
+    /// lock is always the one of `session_id`.
+    pub fn effective_session(&self) -> &str {
+        self.resume_session_id
+            .as_deref()
+            .unwrap_or(&self.session_id)
+    }
 }
 
 /// The columns of an agent, in the order of `agent_from_row`.
-const AGENT_COLUMNS: &str =
-    "id, ticket_id, epic_id, stage, session_id, name, opened_at, state, opened_key";
+const AGENT_COLUMNS: &str = "id, ticket_id, epic_id, stage, session_id, name, opened_at, state, \
+                             opened_key, resume_session_id";
 
 fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
     let ticket: Option<i64> = row.get(1)?;
@@ -263,6 +288,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
         opened_at: row.get(6)?,
         state: row.get(7)?,
         opened_key: row.get(8)?,
+        resume_session_id: row.get(9)?,
     })
 }
 
@@ -731,14 +757,28 @@ impl Db {
         from: &[AgentState],
         to: AgentState,
     ) -> rusqlite::Result<AgentChange> {
+        self.change_agent_state_with(id, from, to, None)
+    }
+
+    /// `change_agent_state` that, with `session`, also sets `resume_session_id` to it in the
+    /// same UPDATE (NS-50). A session another agent has fails with the UNIQUE constraint.
+    fn change_agent_state_with(
+        &self,
+        id: i64,
+        from: &[AgentState],
+        to: AgentState,
+        session: Option<&str>,
+    ) -> rusqlite::Result<AgentChange> {
         let keys: Vec<&str> = from.iter().map(|state| state.key()).collect();
-        let placeholders: Vec<String> = (3..3 + keys.len()).map(|n| format!("?{n}")).collect();
+        let placeholders: Vec<String> = (4..4 + keys.len()).map(|n| format!("?{n}")).collect();
         let to = to.key();
-        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&id, &to];
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&id, &to, &session];
         values.extend(keys.iter().map(|key| key as &dyn rusqlite::ToSql));
         let changed = self.conn.execute(
             &format!(
-                "UPDATE agents SET state = ?2 WHERE id = ?1 AND state IN ({})",
+                "UPDATE agents SET state = ?2, \
+                 resume_session_id = coalesce(?3, resume_session_id) \
+                 WHERE id = ?1 AND state IN ({})",
                 placeholders.join(", ")
             ),
             values.as_slice(),
@@ -763,13 +803,39 @@ impl Db {
     }
 
     /// The agent `id` becomes `active` again (a resume, NS-39): only from `stopped`, or from an
-    /// `active` row whose nick died (the caller holds its lock: agents.rs).
-    pub fn resume_agent(&self, id: i64) -> rusqlite::Result<AgentChange> {
-        self.change_agent_state(
-            id,
-            &[AgentState::Stopped, AgentState::Active],
-            AgentState::Active,
-        )
+    /// `active` row whose nick died (the caller holds its lock: agents.rs). `latest` is the
+    /// session its conversation went on in (NS-50, `--has-conversation`): when it differs from
+    /// the effective one, the same UPDATE stores it as `resume_session_id` (`Swapped`). When
+    /// another agent already has it (the UNIQUE), only the state changes (`Taken`). Only the
+    /// holder of the lock writes `resume_session_id`, so the effective session read first does
+    /// not change before the UPDATE.
+    pub fn resume_agent(
+        &self,
+        id: i64,
+        latest: &str,
+    ) -> rusqlite::Result<(AgentChange, SessionSwap)> {
+        let from = [AgentState::Stopped, AgentState::Active];
+        let effective: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT coalesce(resume_session_id, session_id) FROM agents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if effective.is_none_or(|effective| effective == latest) {
+            let change = self.change_agent_state(id, &from, AgentState::Active)?;
+            return Ok((change, SessionSwap::Same));
+        }
+        match self.change_agent_state_with(id, &from, AgentState::Active, Some(latest)) {
+            Ok(AgentChange::Done) => Ok((AgentChange::Done, SessionSwap::Swapped)),
+            Ok(change) => Ok((change, SessionSwap::Same)),
+            Err(err) if is_unique_violation(&err) => {
+                let change = self.change_agent_state(id, &from, AgentState::Active)?;
+                Ok((change, SessionSwap::Taken))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Archives the agent `id`: only a `stopped` one.
@@ -922,7 +988,7 @@ impl Db {
 mod tests {
     use super::migrations::{
         MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7,
-        MIGRATIONS,
+        MIGRATION_8, MIGRATIONS,
     };
     use super::*;
 
@@ -955,12 +1021,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_7_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_8_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 7);
+        assert_eq!(user_version(db.connection()), 8);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -995,7 +1061,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 7);
+        assert_eq!(user_version(db.connection()), 8);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -1033,7 +1099,7 @@ mod tests {
         let path = tmp.path().join("nick.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 8;")
+            conn.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 9;")
                 .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
@@ -1042,7 +1108,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 8, mais nova que a deste nick (7). \
+                "Erro: o banco {} está na versão 9, mais nova que a deste nick (8). \
                  Atualize o nick.",
                 path.display()
             )
@@ -1117,7 +1183,7 @@ mod tests {
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            7,
+            8,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -1266,6 +1332,14 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
 "
         );
         assert_eq!(MIGRATIONS[6], MIGRATION_7);
+        assert_eq!(
+            MIGRATION_8,
+            "\
+ALTER TABLE agents ADD COLUMN resume_session_id TEXT;  -- the session of the resume; NULL: session_id
+CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
+"
+        );
+        assert_eq!(MIGRATIONS[7], MIGRATION_8);
     }
 
     #[test]
@@ -1274,13 +1348,13 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
         let path = tmp.path().join("nick.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 8;")
+            .execute_batch("PRAGMA user_version = 9;")
             .unwrap();
         let err = Db::open(&path).err().expect("a newer database is refused");
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 8, mais nova que a deste nick (7). \
+                "Erro: o banco {} está na versão 9, mais nova que a deste nick (8). \
                  Atualize o nick.",
                 path.display()
             )
@@ -2525,21 +2599,24 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
             .insert_agent(Owner::Ticket(ticket), "po", "s-1", "n", "NS-1")
             .unwrap();
         db.stop_agent(a.id).unwrap();
-        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Done);
+        assert_eq!(db.resume_agent(a.id, "s-1").unwrap().0, AgentChange::Done);
         assert_eq!(state_of(&db, a.id), "active");
         // An active row with no owner (its nick died): resumed too.
-        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Done);
+        assert_eq!(db.resume_agent(a.id, "s-1").unwrap().0, AgentChange::Done);
         assert_eq!(state_of(&db, a.id), "active");
         db.stop_agent(a.id).unwrap();
         db.archive_agent(a.id).unwrap();
-        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Archived);
+        assert_eq!(
+            db.resume_agent(a.id, "s-1").unwrap().0,
+            AgentChange::Archived
+        );
         assert_eq!(
             state_of(&db, a.id),
             "archived",
             "an archived one is not resumed"
         );
         db.delete_project(project).unwrap();
-        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Gone);
+        assert_eq!(db.resume_agent(a.id, "s-1").unwrap().0, AgentChange::Gone);
     }
 
     #[test]
@@ -2596,7 +2673,7 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
         db.connection()
             .execute("UPDATE agents SET state = 'future' WHERE id = ?1", [a.id])
             .unwrap();
-        assert_eq!(db.resume_agent(a.id).unwrap(), AgentChange::Gone);
+        assert_eq!(db.resume_agent(a.id, "s-1").unwrap().0, AgentChange::Gone);
         assert_eq!(db.archive_agent(a.id).unwrap(), AgentChange::Gone);
         assert_eq!(db.unarchive_agent(a.id).unwrap(), AgentChange::Gone);
         assert_eq!(state_of(&db, a.id), "future");
@@ -2703,7 +2780,8 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
         };
         assert_eq!(before.len(), 4);
         assert_eq!(before[0].0, 2, "the first id after the gap");
-        let db = Db::open(&path).unwrap();
+        // Only up to the migration 7: the test of the migration 8 is its own (NS-50).
+        let db = Db::open_with(&path, &MIGRATIONS[..7]).unwrap();
         let conn = db.connection();
         assert_eq!(user_version(conn), 7);
         assert_eq!(
@@ -3298,5 +3376,167 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
             f.db.set_ticket_epic(f.loose.id, Some(f.e2.id)).unwrap(),
             "a visible one"
         );
+    }
+
+    // ---- migration 8: the session of the resume (NS-50) ----
+
+    /// The `resume_session_id` of the agent `id`, raw.
+    fn resume_session_of(db: &Db, id: i64) -> Option<String> {
+        db.connection()
+            .query_row(
+                "SELECT resume_session_id FROM agents WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_version_7_database_with_agents_migrates_to_8_with_no_session_of_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (before, ids) = {
+            let old = Db::open_with(&path, &MIGRATIONS[..7]).unwrap();
+            assert_eq!(user_version(old.connection()), 7);
+            let conn = old.connection();
+            let p = old.insert_project("auto_scrum", "p", "/p").unwrap();
+            let t = old_insert_ticket(conn, p.id, "NS-1", false, "um");
+            let a = v6_insert_agent(conn, t, "po", "s-1", "stopped", Some("NS-1"));
+            let b = v6_insert_agent(conn, t, "development", "s-2", "active", None);
+            let c = v6_insert_agent(conn, t, "review", "s-3", "archived", Some("NS-1"));
+            (raw_agents(conn), [a, b, c])
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(db.connection()), 8);
+        assert_eq!(raw_agents(db.connection()), before, "every row is kept");
+        for id in ids {
+            assert_eq!(resume_session_of(&db, id), None);
+            let agent = db.get_agent(id).unwrap().unwrap();
+            assert_eq!(agent.resume_session_id, None);
+            assert_eq!(agent.effective_session(), agent.session_id);
+        }
+        assert_eq!(checks(db.connection()), (0, "ok".to_string()));
+    }
+
+    #[test]
+    fn the_session_of_resume_is_unique_but_many_may_have_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let a = db
+            .insert_agent(Owner::Ticket(ticket), "po", "s-1", "n", "NS-1")
+            .unwrap();
+        let b = db
+            .insert_agent(Owner::Ticket(ticket), "po", "s-2", "n", "NS-1")
+            .unwrap();
+        db.insert_agent(Owner::Ticket(ticket), "po", "s-3", "n", "NS-1")
+            .unwrap();
+        let set = |id: i64, session: &str| {
+            db.connection().execute(
+                "UPDATE agents SET resume_session_id = ?2 WHERE id = ?1",
+                params![id, session],
+            )
+        };
+        set(a.id, "s-9").unwrap();
+        let dup = set(b.id, "s-9").unwrap_err();
+        assert!(is_unique_violation(&dup), "{dup:?}");
+        assert_eq!(resume_session_of(&db, b.id), None, "three rows, two NULL");
+        set(b.id, "s-8").unwrap();
+    }
+
+    #[test]
+    fn resume_agent_moves_the_session_of_resume_to_the_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let a = db
+            .insert_agent(Owner::Ticket(ticket), "po", "s-1", "n", "NS-1")
+            .unwrap();
+        db.stop_agent(a.id).unwrap();
+        // The same session as the effective one: nothing to swap, the column stays NULL.
+        assert_eq!(
+            db.resume_agent(a.id, "s-1").unwrap(),
+            (AgentChange::Done, SessionSwap::Same)
+        );
+        assert_eq!(resume_session_of(&db, a.id), None);
+        db.stop_agent(a.id).unwrap();
+        // Another one: swapped, in the same UPDATE as the state.
+        assert_eq!(
+            db.resume_agent(a.id, "s-b").unwrap(),
+            (AgentChange::Done, SessionSwap::Swapped)
+        );
+        assert_eq!(state_of(&db, a.id), "active");
+        let agent = db.get_agent(a.id).unwrap().unwrap();
+        assert_eq!(agent.resume_session_id.as_deref(), Some("s-b"));
+        assert_eq!(agent.effective_session(), "s-b");
+        assert_eq!(
+            agent.session_id, "s-1",
+            "the session of the opening never changes"
+        );
+        db.stop_agent(a.id).unwrap();
+        // The effective one is now s-b: the same again is no swap.
+        assert_eq!(
+            db.resume_agent(a.id, "s-b").unwrap(),
+            (AgentChange::Done, SessionSwap::Same)
+        );
+        db.stop_agent(a.id).unwrap();
+        assert_eq!(
+            db.resume_agent(a.id, "s-c").unwrap(),
+            (AgentChange::Done, SessionSwap::Swapped)
+        );
+        assert_eq!(resume_session_of(&db, a.id).as_deref(), Some("s-c"));
+    }
+
+    #[test]
+    fn resume_agent_does_not_swap_an_archived_or_gone_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        let a = db
+            .insert_agent(Owner::Ticket(ticket), "po", "s-1", "n", "NS-1")
+            .unwrap();
+        db.stop_agent(a.id).unwrap();
+        db.archive_agent(a.id).unwrap();
+        assert_eq!(
+            db.resume_agent(a.id, "s-b").unwrap().0,
+            AgentChange::Archived
+        );
+        assert_eq!(state_of(&db, a.id), "archived");
+        assert_eq!(resume_session_of(&db, a.id), None, "nothing written");
+        db.connection()
+            .execute("UPDATE agents SET state = 'future' WHERE id = ?1", [a.id])
+            .unwrap();
+        assert_eq!(db.resume_agent(a.id, "s-b").unwrap().0, AgentChange::Gone);
+        assert_eq!(
+            resume_session_of(&db, a.id),
+            None,
+            "an unknown state: nothing written"
+        );
+        db.delete_project(project).unwrap();
+        assert_eq!(db.resume_agent(a.id, "s-b").unwrap().0, AgentChange::Gone);
+    }
+
+    /// D4 of the NS-50: another agent already resumes by the latest session (the UNIQUE): the
+    /// resume goes on by the effective one, and says so.
+    #[test]
+    fn resume_agent_keeps_the_session_when_another_agent_has_the_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let a = db
+            .insert_agent(Owner::Ticket(ticket), "po", "s-1", "n", "NS-1")
+            .unwrap();
+        let b = db
+            .insert_agent(Owner::Ticket(ticket), "po", "s-2", "n", "NS-1")
+            .unwrap();
+        db.stop_agent(b.id).unwrap();
+        assert_eq!(
+            db.resume_agent(b.id, "s-9").unwrap(),
+            (AgentChange::Done, SessionSwap::Swapped)
+        );
+        db.stop_agent(a.id).unwrap();
+        assert_eq!(
+            db.resume_agent(a.id, "s-9").unwrap(),
+            (AgentChange::Done, SessionSwap::Taken)
+        );
+        assert_eq!(state_of(&db, a.id), "active", "resumed anyway");
+        assert_eq!(resume_session_of(&db, a.id), None, "by the session it had");
+        assert_eq!(resume_session_of(&db, b.id).as_deref(), Some("s-9"));
     }
 }

@@ -189,31 +189,56 @@ pub fn run_check(launcher: &Path, project: &Path) -> Result<Precheck, String> {
     parse_check(output.status.code(), &output.stdout, &output.stderr)
 }
 
-/// Reads the result of `--has-conversation` (NS-39), like `parse_check`: exit 0 with exactly
-/// the line `conversation=true` or `conversation=false` (with or without the final line break)
-/// is the answer, whatever the stderr; anything else on stdout is an error, so a conversation is
-/// never presumed; a failure is the stderr of the launcher, or a message with the code.
+/// Whether `value` is a session id as claude writes it: a lowercase UUID (8-4-4-4-12 hex digits).
+fn is_session_id(value: &[u8]) -> bool {
+    value.len() == 36
+        && value.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(b),
+        })
+}
+
+/// Reads the result of `--has-conversation` (NS-39), like `parse_check`. Exit 0 with exactly the
+/// line `conversation=false` is `None` (the conversation is lost); exit 0 with exactly the lines
+/// `conversation=true` and `session=<lowercase UUID>` (NS-50: the last session of the chain of
+/// `continued-in`, the session given when there is none) is that session. With or without the
+/// final line break, whatever the stderr. Anything else on stdout is an error, so neither a
+/// conversation nor a session is ever presumed; a failure is the stderr of the launcher, or a
+/// message with the code.
 pub fn parse_has_conversation(
     code: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let stderr = String::from_utf8_lossy(stderr).trim_end().to_string();
     if code != Some(0) {
         return Err(launcher_failure(code, stderr, "verificação da conversa"));
     }
-    let line = stdout.strip_suffix(b"\n").unwrap_or(stdout);
-    flag_line(line, "conversation").ok_or_else(|| UNEXPECTED_CONVERSATION_MESSAGE.to_string())
+    let unexpected = || UNEXPECTED_CONVERSATION_MESSAGE.to_string();
+    let stdout = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+    let lines: Vec<&[u8]> = stdout.split(|b| *b == b'\n').collect();
+    match lines.as_slice() {
+        [line] if flag_line(line, "conversation") == Some(false) => Ok(None),
+        [line, session] if flag_line(line, "conversation") == Some(true) => {
+            let session = session
+                .strip_prefix(b"session=")
+                .filter(|session| is_session_id(session))
+                .ok_or_else(unexpected)?;
+            Ok(Some(String::from_utf8_lossy(session).into_owned()))
+        }
+        _ => Err(unexpected()),
+    }
 }
 
 /// Runs `bash <launcher> --has-conversation <session_id>` with the cwd at `project`, the stdin
 /// closed and the output captured (outside the PTY), and reads it with `parse_has_conversation`:
-/// whether claude still keeps the conversation of the agent, before a resume (NS-39).
+/// whether claude still keeps the conversation of the agent, before a resume (NS-39), and the
+/// session it went on in (NS-50).
 pub fn run_has_conversation(
     launcher: &Path,
     project: &Path,
     session_id: &str,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     run_has_conversation_with_env(launcher, project, session_id, &[])
 }
 
@@ -224,7 +249,7 @@ pub(crate) fn run_has_conversation_with_env(
     project: &Path,
     session_id: &str,
     env: &[(&str, &str)],
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let mut command = Command::new("bash");
     command
         .arg(launcher)
@@ -363,13 +388,14 @@ pub trait AgentLauncher {
         project: &Path,
         request: &RenderRequest,
     ) -> Result<Rendered, String>;
-    /// `bash <launcher> --has-conversation <session_id>` with the cwd at `project` (NS-39).
+    /// `bash <launcher> --has-conversation <session_id>` with the cwd at `project` (NS-39):
+    /// `None` when the conversation is lost, or the last session of its chain (NS-50).
     fn has_conversation(
         &mut self,
         launcher: &Path,
         project: &Path,
         session_id: &str,
-    ) -> Result<bool, String>;
+    ) -> Result<Option<String>, String>;
     /// Starts `bash <launcher> <arguments of launch>` in a PTY with the cwd at `project`, for
     /// the agent whose row has the id `agent_id` (its events carry it): a new one (`--session-id
     /// <session_id> --name <name> --type <kind> --prompt-file <prompt_file>`) or a resume
@@ -439,7 +465,7 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
         launcher: &Path,
         project: &Path,
         session_id: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
         run_has_conversation(launcher, project, session_id)
     }
 
@@ -806,33 +832,63 @@ mod tests {
     // ---- NS-39: the check of the conversation before a resume ----
 
     #[test]
-    fn the_conversation_check_is_exactly_one_line() {
+    fn the_conversation_check_is_false_or_true_with_the_session() {
+        let session = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60";
+        let found = format!("conversation=true\nsession={session}\n");
         assert_eq!(
-            parse_has_conversation(Some(0), b"conversation=true\n", b""),
-            Ok(true)
+            parse_has_conversation(Some(0), found.as_bytes(), b""),
+            Ok(Some(session.to_string()))
+        );
+        // Without the final line break too.
+        assert_eq!(
+            parse_has_conversation(Some(0), found.trim_end().as_bytes(), b""),
+            Ok(Some(session.to_string()))
         );
         assert_eq!(
             parse_has_conversation(Some(0), b"conversation=false", b""),
-            Ok(false)
+            Ok(None)
+        );
+        assert_eq!(
+            parse_has_conversation(Some(0), b"conversation=false\n", b""),
+            Ok(None)
         );
         // A warning on stderr does not change a success (the locale, say).
         assert_eq!(
-            parse_has_conversation(Some(0), b"conversation=true\n", b"aviso"),
-            Ok(true)
+            parse_has_conversation(Some(0), found.as_bytes(), b"aviso"),
+            Ok(Some(session.to_string()))
         );
-        for stdout in [
-            &b""[..],
-            b"conversation=TRUE\n",
-            b"conversation=true\nconversation=true\n",
-            b"jail=true\n",
-            b" conversation=true\n",
-            b"conversation=",
-        ] {
+    }
+
+    /// NS-50: anything out of the new format is refused with the message of before.
+    #[test]
+    fn the_conversation_check_refuses_anything_else() {
+        let session = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60";
+        let upper = session.to_uppercase();
+        let refused = [
+            String::new(),
+            "conversation=true\n".to_string(),
+            "conversation=true".to_string(),
+            "conversation=TRUE\n".to_string(),
+            "conversation=true\nconversation=true\n".to_string(),
+            "conversation=true\nsession=\n".to_string(),
+            format!("conversation=true\nsession={upper}\n"),
+            format!("conversation=true\nsession={}\n", &session[..35]),
+            format!("conversation=true\nsession={session}x\n"),
+            format!("conversation=true\nsession=../{}\n", &session[3..]),
+            format!("conversation=true\nsession= {session}\n"),
+            format!("conversation=true\nsession={session}\nmais\n"),
+            format!("conversation=true\nsession={session}\n\n"),
+            format!("session={session}\nconversation=true\n"),
+            format!("conversation=false\nsession={session}\n"),
+            "jail=true\n".to_string(),
+            " conversation=true\n".to_string(),
+            "conversation=".to_string(),
+        ];
+        for stdout in refused {
             assert_eq!(
-                parse_has_conversation(Some(0), stdout, b""),
+                parse_has_conversation(Some(0), stdout.as_bytes(), b""),
                 Err(UNEXPECTED_CONVERSATION_MESSAGE.to_string()),
-                "{}",
-                String::from_utf8_lossy(stdout)
+                "{stdout:?}"
             );
         }
         assert_eq!(
@@ -869,7 +925,7 @@ mod tests {
         let session = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60";
         assert_eq!(
             run_has_conversation_with_env(&launcher_path(), &proj, session, &env),
-            Ok(false),
+            Ok(None),
             "no config is needed"
         );
         let dir = config.join("projects").join(
@@ -883,7 +939,23 @@ mod tests {
         fs::write(dir.join(format!("{session}.jsonl")), "{}\n").unwrap();
         assert_eq!(
             run_has_conversation_with_env(&launcher_path(), &proj, session, &env),
-            Ok(true)
+            Ok(Some(session.to_string()))
+        );
+        // NS-50: the chain session → b → c, in the real format of the record.
+        let next = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a61";
+        let last = "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a62";
+        let record = |from: &str, to: &str| {
+            format!(
+                "{{\"type\":\"continued-in\",\"timestamp\":\"2026-11-21T14:41:33.908Z\",\
+                 \"sessionId\":\"{from}\",\"continuedInSessionId\":\"{to}\"}}\n"
+            )
+        };
+        fs::write(dir.join(format!("{session}.jsonl")), record(session, next)).unwrap();
+        fs::write(dir.join(format!("{next}.jsonl")), record(next, last)).unwrap();
+        fs::write(dir.join(format!("{last}.jsonl")), "{}\n").unwrap();
+        assert_eq!(
+            run_has_conversation_with_env(&launcher_path(), &proj, session, &env),
+            Ok(Some(last.to_string()))
         );
         assert_eq!(
             fs::read_dir(&proj).unwrap().count(),

@@ -12,8 +12,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::agents::{self, Agent, AgentState};
-use crate::app::{App, Button, Dialog, Row, RunningAgent, Screen, TicketDetail, TicketField};
+use crate::agents::{self, Agent, AgentState, Holder, Owner};
+use crate::app::{
+    App, Button, Dialog, EpicDetail, NewItem, Row, RunningAgent, Screen, TicketDetail, TicketField,
+};
+use crate::db::Epic;
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
 use crate::paths::printable;
@@ -260,6 +263,8 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
 pub(crate) enum Place {
     Module,
     Project,
+    /// The node of an epic (NS-40).
+    Epic,
     Ticket,
     LiveAgent,
     /// An agent not live (NS-39): stopped (resumable), archived, or active in another nick.
@@ -281,6 +286,7 @@ fn help_state(app: &App) -> HelpState {
         match app.selected() {
             NodeId::Module(_) => Place::Module,
             NodeId::Project(_) => Place::Project,
+            NodeId::Epic(_) => Place::Epic,
             NodeId::Ticket(_) => Place::Ticket,
             NodeId::Agent(id) if app.agent(id).is_some() => Place::LiveAgent,
             NodeId::Agent(id) => {
@@ -322,6 +328,11 @@ fn dialog_keys(dialog: &Dialog) -> &'static str {
         Dialog::NewTicket { .. } => "Tab trocar de campo · Enter confirmar · Esc cancelar",
         Dialog::EditTitle { .. } => "Enter confirmar · Esc cancelar",
         Dialog::ConfirmHide { .. } => "s ocultar · qualquer outra tecla cancela",
+        Dialog::EditEpicTitle { .. } => "Enter confirmar · Esc cancelar",
+        Dialog::ConfirmHideEpic { .. } => "s ocultar · qualquer outra tecla cancela",
+        Dialog::EditEpicId { .. } => "Enter confirmar · Esc cancelar",
+        Dialog::ConfirmEditEpicId { .. } => "s trocar · qualquer outra tecla cancela",
+        Dialog::MoveTicket { .. } => "↑/↓ escolher · Enter mover · Esc cancelar",
         Dialog::ChooseType { .. } => "↑/↓ escolher · Enter abrir · Esc cancelar",
         Dialog::StageForm { .. } => {
             "Tab/↑/↓ trocar de campo · Enter confirmar (no campo do editor: abrir o editor) · \
@@ -366,11 +377,15 @@ fn help_text_for(
         Place::Module => {
             "↑/↓ mover · →/Enter abrir · ← fechar · a adicionar projeto · c configurações".into()
         }
-        Place::Project => {
-            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · r remover".into()
-        }
+        Place::Project => "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · \
+                           n novo épico · r remover"
+            .into(),
+        Place::Epic => "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · \
+                        e editar título · o ocultar/restaurar · g abrir agente · i editar ID"
+            .into(),
+        // Shorter since the NS-40 (`m etapa · i ID`), to make room for `p` with the same rows.
         Place::Ticket => "↑/↓ mover · →/Enter abrir · ← fechar/subir · e editar título · \
-                          o ocultar/restaurar · g abrir agente · m mudar etapa · i editar ID"
+                          o ocultar/restaurar · g abrir agente · m etapa · i ID · p épico"
             .into(),
         Place::LiveAgent => {
             format!("↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · {shortcut} alternar")
@@ -395,7 +410,7 @@ fn help_text_for(
 
 /// Every state of the help without a dialog: each kind of node with both filters, and the
 /// settings. `help_rows` reserves rows for the longest of them.
-const HELP_STATES: [HelpState; 29] = [
+const HELP_STATES: [HelpState; 33] = [
     (Place::Module, false, false),
     (Place::Module, true, false),
     (Place::Module, false, true),
@@ -404,6 +419,10 @@ const HELP_STATES: [HelpState; 29] = [
     (Place::Project, true, false),
     (Place::Project, false, true),
     (Place::Project, true, true),
+    (Place::Epic, false, false),
+    (Place::Epic, true, false),
+    (Place::Epic, false, true),
+    (Place::Epic, true, true),
     (Place::Ticket, false, false),
     (Place::Ticket, true, false),
     (Place::Ticket, false, true),
@@ -621,6 +640,28 @@ fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
     (spans, style)
 }
 
+/// The label of an epic (NS-40): `<ID>  [épico]  <título>  [provisório]  [oculto]`, the
+/// `[épico]` in bold (no new color) right after the ID, so the 34 columns of depth 2 keep it;
+/// dimmed when hidden, as a ticket.
+fn epic_spans(epic: &Epic) -> (Vec<Span<'static>>, Style) {
+    let mut spans = vec![
+        Span::raw(printable(&epic.key)),
+        Span::raw("  "),
+        Span::styled("[épico]", Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(printable(&epic.title)),
+    ];
+    if epic.is_provisional {
+        spans.push(Span::raw("  [provisório]"));
+    }
+    let mut style = Style::new();
+    if epic.hidden_at.is_some() {
+        spans.push(Span::raw("  [oculto]"));
+        style = style.add_modifier(Modifier::DIM);
+    }
+    (spans, style)
+}
+
 /// The state of an agent record: `● vivo` (this nick runs it), `ativo em outro nick` (an active
 /// row without a session here), `arquivado`, `parado` (NS-39, the `encerrado` of before), or
 /// `estado desconhecido` (a state this nick does not know: review of the NS-39, point 6).
@@ -724,6 +765,7 @@ fn node_spans(app: &App, row: &Visible) -> (Vec<Span<'static>>, Style) {
     match row.id {
         NodeId::Module(module) => (vec![Span::raw(module.name())], Style::new()),
         NodeId::Project(id) => app.project_row(id).map_or_else(none, project_spans),
+        NodeId::Epic(id) => app.epic(id).map_or_else(none, epic_spans),
         NodeId::Ticket(id) => app.ticket(id).map_or_else(none, ticket_spans),
         NodeId::Agent(id) => app
             .agent_record(id)
@@ -805,8 +847,19 @@ fn draw_node_panel(frame: &mut Frame, app: &App, area: Rect) {
                 lines,
             );
         }
+        NodeId::Epic(_) => match app.epic_detail.as_ref() {
+            Some(detail) => paragraph(
+                frame,
+                format!(" Épico {} ", printable(&detail.epic.key)),
+                epic_lines(detail),
+            ),
+            None => frame.render_widget(block, area),
+        },
         NodeId::Ticket(_) => match app.ticket_detail.as_ref() {
-            Some(detail) => draw_ticket_detail(frame, detail, block, area),
+            Some(detail) => {
+                let epic = detail.ticket.epic_id.and_then(|id| app.epic(id));
+                draw_ticket_detail(frame, detail, epic, block, area);
+            }
             None => frame.render_widget(block, area),
         },
         NodeId::Agent(id) => {
@@ -832,9 +885,10 @@ fn draw_node_panel(frame: &mut Frame, app: &App, area: Rect) {
             ];
             // The ID it was opened with, when it is not the one of its ticket now (NS-39: the
             // resume tells it the new folder), or unknown (before the NS-39, a name without it).
-            let now = app
-                .ticket(agent.ticket_id)
-                .map(|ticket| ticket.key.as_str());
+            let now = match agent.owner {
+                Owner::Ticket(id) => app.ticket(id).map(|ticket| ticket.key.as_str()),
+                Owner::Epic(id) => app.epic(id).map(|epic| epic.key.as_str()),
+            };
             match agents::opened_key(agent) {
                 None => lines.push(Line::from("ID na abertura: desconhecido")),
                 Some(key) if Some(key.as_str()) != now => {
@@ -854,11 +908,59 @@ fn draw_node_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// The lines of the panel of an epic (NS-40): the epic and its marks, its folder and its plan, how
+/// many tickets it has, and that its agents are only of PO and Tech Leader. No stage, no history
+/// and no `m`: an epic has no stage.
+fn epic_lines(detail: &EpicDetail) -> Vec<Line<'static>> {
+    let epic = &detail.epic;
+    let mut head = vec![Span::raw(format!(
+        "Épico {} — {}",
+        printable(&epic.key),
+        printable(&epic.title)
+    ))];
+    if epic.is_provisional {
+        head.push(Span::raw("  [provisório]"));
+    }
+    if epic.hidden_at.is_some() {
+        head.push(Span::raw("  [oculto]"));
+    }
+    let exists = if detail.artifacts.plan {
+        "(existe)"
+    } else {
+        "(não existe)"
+    };
+    let mut tickets = format!("Tickets: {}", detail.tickets);
+    if detail.hidden_tickets > 0 {
+        tickets.push_str(&format!(
+            " ({})",
+            count_of(detail.hidden_tickets, "oculto", "ocultos")
+        ));
+    }
+    vec![
+        Line::from(head),
+        Line::from(format!("Pasta: {}", printable(&docs::dir_text(&epic.key)))),
+        Line::from(format!(
+            "Plano {exists}:  {}",
+            printable(&docs::plan_path(&epic.key))
+        )),
+        Line::from(tickets),
+        Line::from(""),
+        Line::from("Agentes do épico: só PO e Tech Leader."),
+    ]
+}
+
 /// The panel of a ticket (the ticket screen of the NS-36, without its agents, which are on the
 /// tree since the NS-38): the ticket, its stage and its artifacts on top; then the history of
 /// the stage with the rest of the height (the newest when it does not fit, with how many older
 /// ones are left out).
-fn draw_ticket_detail(frame: &mut Frame, detail: &TicketDetail, block: Block<'static>, area: Rect) {
+/// Since the NS-40 it says the epic of the ticket, when it has one.
+fn draw_ticket_detail(
+    frame: &mut Frame,
+    detail: &TicketDetail,
+    epic: Option<&Epic>,
+    block: Block<'static>,
+    area: Rect,
+) {
     let ticket = &detail.ticket;
     let block = block.title(format!(" Ticket {} ", printable(&ticket.key)));
     let inner = block.inner(area);
@@ -880,8 +982,15 @@ fn draw_ticket_detail(frame: &mut Frame, detail: &TicketDetail, block: Block<'st
         Span::raw(printable(&tickets::stage_label(&ticket.stage)))
     };
     let exists = |there: bool| if there { "(existe)" } else { "(não existe)" };
-    let top = vec![
-        Line::from(head),
+    let mut top = vec![Line::from(head)];
+    if let Some(epic) = epic {
+        top.push(Line::from(format!(
+            "Épico: {} — {}",
+            printable(&epic.key),
+            printable(&epic.title)
+        )));
+    }
+    top.extend([
         Line::from(vec![Span::raw("Etapa atual: "), stage]),
         // The state before the path (review of the NS-36, P3.1): the end of a line is cut.
         Line::from(format!(
@@ -895,7 +1004,7 @@ fn draw_ticket_detail(frame: &mut Frame, detail: &TicketDetail, block: Block<'st
             printable(&docs::review_path(&ticket.key))
         )),
         Line::from(""),
-    ];
+    ]);
     let top_rows = u16::try_from(top.len())
         .unwrap_or(u16::MAX)
         .min(inner.height);
@@ -986,8 +1095,16 @@ fn dialog_area(area: Rect, lines: &[Line]) -> Rect {
 
 /// The removal question, with what goes with the project: its agents live in this nick, which
 /// are ended (NS-38), its tickets (plan D7 of NS-32) and its agent records, the ended ones too
-/// (NS-38). Without any of them it is the text of the NS-31, byte for byte.
-fn removal_question(name: &str, path: &str, tickets: i64, agents: i64, live: i64) -> String {
+/// (NS-38). Since the NS-40 its epics too, in a sentence of their own, only when it has any.
+/// Without any of them it is the text of the NS-31, byte for byte.
+fn removal_question(
+    name: &str,
+    path: &str,
+    tickets: i64,
+    agents: i64,
+    live: i64,
+    epics: i64,
+) -> String {
     let ended = match live {
         0 => String::new(),
         1 => "O agente vivo dele neste nick será encerrado. ".to_string(),
@@ -998,6 +1115,11 @@ fn removal_question(name: &str, path: &str, tickets: i64, agents: i64, live: i64
         1 => "O ticket dele será apagado do banco. ".to_string(),
         n => format!("Os {n} tickets dele (inclusive os ocultos) serão apagados do banco. "),
     };
+    let epics = match epics {
+        0 => String::new(),
+        1 => "O épico dele será apagado do banco. ".to_string(),
+        n => format!("Os {n} épicos dele (inclusive os ocultos) serão apagados do banco. "),
+    };
     let records = match agents {
         0 => String::new(),
         1 => "O agente registrado dele será apagado do banco. ".to_string(),
@@ -1006,7 +1128,7 @@ fn removal_question(name: &str, path: &str, tickets: i64, agents: i64, live: i64
              do banco. "
         ),
     };
-    let goes = format!("{ended}{tickets}{records}");
+    let goes = format!("{ended}{tickets}{epics}{records}");
     format!(
         "Remover o projeto {name} ({path}) do nick? Os arquivos do projeto não são tocados. \
          {goes}(s/N)"
@@ -1030,6 +1152,78 @@ fn quit_question(app: &App) -> String {
     }
 }
 
+/// The first line of "Abrir agente": `Ticket <ID> — <título>` or, of an epic (NS-40), `Épico <ID>
+/// — <título>`.
+fn holder_line(holder: &Holder) -> String {
+    let noun = match holder.owner {
+        Owner::Ticket(_) => "Ticket",
+        Owner::Epic(_) => "Épico",
+    };
+    format!(
+        "{noun} {} — {}",
+        printable(&holder.key),
+        printable(&holder.title)
+    )
+}
+
+/// `1 <one>` or `<n> <many>` (review of the NS-40, P3.2: `1 ticket`, `0 tickets`).
+fn count_of(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// The lines of the dialog of the title of a ticket or of an epic (review of the NS-40, P2.1: one
+/// drawing for both), with the cursor after `typed` (the field already cut to the box).
+fn title_lines(key: &str, typed: String) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
+    let cursor = typed.chars().count();
+    (
+        vec![
+            Line::from(format!("ID: {}", printable(key))),
+            Line::from(""),
+            Line::from("Título:"),
+            Line::from(typed),
+        ],
+        Some((3, cursor)),
+    )
+}
+
+/// The lines of the dialog of the new ID of a ticket or of an epic (`noun`).
+fn id_lines(key: &str, noun: &str, typed: String) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
+    let cursor = typed.chars().count();
+    (
+        vec![
+            Line::from(format!("ID atual: {}", printable(key))),
+            Line::from(""),
+            Line::from(format!("Novo ID do {noun} (ex: SC-123):")),
+            Line::from(typed),
+        ],
+        Some((3, cursor)),
+    )
+}
+
+/// The question of the new ID of a ticket or of an epic (`whose`: `o ticket`, `o épico`, what the
+/// Jira does not follow), and whether its folder will be renamed.
+fn confirm_id_lines(key: &str, whose: &str, new: &str, moves: bool) -> Vec<Line<'static>> {
+    let folder = if moves {
+        format!(
+            " A pasta {} será renomeada para {}.",
+            printable(&docs::dir_text(key)),
+            printable(&docs::dir_text(new))
+        )
+    } else {
+        String::new()
+    };
+    vec![Line::from(format!(
+        "Trocar o ID {} por {}?{folder} A branch do git, {whose} no Jira e os agentes já \
+         registrados não mudam. (s/N)",
+        printable(key),
+        printable(new)
+    ))]
+}
+
 fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
     // One-line fields, scrolled to the end (no wrap), so the cursor always shows.
     let inner_width = dialog_width(area).saturating_sub(2);
@@ -1049,6 +1243,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             )
         }
         Dialog::NewTicket {
+            item,
             title,
             jira_id,
             focus,
@@ -1067,7 +1262,10 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
                 TicketField::JiraId => (4, jira_id.chars().count()),
             };
             (
-                " Novo ticket ",
+                match item {
+                    NewItem::Ticket { .. } => " Novo ticket ",
+                    NewItem::Epic => " Novo épico ",
+                },
                 vec![
                     label("Título:", TicketField::Title),
                     Line::from(title),
@@ -1082,18 +1280,8 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             )
         }
         Dialog::EditTitle { ticket, input } => {
-            let typed = field(input);
-            let cursor = typed.chars().count();
-            (
-                " Editar título ",
-                vec![
-                    Line::from(format!("ID: {}", printable(&ticket.key))),
-                    Line::from(""),
-                    Line::from("Título:"),
-                    Line::from(typed),
-                ],
-                Some((3, cursor)),
-            )
+            let (lines, cursor) = title_lines(&ticket.key, field(input));
+            (" Editar título ", lines, cursor)
         }
         Dialog::ConfirmHide { ticket } => (
             " Ocultar ticket ",
@@ -1104,6 +1292,67 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             ))],
             None,
         ),
+        Dialog::EditEpicTitle { epic, input } => {
+            let (lines, cursor) = title_lines(&epic.key, field(input));
+            (" Editar título do épico ", lines, cursor)
+        }
+        Dialog::ConfirmHideEpic { epic, tickets } => (
+            " Ocultar épico ",
+            vec![Line::from(format!(
+                "Ocultar o épico {}? O ramo inteiro ({}) sai da árvore e volta com f. (s/N)",
+                printable(&epic.key),
+                count_of(*tickets, "ticket", "tickets")
+            ))],
+            None,
+        ),
+        Dialog::EditEpicId { epic, input } => {
+            let (lines, cursor) = id_lines(&epic.key, "épico", field(input));
+            (" Editar ID do épico ", lines, cursor)
+        }
+        Dialog::ConfirmEditEpicId { epic, new, moves } => (
+            " Editar ID do épico ",
+            confirm_id_lines(&epic.key, "o épico", new, *moves),
+            None,
+        ),
+        Dialog::MoveTicket {
+            ticket,
+            choices,
+            index,
+        } => {
+            let mut lines = vec![
+                Line::from(format!(
+                    "Ticket {} — {}",
+                    printable(&ticket.key),
+                    printable(&ticket.title)
+                )),
+                Line::from(""),
+                Line::from("Para qual épico?"),
+            ];
+            for (i, choice) in choices.iter().enumerate() {
+                let current = if choice.as_ref().map(|e| e.id) == ticket.epic_id {
+                    " (atual)"
+                } else {
+                    ""
+                };
+                let label = match choice {
+                    None => format!("Sem épico{current}"),
+                    Some(epic) => format!(
+                        "{} — {}{current}",
+                        printable(&epic.key),
+                        printable(&epic.title)
+                    ),
+                };
+                lines.push(if i == *index {
+                    Line::from(vec![
+                        Span::raw("> "),
+                        Span::styled(label, Style::new().add_modifier(Modifier::REVERSED)),
+                    ])
+                } else {
+                    Line::from(format!("  {label}"))
+                });
+            }
+            (" Mover ticket ", lines, None)
+        }
         Dialog::NeedsConfig { dir, focus, note } => {
             let button = |label: &'static str, button: Button| {
                 let style = if *focus == button {
@@ -1131,17 +1380,13 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             (" Configuração do nick ", lines, None)
         }
         Dialog::ChooseType {
-            ticket,
+            holder,
             types,
             index,
             ..
         } => {
             let mut lines = vec![
-                Line::from(format!(
-                    "Ticket {} — {}",
-                    printable(&ticket.key),
-                    printable(&ticket.title)
-                )),
+                Line::from(holder_line(holder)),
                 Line::from(""),
                 Line::from("Qual tipo de conversa você quer iniciar?"),
             ];
@@ -1158,7 +1403,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             (" Abrir agente ", lines, None)
         }
         Dialog::StageForm {
-            ticket,
+            holder,
             kind,
             values,
             focus,
@@ -1166,11 +1411,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             ..
         } => {
             let mut lines = vec![
-                Line::from(format!(
-                    "Ticket {} — {}",
-                    printable(&ticket.key),
-                    printable(&ticket.title)
-                )),
+                Line::from(holder_line(holder)),
                 Line::from(format!("Tipo: {}", kind.label())),
             ];
             let fields = kind.fields();
@@ -1299,45 +1540,20 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             None,
         ),
         Dialog::EditId { ticket, input } => {
-            let typed = field(input);
-            let cursor = typed.chars().count();
-            (
-                " Editar ID ",
-                vec![
-                    Line::from(format!("ID atual: {}", printable(&ticket.key))),
-                    Line::from(""),
-                    Line::from("Novo ID do ticket (ex: SC-123):"),
-                    Line::from(typed),
-                ],
-                Some((3, cursor)),
-            )
+            let (lines, cursor) = id_lines(&ticket.key, "ticket", field(input));
+            (" Editar ID ", lines, cursor)
         }
-        Dialog::ConfirmEditId { ticket, new, moves } => {
-            let folder = if *moves {
-                format!(
-                    " A pasta {} será renomeada para {}.",
-                    printable(&docs::dir_text(&ticket.key)),
-                    printable(&docs::dir_text(new))
-                )
-            } else {
-                String::new()
-            };
-            (
-                " Editar ID ",
-                vec![Line::from(format!(
-                    "Trocar o ID {} por {}?{folder} A branch do git, o ticket no Jira e os \
-                     agentes já registrados não mudam. (s/N)",
-                    printable(&ticket.key),
-                    printable(new)
-                ))],
-                None,
-            )
-        }
+        Dialog::ConfirmEditId { ticket, new, moves } => (
+            " Editar ID ",
+            confirm_id_lines(&ticket.key, "o ticket", new, *moves),
+            None,
+        ),
         Dialog::ConfirmRemove {
             project,
             tickets,
             agents,
             live,
+            epics,
         } => (
             " Remover projeto ",
             vec![Line::from(removal_question(
@@ -1346,6 +1562,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
                 *tickets,
                 *agents,
                 *live,
+                *epics,
             ))],
             None,
         ),
@@ -1612,7 +1829,7 @@ fn draw_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Button, Dialog, Focus, Row, Screen, TicketField};
+    use crate::app::{Button, Dialog, Focus, NewItem, Row, Screen, TicketField};
     use crate::db::Db;
     use crate::projects::{Availability, Project};
     use crate::stages::StageType;
@@ -1851,6 +2068,7 @@ mod tests {
             tickets: 0,
             agents: 0,
             live: 0,
+            epics: 0,
         });
         let buffer = render(&f.app);
         let flat: String = text(&buffer)
@@ -1884,6 +2102,7 @@ mod tests {
             created_at: "2026-11-18T00:00:00Z".into(),
             hidden_at: hidden.then(|| "2026-11-18T01:00:00Z".into()),
             stage: "po".into(),
+            epic_id: None,
         }
     }
 
@@ -1906,6 +2125,7 @@ mod tests {
         ] {
             f.app.dialog = Some(Dialog::NewTicket {
                 project_id: 1,
+                item: NewItem::Ticket { epic_id: None },
                 title: "Meu título".into(),
                 jira_id: "NS-12".into(),
                 focus,
@@ -1986,6 +2206,7 @@ mod tests {
                 tickets,
                 agents: 0,
                 live: 0,
+                epics: 0,
             });
             let buffer = render(&f.app);
             assert!(
@@ -2033,6 +2254,7 @@ mod tests {
                 tickets,
                 agents,
                 live,
+                epics: 0,
             });
             let buffer = render(&f.app);
             assert!(
@@ -2172,7 +2394,7 @@ mod tests {
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
         f.app.dialog = Some(Dialog::ChooseType {
             project: PathBuf::from("/x/meu-proj"),
-            ticket: t,
+            holder: (&t).into(),
             precheck: precheck(false),
             types: StageType::menu(true, false),
             index: 5,
@@ -2205,7 +2427,7 @@ mod tests {
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
         f.app.dialog = Some(Dialog::StageForm {
             project: PathBuf::from("/x/meu-proj"),
-            ticket: t,
+            holder: (&t).into(),
             precheck: precheck(false),
             kind,
             values: values.iter().map(|v| v.to_string()).collect(),
@@ -2265,7 +2487,7 @@ mod tests {
         let t = ticket(1, "NS-1", "Corrigir o login", false, false);
         f.app.dialog = Some(Dialog::ConfirmPrompt {
             project: PathBuf::from("/x/meu-proj"),
-            ticket: t,
+            holder: (&t).into(),
             precheck: precheck(jail),
             kind: StageType::PoDiscussion,
             rendered: Rendered {
@@ -2490,12 +2712,12 @@ mod tests {
             let p = db
                 .insert_project("auto_scrum", name, dir.to_str().unwrap())
                 .unwrap();
-            let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+            let t = db.insert_ticket(p.id, "NS-1", false, "t", None).unwrap();
             let _ = p;
             f.app.refresh_tree();
             f.app.open_agent(
                 &dir,
-                &t,
+                &(&t).into(),
                 StageType::Development,
                 Path::new("/log.md"),
                 precheck(!name.starts_with("fora")),
@@ -2794,12 +3016,12 @@ mod tests {
             let p = db
                 .insert_project("auto_scrum", last, dir.to_str().unwrap())
                 .unwrap();
-            let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+            let t = db.insert_ticket(p.id, "NS-1", false, "t", None).unwrap();
             let _ = p;
             f.app.refresh_tree();
             f.app.open_agent(
                 &dir,
-                &t,
+                &(&t).into(),
                 StageType::Development,
                 Path::new("/log.md"),
                 precheck(jail),
@@ -3139,21 +3361,28 @@ mod tests {
         let sql = |query: &str, id: i64| {
             db.connection().execute(query, [id]).unwrap();
         };
-        let t1 = db.insert_ticket(a.id, "NS-1", false, "Um").unwrap();
+        let t1 = db.insert_ticket(a.id, "NS-1", false, "Um", None).unwrap();
         sql(
             "UPDATE tickets SET stage = 'tech_leader' WHERE id = ?1",
             t1.id,
         );
-        let t2 = db.insert_ticket(a.id, "NS-2", false, "Dois").unwrap();
+        let t2 = db.insert_ticket(a.id, "NS-2", false, "Dois", None).unwrap();
         sql("UPDATE tickets SET stage = 'done' WHERE id = ?1", t2.id);
-        let t3 = db.insert_ticket(a.id, "NS-3", false, "Três").unwrap();
+        let t3 = db.insert_ticket(a.id, "NS-3", false, "Três", None).unwrap();
         sql(
             "UPDATE tickets SET hidden_at = '2026-11-20T00:00:00Z' WHERE id = ?1",
             t3.id,
         );
-        db.insert_ticket(a.id, "abcd1234", true, "Quatro").unwrap();
+        db.insert_ticket(a.id, "abcd1234", true, "Quatro", None)
+            .unwrap();
         let ended = db
-            .insert_agent(t1.id, "development", "s-1", "alfa · Dev · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(t1.id),
+                "development",
+                "s-1",
+                "alfa · Dev · NS-1",
+                "NS-1",
+            )
             .unwrap();
         db.stop_agent(ended.id).unwrap();
         sql(
@@ -3161,7 +3390,13 @@ mod tests {
             ended.id,
         );
         let other = db
-            .insert_agent(t1.id, "po", "s-2", "alfa · PO · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(t1.id),
+                "po",
+                "s-2",
+                "alfa · PO · NS-1",
+                "NS-1",
+            )
             .unwrap();
         sql(
             "UPDATE agents SET opened_at = '2026-11-20T00:00:00Z' WHERE id = ?1",
@@ -3329,7 +3564,7 @@ mod tests {
         // A stopped agent and one active in another nick (NS-39: the actions of each state).
         let agents = f
             .app
-            .ticket_agents
+            .owner_agents
             .values()
             .flatten()
             .cloned()
@@ -3391,7 +3626,7 @@ mod tests {
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · →/Enter abrir · ← fechar/subir · e editar título · \
-             o ocultar/restaurar · g abrir agente · m mudar etapa · i editar ID · \
+             o ocultar/restaurar · g abrir agente · m etapa · i ID · p épico · \
              f mostrar ocultos · v agentes ativos · q sair"
         );
         // A history, oldest first, with the date as AAAA-MM-DD HH:MM UTC (raw when odd).
@@ -3520,8 +3755,8 @@ mod tests {
         f.app.select(project);
         assert_eq!(
             help_text(&f.app),
-            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · r remover · \
-             f esconder ocultos · v mostrar tudo (1) · q sair"
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · n novo épico · \
+             r remover · f esconder ocultos · v mostrar tudo (1) · q sair"
         );
         f.app.screen = Screen::Settings;
         assert_eq!(
@@ -3542,6 +3777,7 @@ mod tests {
         for place in [
             Place::Module,
             Place::Project,
+            Place::Epic,
             Place::Ticket,
             Place::LiveAgent,
             Place::StoppedAgent,
@@ -3553,6 +3789,7 @@ mod tests {
             match place {
                 Place::Module
                 | Place::Project
+                | Place::Epic
                 | Place::Ticket
                 | Place::LiveAgent
                 | Place::StoppedAgent
@@ -3581,9 +3818,17 @@ mod tests {
         let (mut f, root) = with_running(&["proj", "fora"]);
         // An ended agent of `proj`, beside the live one.
         let db = Db::open(&root.join("nick.db")).unwrap();
-        let ticket = f.app.agents[0].ticket_id;
+        let Owner::Ticket(ticket) = f.app.agents[0].owner else {
+            panic!("a ticket agent")
+        };
         let ended = db
-            .insert_agent(ticket, "po", "s-x", "proj · PO · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(ticket),
+                "po",
+                "s-x",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
             .unwrap();
         db.stop_agent(ended.id).unwrap();
         f.app.refresh_tree();
@@ -3690,7 +3935,7 @@ mod tests {
 
     /// The agents of NS-1 of `with_tree`: the stopped Dev and the PO active in another nick.
     fn ns1_agents(f: &Fixture) -> Vec<Agent> {
-        let mut agents: Vec<Agent> = f.app.ticket_agents.values().flatten().cloned().collect();
+        let mut agents: Vec<Agent> = f.app.owner_agents.values().flatten().cloned().collect();
         agents.sort_by_key(|a| a.id);
         agents
     }
@@ -3729,9 +3974,17 @@ mod tests {
     fn a_live_agent_and_a_stopped_one_are_told_apart() {
         let (mut f, root) = with_running(&["proj"]);
         let db = Db::open(&root.join("nick.db")).unwrap();
-        let ticket = f.app.agents[0].ticket_id;
+        let Owner::Ticket(ticket) = f.app.agents[0].owner else {
+            panic!("a ticket agent")
+        };
         let stopped = db
-            .insert_agent(ticket, "po", "s-x", "proj · PO · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(ticket),
+                "po",
+                "s-x",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
             .unwrap();
         db.stop_agent(stopped.id).unwrap();
         f.app.refresh_tree();
@@ -3774,11 +4027,14 @@ mod tests {
     fn the_dialogs_of_the_lost_conversation_and_of_archiving() {
         let (mut f, _) = with_tree();
         let agent = ns1_agents(&f)[0].clone();
-        let ticket = f.app.ticket(agent.ticket_id).unwrap().clone();
+        let Owner::Ticket(ticket_id) = agent.owner else {
+            panic!("a ticket agent")
+        };
+        let ticket = f.app.ticket(ticket_id).unwrap().clone();
         f.app.dialog = Some(Dialog::ConversationLost {
             project: PathBuf::from("/alfa"),
             agent: agent.clone(),
-            ticket,
+            holder: (&ticket).into(),
             precheck: Precheck {
                 jail: true,
                 jira: false,
@@ -3840,5 +4096,345 @@ mod tests {
             help_text(&f.app),
             "↑/↓ mover · ← subir · f mostrar ocultos · v agentes ativos · q sair"
         );
+    }
+
+    // ---- the epics (NS-40) ----
+
+    /// A project `proj` with the epic EPIC-1 (the ticket NS-1 in it) and the ticket NS-2 without
+    /// epic, the epic selected with its branches open. The second connection stores the rows.
+    fn with_epic_tree() -> (Fixture, Db, PathBuf) {
+        let mut f = fixture();
+        let root = std::fs::canonicalize(f._tmp.path()).unwrap();
+        let dir = root.join("proj");
+        std::fs::create_dir_all(dir.join(".nick")).unwrap();
+        std::fs::write(dir.join(".nick/nick.conf"), "").unwrap();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let p = db
+            .insert_project("auto_scrum", "proj", dir.to_str().unwrap())
+            .unwrap();
+        let e = db
+            .insert_epic(p.id, "EPIC-1", false, "Plano longo")
+            .unwrap();
+        let t = db
+            .insert_ticket(p.id, "NS-1", false, "Dentro", Some(e.id))
+            .unwrap();
+        db.insert_ticket(p.id, "NS-2", false, "Fora", None).unwrap();
+        f.app.refresh_tree();
+        f.app.reveal_and_select(NodeId::Ticket(t.id));
+        f.app.refresh_tree();
+        f.app.select(NodeId::Epic(e.id));
+        f.app.refresh_tree();
+        (f, db, dir)
+    }
+
+    fn spans_text(spans: &[Span]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_label_of_an_epic_has_the_mark_bold_and_dims_when_hidden() {
+        let mut epic = Epic {
+            id: 1,
+            project_id: 1,
+            key: "EPIC-1".into(),
+            is_provisional: false,
+            title: "Plano".into(),
+            created_at: String::new(),
+            hidden_at: None,
+        };
+        let (spans, style) = epic_spans(&epic);
+        assert_eq!(spans_text(&spans), "EPIC-1  [épico]  Plano");
+        assert_eq!(spans[2].content, "[épico]");
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].style.fg, None, "no new color");
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+        epic.is_provisional = true;
+        epic.hidden_at = Some("x".into());
+        let (spans, style) = epic_spans(&epic);
+        assert_eq!(
+            spans_text(&spans),
+            "EPIC-1  [épico]  Plano  [provisório]  [oculto]"
+        );
+        assert!(style.add_modifier.contains(Modifier::DIM));
+        epic.title = "\x1b[2J".into();
+        assert_eq!(
+            spans_text(&epic_spans(&epic).0),
+            "EPIC-1  [épico]  ?[2J  [provisório]  [oculto]"
+        );
+    }
+
+    #[test]
+    fn the_tree_shows_the_epic_before_the_tickets_and_a_long_id_fits_with_its_mark() {
+        let (f, db, _) = with_epic_tree();
+        let buffer = render(&f.app);
+        let (epic_row, _) = find(&buffer, "EPIC-1  [épico]").expect("the epic");
+        let (inside, _) = find(&buffer, "NS-1  [PO]").expect("its ticket");
+        let (outside, _) = find(&buffer, "NS-2  [PO]").expect("the loose ticket");
+        assert!(epic_row < inside && inside < outside, "{}", text(&buffer));
+        // The highlight symbol (2), three levels (6) and a leaf (2).
+        assert!(
+            list_row(&buffer, inside).starts_with("          NS-1"),
+            "depth 3: {:?}",
+            list_row(&buffer, inside)
+        );
+        // An ID of 8 characters and the mark fit in the 34 columns of depth 2.
+        let p = f.app.project_rows()[0].project.id;
+        db.insert_epic(p, "abcd1234", true, "um título bem longo que é cortado")
+            .unwrap();
+        let mut f = f;
+        f.app.refresh_tree();
+        let buffer = render(&f.app);
+        let (y, _) = find(&buffer, "abcd1234").expect("the long one");
+        assert!(
+            list_row(&buffer, y).contains("abcd1234  [épico]"),
+            "{:?}",
+            list_row(&buffer, y)
+        );
+    }
+
+    #[test]
+    fn the_panel_of_an_epic_has_no_stage_history_nor_m() {
+        let (mut f, _, dir) = with_epic_tree();
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Épico EPIC-1 ");
+        assert_has(&buffer, "Épico EPIC-1 — Plano longo");
+        assert_has(&buffer, "Pasta: .nick/docs/EPIC-1/");
+        assert_has(&buffer, "Plano (não existe):  .nick/docs/EPIC-1/plan.md");
+        assert_has(&buffer, "Tickets: 1");
+        assert_has(&buffer, "Agentes do épico: só PO e Tech Leader.");
+        for absent in ["Etapa", "Histórico", "m etapa", "mudar etapa"] {
+            assert!(
+                find(&buffer, absent).is_none(),
+                "{absent}: {}",
+                text(&buffer)
+            );
+        }
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · e editar título · \
+             o ocultar/restaurar · g abrir agente · i editar ID · f mostrar ocultos · \
+             v agentes ativos · q sair"
+        );
+        // The plan from the disk, and the hidden tickets counted.
+        std::fs::create_dir_all(dir.join(".nick/docs/EPIC-1")).unwrap();
+        std::fs::write(dir.join(".nick/docs/EPIC-1/plan.md"), "x").unwrap();
+        f.app.refresh_tree();
+        if let Some(detail) = f.app.epic_detail.as_mut() {
+            detail.hidden_tickets = 1;
+        }
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Plano (existe):  .nick/docs/EPIC-1/plan.md");
+        assert_has(&buffer, "Tickets: 1 (1 oculto)");
+        // The plural (review of the NS-40, P3.2).
+        if let Some(detail) = f.app.epic_detail.as_mut() {
+            detail.tickets = 3;
+            detail.hidden_tickets = 2;
+        }
+        assert_has(&render(&f.app), "Tickets: 3 (2 ocultos)");
+    }
+
+    #[test]
+    fn the_panel_of_a_ticket_in_an_epic_says_the_epic() {
+        let (mut f, _, _) = with_epic_tree();
+        let inside = f
+            .app
+            .tickets
+            .values()
+            .flatten()
+            .find(|t| t.key == "NS-1")
+            .unwrap()
+            .id;
+        let outside = f
+            .app
+            .tickets
+            .values()
+            .flatten()
+            .find(|t| t.key == "NS-2")
+            .unwrap()
+            .id;
+        f.app.select(NodeId::Ticket(inside));
+        f.app.refresh_tree();
+        assert_has(&render(&f.app), "Épico: EPIC-1 — Plano longo");
+        f.app.select(NodeId::Ticket(outside));
+        f.app.refresh_tree();
+        assert!(
+            find(&render(&f.app), "Épico:").is_none(),
+            "only with an epic"
+        );
+    }
+
+    #[test]
+    fn the_project_help_has_n_and_the_epic_place_is_in_the_help_states() {
+        let (mut f, _, _) = with_epic_tree();
+        let p = f.app.project_rows()[0].project.id;
+        f.app.select(NodeId::Project(p));
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · n novo épico · \
+             r remover · f mostrar ocultos · v agentes ativos · q sair"
+        );
+        assert_eq!(HELP_STATES.len(), 33);
+        assert_eq!(
+            HELP_STATES
+                .iter()
+                .filter(|(place, _, _)| *place == Place::Epic)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn the_dialogs_of_the_epic() {
+        let (mut f, _, _) = with_epic_tree();
+        let epic = f
+            .app
+            .epic(f.app.project_epics(f.app.project_rows()[0].project.id)[0].id)
+            .unwrap()
+            .clone();
+        let p = epic.project_id;
+        f.app.dialog = Some(Dialog::NewTicket {
+            project_id: p,
+            item: NewItem::Epic,
+            title: String::new(),
+            jira_id: String::new(),
+            focus: TicketField::Title,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Novo épico ");
+        assert_has(
+            &buffer,
+            "ID do Jira (opcional; vazio gera um ID provisório):",
+        );
+        f.app.dialog = Some(Dialog::ConfirmHideEpic {
+            epic: epic.clone(),
+            tickets: 3,
+        });
+        assert!(flat(&render(&f.app)).contains(
+            "Ocultar o épico EPIC-1? O ramo inteiro (3 tickets) sai da árvore e volta com f. (s/N)"
+        ));
+        for (tickets, text) in [(1, "(1 ticket)"), (0, "(0 tickets)")] {
+            f.app.dialog = Some(Dialog::ConfirmHideEpic {
+                epic: epic.clone(),
+                tickets,
+            });
+            assert!(
+                flat(&render(&f.app)).contains(&format!("O ramo inteiro {text} sai")),
+                "{tickets}"
+            );
+        }
+        f.app.dialog = Some(Dialog::EditEpicTitle {
+            epic: epic.clone(),
+            input: "Plano".into(),
+        });
+        assert_has(&render(&f.app), " Editar título do épico ");
+        f.app.dialog = Some(Dialog::EditEpicId {
+            epic: epic.clone(),
+            input: "EPIC-1".into(),
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Editar ID do épico ");
+        assert_has(&buffer, "Novo ID do épico (ex: SC-123):");
+        f.app.dialog = Some(Dialog::ConfirmEditEpicId {
+            epic: epic.clone(),
+            new: "EPIC-2".into(),
+            moves: true,
+        });
+        assert!(flat(&render(&f.app)).contains(
+            "Trocar o ID EPIC-1 por EPIC-2? A pasta .nick/docs/EPIC-1/ será renomeada para \
+             .nick/docs/EPIC-2/."
+        ));
+        let ticket = f
+            .app
+            .tickets
+            .values()
+            .flatten()
+            .find(|t| t.key == "NS-1")
+            .unwrap()
+            .clone();
+        f.app.dialog = Some(Dialog::MoveTicket {
+            ticket,
+            choices: vec![None, Some(epic.clone())],
+            index: 0,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Mover ticket ");
+        assert_has(&buffer, "Ticket NS-1 — Dentro");
+        assert_has(&buffer, "> Sem épico");
+        assert_has(&buffer, "EPIC-1 — Plano longo (atual)");
+        assert_eq!(
+            last_line(&buffer),
+            "↑/↓ escolher · Enter mover · Esc cancelar"
+        );
+        // "Abrir agente" of an epic names it.
+        f.app.dialog = Some(Dialog::ChooseType {
+            project: PathBuf::from("/proj"),
+            holder: (&epic).into(),
+            precheck: precheck(true),
+            types: StageType::epic_menu(false, false),
+            index: 0,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Épico EPIC-1 — Plano longo");
+        assert!(find(&buffer, "Desenvolvimento").is_none());
+    }
+
+    #[test]
+    fn the_removal_confirmation_counts_the_epics_only_when_there_are_any() {
+        let question = |epics| removal_question("alfa", "/w/alfa", 2, 0, 0, epics);
+        assert_eq!(
+            question(0),
+            "Remover o projeto alfa (/w/alfa) do nick? Os arquivos do projeto não são tocados. \
+             Os 2 tickets dele (inclusive os ocultos) serão apagados do banco. (s/N)"
+        );
+        assert_eq!(
+            question(1),
+            "Remover o projeto alfa (/w/alfa) do nick? Os arquivos do projeto não são tocados. \
+             Os 2 tickets dele (inclusive os ocultos) serão apagados do banco. O épico dele será \
+             apagado do banco. (s/N)"
+        );
+        assert_eq!(
+            removal_question("alfa", "/w/alfa", 0, 0, 0, 3),
+            "Remover o projeto alfa (/w/alfa) do nick? Os arquivos do projeto não são tocados. \
+             Os 3 épicos dele (inclusive os ocultos) serão apagados do banco. (s/N)"
+        );
+    }
+
+    /// The agent at depth 4 (a ticket of an epic) keeps its stage and its state whole in the 26
+    /// columns left: `Tech Leader  ● saída nova` has 25; the date is cut first.
+    #[test]
+    fn an_agent_at_depth_4_keeps_its_mark_whole() {
+        let (mut f, root) = with_running(&["fora"]);
+        f.app.focus = Focus::List;
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let id = f.app.agents[0].id;
+        let Owner::Ticket(ticket) = f.app.agents[0].owner else {
+            panic!("a ticket agent")
+        };
+        let project = f.app.agents[0].project_id;
+        let epic = db.insert_epic(project, "EPIC-1", false, "e").unwrap();
+        db.set_ticket_epic(ticket, Some(epic.id)).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE agents SET stage = 'tech_leader' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        f.app.refresh_tree();
+        f.app.reveal_and_select(NodeId::Agent(id));
+        f.app.refresh_tree();
+        f.app.agents[0].unseen = true;
+        f.app.relayout();
+        let depth = f
+            .app
+            .visible()
+            .iter()
+            .find(|r| r.id == NodeId::Agent(id))
+            .unwrap()
+            .depth;
+        assert_eq!(depth, 4);
+        let buffer = render(&f.app);
+        let (y, _) = find(&buffer, "Tech Leader").expect("the row of the agent");
+        let row = list_row(&buffer, y);
+        assert!(row.contains("Tech Leader  ● saída nova"), "{row:?}");
     }
 }

@@ -2464,6 +2464,13 @@ volta do init, e sem resposta ele dá erro depois de 2 s.
 
 ## Rust no projeto: tickets na casca `nick` (NS-32)
 
+> **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): o ID é único entre os
+> tickets **e** os épicos do projeto (os dois usam `.nick/docs/<ID>/`), conferido pelo código
+> (`Db::find_key`, no lugar do `find_ticket_key`) e por triggers da migração 7, com a mensagem
+> `Já existe um épico com o ID <ID> neste projeto.` ao lado da do ticket. Um ID provisório que
+> colide com um épico é gerado de novo. O laço da criação virou `tickets::create_key_with`, usado
+> também pelos épicos.
+
 > **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): a tela de Tickets virou
 > o nível de tickets da árvore; as ações (`a` no nó do projeto; `e`, `o` no nó do ticket) e as
 > regras abaixo não mudaram. O filtro `f` passou a valer para a árvore inteira e não se desliga ao
@@ -3228,6 +3235,11 @@ A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nic
 
 ## Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)
 
+> **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): o "Editar ID" recusa
+> também o ID de um épico do projeto, e o miolo (renomear, gravar, desfazer) virou
+> `tickets::rename_key_with`, usado também pelo "Editar ID" do épico. O rodapé do nó do ticket
+> foi encurtado para caber o `p` (`m etapa · i ID · p épico`), sem mudar a altura reservada.
+
 > **Mudou no NS-39** (seção "Rust no projeto: retomar e arquivar agentes (NS-39)"): o "retomar é
 > da F5" foi feito. Um agente parado é retomado pelo `r` no nó dele, e um agente parado depois de
 > um "Editar ID" é avisado, na retomada, da pasta nova `.nick/docs/<ID novo>/` (o ID de abertura
@@ -3533,6 +3545,12 @@ do helper ele cai, conforme a sabotagem registrada em `.nick/docs/NS-37/review_s
 
 ## Rust no projeto: navegação em árvore (NS-38)
 
+> **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): a árvore ganhou o nível
+> opcional do épico (Módulo > Projeto > [Épico >] Ticket > Agente), com o `NodeId::Epic`, as
+> profundidades 2 a 4, o `Place::Epic` e o `HELP_STATES` com 33 estados (a altura do rodapé não
+> mudou). Um projeto sem épicos gera as linhas de antes. O dono de um agente é um `Owner` (ticket
+> ou épico), e o `RunningAgent`/`LiveAgent` trocaram o `ticket_id` pelo `owner`.
+
 > **Mudou no NS-39** (seção "Rust no projeto: retomar e arquivar agentes (NS-39)"): o agente não
 > vivo é `parado`, `[arquivado]` (só com o filtro `f`) ou `ativo em outro nick`; o painel dele
 > perdeu a frase "Retomar ... ainda não é possível" e ganhou as ações do estado (`r`, `o`); o
@@ -3748,6 +3766,12 @@ estão em `.nick/docs/NS-38/telas/`.
 
 ## Rust no projeto: retomar e arquivar agentes (NS-39)
 
+> **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): o `--resume` aceita
+> `--epic-id <id>` no lugar de `--ticket-id` (exatamente um dos dois), para um agente de épico, e o
+> `resume_id_notice <antigo> <novo> [ticket|epic]` ganhou o texto do épico (o do ticket não mudou,
+> byte a byte). O `Launch::Resume` leva um `HolderKey`, e o `ticket_of_agent` virou
+> `holder_of_agent`. A migração 7 reconstruiu a tabela `agents` (o dono ticket **ou** épico).
+
 A fatia F5 do épico NS-28. Um agente cujo `claude` terminou, ou cujo nick fechou, deixa de ser
 uma conversa perdida: ele fica **parado** e pode ser **retomado** na mesma conversa (`claude
 --resume <session_id>`) pelo nó dele na árvore, ou **arquivado**. Fora do escopo: retomar
@@ -3953,3 +3977,221 @@ configuração atual (jail ligada depois), a conversa perdida com arquivar e des
 em outro nick, o ID trocado e os dois estruturais. As sabotagens ficam em
 `.nick/docs/NS-39/sabotagens.md`, as telas em `.nick/docs/NS-39/telas/`, e a verificação com o
 `claude` real (que não roda dentro da jail do nick) em `.nick/docs/NS-39/verificacao_manual.md`.
+
+## Rust no projeto: épicos opcionais (NS-40)
+
+A fatia F7 do épico NS-28. O **épico** é um nível **opcional** entre o projeto e o ticket, para
+guardar conversas longas: um plano que vive mais que um ticket (como o `migracao_tui.md`). A
+árvore passa a ser **Módulo > Projeto > [Épico >] Ticket > Agente**. Fora do escopo: chat livre
+(agente sem épico nem ticket), sincronizar com o épico do Jira, épico dentro de épico e etapa de
+épico.
+
+**O modelo.** O épico tem ID (do Jira ou UUID provisório) e título, com as regras do ticket, e
+**não tem etapa nem histórico**. Os agentes dele são **só de PO e de Tech Leader**
+(`stages::EPIC_STAGES`, fonte única), com o formulário e o prompt do NS-35, e são retomados e
+arquivados como os de ticket (NS-39): são as conversas de longa duração. Um ticket fica direto no
+projeto (sem épico) ou dentro de um épico.
+
+**Decisão: sem chat livre por enquanto.** Todo agente tem dono: um ticket ou um épico. Um agente
+solto no projeto ficou fora do escopo do ticket; o `Owner` (abaixo) é o lugar onde ele entraria.
+
+**Banco: migração 7** (uma transação, pelo `Db::open_with`):
+- a tabela `epics` (`project_id → projects ON DELETE CASCADE`, `key`, `is_provisional`, `title`
+  com `CHECK`, `created_at`, `hidden_at`, `UNIQUE (project_id, key)`);
+- `tickets.epic_id` (`ALTER TABLE ... ADD COLUMN`, `REFERENCES epics(id)`, **sem `ON DELETE`**):
+  um épico nunca é apagado sozinho, só com o projeto, e aí os tickets também saem. **Conferido na
+  execução:** a ordem do `CASCADE` (projeto → épicos e tickets) não esbarra na FK
+  `tickets.epic_id`, porque a FK sem ação é conferida no fim do `DELETE` e os tickets já saíram
+  (teste `deleting_a_project_deletes_its_epics_tickets_and_the_agents_of_both_and_no_other`, com
+  `foreign_key_check` vazio). O `ON DELETE SET NULL` não foi preciso;
+- **a reconstrução da tabela `agents`**, porque o SQLite não altera `NOT NULL`, `CHECK` nem FK:
+  `ticket_id` e `epic_id` opcionais, `CHECK ((ticket_id IS NULL) <> (epic_id IS NULL))` (um dono,
+  nunca os dois, nunca nenhum) e `CHECK (epic_id IS NULL OR stage IN ('po', 'tech_leader'))`. A
+  ordem é `CREATE TABLE agents_new`, `INSERT ... SELECT` com os `id` mantidos (as travas são por
+  `session_id`, mas a árvore e os testes usam o `id`), `DROP TABLE agents` e `ALTER TABLE
+  agents_new RENAME TO agents`. Funciona com `foreign_keys` ligado, porque nenhuma tabela aponta
+  para `agents`. A coluna `state` continua sem `CHECK` (NS-33, NS-39): o `AgentState` segue a
+  única fonte dos estados. O teste v6 → v7 confere `id`, campos, estados e `opened_key` mantidos,
+  `foreign_key_check` e `integrity_check` vazios e o `UNIQUE` do `session_id` valendo;
+- os triggers (abaixo).
+
+**Unicidade do ID entre tickets e épicos: código + triggers** (decisão do usuário no plano). Os
+dois usam `.nick/docs/<ID>/`, então o ID é único entre os tickets **e** os épicos do projeto. O
+código confere antes (`Db::find_key`, no lugar do `find_ticket_key`, que devolve `KeyKind::Ticket
+| Epic` e se está oculto) e dá a mensagem em PT-BR: `Já existe um ticket com o ID <ID> neste
+projeto.` ou `Já existe um épico com o ID <ID> neste projeto.`, com o sufixo de oculto de antes.
+Um `UNIQUE` não cruza duas tabelas, então a migração 7 cria triggers `BEFORE INSERT` e `BEFORE
+UPDATE OF key` nas duas tabelas com `RAISE(ABORT, 'nick: key of a ticket' | 'nick: key of an
+epic')`, que fecham a corrida entre dois nicks. `db::is_trigger_abort(err, marker)` reconhece o
+`SQLITE_CONSTRAINT_TRIGGER` pela mensagem (o molde do `is_unique_violation`), e o erro vira a
+mesma mensagem do código. Um ID provisório que colide com um ticket ou um épico é gerado de novo.
+Outro par de triggers recusa um ticket num épico de outro projeto (`nick: epic of another
+project`), e o `UPDATE` do `set_ticket_epic` já exige o mesmo projeto no SQL.
+
+**O dono do agente é um tipo:** `db::Owner { Ticket(i64), Epic(i64) }` (reexportado por
+`agents.rs`). O `Agent` trocou o `ticket_id` pelo `owner`, lido de `ticket_id`/`epic_id` (uma
+linha sem nenhum dos dois é erro do banco, nunca `panic!`); o `LiveAgent` e o `RunningAgent`
+também. O `NodeId` ganhou `Epic(i64)`, e o pai de um agente é o nó do dono (`NodeId::from(owner)`).
+O `Db::insert_agent(owner, ...)` e o `count_active_agents(owner)` recebem o dono, e o
+`list_project_agents` inclui os agentes dos épicos (a remoção do projeto e a recusa "ativo em
+outro nick" já os cobrem). `agents::open` recebe o `Owner` e recusa, sem tocar na trava, outra
+etapa num épico: `O épico só tem agentes de PO e de Tech Leader.`. A regra das etapas do épico
+está em três lugares com uma fonte: o `CHECK` (um teste compara o texto da migração com o
+`EPIC_STAGES`), o menu (`StageType::epic_menu`) e o `agents::open`.
+
+**O `Holder`** (`agents.rs`): `{ owner, project_id, key, title, hidden }`, construído por
+`From<&Ticket>` e `From<&Epic>`. Os fluxos de abrir e retomar agente deixaram de receber um
+`Ticket`: `Dialog::ChooseType`, `StageForm`, `ConfirmPrompt`, `ConversationLost`,
+`Action::CheckAgent` e `Action::OpenAgent` carregam um `Holder`, e `check_agent`, `open_agent`,
+`start_running`, `resume_agent` e `holder_of_agent` (era `ticket_of_agent`) o recebem. **É o único
+caminho**: não há um "abrir agente de épico" paralelo. **Diferença do plano:** o `Holder` ganhou o
+`title`, porque os diálogos de "Abrir agente" mostram `Ticket <ID> — <título>` (NS-35), agora
+também `Épico <ID> — <título>`; sem ele, o título viria da árvore, e o teste de desenho do menu
+(que monta o diálogo sem a árvore) mudaria. O `g` de um épico relê o épico do banco antes do menu
+(`get_epic`, no molde do `ask_resume`): outro nick pode tê-lo ocultado.
+
+**O formulário e o prompt do NS-35 não mudaram.** O formulário do épico é o do ticket, e o campo
+`ID do Jira` começa com a chave do épico (`initial_values(&holder.key)`), então o `tech_leader`
+grava em `.nick/docs/<ID do épico>/plan.md` pelo próprio template. **O menu do épico é exclusivo do
+nick** (o `auto_scrum.sh` não tem épico): o diferencial de `nick/tests/stages.rs` cobre os 6 tipos
+de PO e TL com o ID do épico (o log do `main()` do script com `EPIC-1` digitado, byte a byte), e
+um teste separado documenta que o menu do script tem os 8 tipos e o `epic_menu`, só os 6. Os dois
+testes desse binário mudam o ambiente, então passaram a se revezar num `Mutex` (antes havia um
+teste só).
+
+**A árvore** (`tree.rs`): dentro do projeto, primeiro os épicos (por criação), depois os tickets
+sem épico (por criação); dentro do épico, primeiro os agentes do épico (por abertura), depois os
+tickets dele (decisão do usuário: os agentes do épico ficam perto do topo mesmo com muitos
+tickets). Profundidades: épico 2, agente do épico 3, ticket do épico 3, agente de ticket do épico
+4; o ticket sem épico e os agentes dele ficam como antes (2 e 3), e **um projeto sem épicos gera
+exatamente as linhas de antes** (os testes de `tree.rs` passaram só com a construção do
+`TreeData` adaptada). O `TreeData` ganhou `epics` (por projeto) e o `agents` passou a ser por dono
+(`HashMap<Owner, Vec<Agent>>`); o `LiveAgent.epic_id` é o épico do ramo (o do dono, ou o do
+ticket), por onde sobem a marca `● saída nova` e o filtro `v`. O `App` lê os épicos com uma
+consulta por projeto, como os tickets (P2 do review do NS-38). O `reselect` não mudou e funciona a
+partir da profundidade 4 (teste).
+
+**As teclas** (todas no rodapé do nó):
+- projeto: `a` novo ticket (sem épico) e **`n` novo épico** (o mesmo diálogo `NewTicket`, com
+  `NewItem::Epic` e o título ` Novo épico `);
+- épico: **`a` novo ticket dentro dele** (o ramo abre e o ticket fica selecionado), `e` título,
+  `o` ocultar/restaurar, `g` abrir agente (só PO e TL), `i` editar ID. Não há `m`, `p` nem `r`. O
+  `a` num épico oculto é recusado: `O épico <ID> está oculto. Restaure-o (o) para criar um
+  ticket.` (decisão do usuário na execução; o plano não dizia);
+- ticket: **`p` ("pôr em épico")** abre ` Mover ticket `, com `Sem épico` e os épicos visíveis do
+  projeto, e o lugar atual marcado `(atual)`. Sem épico para oferecer: `O projeto não tem épicos.
+  Crie um com n no nó do projeto.`.
+
+**Ocultar o épico oculta o ramo inteiro** sem mudar o `hidden_at` dos tickets: a árvore esconde o
+ramo pelo `epics.hidden_at`, e ao restaurar cada ticket volta como estava (um ticket oculto antes
+continua oculto). O `o` pede `Ocultar o épico <ID>? O ramo inteiro (<N> tickets) sai da árvore e
+volta com f. (s/N)` e é recusado, já na tecla e sem diálogo, quando há agente `active` (de qualquer
+nick) no épico ou num ticket dele: `O épico <ID> tem <N> agente(s) ativo(s) (no épico ou nos
+tickets dele). Encerre-os antes de ocultar.` (`1 agente ativo` / `N agentes ativos`). A contagem e
+a gravação são **um único `UPDATE` condicionado** (`Db::hide_epic`: `... WHERE id = ? AND NOT
+EXISTS (agente active do ramo)`), no molde do `change_agent_state`: com 0 linhas, a linha é relida
+e o motivo contado (`EpicHide::{Done, Gone, Active(n)}`); um ramo cujos agentes acabaram entre os
+dois comandos é tentado mais uma vez. As regras do ramo oculto são as do ticket oculto: `g` num
+épico oculto, ou num ticket dele, é recusado (`O épico <ID> está oculto. Restaure-o (o) para abrir
+um agente.`); `r` não é recusado (NS-39); um épico oculto com agente vivo deste nick continua na
+árvore; o `p` só oferece épicos visíveis.
+
+**Mover não toca arquivo nem avisa o agente.** `epics::move_ticket` (o único que chama o
+`Db::set_ticket_epic`; um estrutural cobra isso, e nenhum `UPDATE tickets SET epic_id` fora de
+`src/db/`) só muda o banco: `Ticket <ID> movido para o épico <EID>.`, `Ticket <ID> tirado do
+épico <EID>.` e `O ticket <ID> já está aí.`. Sem `(s/N)`, porque mover se desfaz do mesmo jeito.
+A pasta `.nick/docs/<ticket>/` é do ticket e não muda; o retrato do projeto é o mesmo antes e
+depois, inclusive com agente ativo no ticket (unidade, `App` e PTY), e o agente não é avisado
+(decisão do ticket).
+
+**"Editar ID" do épico** (`epics::edit_id`) segue as regras do NS-36 (`docs::rename` primeiro, o
+banco depois, desfazer se o banco falhar), recusado se o destino existir ou com agente `active`
+**do épico** (o prompt dele cita a pasta). Os agentes dos tickets do épico não contam: a pasta
+deles é a do ticket. **Reaproveitamento:** o laço da criação (`tickets::create_key_with`) e o miolo
+do "Editar ID" (`tickets::check_new_key` e `tickets::rename_key_with`) foram extraídos do
+`tickets.rs` para funções genéricas usadas pelos dois. Ficaram no `tickets.rs`, e não num
+`keys::create_with` como o plano sugeria, porque o `keys.rs` já é o módulo do teclado (decisão do
+usuário na execução). O `check_title` ganhou o irmão `check_title_of(input, noun)` (`Informe o
+título do épico.`), e o `NO_UNIQUE_ID_MESSAGE` do épico troca o substantivo (decisão do usuário).
+O `tickets::create` ganhou o irmão `create_in(..., epic_id, ...)`; o `create` e o `create_with`
+não mudaram de assinatura, e os testes de `tickets.rs` passaram sem mudar asserção.
+
+**O `--epic-id` e o aviso do épico.** O `--resume` do `bin/nick-agent` aceita `--epic-id <id>` no
+lugar de `--ticket-id`, **exatamente um dos dois** (`informe só um dos dois: --ticket-id ou
+--epic-id.`, `informe o --ticket-id <id> ou o --epic-id <id>.`), com as recusas de antes (repetido,
+sem valor, `jira_id_valid`). O `resume_id_notice <antigo> <novo> [ticket|epic]` do `prompt.sh` tem o
+padrão `ticket`, com o texto do NS-39 byte a byte, e com `epic` diz `O ID deste épico mudou de
+<antigo> para <novo> depois que esta conversa começou. A pasta do épico agora é .nick/docs/<novo>/
+(antes era .nick/docs/<antigo>/): use o caminho novo para o plano e os artefatos.`. Um estrutural
+(`the_notice_of_the_new_id_of_an_epic_is_only_in_bash`, com controle positivo) proíbe o texto em
+`nick/src/`. No Rust, o `Launch::Resume` troca o `ticket_key` por `holder_key: HolderKey`
+(`Ticket(&str) | Epic(&str)`), e o `args` gera `--ticket-id` ou `--epic-id`. O `Uso:` cita os dois
+(`(--ticket-id <id> | --epic-id <id>)`), e a mensagem de "nenhum argumento" também.
+
+**Desenho** (`ui.rs`): o nó do épico é `<ID>  [épico]  <título>  [provisório]  [oculto]`, com o
+`[épico]` em negrito (sem cor nova) logo depois do ID, para caber nas 34 colunas da profundidade 2
+com um ID de 8 caracteres; oculto, apagado. O painel do épico mostra `Épico <ID> — <título>`, as
+marcas, `Pasta:`, o plano (`(existe)`/`(não existe)`), `Tickets: N (M ocultos)` e `Agentes do
+épico: só PO e Tech Leader.`, sem etapa, histórico nem `m`. O painel do ticket ganhou `Épico: <EID>
+— <título>` quando o ticket tem épico. Na profundidade 4 sobram 26 colunas, e o `Tech Leader  ●
+saída nova` (25) cabe inteiro (teste); a data é cortada antes. O `Place` ganhou `Epic`, e o
+`HELP_STATES` foi de 29 para 33 estados. Rodapés:
+- projeto: `↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · n novo épico · r remover`;
+- épico: `... · a novo ticket · e editar título · o ocultar/restaurar · g abrir agente · i editar ID`;
+- ticket, **encurtado de propósito** para caber o `p`: `... · g abrir agente · m etapa · i ID · p
+  épico`.
+
+**Nenhum rodapé mudou a altura reservada** (P1 do review do NS-34): os `SIZE 23 58`/`SIZE 34 78` do
+`a_resize_reaches_claude_below_the_header` e o teste do tamanho em cinco larguras passaram sem
+mudar números.
+
+**Remoção de projeto:** a confirmação ganhou, numa frase própria e só quando há épicos, `O épico
+dele será apagado do banco.` ou `Os <N> épicos dele (inclusive os ocultos) serão apagados do
+banco.` (decisão do usuário na execução: frase própria, que funciona também sem tickets). Sem
+épicos, o texto de antes. Os épicos saem com o projeto (`ON DELETE CASCADE`).
+
+**Ajustes do review do NS-40** (cada um com teste que falha sem a correção, provado na cópia):
+- **P2.1, handlers compartilhados** (a condição do plano para os diálogos irmãos): o título e o
+  ID do ticket e do épico usam um handler só (`App::key_text_field`, com o Enter e a reabertura
+  por parâmetro), a confirmação do ID também (`App::confirm_edit_id`, com o `tickets::edit_id` ou
+  o `epics::edit_id`), e a recusa do projeto indisponível do `i` virou `App::edit_id_refusal`. No
+  `ui.rs`, `title_lines`, `id_lines` e `confirm_id_lines` desenham os dois, com o substantivo por
+  parâmetro. Ficaram os diálogos irmãos (`EditEpicTitle`, `EditEpicId`, `ConfirmEditEpicId`), e não
+  um alvo no diálogo, porque assim os testes de ticket que comparam `Dialog::EditTitle`/`EditId`
+  não mudam (passaram sem diff). O `o` do ticket e o do épico não foram unidos: só a linha do
+  restaurar se parece, e o ocultar do épico tem a contagem e outro diálogo;
+- **P3.1:** `tickets::create_in` e `create_with` chamam um corpo só (`create_in_with`);
+- **P3.2:** o plural do `(1 ticket)` da confirmação de ocultar e do `(1 oculto)` do painel do
+  épico (`ui::count_of`). O `Tickets: N (M ocultos)` do painel do projeto (NS-38) não mudou;
+- **P3.3:** o `hide_epic` que perde a corrida nas duas tentativas sem nenhum ativo para contar
+  devolve `EpicHide::Changed`, com `O épico <ID> mudou enquanto era ocultado. Tente de novo.`, e
+  não mais "1 agente ativo" (o teste provoca isso com um trigger de teste `RAISE(IGNORE)`);
+- **P3.4:** o `set_ticket_epic` só põe um ticket num épico **visível** (`AND hidden_at IS NULL`):
+  com a lista do `p` aberta, outro nick pode ter ocultado o épico, e o ticket (talvez com agente
+  ativo) cairia num ramo oculto, furando a regra que o `hide_epic` garante. O `move_ticket` relê o
+  épico e diz `O épico <ID> está oculto.`. Tirar de um épico oculto continua livre;
+- **P3.5:** o `n` da conversa perdida lê o `hidden_refusal` uma vez só.
+
+**Testes adaptados, com o motivo** (o mapa teste a teste está em `.nick/docs/NS-40/mapa_testes.md`):
+os de banco que citavam a versão 6 (7 migrações, o texto da 7, "mais novo" com 8); os de migração
+antiga v4 → v5 e v5 → v6, que passaram a gravar e ler os tickets e agentes por SQL cru (o
+`TICKET_COLUMNS` e o `AGENT_COLUMNS` têm as colunas da 7), e o v5 → v6 abre só com as migrações 1
+a 6; a construção de `insert_ticket` (`, None`), `insert_agent`/`count_active_agents`/
+`agents::open` (`Owner::Ticket(..)`), dos literais de `Ticket`/`Agent`/`LiveAgent`/`TreeData`, dos
+diálogos e ações com `holder` (`(&ticket).into()`) e do `ConfirmRemove` (`epics: 0`); as asserções
+`agent.ticket_id == t` viraram `agent.owner == Owner::Ticket(t)` (o mesmo fato); o
+`find_ticket_key` virou `find_key`; os rodapés do projeto e do ticket (`n novo épico`, `m etapa ·
+i ID · p épico`) e as esperas do PTY por `m mudar etapa` (agora `p épico`); e o `Uso:` do
+`test_nick_agent.sh`.
+
+**Testes novos:** `db` (migração v6 → v7 com dados, os `CHECK`, o cascade, os triggers nos dois
+sentidos e entre projetos, `is_trigger_abort` e cada método novo), `epics` (criar, unicidade nos
+dois sentidos e a corrida pelo trigger, ocultar/restaurar, "Editar ID", mover com retrato),
+`agents` (o `open` de épico e o `Holder`), `stages` (`epic_menu` em cada combinação de flags),
+`launch` e `agent_session` (o `--epic-id`, no PTY real com o launcher real), `tree` (ordem,
+profundidades, ramo oculto, `v`, marca, `parent`, `reveal` e `reselect`), `app` (cada item do 6.6
+do plano), `ui` (nó, painéis, diálogos, rodapés e a profundidade 4), o diferencial do épico e o do
+menu exclusivo do nick (`nick/tests/stages.rs`), o `bin/tests/test_nick_agent.sh` (`--epic-id`, as
+recusas e o `resume_id_notice` dos dois tipos) e, no PTY (`nick/tests/agent.rs`), o épico de ponta
+a ponta, mover com agente vivo, ocultar o ramo, um banco v6 de verdade e os dois estruturais. As
+sabotagens, as telas e o roteiro de verificação manual ficam em `.nick/docs/NS-40/`.

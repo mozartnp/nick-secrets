@@ -318,11 +318,17 @@ render_prompt() {
   { echo; exchange_block; } >> "$log_file"
 }
 
-# resume_id_notice <old> <new>: prints the notice a resumed agent gets (NS-39, through
+# resume_id_notice <old> <new> [ticket|epic]: prints the notice a resumed agent gets (NS-39, through
 # --append-system-prompt of bin/nick-agent --resume) when the ID of its ticket changed after its
 # conversation started ("Editar ID", NS-36): the folder of the ticket is now $NICK_DOCS_DIR/<new>/.
-# Here, and not in the nick shell, because the text is prompt, and no Rust builds a prompt.
+# With epic (NS-40), the notice of an agent of an epic; the default, ticket, is the text of the
+# NS-39 byte for byte. Here, and not in the nick shell, because the text is prompt, and no Rust
+# builds a prompt.
 resume_id_notice() {
+  if [ "${3:-ticket}" = "epic" ]; then
+    echo "O ID deste épico mudou de $1 para $2 depois que esta conversa começou. A pasta do épico agora é $NICK_DOCS_DIR/$2/ (antes era $NICK_DOCS_DIR/$1/): use o caminho novo para o plano e os artefatos."
+    return 0
+  fi
   echo "O ID deste ticket mudou de $1 para $2 depois que esta conversa começou. A pasta do ticket agora é $NICK_DOCS_DIR/$2/ (antes era $NICK_DOCS_DIR/$1/): use o caminho novo para o plano, o review e os artefatos."
 }
 

@@ -175,8 +175,14 @@ impl World {
             .into_iter()
             .find(|t| t.key == key)
             .unwrap();
-        db.insert_agent(ticket.id, "po", session_id, "x", "NS-1")
-            .unwrap();
+        db.insert_agent(
+            nick::agents::Owner::Ticket(ticket.id),
+            "po",
+            session_id,
+            "x",
+            "NS-1",
+        )
+        .unwrap();
     }
 
     /// Registers `dir` in the database the binary will use, through the library.
@@ -217,6 +223,19 @@ impl World {
         let db = nick::db::Db::open(&self.db_path()).unwrap();
         let id = self.project_id(&db, dir);
         nick::tickets::create(&db, id, title, key).unwrap();
+    }
+
+    /// Stores an epic of the registered project at `dir`, through the library (NS-40), and puts
+    /// the tickets `inside` in it.
+    pub fn epic(&self, dir: &Path, key: &str, title: &str, inside: &[&str]) {
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        let id = self.project_id(&db, dir);
+        let epic = nick::epics::create(&db, id, title, key).unwrap();
+        for ticket in db.list_tickets(id, true).unwrap() {
+            if inside.contains(&ticket.key.as_str()) {
+                nick::epics::move_ticket(&db, &ticket, Some(&epic)).unwrap();
+            }
+        }
     }
 
     /// Hides the ticket `key` of the registered project at `dir`, through the library.

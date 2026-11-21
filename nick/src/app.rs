@@ -24,13 +24,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-use crate::agents::{self, Agent, AgentState, OpenAgent};
-use crate::db::{Db, SETTING_RESERVED_SHORTCUT, StageChangeRow};
+use crate::agents::{self, Agent, AgentState, Holder, OpenAgent, Owner};
+use crate::db::{Db, Epic, SETTING_RESERVED_SHORTCUT, StageChangeRow};
 use crate::docs::{self, Artifacts};
 use crate::editor::{EditorOutcome, EditorRunner};
+use crate::epics;
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
-use crate::launch::{self, AgentLauncher, Launch, Precheck, RenderRequest, Rendered};
+use crate::launch::{self, AgentLauncher, HolderKey, Launch, Precheck, RenderRequest, Rendered};
 use crate::modules::ModuleKind;
 use crate::paths::printable;
 use crate::projects::{self, Availability, Check, Project};
@@ -64,6 +65,15 @@ pub enum Button {
     Cancel,
 }
 
+/// What the dialog "Novo ticket" creates (NS-40): a ticket, in an epic or not (`a` on the node of
+/// the project or of the epic), or an epic (`n` on the node of the project). The same two fields
+/// and the same typing for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewItem {
+    Ticket { epic_id: Option<i64> },
+    Epic,
+}
+
 /// The fields of the new ticket dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketField {
@@ -85,17 +95,21 @@ pub enum Dialog {
     },
     /// The `(s/N)` confirmation of a removal, with how many tickets and agent records go with
     /// the project, and how many of its agents this nick runs (they are ended first, NS-38).
+    /// Since the NS-40 also how many epics go with it.
     ConfirmRemove {
         project: Project,
         tickets: i64,
         agents: i64,
         live: i64,
+        epics: i64,
     },
     /// A new ticket of the project `project_id` (the node where `a` opened it, review of the
     /// NS-38, P5): the title (required) and the Jira ID (optional; empty generates a
-    /// provisional one).
+    /// provisional one). Since the NS-40 `item` says whether it is a ticket (and in which epic)
+    /// or an epic.
     NewTicket {
         project_id: i64,
+        item: NewItem,
         title: String,
         jira_id: String,
         focus: TicketField,
@@ -104,11 +118,31 @@ pub enum Dialog {
     EditTitle { ticket: Ticket, input: String },
     /// The `(s/N)` confirmation of hiding a ticket.
     ConfirmHide { ticket: Ticket },
-    /// "Abrir agente": the type of the stage for the ticket of the project at `project`, among
-    /// `types` (the menu of `choose_type` with the flags of the check), `index` selected.
+    /// The title of an epic (NS-40).
+    EditEpicTitle { epic: Epic, input: String },
+    /// The `(s/N)` confirmation of hiding an epic and its branch of `tickets` tickets (NS-40).
+    ConfirmHideEpic { epic: Epic, tickets: usize },
+    /// "Editar ID" of an epic (NS-40), starting with the current one.
+    EditEpicId { epic: Epic, input: String },
+    /// The `(s/N)` confirmation of the new ID of an epic; `moves` when its folder exists now.
+    ConfirmEditEpicId {
+        epic: Epic,
+        new: String,
+        moves: bool,
+    },
+    /// "Mover ticket" (`p`, NS-40): `Sem épico` (None) and the visible epics of its project,
+    /// `index` selected.
+    MoveTicket {
+        ticket: Ticket,
+        choices: Vec<Option<Epic>>,
+        index: usize,
+    },
+    /// "Abrir agente": the type of the stage for the ticket or the epic (`holder`, NS-40) of the
+    /// project at `project`, among `types` (the menu of `choose_type` with the flags of the check;
+    /// of an epic, `StageType::epic_menu`), `index` selected.
     ChooseType {
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
         types: Vec<StageType>,
         index: usize,
@@ -116,7 +150,7 @@ pub enum Dialog {
     /// The form of `kind`: one value per field (stages.rs), `focus` the field being answered.
     StageForm {
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
         kind: StageType,
         values: Vec<String>,
@@ -130,7 +164,7 @@ pub enum Dialog {
     /// scrolled `scroll` lines down.
     ConfirmPrompt {
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
         kind: StageType,
         rendered: Rendered,
@@ -142,11 +176,11 @@ pub enum Dialog {
     ConfirmEndAgent { id: i64, name: String },
     /// The conversation of `agent` is no longer in claude (NS-39): nothing was opened. `a`
     /// archives it (the dialog is the question), `n` opens the menu of a new agent of its stage
-    /// for `ticket` with the `precheck` of the resume, Esc closes it.
+    /// for its ticket or epic (`holder`) with the `precheck` of the resume, Esc closes it.
     ConversationLost {
         project: PathBuf,
         agent: Agent,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
     },
     /// The `(s/N)` confirmation of archiving a stopped agent (`o` on its node, NS-39).
@@ -179,23 +213,23 @@ pub enum Action {
     RunInit {
         project: PathBuf,
     },
-    /// Check the launcher before the menu of the types (`g` on a ticket); the loop calls
-    /// `check_agent`.
+    /// Check the launcher before the menu of the types (`g` on a ticket or an epic); the loop
+    /// calls `check_agent`.
     CheckAgent {
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
     },
     /// Open the editor on the focused field of the form; the loop calls `edit_description`.
     EditDescription,
     /// Build the prompt of the form (its answers passed the rules); the loop calls
     /// `render_prompt`.
     RenderPrompt,
-    /// Open an agent of `kind` for `ticket`, with the cwd at `project` (the path in the
-    /// database) and the prompt of `log` (confirmed on the preview); the loop calls
+    /// Open an agent of `kind` for the ticket or the epic `holder`, with the cwd at `project` (the
+    /// path in the database) and the prompt of `log` (confirmed on the preview); the loop calls
     /// `open_agent`.
     OpenAgent {
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         kind: StageType,
         log: PathBuf,
         precheck: Precheck,
@@ -250,8 +284,8 @@ pub struct RunningAgent {
     pub name: String,
     /// The name of its project.
     pub project: String,
-    /// Where it is in the tree (NS-38): its ticket and the project of the ticket.
-    pub ticket_id: i64,
+    /// Where it is in the tree (NS-38): its ticket or epic (NS-40) and their project.
+    pub owner: Owner,
     pub project_id: i64,
     /// Whether it runs in the jail (the `jail=` of the check). Only in memory: every running
     /// agent is of this process (NS-34, not a column).
@@ -273,6 +307,17 @@ pub struct TicketDetail {
     /// The history of its stage, oldest first.
     pub changes: Vec<StageChangeRow>,
     pub artifacts: Artifacts,
+}
+
+/// The selected epic (NS-40), read again after every action, as the `TicketDetail`: the artifacts
+/// come from the disk each time; the count of its tickets from the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpicDetail {
+    pub epic: Epic,
+    pub artifacts: Artifacts,
+    /// Its tickets, the hidden ones included, and how many of them are hidden.
+    pub tickets: usize,
+    pub hidden_tickets: usize,
 }
 
 /// A project of the list with its availability, computed when the list is refreshed.
@@ -320,9 +365,13 @@ pub struct App {
     pub(crate) selected: NodeId,
     /// The tickets of every project of the module (the hidden ones too), by project id.
     pub(crate) tickets: HashMap<i64, Vec<Ticket>>,
-    /// The agents (of every stage and state) of the tickets of the open projects and of the
-    /// projects with a live agent, by ticket id.
-    pub(crate) ticket_agents: HashMap<i64, Vec<Agent>>,
+    /// The epics of every project of the module (the hidden ones too), by project id (NS-40).
+    pub(crate) epics: HashMap<i64, Vec<Epic>>,
+    /// The detail of the selected epic (NS-40).
+    pub(crate) epic_detail: Option<EpicDetail>,
+    /// The agents (of every stage and state) of the tickets and epics of the open projects and of
+    /// the projects with a live agent, by owner.
+    pub(crate) owner_agents: HashMap<Owner, Vec<Agent>>,
     /// The visible rows of the tree, computed after every change of the tree.
     pub(crate) visible: Vec<Visible>,
     /// The last agent shown (decision 2 of NS-38): where the shortcut goes from another node.
@@ -356,7 +405,9 @@ impl App {
             tree: Tree::default(),
             selected: NodeId::Module(ModuleKind::ALL[0]),
             tickets: HashMap::new(),
-            ticket_agents: HashMap::new(),
+            epics: HashMap::new(),
+            epic_detail: None,
+            owner_agents: HashMap::new(),
             visible: Vec::new(),
             last_shown: None,
         };
@@ -530,44 +581,66 @@ impl App {
             Some(Dialog::ConfirmRemove { project, .. }) => self.key_confirm_remove(key, project),
             Some(Dialog::NewTicket {
                 project_id,
+                item,
                 title,
                 jira_id,
                 focus,
-            }) => self.key_new_ticket(key, project_id, title, jira_id, focus),
+            }) => self.key_new_ticket(key, project_id, item, title, jira_id, focus),
             Some(Dialog::EditTitle { ticket, input }) => self.key_edit_title(key, ticket, input),
             Some(Dialog::ConfirmHide { ticket }) => self.key_confirm_hide(key, ticket),
+            Some(Dialog::EditEpicTitle { epic, input }) => {
+                self.key_edit_epic_title(key, epic, input)
+            }
+            Some(Dialog::ConfirmHideEpic { epic, .. }) => {
+                // Only s/S confirm; the conditioned UPDATE runs again (decision 8 of NS-40).
+                if is_yes(key) {
+                    self.status = Some(match epics::hide(&self.db, &epic) {
+                        Ok(message) | Err(message) => message,
+                    });
+                }
+                Action::None
+            }
+            Some(Dialog::EditEpicId { epic, input }) => self.key_edit_epic_id(key, epic, input),
+            Some(Dialog::ConfirmEditEpicId { epic, new, .. }) => {
+                self.confirm_edit_id(key, &epic, epic.project_id, &new, epics::edit_id)
+            }
+            Some(Dialog::MoveTicket {
+                ticket,
+                choices,
+                index,
+            }) => self.key_move_ticket(key, ticket, choices, index),
             Some(Dialog::ChooseType {
                 project,
-                ticket,
+                holder,
                 precheck,
                 types,
                 index,
-            }) => self.key_choose_type(key, project, ticket, precheck, types, index),
+            }) => self.key_choose_type(key, project, holder, precheck, types, index),
             Some(Dialog::StageForm {
                 project,
-                ticket,
+                holder,
                 precheck,
                 kind,
                 values,
                 focus,
                 ..
-            }) => self.key_stage_form(key, project, ticket, precheck, kind, values, focus),
+            }) => self.key_stage_form(key, project, holder, precheck, kind, values, focus),
             Some(Dialog::ConfirmPrompt {
                 project,
-                ticket,
+                holder,
                 precheck,
                 kind,
                 rendered,
                 scroll,
-            }) => self.key_confirm_prompt(key, project, ticket, precheck, kind, rendered, scroll),
+            }) => self.key_confirm_prompt(key, project, holder, precheck, kind, rendered, scroll),
             Some(Dialog::AgentError { message }) => self.key_agent_error(key, message),
             Some(Dialog::ConfirmEndAgent { id, .. }) => confirmed(key, Action::EndAgent(id)),
             Some(Dialog::ConversationLost {
                 project,
                 agent,
-                ticket,
+                holder,
                 precheck,
-            }) => self.key_conversation_lost(key, project, agent, ticket, precheck),
+            }) => self.key_conversation_lost(key, project, agent, holder, precheck),
             Some(Dialog::ConfirmArchive { agent }) => {
                 // Only s/S confirm; any other key cancels.
                 if is_yes(key) {
@@ -654,8 +727,9 @@ impl App {
             .iter()
             .map(|agent| LiveAgent {
                 id: agent.id,
-                ticket_id: agent.ticket_id,
+                owner: agent.owner,
                 project_id: agent.project_id,
+                epic_id: self.epic_of_owner(agent.owner),
                 unseen: agent.unseen,
             })
             .collect()
@@ -666,7 +740,8 @@ impl App {
             module: self.module(),
             projects: &self.rows,
             tickets: &self.tickets,
-            agents: &self.ticket_agents,
+            epics: &self.epics,
+            agents: &self.owner_agents,
             live,
         }
     }
@@ -704,9 +779,44 @@ impl App {
             .find(|ticket| ticket.id == id)
     }
 
-    /// The record of the agent `id` (of every state), when its ticket's agents were read.
+    /// The epics of the project `id` (the hidden ones too).
+    pub fn project_epics(&self, id: i64) -> &[Epic] {
+        self.epics.get(&id).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The epic `id`, of any project.
+    pub fn epic(&self, id: i64) -> Option<&Epic> {
+        self.epics.values().flatten().find(|epic| epic.id == id)
+    }
+
+    /// The epic of the branch of `owner` (NS-40): the epic itself, or the epic of the ticket.
+    pub fn epic_of_owner(&self, owner: Owner) -> Option<i64> {
+        match owner {
+            Owner::Epic(id) => Some(id),
+            Owner::Ticket(id) => self.ticket(id).and_then(|ticket| ticket.epic_id),
+        }
+    }
+
+    /// The tickets of the epic `id` (the hidden ones too).
+    pub fn epic_tickets(&self, id: i64) -> Vec<&Ticket> {
+        self.tickets
+            .values()
+            .flatten()
+            .filter(|ticket| ticket.epic_id == Some(id))
+            .collect()
+    }
+
+    /// The project of the ticket or epic `owner`.
+    fn project_id_of_owner(&self, owner: Owner) -> Option<i64> {
+        match owner {
+            Owner::Ticket(id) => self.ticket(id).map(|ticket| ticket.project_id),
+            Owner::Epic(id) => self.epic(id).map(|epic| epic.project_id),
+        }
+    }
+
+    /// The record of the agent `id` (of every state), when its owner's agents were read.
     pub fn agent_record(&self, id: i64) -> Option<&Agent> {
-        self.ticket_agents
+        self.owner_agents
             .values()
             .flatten()
             .find(|agent| agent.id == id)
@@ -722,13 +832,14 @@ impl App {
         let project = match self.selected {
             NodeId::Module(_) => return None,
             NodeId::Project(id) => id,
+            NodeId::Epic(id) => self.epic(id)?.project_id,
             NodeId::Ticket(id) => self.ticket(id)?.project_id,
             NodeId::Agent(id) => {
-                let ticket = match self.agent(id) {
-                    Some(agent) => agent.ticket_id,
-                    None => self.agent_record(id)?.ticket_id,
+                let owner = match self.agent(id) {
+                    Some(agent) => agent.owner,
+                    None => self.agent_record(id)?.owner,
                 };
-                self.ticket(ticket)?.project_id
+                self.project_id_of_owner(owner)?
             }
         };
         self.project_row(project).map(|row| &row.project)
@@ -737,6 +848,11 @@ impl App {
     /// The project of `ticket`, from the list of the module.
     fn project_of(&self, ticket: &Ticket) -> Option<&Project> {
         self.project_row(ticket.project_id).map(|row| &row.project)
+    }
+
+    /// The project of the ticket or the epic `holder` (NS-40).
+    fn project_of_holder(&self, holder: &Holder) -> Option<&Project> {
+        self.project_row(holder.project_id).map(|row| &row.project)
     }
 
     /// Computes the visible rows again (after the tree or its data changed).
@@ -793,24 +909,35 @@ impl App {
             self.tree.close(NodeId::Project(id));
         }
         let mut tickets = HashMap::new();
+        let mut epics = HashMap::new();
         let mut agents = HashMap::new();
         let mut error = None;
         for row in &self.rows {
             let id = row.project.id;
+            // One query of epics per project, as the tickets (P2 of the review of the NS-38).
+            match self.db.list_epics(id, true) {
+                Ok(list) => {
+                    epics.insert(id, list);
+                }
+                Err(err) => error = Some(err),
+            }
             match self.db.list_tickets(id, true) {
                 Ok(list) => {
                     // One query per open project (or with a live agent), not one per ticket:
                     // this runs after every key (review of the NS-38, P2). Ordered by id, so
-                    // each ticket keeps its agents in the order they were opened.
+                    // each ticket and epic keeps its agents in the order they were opened.
                     if self.tree.is_open(NodeId::Project(id)) || live_projects.contains(&id) {
                         match self.db.list_project_agents(id) {
                             Ok(found) => {
                                 for ticket in &list {
-                                    agents.insert(ticket.id, Vec::new());
+                                    agents.insert(Owner::Ticket(ticket.id), Vec::new());
+                                }
+                                for epic in epics.get(&id).map_or(&[][..], Vec::as_slice) {
+                                    agents.insert(Owner::Epic(epic.id), Vec::new());
                                 }
                                 for agent in found {
                                     agents
-                                        .entry(agent.ticket_id)
+                                        .entry(agent.owner)
                                         .or_insert_with(Vec::new)
                                         .push(agent);
                                 }
@@ -833,8 +960,16 @@ impl App {
         {
             self.status = Some(tickets::gone_message(old));
         }
+        // The selected epic gone from the database: say so too (NS-40).
+        if let NodeId::Epic(id) = self.selected
+            && let Some(old) = self.epic(id)
+            && !epics.values().flatten().any(|e: &Epic| e.id == id)
+        {
+            self.status = Some(epics::gone_message(old));
+        }
         self.tickets = tickets;
-        self.ticket_agents = agents;
+        self.epics = epics;
+        self.owner_agents = agents;
         let before = std::mem::take(&mut self.visible);
         self.relayout();
         let selected = Tree::reselect(&before, &self.visible, self.selected);
@@ -842,6 +977,38 @@ impl App {
             self.select(selected);
         }
         self.read_ticket_detail();
+        self.read_epic_detail();
+    }
+
+    /// The detail of the selected epic (NS-40): the row from the database, its artifacts from the
+    /// disk, and the count of its tickets from the tree; None on another node.
+    fn read_epic_detail(&mut self) {
+        let NodeId::Epic(id) = self.selected else {
+            self.epic_detail = None;
+            return;
+        };
+        let Some(path) = self
+            .epic(id)
+            .and_then(|epic| self.project_row(epic.project_id))
+            .map(|row| row.project.path.clone())
+        else {
+            self.epic_detail = None;
+            return;
+        };
+        match self.db.get_epic(id) {
+            Ok(Some(epic)) => {
+                let tickets = self.epic_tickets(id);
+                let hidden_tickets = tickets.iter().filter(|t| t.hidden_at.is_some()).count();
+                self.epic_detail = Some(EpicDetail {
+                    artifacts: docs::artifacts(&path, &epic.key),
+                    tickets: tickets.len(),
+                    hidden_tickets,
+                    epic,
+                });
+            }
+            Ok(None) => self.epic_detail = None,
+            Err(err) => self.status = Some(projects::db_error_message(&err)),
+        }
     }
 
     /// The detail of the selected ticket (its history from the database, its artifacts from
@@ -1004,12 +1171,16 @@ impl App {
                 self.status = None;
             }
             (NodeId::Project(project_id), KeyCode::Char('a')) => {
-                self.dialog = Some(Dialog::NewTicket {
-                    project_id,
-                    title: String::new(),
-                    jira_id: String::new(),
-                    focus: TicketField::Title,
-                });
+                self.new_item(project_id, NewItem::Ticket { epic_id: None });
+            }
+            (NodeId::Project(project_id), KeyCode::Char('n')) => {
+                self.new_item(project_id, NewItem::Epic);
+            }
+            (NodeId::Epic(id), code) => {
+                let Some(epic) = self.epic(id).cloned() else {
+                    return Action::None;
+                };
+                return self.key_epic_node(code, epic);
             }
             (NodeId::Project(id), KeyCode::Char('r')) => {
                 if let Some(project) = self.project_row(id).map(|row| row.project.clone()) {
@@ -1085,9 +1256,9 @@ impl App {
             return Action::None;
         }
         let Some(project) = self
-            .ticket(agent.ticket_id)
-            .and_then(|ticket| self.project_of(ticket))
-            .cloned()
+            .project_id_of_owner(agent.owner)
+            .and_then(|id| self.project_row(id))
+            .map(|row| row.project.clone())
         else {
             return Action::None;
         };
@@ -1147,7 +1318,8 @@ impl App {
                     self.dialog = Some(Dialog::ConfirmHide { ticket });
                 }
             }
-            KeyCode::Char('g') => return self.choose_stage(Some(ticket)),
+            KeyCode::Char('g') => return self.choose_stage(Some((&ticket).into())),
+            KeyCode::Char('p') => self.ask_move(ticket),
             KeyCode::Char('m') => {
                 let index = TicketStage::ALL
                     .iter()
@@ -1157,16 +1329,8 @@ impl App {
                 self.dialog = Some(Dialog::ChooseTicketStage { ticket, index });
             }
             KeyCode::Char('i') => {
-                let mark = self.project_of(&ticket).and_then(|project| {
-                    projects::unavailable_text(projects::availability(&project.path))
-                });
-                if let Some(mark) = mark {
-                    self.status = Some(format!(
-                        "Projeto indisponível: {mark}. O ID só é editado com a pasta e o \
-                         .nick/nick.conf no lugar."
-                    ));
-                } else {
-                    self.status = None;
+                self.status = self.edit_id_refusal(ticket.project_id);
+                if self.status.is_none() {
                     self.dialog = Some(Dialog::EditId {
                         input: ticket.key.clone(),
                         ticket,
@@ -1176,6 +1340,270 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// Opens the dialog "Novo ticket" of the project for `item` (a ticket, in an epic or not, or
+    /// an epic: NS-40).
+    fn new_item(&mut self, project_id: i64, item: NewItem) {
+        self.dialog = Some(Dialog::NewTicket {
+            project_id,
+            item,
+            title: String::new(),
+            jira_id: String::new(),
+            focus: TicketField::Title,
+        });
+    }
+
+    /// The keys of the node of an epic (NS-40): `a` a ticket in it (not in a hidden one), `e` the
+    /// title, `o` hide its branch (asking, and refused with an active agent in it) or restore it,
+    /// `g` an agent of PO or Tech Leader, `i` the ID. No `m`, `p` nor `r`: an epic has no stage.
+    fn key_epic_node(&mut self, code: KeyCode, epic: Epic) -> Action {
+        match code {
+            KeyCode::Char('a') => {
+                if epic.hidden_at.is_some() {
+                    self.status = Some(format!(
+                        "O épico {} está oculto. Restaure-o (o) para criar um ticket.",
+                        epic.key
+                    ));
+                } else {
+                    self.status = None;
+                    self.new_item(
+                        epic.project_id,
+                        NewItem::Ticket {
+                            epic_id: Some(epic.id),
+                        },
+                    );
+                }
+            }
+            KeyCode::Char('e') => {
+                self.dialog = Some(Dialog::EditEpicTitle {
+                    input: epic.title.clone(),
+                    epic,
+                });
+            }
+            KeyCode::Char('o') => {
+                if epic.hidden_at.is_some() {
+                    // Restoring hides nothing and is undone with `o`: no confirmation.
+                    self.status = Some(match epics::restore(&self.db, &epic) {
+                        Ok(message) | Err(message) => message,
+                    });
+                    return Action::None;
+                }
+                // The refusal with the count right at the key, with no dialog; the confirmation
+                // runs the conditioned UPDATE again.
+                match self.db.count_active_agents_of_epic_branch(epic.id) {
+                    Ok(0) => {
+                        self.status = None;
+                        let tickets = self.epic_tickets(epic.id).len();
+                        self.dialog = Some(Dialog::ConfirmHideEpic { epic, tickets });
+                    }
+                    Ok(active) => self.status = Some(epics::active_message(&epic, active)),
+                    Err(err) => self.status = Some(projects::db_error_message(&err)),
+                }
+            }
+            KeyCode::Char('g') => return self.choose_stage(Some((&epic).into())),
+            KeyCode::Char('i') => {
+                self.status = self.edit_id_refusal(epic.project_id);
+                if self.status.is_none() {
+                    self.dialog = Some(Dialog::EditEpicId {
+                        input: epic.key.clone(),
+                        epic,
+                    });
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// `p` on a ticket (NS-40): the list `Sem épico` and the visible epics of its project, the
+    /// current place selected; without any epic to offer, why.
+    fn ask_move(&mut self, ticket: Ticket) {
+        let visible: Vec<Epic> = self
+            .project_epics(ticket.project_id)
+            .iter()
+            .filter(|epic| epic.hidden_at.is_none())
+            .cloned()
+            .collect();
+        if visible.is_empty() && ticket.epic_id.is_none() {
+            self.status = Some("O projeto não tem épicos. Crie um com n no nó do projeto.".into());
+            return;
+        }
+        let mut choices = vec![None];
+        choices.extend(visible.into_iter().map(Some));
+        let index = choices
+            .iter()
+            .position(|choice| choice.as_ref().map(|e| e.id) == ticket.epic_id)
+            .unwrap_or(0);
+        self.status = None;
+        self.dialog = Some(Dialog::MoveTicket {
+            ticket,
+            choices,
+            index,
+        });
+    }
+
+    /// The list of "Mover ticket": Enter moves to the selected place (no `(s/N)`: moving is undone
+    /// the same way and touches no file); the current place is refused with the list open.
+    fn key_move_ticket(
+        &mut self,
+        key: KeyEvent,
+        ticket: Ticket,
+        choices: Vec<Option<Epic>>,
+        mut index: usize,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                index = (index + 1).min(choices.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let to = choices.get(index).cloned().flatten();
+                match epics::move_ticket(&self.db, &ticket, to.as_ref()) {
+                    Ok(message) => {
+                        self.status = Some(message);
+                        // The ticket stays selected, in its new place.
+                        if let Some(epic) = &to {
+                            self.tree.open(NodeId::Epic(epic.id));
+                        }
+                        return Action::None;
+                    }
+                    Err(message) => self.status = Some(message),
+                }
+            }
+            _ => {}
+        }
+        self.dialog = Some(Dialog::MoveTicket {
+            ticket,
+            choices,
+            index,
+        });
+        Action::None
+    }
+
+    fn key_edit_epic_title(&mut self, key: KeyEvent, epic: Epic, input: String) -> Action {
+        self.key_text_field(
+            key,
+            epic,
+            input,
+            |app, epic, input| {
+                app.status = Some(epics::rename(&app.db, epic, input)?);
+                Ok(None)
+            },
+            |epic, input| Dialog::EditEpicTitle { epic, input },
+        )
+    }
+
+    /// The field of the new ID of an epic: the rules of `key_edit_id`, the same handler.
+    fn key_edit_epic_id(&mut self, key: KeyEvent, epic: Epic, input: String) -> Action {
+        self.key_text_field(
+            key,
+            epic,
+            input,
+            |app, epic, input| {
+                let new = epics::check_new_id(&app.db, epic, input)?;
+                app.status = None;
+                Ok(Some(Dialog::ConfirmEditEpicId {
+                    moves: app.has_docs(epic.project_id, &epic.key),
+                    epic: epic.clone(),
+                    new,
+                }))
+            },
+            |epic, input| Dialog::EditEpicId { epic, input },
+        )
+    }
+
+    /// The one-line field of the dialogs of a title and of an ID, of a ticket or of an epic
+    /// (review of the NS-40, P2.1: one handler for both): Esc closes it, Enter runs `enter` (Ok:
+    /// the dialog that follows, or none; Err: the refusal on the bar with the field open), and
+    /// any other key types in it (`reopen` puts the dialog back with the text).
+    fn key_text_field<T>(
+        &mut self,
+        key: KeyEvent,
+        item: T,
+        mut input: String,
+        enter: fn(&mut App, &T, &str) -> Result<Option<Dialog>, String>,
+        reopen: fn(T, String) -> Dialog,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.status = None;
+                return Action::None;
+            }
+            KeyCode::Enter => match enter(self, &item, &input) {
+                Ok(next) => {
+                    self.dialog = next;
+                    return Action::None;
+                }
+                Err(message) => self.status = Some(message),
+            },
+            _ => {
+                edit_text(&mut input, key);
+            }
+        }
+        self.dialog = Some(reopen(item, input));
+        Action::None
+    }
+
+    /// Only s/S apply the new ID of a ticket or of an epic (`edit` runs every check again: the
+    /// state may have changed); any other key cancels, renaming nothing.
+    fn confirm_edit_id<T>(
+        &mut self,
+        key: KeyEvent,
+        item: &T,
+        project_id: i64,
+        new: &str,
+        edit: fn(&Db, &Path, &T, &str) -> Result<String, String>,
+    ) -> Action {
+        if is_yes(key)
+            && let Some(row) = self.project_row(project_id)
+        {
+            let path = row.project.path.clone();
+            self.status = Some(match edit(&self.db, &path, item, new) {
+                Ok(message) | Err(message) => message,
+            });
+        }
+        Action::None
+    }
+
+    /// The refusal of "Editar ID" (`i`) of a ticket or an epic when its project is unavailable
+    /// now (read from the disk at the key); None when the ID can be edited.
+    fn edit_id_refusal(&self, project_id: i64) -> Option<String> {
+        let row = self.project_row(project_id)?;
+        let mark = projects::unavailable_text(projects::availability(&row.project.path))?;
+        Some(format!(
+            "Projeto indisponível: {mark}. O ID só é editado com a pasta e o .nick/nick.conf no \
+             lugar."
+        ))
+    }
+
+    /// Whether `.nick/docs/<key>/` exists now in the project `project_id`.
+    fn has_docs(&self, project_id: i64, key: &str) -> bool {
+        self.project_row(project_id)
+            .is_some_and(|row| docs::has_dir(&row.project.path, key))
+    }
+
+    /// The refusal of a new agent of `holder` (`g`, or `n` on a lost conversation) when it is
+    /// hidden, or is a ticket of a hidden epic (decision 9 of NS-40); None when it can have one.
+    fn hidden_refusal(&self, holder: &Holder) -> Option<String> {
+        if holder.hidden {
+            return Some(format!(
+                "O {} {} está oculto. Restaure-o (o) para abrir um agente.",
+                holder.noun(),
+                holder.key
+            ));
+        }
+        let Owner::Ticket(id) = holder.owner else {
+            return None;
+        };
+        let epic = self.ticket(id)?.epic_id.and_then(|epic| self.epic(epic))?;
+        epic.hidden_at
+            .is_some()
+            .then(|| epics::hidden_message(epic))
     }
 
     /// Shows the agent `id` on the right: being shown counts as seen, so its mark goes. The
@@ -1297,6 +1725,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project_id: i64,
+        item: NewItem,
         mut title: String,
         mut jira_id: String,
         mut focus: TicketField,
@@ -1310,14 +1739,31 @@ impl App {
                 // The project where `a` opened the dialog, not the selection now (a refresh by
                 // the end of an agent may have moved it). One gone from the database fails in
                 // `create`, which says why, with the dialog open.
-                match tickets::create(&self.db, project_id, &title, &jira_id) {
-                    Ok(ticket) => {
-                        self.status = Some(tickets::created_message(&ticket));
-                        // Select the new ticket, its branch open: the refresh after the dialog
+                let created = match item {
+                    NewItem::Ticket { epic_id } => tickets::create_in(
+                        &self.db, project_id, epic_id, &title, &jira_id,
+                    )
+                    .map(|ticket| {
+                        (
+                            tickets::created_message(&ticket),
+                            NodeId::Ticket(ticket.id),
+                            epic_id,
+                        )
+                    }),
+                    NewItem::Epic => epics::create(&self.db, project_id, &title, &jira_id)
+                        .map(|epic| (epics::created_message(&epic), NodeId::Epic(epic.id), None)),
+                };
+                match created {
+                    Ok((message, node, epic_id)) => {
+                        self.status = Some(message);
+                        // Select the new node, its branch open: the refresh after the dialog
                         // closes reads it.
                         self.tree.open(NodeId::Module(self.module()));
                         self.tree.open(NodeId::Project(project_id));
-                        self.selected = NodeId::Ticket(ticket.id);
+                        if let Some(epic) = epic_id {
+                            self.tree.open(NodeId::Epic(epic));
+                        }
+                        self.selected = node;
                         return Action::None;
                     }
                     Err(message) => self.status = Some(message),
@@ -1339,6 +1785,7 @@ impl App {
         }
         self.dialog = Some(Dialog::NewTicket {
             project_id,
+            item,
             title,
             jira_id,
             focus,
@@ -1346,25 +1793,17 @@ impl App {
         Action::None
     }
 
-    fn key_edit_title(&mut self, key: KeyEvent, ticket: Ticket, mut input: String) -> Action {
-        match key.code {
-            KeyCode::Esc => {
-                self.status = None;
-                return Action::None;
-            }
-            KeyCode::Enter => match tickets::rename(&self.db, &ticket, &input) {
-                Ok(message) => {
-                    self.status = Some(message);
-                    return Action::None;
-                }
-                Err(message) => self.status = Some(message),
+    fn key_edit_title(&mut self, key: KeyEvent, ticket: Ticket, input: String) -> Action {
+        self.key_text_field(
+            key,
+            ticket,
+            input,
+            |app, ticket, input| {
+                app.status = Some(tickets::rename(&app.db, ticket, input)?);
+                Ok(None)
             },
-            _ => {
-                edit_text(&mut input, key);
-            }
-        }
-        self.dialog = Some(Dialog::EditTitle { ticket, input });
-        Action::None
+            |ticket, input| Dialog::EditTitle { ticket, input },
+        )
     }
 
     fn key_confirm_hide(&mut self, key: KeyEvent, ticket: Ticket) -> Action {
@@ -1377,21 +1816,34 @@ impl App {
         Action::None
     }
 
-    /// `g` on the node of a ticket (NS-38; before, on the lists and the ticket screen): the check
-    /// of the launcher (`Action::CheckAgent`), then the menu, only for a visible ticket of a
-    /// project available now (read from the disk at the key, like the Enter on a project).
-    fn choose_stage(&mut self, ticket: Option<Ticket>) -> Action {
-        let Some(ticket) = ticket else {
+    /// `g` on the node of a ticket or of an epic (NS-38, NS-40): the check of the launcher
+    /// (`Action::CheckAgent`), then the menu, only for a visible ticket or epic (and not a ticket
+    /// of a hidden epic) of a project available now (read from the disk at the key, like the
+    /// Enter on a project). An epic is read again first: another nick may have hidden it.
+    fn choose_stage(&mut self, holder: Option<Holder>) -> Action {
+        let Some(mut holder) = holder else {
             return Action::None;
         };
-        if ticket.hidden_at.is_some() {
-            self.status = Some(format!(
-                "O ticket {} está oculto. Restaure-o (o) para abrir um agente.",
-                ticket.key
-            ));
+        if let Owner::Epic(id) = holder.owner {
+            match self.db.get_epic(id) {
+                Ok(Some(epic)) => holder = (&epic).into(),
+                Ok(None) => {
+                    if let Some(epic) = self.epic(id) {
+                        self.status = Some(epics::gone_message(epic));
+                    }
+                    return Action::None;
+                }
+                Err(err) => {
+                    self.status = Some(projects::db_error_message(&err));
+                    return Action::None;
+                }
+            }
+        }
+        if let Some(refusal) = self.hidden_refusal(&holder) {
+            self.status = Some(refusal);
             return Action::None;
         }
-        let Some(project) = self.project_of(&ticket) else {
+        let Some(project) = self.project_of_holder(&holder) else {
             return Action::None;
         };
         if let Some(mark) = projects::unavailable_text(projects::availability(&project.path)) {
@@ -1403,18 +1855,18 @@ impl App {
         }
         Action::CheckAgent {
             project: project.path.clone(),
-            ticket,
+            holder,
         }
     }
 
     /// The check before the menu (plan D7 of NS-35): the launcher must be a file, and its
     /// `--check` must pass (a failure becomes the alert, with `Nada foi aberto.` on top, and
     /// nothing is stored nor launched). Then the menu of the types the flags of the project offer
-    /// (`StageType::menu`).
+    /// (`StageType::menu`; of an epic, only PO and Tech Leader: `StageType::epic_menu`, NS-40).
     pub fn check_agent(
         &mut self,
         project: &Path,
-        ticket: &Ticket,
+        holder: &Holder,
         launcher: &mut dyn AgentLauncher,
     ) {
         if !self.launcher_found() {
@@ -1422,10 +1874,14 @@ impl App {
         }
         match launcher.check(&self.launcher, project) {
             Ok(precheck) => {
+                let types = match holder.owner {
+                    Owner::Ticket(_) => StageType::menu(precheck.jira, precheck.sentry),
+                    Owner::Epic(_) => StageType::epic_menu(precheck.jira, precheck.sentry),
+                };
                 self.dialog = Some(Dialog::ChooseType {
                     project: project.to_path_buf(),
-                    ticket: ticket.clone(),
-                    types: StageType::menu(precheck.jira, precheck.sentry),
+                    holder: holder.clone(),
+                    types,
                     precheck,
                     index: 0,
                 });
@@ -1470,11 +1926,11 @@ impl App {
             Err(message) => self.agent_failed(&message),
             Ok(true) => self.resume_agent(project, agent, precheck, launcher),
             Ok(false) => {
-                if let Some(ticket) = self.ticket_of_agent(agent) {
+                if let Some(holder) = self.holder_of_agent(agent) {
                     self.dialog = Some(Dialog::ConversationLost {
                         project: project.to_path_buf(),
                         agent: agent.clone(),
-                        ticket,
+                        holder,
                         precheck,
                     });
                 }
@@ -1488,11 +1944,15 @@ impl App {
         }
     }
 
-    /// The ticket of `agent`, read from the database now; when it is gone (or the database
-    /// fails), the status bar says why and there is none.
-    fn ticket_of_agent(&mut self, agent: &Agent) -> Option<Ticket> {
-        match self.db.get_ticket(agent.ticket_id) {
-            Ok(Some(ticket)) => Some(ticket),
+    /// The ticket or the epic of `agent` (NS-40: by its owner), read from the database now; when
+    /// it is gone (or the database fails), the status bar says why and there is none.
+    fn holder_of_agent(&mut self, agent: &Agent) -> Option<Holder> {
+        let read = match agent.owner {
+            Owner::Ticket(id) => self.db.get_ticket(id).map(|t| t.as_ref().map(Holder::from)),
+            Owner::Epic(id) => self.db.get_epic(id).map(|e| e.as_ref().map(Holder::from)),
+        };
+        match read {
+            Ok(Some(holder)) => Some(holder),
             Ok(None) => {
                 self.status = Some(format!("O agente {} não existe mais no banco.", agent.name));
                 None
@@ -1527,7 +1987,7 @@ impl App {
             ));
             return;
         };
-        let Some(ticket) = self.ticket_of_agent(agent) else {
+        let Some(holder) = self.holder_of_agent(agent) else {
             return;
         };
         let Some(agents_dir) = self.agents_dir.as_deref() else {
@@ -1545,7 +2005,10 @@ impl App {
         let launch = Launch::Resume {
             stage,
             opened_key: opened.as_deref(),
-            ticket_key: &ticket.key,
+            holder_key: match holder.owner {
+                Owner::Ticket(_) => HolderKey::Ticket(&holder.key),
+                Owner::Epic(_) => HolderKey::Epic(&holder.key),
+            },
         };
         let id = record.agent.id;
         let name = record.agent.name.clone();
@@ -1558,12 +2021,12 @@ impl App {
             self.status = Some(message);
             return;
         }
-        self.start_running(record, name.clone(), &ticket, check);
+        self.start_running(record, name.clone(), &holder, check);
         let mut message = format!("O agente {name} foi retomado.");
-        if opened.as_deref().is_some_and(|key| key != ticket.key) {
+        if opened.as_deref().is_some_and(|key| key != holder.key) {
             message.push_str(&format!(
                 " Ele foi avisado de que a pasta agora é {}.",
-                docs::dir_text(&ticket.key)
+                docs::dir_text(&holder.key)
             ));
         }
         self.status = Some(message);
@@ -1571,14 +2034,14 @@ impl App {
 
     /// The keys of the warning of a lost conversation (NS-39): `a` archives (no second
     /// question), `n` opens the menu "Abrir agente" of the types of the stage of the agent that
-    /// the flags offer, with the precheck of the resume (no second `--check`; a hidden ticket is
-    /// refused as by `g`), Esc closes writing nothing; any other key keeps it.
+    /// the flags offer, with the precheck of the resume (no second `--check`; a hidden ticket or
+    /// epic is refused as by `g`), Esc closes writing nothing; any other key keeps it.
     fn key_conversation_lost(
         &mut self,
         key: KeyEvent,
         project: PathBuf,
         agent: Agent,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
     ) -> Action {
         match key.code {
@@ -1588,11 +2051,8 @@ impl App {
                     Ok(message) | Err(message) => message,
                 });
             }
-            KeyCode::Char('n') if ticket.hidden_at.is_some() => {
-                self.status = Some(format!(
-                    "O ticket {} está oculto. Restaure-o (o) para abrir um agente.",
-                    ticket.key
-                ));
+            KeyCode::Char('n') if let Some(refusal) = self.hidden_refusal(&holder) => {
+                self.status = Some(refusal);
             }
             KeyCode::Char('n') => {
                 let types: Vec<StageType> = StageType::menu(precheck.jira, precheck.sentry)
@@ -1608,7 +2068,7 @@ impl App {
                     self.status = None;
                     self.dialog = Some(Dialog::ChooseType {
                         project,
-                        ticket,
+                        holder,
                         precheck,
                         types,
                         index: 0,
@@ -1619,7 +2079,7 @@ impl App {
                 self.dialog = Some(Dialog::ConversationLost {
                     project,
                     agent,
-                    ticket,
+                    holder,
                     precheck,
                 });
             }
@@ -1640,7 +2100,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
         types: Vec<StageType>,
         mut index: usize,
@@ -1649,12 +2109,12 @@ impl App {
             KeyCode::Esc => return Action::None,
             KeyCode::Enter => {
                 if let Some(kind) = types.get(index).copied() {
-                    let values = kind.initial_values(&ticket.key);
+                    let values = kind.initial_values(&holder.key);
                     self.dialog = Some(Dialog::StageForm {
                         plan_missing: plan_missing(&project, kind, &values),
                         values,
                         project,
-                        ticket,
+                        holder,
                         precheck,
                         kind,
                         focus: 0,
@@ -1670,7 +2130,7 @@ impl App {
         }
         self.dialog = Some(Dialog::ChooseType {
             project,
-            ticket,
+            holder,
             precheck,
             types,
             index,
@@ -1683,7 +2143,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
         kind: StageType,
         mut values: Vec<String>,
@@ -1722,7 +2182,7 @@ impl App {
         self.dialog = Some(Dialog::StageForm {
             plan_missing: plan_missing(&project, kind, &values),
             project,
-            ticket,
+            holder,
             precheck,
             kind,
             values,
@@ -1773,7 +2233,7 @@ impl App {
     pub fn render_prompt(&mut self, launcher: &mut dyn AgentLauncher) {
         let Some(Dialog::StageForm {
             project,
-            ticket,
+            holder,
             precheck,
             kind,
             values,
@@ -1794,7 +2254,7 @@ impl App {
             Ok(rendered) => {
                 self.dialog = Some(Dialog::ConfirmPrompt {
                     project,
-                    ticket,
+                    holder,
                     precheck,
                     kind,
                     rendered,
@@ -1810,7 +2270,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project: PathBuf,
-        ticket: Ticket,
+        holder: Holder,
         precheck: Precheck,
         kind: StageType,
         rendered: Rendered,
@@ -1819,7 +2279,7 @@ impl App {
         if is_yes(key) {
             return Action::OpenAgent {
                 project,
-                ticket,
+                holder,
                 kind,
                 log: rendered.log,
                 precheck,
@@ -1850,7 +2310,7 @@ impl App {
         .min(max);
         self.dialog = Some(Dialog::ConfirmPrompt {
             project,
-            ticket,
+            holder,
             precheck,
             kind,
             rendered,
@@ -1876,15 +2336,17 @@ impl App {
     pub fn open_agent(
         &mut self,
         project: &Path,
-        ticket: &Ticket,
+        holder: &Holder,
         kind: StageType,
         log: &Path,
         check: Precheck,
         launcher: &mut dyn AgentLauncher,
     ) {
         let stage = kind.stage();
-        let project_name = self.project_of(ticket).map_or("", |p| p.name.as_str());
-        let name = agents::agent_name(project_name, stage, &ticket.key);
+        let project_name = self
+            .project_of_holder(holder)
+            .map_or("", |p| p.name.as_str());
+        let name = agents::agent_name(project_name, stage, &holder.key);
         let session_id = match self.db.random_session_id() {
             Ok(id) => id,
             Err(err) => {
@@ -1899,11 +2361,11 @@ impl App {
         let record = match agents::open(
             &self.db,
             agents_dir,
-            ticket.id,
+            holder.owner,
             stage,
             &session_id,
             &name,
-            &ticket.key,
+            &holder.key,
         ) {
             Ok(record) => record,
             Err(message) => {
@@ -1924,24 +2386,24 @@ impl App {
             self.status = Some(message);
             return;
         }
-        self.start_running(record, name, ticket, check);
+        self.start_running(record, name, holder, check);
     }
 
     /// An agent whose PTY started (opened, or resumed: NS-39) joins the running ones, with the
     /// jail and the warning of its `check`; its node is selected (its branches open: reading
     /// only, the stage does not change), and it is shown with the focus on its terminal.
-    fn start_running(&mut self, record: OpenAgent, name: String, ticket: &Ticket, check: Precheck) {
+    fn start_running(&mut self, record: OpenAgent, name: String, holder: &Holder, check: Precheck) {
         let id = record.agent.id;
         let project = self
-            .project_of(ticket)
+            .project_of_holder(holder)
             .map_or(String::new(), |p| p.name.clone());
         self.agents.push(RunningAgent {
             record,
             id,
             name,
             project,
-            ticket_id: ticket.id,
-            project_id: ticket.project_id,
+            owner: holder.owner,
+            project_id: holder.project_id,
             jail: check.jail,
             warning: check.warning,
             seen_text: String::new(),
@@ -2116,44 +2578,28 @@ impl App {
     /// The field of the new ID: Enter runs the checks 1 to 5 of plan D5 of NS-36, renaming
     /// nothing (a refusal stays on the bar with the field open, as in `EditTitle`); then the
     /// confirmation, which says whether the folder will be renamed.
-    fn key_edit_id(&mut self, key: KeyEvent, ticket: Ticket, mut input: String) -> Action {
-        match key.code {
-            KeyCode::Esc => {
-                self.status = None;
-                return Action::None;
-            }
-            KeyCode::Enter => match tickets::check_new_id(&self.db, &ticket, &input) {
-                Ok(new) => {
-                    let moves = self
-                        .project_of(&ticket)
-                        .is_some_and(|p| docs::has_dir(&p.path, &ticket.key));
-                    self.status = None;
-                    self.dialog = Some(Dialog::ConfirmEditId { ticket, new, moves });
-                    return Action::None;
-                }
-                Err(message) => self.status = Some(message),
+    fn key_edit_id(&mut self, key: KeyEvent, ticket: Ticket, input: String) -> Action {
+        self.key_text_field(
+            key,
+            ticket,
+            input,
+            |app, ticket, input| {
+                let new = tickets::check_new_id(&app.db, ticket, input)?;
+                app.status = None;
+                Ok(Some(Dialog::ConfirmEditId {
+                    moves: app.has_docs(ticket.project_id, &ticket.key),
+                    ticket: ticket.clone(),
+                    new,
+                }))
             },
-            _ => {
-                edit_text(&mut input, key);
-            }
-        }
-        self.dialog = Some(Dialog::EditId { ticket, input });
-        Action::None
+            |ticket, input| Dialog::EditId { ticket, input },
+        )
     }
 
     /// Only s/S apply the new ID (`tickets::edit_id` runs every check again: the state may have
     /// changed); any other key cancels, renaming nothing.
     fn key_confirm_edit_id(&mut self, key: KeyEvent, ticket: Ticket, new: String) -> Action {
-        if is_yes(key)
-            && let Some(project) = self.project_of(&ticket)
-        {
-            self.status = Some(
-                match tickets::edit_id(&self.db, &project.path, &ticket, &new) {
-                    Ok(message) | Err(message) => message,
-                },
-            );
-        }
-        Action::None
+        self.confirm_edit_id(key, &ticket, ticket.project_id, &new, tickets::edit_id)
     }
 
     fn key_add_path(&mut self, key: KeyEvent, mut input: String) -> Action {
@@ -2252,11 +2698,14 @@ impl App {
     /// records and its agents live in this nick), or the refusal when an agent of it is active
     /// in another nick, which this one can't end (the safe side, as "Editar ID" of NS-36).
     fn ask_removal(&mut self, project: Project) {
-        let counted = self
-            .db
-            .count_tickets(project.id)
-            .and_then(|tickets| Ok((tickets, self.db.list_project_agents(project.id)?)));
-        let (tickets, agents) = match counted {
+        let counted = self.db.count_tickets(project.id).and_then(|tickets| {
+            Ok((
+                tickets,
+                self.db.list_project_agents(project.id)?,
+                self.db.count_epics(project.id)?,
+            ))
+        });
+        let (tickets, agents, epics) = match counted {
             Ok(counted) => counted,
             Err(err) => {
                 self.status = Some(projects::db_error_message(&err));
@@ -2273,6 +2722,7 @@ impl App {
             tickets,
             agents: i64::try_from(agents.len()).unwrap_or(i64::MAX),
             live: i64::try_from(live).unwrap_or(i64::MAX),
+            epics,
         });
     }
 
@@ -2486,6 +2936,14 @@ fn is_quit(key: KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The ticket of an agent owned by a ticket (the tests of before the NS-40 have only those).
+    fn owner_ticket(owner: Owner) -> i64 {
+        match owner {
+            Owner::Ticket(id) => id,
+            Owner::Epic(id) => panic!("the agent is of the epic {id}"),
+        }
+    }
+
     use super::*;
     use std::fs;
 
@@ -3148,11 +3606,11 @@ mod tests {
         /// From an agent node, selects its ticket (where `g`, `m`, `i` act).
         fn on_ticket(&mut self) {
             if let crate::tree::NodeId::Agent(id) = self.app.selected {
-                let ticket = match self.app.agent(id) {
-                    Some(agent) => agent.ticket_id,
-                    None => self.app.agent_record(id).expect("read").ticket_id,
+                let owner = match self.app.agent(id) {
+                    Some(agent) => agent.owner,
+                    None => self.app.agent_record(id).expect("read").owner,
                 };
-                self.app.select(crate::tree::NodeId::Ticket(ticket));
+                self.app.select(owner.into());
             }
         }
 
@@ -3239,6 +3697,7 @@ mod tests {
             f.app.dialog,
             Some(Dialog::NewTicket {
                 project_id: f.pid("proj"),
+                item: NewItem::Ticket { epic_id: None },
                 title: String::new(),
                 jira_id: String::new(),
                 focus: TicketField::Title,
@@ -3264,6 +3723,7 @@ mod tests {
             f.app.dialog,
             Some(Dialog::NewTicket {
                 project_id: f.pid("proj"),
+                item: NewItem::Ticket { epic_id: None },
                 title: "Tqx".into(),
                 jira_id: "NS-".into(),
                 focus: TicketField::Title,
@@ -3332,6 +3792,7 @@ mod tests {
                 f.app.dialog,
                 Some(Dialog::NewTicket {
                     project_id: f.pid("proj"),
+                    item: NewItem::Ticket { epic_id: None },
                     title: title.into(),
                     jira_id: jira.into(),
                     focus: TicketField::JiraId,
@@ -3488,6 +3949,7 @@ mod tests {
             f.app.dialog,
             Some(Dialog::NewTicket {
                 project_id: f.pid("proj"),
+                item: NewItem::Ticket { epic_id: None },
                 title: "q".into(),
                 jira_id: "Q".into(),
                 focus: TicketField::JiraId,
@@ -3593,6 +4055,8 @@ mod tests {
         kinds: Vec<(StageType, PathBuf)>,
         /// The resumes (NS-39): the stage, the key at the opening and the key of now.
         resumes: Vec<(Stage, Option<String>, String)>,
+        /// Whether each resume named an epic (`--epic-id`, NS-40) and not a ticket.
+        resume_epics: Vec<bool>,
         /// The sessions whose conversation was asked for (NS-39).
         conversations: Vec<String>,
         check: Result<Precheck, String>,
@@ -3623,6 +4087,7 @@ mod tests {
                 ids: Vec::new(),
                 kinds: Vec::new(),
                 resumes: Vec::new(),
+                resume_epics: Vec::new(),
                 conversations: Vec::new(),
                 check: Ok(Precheck {
                     jail,
@@ -3685,12 +4150,16 @@ mod tests {
                 Launch::Resume {
                     stage,
                     opened_key,
-                    ticket_key,
-                } => self.resumes.push((
-                    stage,
-                    opened_key.map(str::to_string),
-                    ticket_key.to_string(),
-                )),
+                    holder_key:
+                        holder @ (HolderKey::Ticket(ticket_key) | HolderKey::Epic(ticket_key)),
+                } => {
+                    self.resume_epics.push(matches!(holder, HolderKey::Epic(_)));
+                    self.resumes.push((
+                        stage,
+                        opened_key.map(str::to_string),
+                        ticket_key.to_string(),
+                    ));
+                }
             }
             self.spawns.push((
                 launcher.to_path_buf(),
@@ -3776,7 +4245,10 @@ mod tests {
         fn g(&mut self, launcher: &mut FakeLauncher) {
             self.on_ticket();
             match self.ch('g') {
-                Action::CheckAgent { project, ticket } => {
+                Action::CheckAgent {
+                    project,
+                    holder: ticket,
+                } => {
                     self.app.check_agent(&project, &ticket, launcher);
                 }
                 other => panic!("no CheckAgent: {other:?}"),
@@ -3866,7 +4338,7 @@ mod tests {
             self.app.render_prompt(launcher);
             let Action::OpenAgent {
                 project,
-                ticket,
+                holder: ticket,
                 kind,
                 log,
                 precheck,
@@ -3898,12 +4370,12 @@ mod tests {
             f.ch('g'),
             Action::CheckAgent {
                 project: p.clone(),
-                ticket: ticket.clone()
+                holder: (&ticket).into()
             }
         );
         assert_eq!(f.app.dialog, None, "no menu before the check");
         let mut launcher = FakeLauncher::new(false);
-        f.app.check_agent(&p, &ticket, &mut launcher);
+        f.app.check_agent(&p, &(&ticket).into(), &mut launcher);
         assert_eq!(
             launcher.checks,
             [(f.root.join("bin/nick-agent"), p.clone())]
@@ -4233,7 +4705,7 @@ mod tests {
         let action = f.mods(KeyCode::Char('S'), KeyModifiers::SHIFT);
         let Action::OpenAgent {
             project,
-            ticket,
+            holder: ticket,
             kind,
             log,
             precheck,
@@ -4272,7 +4744,7 @@ mod tests {
         );
         let Action::OpenAgent {
             project,
-            ticket,
+            holder: ticket,
             kind,
             log,
             precheck,
@@ -4708,7 +5180,7 @@ mod tests {
             crate::tree::NodeId::Agent(launcher.ids[1]),
             "the node of the last one is selected (NS-38)"
         );
-        assert_eq!(f.app.agents[1].ticket_id, f.tnode_id("B-1"));
+        assert_eq!(f.app.agents[1].owner, Owner::Ticket(f.tnode_id("B-1")));
         assert_eq!(launcher.spawns[0].1, f.root.join("proj"));
         assert_eq!(launcher.spawns[1].1, f.root.join("beta"));
         let rows = f.agent_rows();
@@ -5358,7 +5830,7 @@ mod tests {
         // The agents of the ticket are on the tree now (NS-38), every stage and state.
         let id = detail.ticket.id;
         assert_eq!(
-            f.app.ticket_agents[&id]
+            f.app.owner_agents[&Owner::Ticket(id)]
                 .iter()
                 .map(|a| (a.name.as_str(), a.state.as_str()))
                 .collect::<Vec<_>>(),
@@ -5436,7 +5908,7 @@ mod tests {
         f.app
             .db
             .insert_agent(
-                f.tnode_id("NS-1"),
+                Owner::Ticket(f.tnode_id("NS-1")),
                 "review",
                 "outro",
                 "proj · Review · NS-1",
@@ -5446,7 +5918,7 @@ mod tests {
         // A first key reads it (the refresh comes after the key), the next one reaches it.
         f.key(KeyCode::Char('z'));
         f.key(KeyCode::Down);
-        let other = f.app.ticket_agents[&f.tnode_id("NS-1")][2].id;
+        let other = f.app.owner_agents[&Owner::Ticket(f.tnode_id("NS-1"))][2].id;
         assert_eq!(f.app.selected, NodeId::Agent(other));
         f.key(KeyCode::Enter);
         assert_eq!(f.app.focus, Focus::List);
@@ -5565,14 +6037,14 @@ mod tests {
             f.ch('g'),
             Action::CheckAgent {
                 project: p.clone(),
-                ticket
+                holder: (&ticket).into()
             }
         );
         let mut launcher = FakeLauncher::new(true);
         f.open_kind(StageType::PoDiscussion, &mut launcher);
         assert_eq!(f.app.screen, Screen::Tree);
         assert_eq!(
-            f.app.ticket_agents[&f.tnode_id("NS-1")].len(),
+            f.app.owner_agents[&Owner::Ticket(f.tnode_id("NS-1"))].len(),
             1,
             "the new agent is on the tree"
         );
@@ -5647,7 +6119,13 @@ mod tests {
         // An active agent (of this nick or not) is refused at Enter too.
         f.app
             .db
-            .insert_agent(ticket.id, "po", "outro", "proj · PO · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(ticket.id),
+                "po",
+                "outro",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
             .unwrap();
         f.ch('i');
         f.ch('9');
@@ -6068,7 +6546,7 @@ mod tests {
         assert_eq!(f.app.last_shown, Some(id));
         assert_eq!(f.app.focus, Focus::Terminal);
         assert!(f.rows().contains(&Fixture::anode(id)), "its branch is open");
-        assert_eq!(f.app.agents[0].ticket_id, f.tnode_id("NS-2"));
+        assert_eq!(f.app.agents[0].owner, Owner::Ticket(f.tnode_id("NS-2")));
         assert_eq!(f.app.agents[0].project_id, f.pid("proj"));
     }
 
@@ -6429,7 +6907,13 @@ mod tests {
         let ticket = f.tnode_id("NS-1");
         f.app
             .db
-            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(ticket),
+                "po",
+                "outro",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
             .unwrap();
         f.app.select(NodeId::Project(f.pid("proj")));
         assert_eq!(f.ch('r'), Action::None);
@@ -6441,7 +6925,13 @@ mod tests {
         let ticket = f.tnode_id("NS-1");
         f.app
             .db
-            .insert_agent(ticket, "po", "outro", "proj · PO · NS-1", "NS-1")
+            .insert_agent(
+                Owner::Ticket(ticket),
+                "po",
+                "outro",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
             .unwrap();
         assert_eq!(f.ch('s'), Action::None);
         assert_eq!(f.status(), Some(refusal));
@@ -6534,7 +7024,13 @@ mod tests {
             let agent = self
                 .app
                 .db
-                .insert_agent(ticket, "review", session, "proj · Review · NS-1", key)
+                .insert_agent(
+                    Owner::Ticket(ticket),
+                    "review",
+                    session,
+                    "proj · Review · NS-1",
+                    key,
+                )
                 .unwrap();
             self.app.tree.open(NodeId::Ticket(ticket));
             self.app.refresh_tree();
@@ -6665,7 +7161,7 @@ mod tests {
     #[test]
     fn a_on_the_lost_conversation_archives_without_asking_again() {
         let (mut f, mut launcher, id) = stopped_agent();
-        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let ticket = owner_ticket(f.app.agent_record(id).unwrap().owner);
         launcher.conversation = Ok(false);
         f.r(&mut launcher);
         assert_eq!(f.ch('a'), Action::None);
@@ -6706,7 +7202,7 @@ mod tests {
         f.app.render_prompt(&mut launcher);
         let Action::OpenAgent {
             project,
-            ticket,
+            holder: ticket,
             kind,
             log,
             precheck,
@@ -6778,7 +7274,7 @@ mod tests {
     #[test]
     fn n_on_the_lost_conversation_of_a_hidden_ticket_says_to_restore_it() {
         let (mut f, mut launcher, id) = stopped_agent();
-        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let ticket = owner_ticket(f.app.agent_record(id).unwrap().owner);
         let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
         tickets::hide(&f.app.db, &t).unwrap();
         f.ch('f');
@@ -6799,7 +7295,7 @@ mod tests {
     #[test]
     fn the_agent_of_a_hidden_ticket_is_resumed() {
         let (mut f, mut launcher, id) = stopped_agent();
-        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let ticket = owner_ticket(f.app.agent_record(id).unwrap().owner);
         let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
         tickets::hide(&f.app.db, &t).unwrap();
         f.ch('f');
@@ -6874,7 +7370,7 @@ mod tests {
     #[test]
     fn a_resume_after_the_id_changed_tells_the_agent_the_new_folder() {
         let (mut f, mut launcher, id) = stopped_agent();
-        let ticket = f.app.agent_record(id).unwrap().ticket_id;
+        let ticket = owner_ticket(f.app.agent_record(id).unwrap().owner);
         let t = f.app.db.get_ticket(ticket).unwrap().unwrap();
         let p = f.app.selected_project().unwrap().path.clone();
         tickets::edit_id(&f.app.db, &p, &t, "NS-9").unwrap();
@@ -7143,5 +7639,616 @@ mod tests {
         assert_eq!(f.app.dialog, None);
         assert_eq!(f.status(), Some(message));
         assert_eq!(f.state_of(id), "futuro");
+    }
+
+    // ---- the epics (NS-40) ----
+
+    impl Fixture {
+        /// Creates an epic by the dialog on the node of the project of the selection: `n`, the
+        /// title, Tab, the ID, Enter.
+        fn new_epic(&mut self, title: &str, jira: &str) -> Action {
+            self.on_project();
+            self.ch('n');
+            self.type_text(title);
+            self.key(KeyCode::Tab);
+            self.type_text(jira);
+            self.key(KeyCode::Enter)
+        }
+
+        /// The epic `key` of the selected project.
+        fn epic_of(&self, key: &str) -> Epic {
+            let project = self.app.selected_project().expect("a project").id;
+            self.app
+                .project_epics(project)
+                .iter()
+                .find(|e| e.key == key)
+                .cloned()
+                .unwrap_or_else(|| panic!("no epic {key}"))
+        }
+
+        fn epic_node(&self, key: &str) -> NodeId {
+            NodeId::Epic(self.epic_of(key).id)
+        }
+
+        fn ticket_of(&self, key: &str) -> Ticket {
+            self.app
+                .tickets
+                .values()
+                .flatten()
+                .find(|t| t.key == key)
+                .cloned()
+                .unwrap_or_else(|| panic!("no ticket {key}"))
+        }
+    }
+
+    /// `proj` with the tickets NS-1 and NS-2, the agents on (`with_agents`) and the epic EPIC-1
+    /// selected.
+    fn with_epic() -> (Fixture, PathBuf) {
+        let (mut f, p) = with_agents();
+        assert_eq!(f.new_epic("Plano longo", "EPIC-1"), Action::None);
+        (f, p)
+    }
+
+    #[test]
+    fn n_on_the_project_creates_an_epic_and_selects_it() {
+        let (mut f, _) = with_tickets("proj");
+        f.ch('n');
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::NewTicket {
+                project_id: f.pid("proj"),
+                item: NewItem::Epic,
+                title: String::new(),
+                jira_id: String::new(),
+                focus: TicketField::Title,
+            })
+        );
+        // Esc writes nothing.
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.app.project_epics(f.pid("proj")), []);
+        // The refusals keep the dialog open.
+        f.ch('n');
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Informe o título do épico."));
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::NewTicket {
+                item: NewItem::Epic,
+                ..
+            })
+        ));
+        f.key(KeyCode::Esc);
+        f.new_ticket("t", "NS-1");
+        assert_eq!(f.new_epic("e", "NS-1"), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("Já existe um ticket com o ID NS-1 neste projeto.")
+        );
+        assert!(f.app.dialog.is_some());
+        f.key(KeyCode::Esc);
+        assert_eq!(f.new_epic("Migrar", "EPIC-1"), Action::None);
+        assert_eq!(f.status(), Some("Épico criado: EPIC-1 — Migrar."));
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.app.selected, f.epic_node("EPIC-1"));
+        // The epics before the tickets without epic.
+        let at = |id: NodeId| f.rows().iter().position(|r| *r == id).unwrap();
+        assert!(at(f.epic_node("EPIC-1")) < at(f.tnode("NS-1")));
+        // A provisional one.
+        f.new_epic("Sem ID", "");
+        let message = f.status().unwrap().to_string();
+        assert!(
+            message.starts_with("Épico criado com o ID provisório "),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_on_the_epic_creates_a_ticket_in_it_and_selects_it_with_the_branch_open() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        f.ch('a');
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::NewTicket { item: NewItem::Ticket { epic_id: Some(id) }, .. }) if id == epic.id
+        ));
+        f.type_text("Dentro");
+        f.key(KeyCode::Tab);
+        f.type_text("NS-5");
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.status(), Some("Ticket criado: NS-5 — Dentro."));
+        let ticket = f.ticket_of("NS-5");
+        assert_eq!(ticket.epic_id, Some(epic.id));
+        assert_eq!(f.app.selected, NodeId::Ticket(ticket.id));
+        assert!(f.app.tree.is_open(NodeId::Epic(epic.id)));
+        let depth = f
+            .app
+            .visible()
+            .iter()
+            .find(|r| r.id == f.app.selected)
+            .unwrap()
+            .depth;
+        assert_eq!(depth, 3, "under the epic");
+        // In a hidden epic, refused.
+        f.app.select(NodeId::Epic(epic.id));
+        epics::hide(&f.app.db, &epic).unwrap();
+        f.ch('f');
+        f.app.refresh_tree();
+        f.app.select(NodeId::Epic(epic.id));
+        f.ch('a');
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some("O épico EPIC-1 está oculto. Restaure-o (o) para criar um ticket.")
+        );
+    }
+
+    #[test]
+    fn e_and_i_on_the_epic_with_their_refusals() {
+        let (mut f, p) = with_epic();
+        let node = f.epic_node("EPIC-1");
+        f.ch('e');
+        assert!(matches!(f.app.dialog, Some(Dialog::EditEpicTitle { .. })));
+        for _ in 0.."Plano longo".len() {
+            f.key(KeyCode::Backspace);
+        }
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Informe o título do épico."));
+        f.type_text("Novo");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Título atualizado: EPIC-1."));
+        assert_eq!(f.epic_of("EPIC-1").title, "Novo");
+        // `i`: the ID of a ticket is refused; then a new one renames the folder.
+        f.app.select(node);
+        f.ch('i');
+        let erase = |f: &mut Fixture| {
+            for _ in 0..10 {
+                f.key(KeyCode::Backspace);
+            }
+        };
+        erase(&mut f);
+        f.type_text("NS-1");
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some("Já existe um ticket com o ID NS-1 neste projeto.")
+        );
+        assert!(matches!(f.app.dialog, Some(Dialog::EditEpicId { .. })));
+        erase(&mut f);
+        f.type_text("EPIC-2");
+        fs::create_dir_all(p.join(".nick/docs/EPIC-1")).unwrap();
+        f.key(KeyCode::Enter);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConfirmEditEpicId { moves: true, .. })
+        ));
+        f.ch('s');
+        assert_eq!(
+            f.status(),
+            Some(
+                "ID atualizado: EPIC-1 → EPIC-2. A pasta .nick/docs/EPIC-1/ virou .nick/docs/EPIC-2/."
+            )
+        );
+        assert!(p.join(".nick/docs/EPIC-2").is_dir());
+        // A ticket with the ID of the epic (the other way).
+        f.app.select(f.tnode("NS-1"));
+        f.ch('i');
+        erase(&mut f);
+        f.type_text("EPIC-2");
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some("Já existe um épico com o ID EPIC-2 neste projeto.")
+        );
+        f.key(KeyCode::Esc);
+        // The project unavailable: `i` refused at the key.
+        f.app.select(f.epic_node("EPIC-2"));
+        fs::remove_file(p.join(".nick/nick.conf")).unwrap();
+        f.ch('i');
+        assert_eq!(f.app.dialog, None);
+        assert!(
+            f.status().unwrap().starts_with("Projeto indisponível: "),
+            "{:?}",
+            f.status()
+        );
+    }
+
+    #[test]
+    fn i_on_the_epic_is_refused_with_an_active_agent_of_the_epic() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        let dir = f.agents_dir();
+        let _agent = agents::open(
+            &f.app.db,
+            &dir,
+            Owner::Epic(epic.id),
+            Stage::Po,
+            "s-other",
+            "n",
+            "EPIC-1",
+        )
+        .unwrap();
+        f.app.select(NodeId::Epic(epic.id));
+        f.ch('i');
+        f.key(KeyCode::Backspace);
+        f.type_text("9");
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O épico EPIC-1 tem agente ativo. Encerre os agentes dele antes de editar o ID: o \
+                 prompt deles cita a pasta .nick/docs/EPIC-1/."
+            )
+        );
+    }
+
+    #[test]
+    fn o_on_the_epic_asks_hides_the_branch_and_restores_it() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        f.ch('a');
+        f.type_text("Dentro");
+        f.key(KeyCode::Tab);
+        f.type_text("NS-5");
+        f.key(KeyCode::Enter);
+        f.app.select(NodeId::Epic(epic.id));
+        f.ch('o');
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmHideEpic {
+                epic: f.app.db.get_epic(epic.id).unwrap().unwrap(),
+                tickets: 1
+            })
+        );
+        f.ch('n');
+        assert!(
+            f.app
+                .db
+                .get_epic(epic.id)
+                .unwrap()
+                .unwrap()
+                .hidden_at
+                .is_none(),
+            "only s"
+        );
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(
+            f.status(),
+            Some(
+                "Épico ocultado: EPIC-1. O ramo inteiro continua no banco e pode ser restaurado \
+                 (f mostra os ocultos)."
+            )
+        );
+        assert!(!f.rows().contains(&NodeId::Epic(epic.id)));
+        assert!(
+            !f.rows().contains(&f.tnode("NS-5")),
+            "its tickets go with it"
+        );
+        assert_eq!(f.app.selected, f.tnode("NS-1"), "the next sibling");
+        assert!(
+            f.ticket_of("NS-5").hidden_at.is_none(),
+            "the ticket is not hidden"
+        );
+        // `f` shows it, and `o` restores it at once.
+        f.ch('f');
+        f.app.select(NodeId::Epic(epic.id));
+        f.ch('o');
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some("Épico restaurado: EPIC-1."));
+        f.ch('f');
+        assert!(f.rows().contains(&NodeId::Epic(epic.id)));
+    }
+
+    #[test]
+    fn o_on_the_epic_with_active_agents_is_refused_with_the_count_and_no_dialog() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        let ticket = f.ticket_of("NS-1");
+        epics::move_ticket(&f.app.db, &ticket, Some(&epic)).unwrap();
+        let dir = f.agents_dir();
+        let _a = agents::open(
+            &f.app.db,
+            &dir,
+            Owner::Ticket(ticket.id),
+            Stage::Po,
+            "s-a",
+            "n",
+            "NS-1",
+        )
+        .unwrap();
+        let _b = agents::open(
+            &f.app.db,
+            &dir,
+            Owner::Epic(epic.id),
+            Stage::Po,
+            "s-b",
+            "n",
+            "EPIC-1",
+        )
+        .unwrap();
+        f.app.refresh_tree();
+        f.app.select(NodeId::Epic(epic.id));
+        f.ch('o');
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O épico EPIC-1 tem 2 agentes ativos (no épico ou nos tickets dele). Encerre-os \
+                 antes de ocultar."
+            )
+        );
+    }
+
+    #[test]
+    fn g_on_the_epic_offers_only_po_and_tech_leader_and_opens_an_epic_agent() {
+        let (mut f, p) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        for (jira, sentry, count) in [(false, false, 3), (true, true, 6)] {
+            let mut launcher = FakeLauncher::new(true);
+            if let Ok(check) = launcher.check.as_mut() {
+                check.jira = jira;
+                check.sentry = sentry;
+            }
+            f.app.select(NodeId::Epic(epic.id));
+            f.g(&mut launcher);
+            let (types, _) = f.menu();
+            assert_eq!(types, StageType::epic_menu(jira, sentry));
+            assert_eq!(types.len(), count);
+            assert!(
+                types
+                    .iter()
+                    .all(|t| matches!(t.stage(), Stage::Po | Stage::TechLeader))
+            );
+            f.key(KeyCode::Esc);
+        }
+        let mut launcher = FakeLauncher::new(true);
+        f.app.select(NodeId::Epic(epic.id));
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeader);
+        assert_eq!(
+            f.form().1[0],
+            "EPIC-1",
+            "the form of the TL with the ID of the epic"
+        );
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        assert_eq!(launcher.renders.len(), 0);
+        f.app.render_prompt(&mut launcher);
+        assert_eq!(
+            launcher.renders[0].2.answers[0],
+            ("--jira-id", "EPIC-1".to_string())
+        );
+        let Action::OpenAgent {
+            project,
+            holder,
+            kind,
+            log,
+            precheck,
+        } = f.ch('s')
+        else {
+            panic!("no OpenAgent");
+        };
+        assert_eq!(project, p);
+        assert_eq!(holder, Holder::from(&epic));
+        f.app
+            .open_agent(&project, &holder, kind, &log, precheck, &mut launcher);
+        let id = launcher.ids[0];
+        let row = f.app.db.get_agent(id).unwrap().unwrap();
+        assert_eq!(row.owner, Owner::Epic(epic.id));
+        assert_eq!(row.name, "proj · Tech Leader · EPIC-1");
+        assert_eq!(row.opened_key.as_deref(), Some("EPIC-1"));
+        assert_eq!(launcher.spawns[0].3, "proj · Tech Leader · EPIC-1");
+        assert_eq!(f.app.selected, NodeId::Agent(id));
+        assert_eq!(f.app.focus, Focus::Terminal);
+        let at = |id: NodeId| f.app.visible().iter().find(|r| r.id == id).unwrap().depth;
+        assert_eq!(at(NodeId::Agent(id)), 3, "under the epic");
+        assert_eq!(f.app.agents[0].owner, Owner::Epic(epic.id));
+    }
+
+    #[test]
+    fn g_on_a_hidden_epic_and_on_a_ticket_of_one_is_refused() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        let ticket = f.ticket_of("NS-1");
+        epics::move_ticket(&f.app.db, &ticket, Some(&epic)).unwrap();
+        epics::hide(&f.app.db, &epic).unwrap();
+        f.ch('f');
+        f.app.refresh_tree();
+        let message = "O épico EPIC-1 está oculto. Restaure-o (o) para abrir um agente.";
+        f.app.select(NodeId::Epic(epic.id));
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.status(), Some(message));
+        f.app.select(NodeId::Ticket(ticket.id));
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.status(), Some(message));
+        // Another nick hid the epic after this one read the tree: `g` reads it again.
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        epics::hide(&f.app.db, &epic).unwrap();
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.status(), Some(message));
+    }
+
+    #[test]
+    fn p_on_a_ticket_moves_it_with_the_list_and_touches_no_file() {
+        let (mut f, p) = with_epic();
+        f.new_epic("Outro", "EPIC-2");
+        f.new_epic("Escondido", "EPIC-3");
+        let hidden = f.epic_of("EPIC-3");
+        epics::hide(&f.app.db, &hidden).unwrap();
+        f.app.refresh_tree();
+        fs::create_dir_all(p.join(".nick/docs/NS-1")).unwrap();
+        fs::create_dir_all(p.join(".nick/docs/EPIC-1")).unwrap();
+        let before = crate::projects::snapshot::snapshot(&p);
+        f.app.select(f.tnode("NS-1"));
+        f.ch('p');
+        let Some(Dialog::MoveTicket { choices, index, .. }) = f.app.dialog.clone() else {
+            panic!("no list: {:?}", f.app.dialog);
+        };
+        let keys: Vec<Option<String>> = choices
+            .iter()
+            .map(|c| c.as_ref().map(|e| e.key.clone()))
+            .collect();
+        assert_eq!(
+            keys,
+            [None, Some("EPIC-1".into()), Some("EPIC-2".into())],
+            "Sem épico first, then the visible epics"
+        );
+        assert_eq!(index, 0, "the current place");
+        // Enter on the current place: refused, the list stays.
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("O ticket NS-1 já está aí."));
+        assert!(f.app.dialog.is_some());
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Enter);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some("Ticket NS-1 movido para o épico EPIC-1."));
+        assert_eq!(f.ticket_of("NS-1").epic_id, Some(f.epic_of("EPIC-1").id));
+        assert_eq!(f.app.selected, f.tnode("NS-1"), "it stays selected");
+        // Now in EPIC-1: the list starts there; out of the epic.
+        f.ch('p');
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::MoveTicket { index: 1, .. })
+        ));
+        f.key(KeyCode::Up);
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Ticket NS-1 tirado do épico EPIC-1."));
+        assert_eq!(
+            crate::projects::snapshot::snapshot(&p),
+            before,
+            "no file touched"
+        );
+    }
+
+    #[test]
+    fn p_without_epics_says_how_to_create_one() {
+        let (mut f, _) = with_agents();
+        f.app.select(f.tnode("NS-1"));
+        f.ch('p');
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some("O projeto não tem épicos. Crie um com n no nó do projeto.")
+        );
+    }
+
+    /// An agent of the epic EPIC-1 (Tech Leader), opened and ended: stopped, its node selected.
+    fn stopped_epic_agent() -> (Fixture, FakeLauncher, i64) {
+        let (mut f, _) = with_epic();
+        let mut launcher = FakeLauncher::new(true);
+        f.open_kind(StageType::TechLeader, &mut launcher);
+        let id = launcher.ids[0];
+        f.app.agent_ended(id, 0);
+        assert_eq!(f.app.selected, NodeId::Agent(id));
+        f.app.status = None;
+        (f, launcher, id)
+    }
+
+    #[test]
+    fn an_epic_agent_is_stopped_resumed_with_its_epic_and_archived() {
+        let (mut f, mut launcher, id) = stopped_epic_agent();
+        assert_eq!(f.state_of(id), "stopped");
+        assert!(f.r(&mut launcher));
+        assert_eq!(f.state_of(id), "active");
+        assert_eq!(
+            launcher.resumes,
+            [(
+                Stage::TechLeader,
+                Some("EPIC-1".to_string()),
+                "EPIC-1".to_string()
+            )]
+        );
+        assert_eq!(launcher.resume_epics, [true], "--epic-id, not --ticket-id");
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · EPIC-1 foi retomado.")
+        );
+        assert_eq!(f.app.focus, Focus::Terminal);
+        // `x` ends it again, and `o` archives it.
+        f.shortcut();
+        assert_eq!(f.ch('x'), Action::None);
+        assert_eq!(f.ch('s'), Action::EndAgent(id));
+        f.app.agent_ended_by_operator(id);
+        assert_eq!(f.state_of(id), "stopped");
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.state_of(id), "archived");
+    }
+
+    #[test]
+    fn the_lost_conversation_of_an_epic_agent_offers_only_the_types_of_its_stage() {
+        let (mut f, mut launcher, _) = stopped_epic_agent();
+        launcher.conversation = Ok(false);
+        if let Ok(check) = launcher.check.as_mut() {
+            check.jira = true;
+        }
+        f.r(&mut launcher);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConversationLost { .. })
+        ));
+        f.ch('n');
+        let (types, _) = f.menu();
+        assert_eq!(types, [StageType::TechLeader, StageType::TechLeaderJira]);
+    }
+
+    #[test]
+    fn a_resume_after_the_id_of_the_epic_changed_tells_the_new_folder() {
+        let (mut f, mut launcher, id) = stopped_epic_agent();
+        let epic = f.app.db.list_epics(f.pid("proj"), true).unwrap()[0].clone();
+        let p = f.root.join("proj");
+        epics::edit_id(&f.app.db, &p, &epic, "EPIC-9").unwrap();
+        f.app.refresh_tree();
+        f.app.select(NodeId::Agent(id));
+        assert!(f.r(&mut launcher));
+        assert_eq!(
+            launcher.resumes,
+            [(
+                Stage::TechLeader,
+                Some("EPIC-1".to_string()),
+                "EPIC-9".to_string()
+            )]
+        );
+        assert_eq!(launcher.resume_epics, [true]);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · EPIC-1 foi retomado. Ele foi avisado de que a pasta \
+                 agora é .nick/docs/EPIC-9/."
+            )
+        );
+    }
+
+    #[test]
+    fn the_removal_of_a_project_counts_its_epics_and_their_agents() {
+        let (mut f, _) = with_epic();
+        let (mut launcher, epic) = (FakeLauncher::new(true), f.epic_of("EPIC-1"));
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
+        let id = launcher.ids[0];
+        f.app.agent_ended(id, 0);
+        f.app.select(NodeId::Project(epic.project_id));
+        f.ch('r');
+        assert!(
+            matches!(
+                f.app.dialog,
+                Some(Dialog::ConfirmRemove {
+                    epics: 1,
+                    agents: 1,
+                    tickets: 2,
+                    ..
+                })
+            ),
+            "{:?}",
+            f.app.dialog
+        );
+        // Without epics: 0, and the text of before (ui.rs).
+        let (mut f, _) = with_agents();
+        f.on_project();
+        f.ch('r');
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConfirmRemove { epics: 0, .. })
+        ));
     }
 }

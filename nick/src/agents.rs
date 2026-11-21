@@ -17,10 +17,11 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-pub use crate::db::Agent;
+pub use crate::db::{Agent, Owner};
 
-use crate::db::{AgentChange, Db};
+use crate::db::{AgentChange, Db, Epic, Ticket};
 use crate::projects::db_error_message;
+use crate::stages::EPIC_STAGES;
 use crate::tickets::jira_id_valid;
 
 /// The directory of the locks, inside the state directory.
@@ -104,6 +105,54 @@ impl AgentState {
     }
 }
 
+/// Who holds the agents of a flow of "Abrir agente" or of a resume (NS-40): a ticket or an epic,
+/// with what the flow needs of it (its owner, its project, its key and whether it is hidden). The
+/// one way of opening and resuming an agent: there is no separate path for the epics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    pub owner: Owner,
+    pub project_id: i64,
+    pub key: String,
+    /// What the dialogs show beside the key (a field the plan did not have: the dialogs of
+    /// "Abrir agente" show `Ticket <ID> — <título>`, NS-35).
+    pub title: String,
+    pub hidden: bool,
+}
+
+impl From<&Ticket> for Holder {
+    fn from(ticket: &Ticket) -> Holder {
+        Holder {
+            owner: Owner::Ticket(ticket.id),
+            project_id: ticket.project_id,
+            key: ticket.key.clone(),
+            title: ticket.title.clone(),
+            hidden: ticket.hidden_at.is_some(),
+        }
+    }
+}
+
+impl From<&Epic> for Holder {
+    fn from(epic: &Epic) -> Holder {
+        Holder {
+            owner: Owner::Epic(epic.id),
+            project_id: epic.project_id,
+            key: epic.key.clone(),
+            title: epic.title.clone(),
+            hidden: epic.hidden_at.is_some(),
+        }
+    }
+}
+
+impl Holder {
+    /// What the messages call it: `ticket` or `épico`.
+    pub fn noun(&self) -> &'static str {
+        match self.owner {
+            Owner::Ticket(_) => "ticket",
+            Owner::Epic(_) => "épico",
+        }
+    }
+}
+
 /// The `claude --name` of an agent: `<project> · <Stage> · <ticket ID>`.
 pub fn agent_name(project: &str, stage: Stage, ticket_key: &str) -> String {
     format!("{project} · {} · {ticket_key}", stage.label())
@@ -128,20 +177,28 @@ pub struct OpenAgent {
     lock_path: PathBuf,
 }
 
-/// Opens the record of an agent: creates `agents_dir` (0700), takes the lock of `session_id`
-/// and only then inserts the `active` row, with the ticket key it is opened with (`opened_key`,
-/// NS-39). On any failure nothing is left: no row and no lock.
+/// The refusal of opening an agent of another stage in an epic (NS-40).
+pub const EPIC_STAGE_MESSAGE: &str = "O épico só tem agentes de PO e de Tech Leader.";
+
+/// Opens the record of an agent of `owner` (a ticket, or an epic: NS-40): creates `agents_dir`
+/// (0700), takes the lock of `session_id` and only then inserts the `active` row, with the key of
+/// the owner it is opened with (`opened_key`, NS-39). An epic only has agents of
+/// `stages::EPIC_STAGES`: another stage is refused before the lock. On any failure nothing is
+/// left: no row and no lock.
 pub fn open(
     db: &Db,
     agents_dir: &Path,
-    ticket_id: i64,
+    owner: Owner,
     stage: Stage,
     session_id: &str,
     name: &str,
     opened_key: &str,
 ) -> Result<OpenAgent, String> {
+    if matches!(owner, Owner::Epic(_)) && !EPIC_STAGES.contains(&stage) {
+        return Err(EPIC_STAGE_MESSAGE.into());
+    }
     open_with(agents_dir, session_id, &mut || {
-        db.insert_agent(ticket_id, stage.key(), session_id, name, opened_key)
+        db.insert_agent(owner, stage.key(), session_id, name, opened_key)
     })
 }
 
@@ -407,7 +464,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("nick.db")).unwrap();
         let p = db.insert_project("auto_scrum", "proj", "/proj").unwrap();
-        let t = db.insert_ticket(p.id, "NS-1", false, "t").unwrap();
+        let t = db.insert_ticket(p.id, "NS-1", false, "t", None).unwrap();
         let dir = agents_dir(tmp.path());
         Fixture {
             _tmp: tmp,
@@ -479,7 +536,7 @@ mod tests {
         let mut held_at_insert = None;
         let open = open_with(&f.dir, "s-1", &mut || {
             held_at_insert = Some(!lock_is_free(&lock));
-            f.db.insert_agent(f.ticket, "po", "s-1", "n", "NS-1")
+            f.db.insert_agent(Owner::Ticket(f.ticket), "po", "s-1", "n", "NS-1")
         })
         .unwrap();
         assert_eq!(held_at_insert, Some(true), "the lock is held at the insert");
@@ -494,7 +551,7 @@ mod tests {
         let open = open(
             &f.db,
             &f.dir,
-            f.ticket,
+            Owner::Ticket(f.ticket),
             Stage::Review,
             "s-1",
             "proj · Review · NS-1",
@@ -503,7 +560,7 @@ mod tests {
         .unwrap();
         assert_eq!(open.agent.stage, "review");
         assert_eq!(open.agent.name, "proj · Review · NS-1");
-        assert_eq!(open.agent.ticket_id, f.ticket);
+        assert_eq!(open.agent.owner, Owner::Ticket(f.ticket));
         assert!(lock_path(&f.dir, "s-1").is_file());
     }
 
@@ -511,7 +568,16 @@ mod tests {
     fn the_agents_dir_is_created_with_mode_0700() {
         let f = fixture();
         assert!(!f.dir.exists());
-        let _open = open(&f.db, &f.dir, f.ticket, Stage::Po, "s-1", "n", "NS-1").unwrap();
+        let _open = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Po,
+            "s-1",
+            "n",
+            "NS-1",
+        )
+        .unwrap();
         let mode = std::fs::metadata(&f.dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
@@ -520,10 +586,19 @@ mod tests {
     fn a_failing_insert_leaves_no_lock() {
         let f = fixture();
         // A session id already stored: the UNIQUE constraint refuses it.
-        f.db.insert_agent(f.ticket, "po", "s-1", "n", "NS-1")
+        f.db.insert_agent(Owner::Ticket(f.ticket), "po", "s-1", "n", "NS-1")
             .unwrap();
         f.db.stop_agent(1).unwrap();
-        let err = open(&f.db, &f.dir, f.ticket, Stage::Po, "s-1", "n", "NS-1").unwrap_err();
+        let err = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Po,
+            "s-1",
+            "n",
+            "NS-1",
+        )
+        .unwrap_err();
         assert!(err.starts_with("Erro no banco do nick: "), "{err}");
         assert!(!lock_path(&f.dir, "s-1").exists(), "no lock file left");
         assert_eq!(states(&f.db), pairs(&[("s-1", "stopped")]));
@@ -535,7 +610,16 @@ mod tests {
         create_agents_dir(&f.dir).unwrap();
         let other = open_lock_file(&lock_path(&f.dir, "s-1")).unwrap();
         other.lock().unwrap();
-        let err = open(&f.db, &f.dir, f.ticket, Stage::Po, "s-1", "n", "NS-1").unwrap_err();
+        let err = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Po,
+            "s-1",
+            "n",
+            "NS-1",
+        )
+        .unwrap_err();
         assert!(!err.is_empty());
         assert_eq!(states(&f.db), Vec::<(String, String)>::new(), "no row");
     }
@@ -543,7 +627,16 @@ mod tests {
     #[test]
     fn ending_marks_stopped_releases_and_removes_the_lock() {
         let f = fixture();
-        let open = open(&f.db, &f.dir, f.ticket, Stage::Po, "s-1", "n", "NS-1").unwrap();
+        let open = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Po,
+            "s-1",
+            "n",
+            "NS-1",
+        )
+        .unwrap();
         let lock = lock_path(&f.dir, "s-1");
         end(&f.db, open).unwrap();
         assert_eq!(states(&f.db), pairs(&[("s-1", "stopped")]));
@@ -556,7 +649,16 @@ mod tests {
     #[test]
     fn ending_a_row_that_is_gone_still_releases_the_lock() {
         let f = fixture();
-        let open = open(&f.db, &f.dir, f.ticket, Stage::Po, "s-1", "n", "NS-1").unwrap();
+        let open = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Po,
+            "s-1",
+            "n",
+            "NS-1",
+        )
+        .unwrap();
         f.db.connection().execute("DELETE FROM agents", []).unwrap();
         end(&f.db, open).unwrap();
         assert!(!lock_path(&f.dir, "s-1").exists());
@@ -565,7 +667,7 @@ mod tests {
     #[test]
     fn cleanup_ends_an_active_row_without_a_lock_file() {
         let f = fixture();
-        f.db.insert_agent(f.ticket, "po", "s-1", "n", "NS-1")
+        f.db.insert_agent(Owner::Ticket(f.ticket), "po", "s-1", "n", "NS-1")
             .unwrap();
         assert_eq!(cleanup(&f.db, &f.dir), Ok(1));
         assert_eq!(states(&f.db), pairs(&[("s-1", "stopped")]));
@@ -580,7 +682,7 @@ mod tests {
     #[test]
     fn cleanup_ends_an_active_row_whose_lock_is_free_and_removes_the_file() {
         let f = fixture();
-        f.db.insert_agent(f.ticket, "po", "s-1", "n", "NS-1")
+        f.db.insert_agent(Owner::Ticket(f.ticket), "po", "s-1", "n", "NS-1")
             .unwrap();
         create_agents_dir(&f.dir).unwrap();
         // A file left by a nick that died (kill -9): nobody holds it.
@@ -593,8 +695,17 @@ mod tests {
     #[test]
     fn cleanup_keeps_an_agent_whose_lock_another_nick_holds() {
         let f = fixture();
-        let held = open(&f.db, &f.dir, f.ticket, Stage::Po, "s-1", "n", "NS-1").unwrap();
-        f.db.insert_agent(f.ticket, "review", "s-2", "n", "NS-1")
+        let held = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Po,
+            "s-1",
+            "n",
+            "NS-1",
+        )
+        .unwrap();
+        f.db.insert_agent(Owner::Ticket(f.ticket), "review", "s-2", "n", "NS-1")
             .unwrap();
         assert_eq!(cleanup(&f.db, &f.dir), Ok(1));
         assert_eq!(
@@ -609,7 +720,7 @@ mod tests {
     fn cleanup_does_not_touch_ended_rows() {
         let f = fixture();
         let a =
-            f.db.insert_agent(f.ticket, "po", "s-1", "n", "NS-1")
+            f.db.insert_agent(Owner::Ticket(f.ticket), "po", "s-1", "n", "NS-1")
                 .unwrap();
         f.db.stop_agent(a.id).unwrap();
         create_agents_dir(&f.dir).unwrap();
@@ -623,7 +734,7 @@ mod tests {
     #[test]
     fn cleanup_keeps_an_agent_whose_lock_cant_be_opened() {
         let f = fixture();
-        f.db.insert_agent(f.ticket, "po", "s-1", "n", "NS-1")
+        f.db.insert_agent(Owner::Ticket(f.ticket), "po", "s-1", "n", "NS-1")
             .unwrap();
         create_agents_dir(&f.dir).unwrap();
         // A directory in place of the lock file: an I/O error, not a proof of death.
@@ -712,8 +823,14 @@ mod tests {
 
     fn stopped(f: &Fixture, session: &str) -> Agent {
         let agent =
-            f.db.insert_agent(f.ticket, "po", session, "proj · PO · NS-1", "NS-1")
-                .unwrap();
+            f.db.insert_agent(
+                Owner::Ticket(f.ticket),
+                "po",
+                session,
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
         f.db.stop_agent(agent.id).unwrap();
         f.db.get_agent(agent.id).unwrap().unwrap()
     }
@@ -742,8 +859,14 @@ mod tests {
     fn a_lock_held_by_another_nick_refuses_to_resume_and_changes_nothing() {
         let f = fixture();
         let agent =
-            f.db.insert_agent(f.ticket, "po", "s-1", "proj · PO · NS-1", "NS-1")
-                .unwrap();
+            f.db.insert_agent(
+                Owner::Ticket(f.ticket),
+                "po",
+                "s-1",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
         let _other = held_by_another(&f, "s-1");
         let err = resume(&f.db, &f.dir, &agent).unwrap_err();
         assert_eq!(
@@ -758,8 +881,14 @@ mod tests {
     fn an_active_agent_whose_lock_is_free_is_resumed() {
         let f = fixture();
         let agent =
-            f.db.insert_agent(f.ticket, "po", "s-1", "proj · PO · NS-1", "NS-1")
-                .unwrap();
+            f.db.insert_agent(
+                Owner::Ticket(f.ticket),
+                "po",
+                "s-1",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
         let open = resume(&f.db, &f.dir, &agent).unwrap();
         assert_eq!(open.agent.state, "active");
         assert!(!lock_is_free(&lock_path(&f.dir, "s-1")));
@@ -812,8 +941,14 @@ mod tests {
         );
         assert_eq!(states(&f.db), pairs(&[("s-1", "stopped")]));
         let active =
-            f.db.insert_agent(f.ticket, "po", "s-2", "proj · PO · NS-1", "NS-1")
-                .unwrap();
+            f.db.insert_agent(
+                Owner::Ticket(f.ticket),
+                "po",
+                "s-2",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
         assert_eq!(
             archive(&f.db, &active),
             Err("Um agente ativo não pode ser arquivado.".to_string())
@@ -827,7 +962,7 @@ mod tests {
     fn named(name: &str, key: Option<&str>) -> Agent {
         Agent {
             id: 1,
-            ticket_id: 1,
+            owner: Owner::Ticket(1),
             stage: "po".into(),
             session_id: "s".into(),
             name: name.into(),
@@ -889,12 +1024,103 @@ mod tests {
     fn unarchiving_an_active_agent_says_it_is_active() {
         let f = fixture();
         let active =
-            f.db.insert_agent(f.ticket, "po", "s-1", "proj · PO · NS-1", "NS-1")
-                .unwrap();
+            f.db.insert_agent(
+                Owner::Ticket(f.ticket),
+                "po",
+                "s-1",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
         assert_eq!(
             unarchive(&f.db, &active),
             Err("O agente proj · PO · NS-1 já está ativo.".to_string())
         );
         assert_eq!(states(&f.db), pairs(&[("s-1", "active")]));
+    }
+
+    // ---- the agents of an epic (NS-40) ----
+
+    #[test]
+    fn an_epic_has_agents_of_po_and_tech_leader_only() {
+        let f = fixture();
+        let project = f.db.get_ticket(f.ticket).unwrap().unwrap().project_id;
+        let epic = f.db.insert_epic(project, "EPIC-1", false, "e").unwrap();
+        for (i, stage) in [Stage::Po, Stage::TechLeader].into_iter().enumerate() {
+            let session = format!("ok-{i}");
+            let name = agent_name("proj", stage, "EPIC-1");
+            let open = open(
+                &f.db,
+                &f.dir,
+                Owner::Epic(epic.id),
+                stage,
+                &session,
+                &name,
+                "EPIC-1",
+            )
+            .unwrap();
+            assert_eq!(open.agent.owner, Owner::Epic(epic.id));
+            assert_eq!(open.agent.opened_key.as_deref(), Some("EPIC-1"));
+            assert!(lock_path(&f.dir, &session).is_file());
+            end(&f.db, open).unwrap();
+        }
+        assert_eq!(
+            agent_name("proj", Stage::TechLeader, "EPIC-1"),
+            "proj · Tech Leader · EPIC-1"
+        );
+        for stage in [Stage::Development, Stage::Review] {
+            let err = open(
+                &f.db,
+                &f.dir,
+                Owner::Epic(epic.id),
+                stage,
+                "no",
+                "n",
+                "EPIC-1",
+            )
+            .unwrap_err();
+            assert_eq!(err, EPIC_STAGE_MESSAGE);
+            assert_eq!(err, "O épico só tem agentes de PO e de Tech Leader.");
+            assert!(!lock_path(&f.dir, "no").exists(), "the lock is not touched");
+        }
+        assert_eq!(f.db.list_project_agents(project).unwrap().len(), 2);
+        // A ticket takes every stage, as before.
+        let dev = open(
+            &f.db,
+            &f.dir,
+            Owner::Ticket(f.ticket),
+            Stage::Development,
+            "d",
+            "n",
+            "NS-1",
+        );
+        assert!(dev.is_ok());
+    }
+
+    #[test]
+    fn a_holder_is_built_from_a_ticket_or_an_epic() {
+        let f = fixture();
+        let mut ticket = f.db.get_ticket(f.ticket).unwrap().unwrap();
+        let epic =
+            f.db.insert_epic(ticket.project_id, "E", false, "um épico")
+                .unwrap();
+        let from_ticket = Holder::from(&ticket);
+        assert_eq!(from_ticket.owner, Owner::Ticket(ticket.id));
+        assert_eq!(
+            (from_ticket.key.as_str(), from_ticket.title.as_str()),
+            ("NS-1", "t")
+        );
+        assert_eq!(from_ticket.project_id, ticket.project_id);
+        assert!(!from_ticket.hidden);
+        assert_eq!(from_ticket.noun(), "ticket");
+        ticket.hidden_at = Some("x".into());
+        assert!(Holder::from(&ticket).hidden);
+        let from_epic = Holder::from(&epic);
+        assert_eq!(from_epic.owner, Owner::Epic(epic.id));
+        assert_eq!(
+            (from_epic.key.as_str(), from_epic.title.as_str()),
+            ("E", "um épico")
+        );
+        assert_eq!(from_epic.noun(), "épico");
     }
 }

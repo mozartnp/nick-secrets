@@ -29,7 +29,8 @@
 #       and --name: the deny/ask rules, --permission-mode auto only with --type development, the
 #       jail notice (only with the jail on), --session-id, --name and the content of <file> (the
 #       log of --render) as the last argument.
-#   nick-agent --resume <uuid> --name <name> --stage <stage> [--opened-id <id>] --ticket-id <id>
+#   nick-agent --resume <uuid> --name <name> --stage <stage> [--opened-id <id>]
+#              (--ticket-id <id> | --epic-id <id>)
 #       (NS-39) resumes the conversation <uuid> of a stopped agent, by the same path as the launch
 #       (the same checks, config_dir_prepare, jail_print_status and jail_exec, with the config of
 #       now): claude --settings <rules> [--permission-mode auto only with --stage development]
@@ -37,7 +38,8 @@
 #       notice is the jail one (only with the jail on) and, when --opened-id (the ticket key the
 #       agent was opened with) differs from --ticket-id (the key of now), a blank line and
 #       resume_id_notice (auto_scrum/prompt.sh): the folder of the ticket changed. The stage, and
-#       not the type, because the type of an agent is not stored.
+#       not the type, because the type of an agent is not stored. An agent of an epic (NS-40) gets
+#       --epic-id in the place of --ticket-id (exactly one of the two), and the notice of an epic.
 #   nick-agent --has-conversation <uuid>
 #       (NS-39) prints exactly conversation=true or conversation=false and exits with 0: whether
 #       claude keeps the conversation <uuid> of a session run with the cwd at this project
@@ -97,7 +99,7 @@ AGENT_STAGES=(po tech_leader development review)
 # usage_error <message>: the error and the usage on stderr, exit 1 (the pattern of bin/nick-init).
 usage_error() {
   echo "Erro: $1" >&2
-  echo "Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id> | --has-conversation <uuid>" >&2
+  echo "Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>" >&2
   exit 1
 }
 
@@ -301,10 +303,10 @@ stage_known() {
 
 # resume_mode <args...>: the resume (see the header), its options in any order.
 resume_mode() {
-  local session_id="" name="" stage="" opened_id="" ticket_id="" seen=" " notice=""
+  local session_id="" name="" stage="" opened_id="" holder_id="" holder="" seen=" " notice=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --resume | --name | --stage | --opened-id | --ticket-id)
+      --resume | --name | --stage | --opened-id | --ticket-id | --epic-id)
         [ "$#" -ge 2 ] || usage_error "falta o valor de $1."
         case "$seen" in
           *" $1 "*) usage_error "o $1 foi repetido." ;;
@@ -315,7 +317,13 @@ resume_mode() {
           --name) name="$2" ;;
           --stage) stage="$2" ;;
           --opened-id) opened_id="$2" ;;
-          --ticket-id) ticket_id="$2" ;;
+          --ticket-id | --epic-id)
+            # Exactly one of the two (NS-40): the ticket or the epic of the agent.
+            [ -z "$holder" ] || usage_error "informe só um dos dois: --ticket-id ou --epic-id."
+            holder="${1#--}"
+            holder="${holder%-id}"
+            holder_id="$2"
+            ;;
         esac
         shift 2
         ;;
@@ -327,10 +335,11 @@ resume_mode() {
   [ -n "$name" ] || usage_error "informe o --name <nome> (não vazio)."
   [ -n "$stage" ] || usage_error "informe o --stage <etapa>."
   stage_known "$stage" || usage_error "a etapa '$stage' não existe."
-  [ -n "$ticket_id" ] || usage_error "informe o --ticket-id <id>."
+  [ -n "$holder" ] || usage_error "informe o --ticket-id <id> ou o --epic-id <id>."
+  [ -n "$holder_id" ] || usage_error "informe o --$holder-id <id>."
   # The message of read_jira_id (auto_scrum.sh), without its "Tente de novo."; an --opened-id
   # given goes through it too (empty included).
-  jira_id_valid "$ticket_id" || usage_error "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/)."
+  jira_id_valid "$holder_id" || usage_error "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/)."
   case "$seen" in
     *" --opened-id "*)
       jira_id_valid "$opened_id" || usage_error "ID do Jira inválido: não pode ter /, .., espaço nem caractere de controle (ele vira o nome da pasta $NICK_DOCS_DIR/<ID>/)."
@@ -340,8 +349,8 @@ resume_mode() {
   load_and_check
   config_dir_prepare || exit 1
   jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
-  if [ -n "$opened_id" ] && [ "$opened_id" != "$ticket_id" ]; then
-    notice="$(resume_id_notice "$opened_id" "$ticket_id")"
+  if [ -n "$opened_id" ] && [ "$opened_id" != "$holder_id" ]; then
+    notice="$(resume_id_notice "$opened_id" "$holder_id" "$holder")"
   fi
   # No prompt: the conversation goes on where it stopped.
   exec_claude "$stage" "$notice" --resume "$session_id" --name "$name"
@@ -365,7 +374,7 @@ launch_kind() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --resume) echo "resume" && return 0 ;;
-      --session-id | --name | --type | --prompt-file | --stage | --opened-id | --ticket-id) shift ;;
+      --session-id | --name | --type | --prompt-file | --stage | --opened-id | --ticket-id | --epic-id) shift ;;
     esac
     [ "$#" -gt 0 ] && shift
   done
@@ -374,7 +383,7 @@ launch_kind() {
 
 main() {
   if [ "$#" -eq 0 ]; then
-    usage_error "informe --check, --render <tipo>, --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>, --resume <uuid> --name <nome> --stage <etapa> --ticket-id <id> ou --has-conversation <uuid>."
+    usage_error "informe --check, --render <tipo>, --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo>, --resume <uuid> --name <nome> --stage <etapa> --ticket-id <id> (ou --epic-id <id>) ou --has-conversation <uuid>."
   fi
   case "$1" in
     --check)

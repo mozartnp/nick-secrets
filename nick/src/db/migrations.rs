@@ -107,6 +107,79 @@ ALTER TABLE agents ADD COLUMN opened_key TEXT;  -- the ticket key at the opening
 UPDATE agents SET state = 'stopped' WHERE state = 'ended';
 ";
 
+/// Migration 7 (NS-40): the optional epics, a level between the project and the ticket that holds
+/// long conversations (only of PO and Tech Leader), with no stage. An epic has the key and the
+/// title of a ticket, and hiding it (`hidden_at`) hides its whole branch without touching the
+/// `hidden_at` of its tickets. A ticket goes into an epic by `tickets.epic_id` (NULL: no epic),
+/// which has no ON DELETE: an epic is never deleted alone, only with its project, and then its
+/// tickets go too (ON DELETE CASCADE from the project).
+///
+/// The table `agents` is rebuilt, because SQLite can't alter a NOT NULL, a CHECK nor a foreign
+/// key: the owner of an agent is a ticket or an epic, never both and never none, and an agent of
+/// an epic is only of PO or Tech Leader (`stages::EPIC_STAGES`). The rebuild works with the
+/// foreign keys on, because no table points to `agents`; the `id` of every row is kept (the locks
+/// are by `session_id`, but the tree and the tests use the `id`). The column `state` still has no
+/// CHECK (see the migration 3): the `AgentState` enum stays its only source.
+///
+/// The triggers: the key is unique across the tickets and the epics of a project, because both
+/// use `.nick/docs/<key>/`, and a UNIQUE does not cross two tables (the code checks it first, with
+/// the message in PT-BR; the triggers close the race between two nicks, and their error becomes
+/// the same message: `db::is_trigger_abort`). A ticket only goes into an epic of its own project.
+pub const MIGRATION_7: &str = "\
+CREATE TABLE epics (
+    id             INTEGER PRIMARY KEY,
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,     -- the Jira ID, or the provisional short UUID
+    is_provisional INTEGER NOT NULL CHECK (is_provisional IN (0, 1)),
+    title          TEXT NOT NULL CHECK (trim(title) <> ''),
+    created_at     TEXT NOT NULL,     -- RFC 3339, in UTC
+    hidden_at      TEXT,              -- RFC 3339, in UTC; NULL while visible (the whole branch)
+    UNIQUE (project_id, key)
+);
+ALTER TABLE tickets ADD COLUMN epic_id INTEGER REFERENCES epics(id);  -- NULL: no epic
+CREATE TABLE agents_new (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER REFERENCES tickets(id) ON DELETE CASCADE,
+    epic_id    INTEGER REFERENCES epics(id) ON DELETE CASCADE,
+    stage      TEXT NOT NULL
+               CHECK (stage IN ('po', 'tech_leader', 'development', 'review')),
+    session_id TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
+    opened_at  TEXT NOT NULL,
+    state      TEXT NOT NULL,          -- no CHECK (NS-33, NS-39): the AgentState enum
+    opened_key TEXT,
+    CHECK ((ticket_id IS NULL) <> (epic_id IS NULL)),
+    CHECK (epic_id IS NULL OR stage IN ('po', 'tech_leader'))
+);
+INSERT INTO agents_new (id, ticket_id, epic_id, stage, session_id, name, opened_at, state,
+                        opened_key)
+    SELECT id, ticket_id, NULL, stage, session_id, name, opened_at, state, opened_key FROM agents;
+DROP TABLE agents;
+ALTER TABLE agents_new RENAME TO agents;
+-- the key is unique across the tickets and the epics of a project (both use .nick/docs/<key>/)
+CREATE TRIGGER epics_key_not_a_ticket_insert BEFORE INSERT ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER epics_key_not_a_ticket_update BEFORE UPDATE OF key ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER tickets_key_not_an_epic_insert BEFORE INSERT ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+CREATE TRIGGER tickets_key_not_an_epic_update BEFORE UPDATE OF key ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+-- a ticket only goes to an epic of its own project
+CREATE TRIGGER tickets_epic_of_the_project_insert BEFORE INSERT ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
 pub const MIGRATIONS: &[&str] = &[
     MIGRATION_1,
@@ -115,4 +188,5 @@ pub const MIGRATIONS: &[&str] = &[
     MIGRATION_4,
     MIGRATION_5,
     MIGRATION_6,
+    MIGRATION_7,
 ];

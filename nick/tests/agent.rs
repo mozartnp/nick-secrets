@@ -1824,7 +1824,7 @@ fn stage_of(world: &World, key: &str) -> String {
 /// Enter opened the ticket screen).
 fn open_ticket_screen(nick: &mut Nick) {
     nick.send(LEFT);
-    wait_flat(nick, "m mudar etapa");
+    wait_flat(nick, "p épico");
 }
 
 #[test]
@@ -1897,7 +1897,7 @@ fn editing_the_id_with_a_live_agent_is_refused() {
         [("NS-1".into(), "Primeiro".into(), false)]
     );
     nick.send(ESC);
-    wait_flat(&nick, "m mudar etapa");
+    wait_flat(&nick, "p épico");
     nick.send("q");
     nick.wait_for("Encerrar e sair? (s/N)");
     nick.send("s");
@@ -2005,7 +2005,7 @@ fn the_shortcut_from_a_ticket_goes_to_the_last_agent_and_back() {
     wait_for_focus_border(&nick, false);
     // The ticket selected: no agent shown, its panel on the right.
     nick.send(LEFT);
-    wait_flat(&nick, "m mudar etapa");
+    wait_flat(&nick, "p épico");
     nick.wait_for(" Ticket NS-1 ");
     nick.keep_screen("ticket selecionado com um agente vivo escondido");
     nick.send(SHORTCUT);
@@ -2041,8 +2041,8 @@ fn moving_on_the_tree_sends_no_sigwinch_to_claude() {
     // The ticket, the project, the module, down again to the other ticket, the filters.
     // ← goes up from a leaf and closes an open node; → opens.
     for (key, help) in [
-        (LEFT, "m mudar etapa"),
-        (LEFT, "m mudar etapa"),
+        (LEFT, "p épico"),
+        (LEFT, "p épico"),
         (LEFT, "a novo ticket"),
         (LEFT, "a novo ticket"),
         (LEFT, "a adicionar projeto"),
@@ -2050,10 +2050,10 @@ fn moving_on_the_tree_sends_no_sigwinch_to_claude() {
         (RIGHT, "a adicionar projeto"),
         (DOWN, "a novo ticket"),
         (RIGHT, "a novo ticket"),
-        (DOWN, "m mudar etapa"),
-        (RIGHT, "m mudar etapa"),
+        (DOWN, "p épico"),
+        (RIGHT, "p épico"),
         (DOWN, "Enter ir ao terminal"),
-        (DOWN, "m mudar etapa"),
+        (DOWN, "p épico"),
         ("f", "f esconder ocultos"),
         ("v", "v mostrar tudo"),
         ("v", "v agentes ativos"),
@@ -2109,12 +2109,7 @@ fn each_kind_of_node_has_its_panel_and_its_help() {
             "↑/↓ mover · r retomar · o arquivar · ← subir",
             "agente parado",
         ),
-        (
-            "NS-1",
-            " Ticket NS-1 ",
-            "m mudar etapa",
-            "ticket com agentes",
-        ),
+        ("NS-1", " Ticket NS-1 ", "p épico", "ticket com agentes"),
         ("proj", " Projeto proj ", "a novo ticket", "projeto"),
         (
             "auto_scrum",
@@ -2483,4 +2478,294 @@ fn no_rust_source_writes_the_state_ended() {
         .1;
     assert_eq!(ended_literals(&migrations), 2);
     assert_eq!(ended_literals("state = 'ended' or \"ended\""), 2);
+}
+
+// ---- the epics (NS-40) ----
+
+/// From the node of the project `proj`, `n` and the dialog answered: the epic `key` created and
+/// selected.
+fn new_epic(nick: &mut Nick, title: &str, key: &str) {
+    nick.select("proj");
+    nick.send("n");
+    nick.wait_for(" Novo épico ");
+    nick.send(title);
+    nick.send(TAB);
+    nick.send(key);
+    nick.send(ENTER);
+    nick.wait_for_flat(&format!("Épico criado: {key} — {title}."));
+}
+
+#[test]
+fn an_epic_from_its_creation_to_the_resume_of_its_agent() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    nick.open_project("proj");
+    new_epic(&mut nick, "Plano longo", "EPIC-1");
+    let (_, row) = nick.selected_row().expect("the epic selected");
+    assert!(row.contains("EPIC-1  [épico]  Plano longo"), "{row}");
+    nick.wait_for_flat("Agentes do épico: só PO e Tech Leader.");
+    nick.keep_screen("painel do épico");
+    // `g`: only the types of PO and Tech Leader.
+    assert!(open_menu(&mut nick));
+    let screen = nick.screen();
+    assert!(screen.contains("Épico EPIC-1 — Plano longo"), "{screen}");
+    assert!(
+        !screen.contains("Desenvolvimento") && !screen.contains("Review"),
+        "{screen}"
+    );
+    choose_type(&mut nick, "PO - Conversar para definir ticket");
+    nick.send("Assunto do épico");
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    nick.send("s");
+    nick.wait_for("READY");
+    let argv = read(&logs(&world).claude);
+    assert!(argv.contains("--name\nproj · PO · EPIC-1\n"), "{argv}");
+    let session = world.agents()[0].0.clone();
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · EPIC-1 terminou.");
+    nick.wait_for_flat("r retomar");
+    let rows = nick.tree_rows();
+    let at = |label: &str| rows.iter().position(|r| r.contains(label)).unwrap();
+    assert!(
+        at("EPIC-1  [épico]") < at("PO  parado"),
+        "the agent under the epic: {rows:?}"
+    );
+    assert!(
+        at("PO  parado") < at("NS-1"),
+        "the agents of the epic before the tickets: {rows:?}"
+    );
+    nick.keep_screen("árvore com o épico aberto: o agente do épico (parado) e o ticket sem épico");
+    keep_conversation(&world, &proj, &session);
+    fs::remove_file(logs(&world).claude).unwrap();
+    nick.send("r");
+    nick.wait_for("READY");
+    nick.wait_for_flat("O agente proj · PO · EPIC-1 foi retomado.");
+    assert_resumed(&world, &session, "proj · PO · EPIC-1");
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · EPIC-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn moving_a_ticket_with_a_live_agent_touches_no_file_and_the_agent_goes_on() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    world.epic(&proj, "EPIC-1", "Plano longo", &[]);
+    fs::create_dir_all(proj.join(".nick/docs/NS-1")).unwrap();
+    fs::create_dir_all(proj.join(".nick/docs/EPIC-1")).unwrap();
+    let mut nick = spawn(&world, "sleep", &[]);
+    nick.open_project("proj");
+    nick.select("NS-1");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    let pid = pids(&world)[0];
+    nick.send(SHORTCUT);
+    nick.wait_for_flat("Enter ir ao terminal");
+    nick.select("NS-1");
+    let before = common::snapshot(&proj);
+    nick.send("p");
+    nick.wait_for(" Mover ticket ");
+    nick.wait_for_flat("Sem épico (atual)");
+    nick.keep_screen("diálogo Mover ticket");
+    nick.send(DOWN);
+    nick.send(ENTER);
+    nick.wait_for_flat("Ticket NS-1 movido para o épico EPIC-1.");
+    assert_eq!(
+        common::snapshot(&proj),
+        before,
+        "no file of the project touched"
+    );
+    assert!(alive(pid), "the agent goes on");
+    assert_eq!(world.agents()[0].3, "active");
+    // Reachable by the shortcut, now under the epic.
+    nick.send(SHORTCUT);
+    nick.wait_for_flat(&format!("{} voltar à lista", "Ctrl+\\"));
+    nick.send(SHORTCUT);
+    nick.wait_for_flat("Enter ir ao terminal");
+    let rows = nick.tree_rows();
+    let at = |label: &str| rows.iter().position(|r| r.contains(label)).unwrap();
+    assert!(
+        at("EPIC-1  [épico]") < at("NS-1") && at("NS-1") < at("PO  ● vivo"),
+        "{rows:?}"
+    );
+    nick.keep_screen("agente na profundidade 4 (ticket dentro do épico)");
+    nick.select("NS-1");
+    nick.wait_for_flat("Épico: EPIC-1 — Plano longo");
+    nick.keep_screen("painel do ticket com épico");
+    nick.send("q");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn hiding_an_epic_is_refused_with_a_live_agent_and_then_takes_and_brings_back_the_branch() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    world.ticket(&proj, "NS-2", "Segundo");
+    world.hide_ticket(&proj, "NS-2");
+    world.epic(&proj, "EPIC-1", "Plano longo", &["NS-1", "NS-2"]);
+    let before = world.tickets(Some(&proj));
+    let mut nick = spawn(&world, "sleep", &[]);
+    nick.open_project("proj");
+    nick.open_node("EPIC-1");
+    nick.select("NS-1");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.send(SHORTCUT);
+    nick.wait_for_flat("Enter ir ao terminal");
+    nick.select("EPIC-1");
+    nick.send("o");
+    nick.wait_for_flat(
+        "O épico EPIC-1 tem 1 agente ativo (no épico ou nos tickets dele). Encerre-os antes de \
+         ocultar.",
+    );
+    assert!(!nick.screen().contains("(s/N)"), "no dialog");
+    nick.keep_screen("recusa de ocultar o épico com agente ativo");
+    nick.select("PO  ● vivo");
+    nick.send("x");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    nick.wait_for_flat("foi encerrado.");
+    nick.select("EPIC-1");
+    nick.send("o");
+    nick.wait_for_flat("O ramo inteiro (2 tickets) sai da árvore e volta com f. (s/N)");
+    nick.send("s");
+    nick.wait_for_flat("Épico ocultado: EPIC-1.");
+    nick.wait_until("the branch out of the tree", || {
+        !nick
+            .tree_rows()
+            .iter()
+            .any(|r| r.contains("[épico]") || r.contains("NS-1  [PO]"))
+    });
+    nick.send("f");
+    // The `[oculto]` is past the 38 columns at depth 2 (the end of a row is cut, NS-34).
+    nick.wait_for(" Navegação (com ocultos) ");
+    nick.wait_for_tree("EPIC-1  [épico]  Plano longo");
+    nick.keep_screen("épico oculto com f");
+    nick.select("EPIC-1");
+    nick.send("o");
+    nick.wait_for_flat("Épico restaurado: EPIC-1.");
+    assert_eq!(
+        world.tickets(Some(&proj)),
+        before,
+        "every ticket as it was (NS-2 still hidden)"
+    );
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn a_real_version_6_database_opens_migrated_with_the_tree_of_before() {
+    let world = World::new();
+    let proj = world.project("proj", &["JAIL_ENABLED=\"false\""]);
+    nick::paths::create_state_dir(world.db_path().parent().unwrap()).unwrap();
+    {
+        let old = nick::db::Db::open_with(&world.db_path(), &nick::db::migrations::MIGRATIONS[..6])
+            .unwrap();
+        let canonical = fs::canonicalize(&proj).unwrap();
+        let p = old
+            .insert_project("auto_scrum", "proj", canonical.to_str().unwrap())
+            .unwrap();
+        let conn = old.connection();
+        conn.execute(
+            "INSERT INTO tickets (project_id, key, is_provisional, title, created_at) \
+             VALUES (?1, 'NS-1', 0, 'Primeiro', '2026-11-20T10:00:00Z')",
+            [p.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (ticket_id, stage, session_id, name, opened_at, state, opened_key) \
+             VALUES (1, 'po', 's-1', 'proj · PO · NS-1', '2026-11-20T10:00:00Z', 'stopped', 'NS-1')",
+            [],
+        )
+        .unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+    }
+    let mut nick = spawn(&world, "sleep", &[]);
+    nick.open_project("proj");
+    nick.open_node("NS-1");
+    nick.wait_for_tree("PO  parado");
+    let rows: Vec<String> = nick
+        .tree_rows()
+        .into_iter()
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    assert!(
+        !rows.iter().any(|r| r.contains("[épico]")),
+        "no epic: {rows:?}"
+    );
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    let db = nick::db::Db::open(&world.db_path()).unwrap();
+    let version: u32 = db
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    assert_eq!(world.agents()[0].3, "stopped");
+}
+
+/// A fixed piece of the notice of the new ID of an epic (NS-40): prompt, so only in bash.
+const EPIC_NOTICE_PIECE: &str = "A pasta do épico agora é";
+
+#[test]
+fn the_notice_of_the_new_id_of_an_epic_is_only_in_bash() {
+    for (name, code) in production_sources() {
+        assert!(!code.contains(EPIC_NOTICE_PIECE), "{name}");
+    }
+    let prompt =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../auto_scrum/prompt.sh"))
+            .unwrap();
+    assert!(prompt.contains(EPIC_NOTICE_PIECE), "positive control");
+}
+
+/// The writes of `tickets.epic_id` and the calls of `set_ticket_epic` in `code` (NS-40).
+fn epic_moves(code: &str) -> (usize, usize) {
+    (
+        code.matches("UPDATE tickets SET epic_id").count(),
+        code.matches("set_ticket_epic(").count(),
+    )
+}
+
+#[test]
+fn only_move_ticket_moves_a_ticket_between_epics() {
+    let mut calls = Vec::new();
+    for (name, code) in production_sources() {
+        let (updates, sets) = epic_moves(&code);
+        if !name.contains("/db/") {
+            assert_eq!(updates, 0, "{name}: no UPDATE of epic_id out of src/db/");
+        }
+        if sets > 0 {
+            calls.push((name, sets));
+        }
+    }
+    calls.sort();
+    let calls: Vec<(String, usize)> = calls
+        .into_iter()
+        .map(|(name, n)| (name.rsplit("src/").next().unwrap().to_string(), n))
+        .collect();
+    assert_eq!(
+        calls,
+        [("db/mod.rs".to_string(), 1), ("epics.rs".to_string(), 1)],
+        "the definition and the one call, in epics::move_ticket"
+    );
+    let epics = production_sources()
+        .into_iter()
+        .find(|(name, _)| name.ends_with("epics.rs"))
+        .unwrap()
+        .1;
+    let start = epics.find("pub fn move_ticket").expect("move_ticket");
+    assert!(
+        epics[start..].contains("set_ticket_epic("),
+        "inside move_ticket"
+    );
+    // Positive control: the filter finds both.
+    assert_eq!(
+        epic_moves("db.set_ticket_epic(1, None); \"UPDATE tickets SET epic_id = 1\""),
+        (1, 1)
+    );
 }

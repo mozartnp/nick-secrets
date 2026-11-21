@@ -932,7 +932,10 @@ mod tests {
         assert_eq!(wait_exit(&session), 0);
         session.wait();
         let argv = fs::read_to_string(case.path("claude.argv")).unwrap();
-        assert!(!argv.contains("--append-system-prompt"), "{argv}");
+        // NS-41: the launcher always sends one --append-system-prompt (the instruction about the
+        // permission rules), but with no notice of the ID: no folder of a ticket in it.
+        assert!(argv.contains("--append-system-prompt\n"), "{argv}");
+        assert!(!argv.contains(".nick/docs/"), "{argv}");
         assert!(
             !argv.contains("\nauto\n"),
             "no auto mode out of the Dev stage: {argv}"

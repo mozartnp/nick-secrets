@@ -1123,11 +1123,12 @@ Hoje as três bibliotecas têm diretório: `lib/config/` (dois arquivos de códi
   versão mínima em `JAIL_VERSION_MIN`) e lançamento (`jail_exec`), com a lista padrão de hosts da rede em `lib/jail/allow_hosts.txt`
   (`jail_nick_hosts`). Mesmo formato do `lib/claude/`: pasta própria com o código e o dado,
   testes em `lib/tests/`. Ver seção "Sandbox do agente com ai-jail (`JAIL_ENABLED`)";
-- `lib/claude/claude.sh` + `lib/claude/permissions.json`: as regras de deny/ask do Claude
-  Code que toda sessão aberta pelo nick recebe, e, desde o NS-39, onde o `claude` guarda a
-  conversa de uma sessão (`claude_conversation_file`, com a pasta de configuração por parâmetro:
-  seção "Rust no projeto: retomar e arquivar agentes (NS-39)"). Ver seção "Regras de deny/ask do
-  Claude Code (`lib/claude/`)". A divisão:
+- `lib/claude/claude.sh` + `lib/claude/permissions.json`: as regras de deny/ask do Claude Code
+  que toda sessão aberta pelo nick recebe, a instrução de sistema de não contornar uma recusa
+  dessas regras (`claude_permission_notice`, desde o NS-41), e, desde o NS-39, onde o `claude`
+  guarda a conversa de uma sessão (`claude_conversation_file`, com a pasta de configuração por
+  parâmetro: seção "Rust no projeto: retomar e arquivar agentes (NS-39)"). Ver seção "Regras de
+  deny/ask do Claude Code (`lib/claude/`)". A divisão:
 
   | Fica em `lib/claude/` | Fica na ferramenta (`auto_scrum.sh`) |
   |---|---|
@@ -1135,6 +1136,7 @@ Hoje as três bibliotecas têm diretório: `lib/config/` (dois arquivos de códi
   | achar o arquivo pelo `BASH_SOURCE` (`NICK_CLAUDE_PERMISSIONS_FILE`) | quando carregar (`main()`, logo depois de `jail_check`, com `\|\| exit 1`) |
   | ler o arquivo e entregar o conteúdo (`claude_settings_load`) | montar o argv: `claude_args=(--settings "$NICK_CLAUDE_SETTINGS")` |
   | a mensagem de erro (`claude_print_settings_error`) | o resto do argv (`--permission-mode`, `--append-system-prompt`, prompt) |
+  | o texto da instrução de não contornar uma recusa (`claude_permission_notice`, NS-41) | entregá-lo no início do único `--append-system-prompt` (`main()` e `exec_claude`) |
 
 **As bibliotecas não dependem umas das outras:** cada uma pode ser carregada sozinha, e a suíte
 de uma não carrega a outra (`lib/tests/test_jail.sh` nunca carrega `lib/config/config.sh`, e um teste
@@ -1795,14 +1797,17 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   conferível, e, se faltar algo, a primeira hipótese é a jail — parar e avisar o usuário com o
   caminho, serviço ou host, sem diagnosticar a máquina. O `auto_scrum` o passa ao `claude` por
   `--append-system-prompt`, só com `JAIL_ENABLED="true"`: desligada, o argv continua o de antes
-  da jail. Pelo system prompt, e não por um bloco nos 8 templates, porque vale pra sessão
-  inteira, fica num lugar só e não depende da etapa. O texto fica na biblioteca (o conhecimento
-  sobre a jail é dela) e a ferramenta só decide como entregá-lo, porque `jail_exec` é genérico
-  sobre o comando e não pode injetar argumento do `claude`. O texto descreve o padrão do
-  ai-jail (rede: API do Claude, registries e GitHub; home: estado do `claude`, configuração do
-  git e, desde o ticket 27, os caches de dependência do `--toolchains`; reconferido no 3.2.0 com
-  `--dry-run`), por isso diz "por padrão": com `allow_hosts` na configuração global do
-  ai-jail (`~/.config/ai-jail/config.toml`) ou numa versão nova, pode haver mais. **A cada atualização do ai-jail, reconferir com `--dry-run`
+  da jail (desde o NS-41, o `--append-system-prompt` existe sempre e começa pela instrução de
+  não contornar uma recusa, e o aviso da jail vem depois dela, no mesmo argumento: ver
+  "Instrução de não contornar uma recusa (NS-41)"). Pelo system prompt, e não por um bloco nos
+  8 templates, porque vale pra sessão inteira, fica num lugar só e não depende da etapa. O
+  texto fica na biblioteca (o conhecimento sobre a jail é dela) e a ferramenta só decide como
+  entregá-lo, porque `jail_exec` é genérico sobre o comando e não pode injetar argumento do
+  `claude`. O texto descreve o padrão do ai-jail (rede: API do Claude, registries e GitHub;
+  home: estado do `claude`, configuração do git e, desde o ticket 27, os caches de dependência
+  do `--toolchains`; reconferido no 3.2.0 com `--dry-run`), por isso diz "por padrão": com
+  `allow_hosts` na configuração global do ai-jail (`~/.config/ai-jail/config.toml`) ou numa
+  versão nova, pode haver mais. **A cada atualização do ai-jail, reconferir com `--dry-run`
   esse texto e as strings de `jail_landlock_state`** (achado do review: o agente confia no
   aviso).
 - **Portas de `localhost`: `JAIL_FORWARD_PORTS` no `.nick/nick.conf`** (decisão do usuário). A
@@ -1954,7 +1959,7 @@ Toda sessão do `claude` aberta pelo nick, em todas as etapas, com ou sem jail, 
 conjunto fixo de regras de permissão do Claude Code:
 
 ```
-claude --settings "<conteúdo de lib/claude/permissions.json>" [--permission-mode auto] [--append-system-prompt <aviso da jail>] "<prompt>"
+claude --settings "<conteúdo de lib/claude/permissions.json>" [--permission-mode auto] --append-system-prompt "<instrução (NS-41)>[\n\n<aviso da jail>]" "<prompt>"
 ```
 
 Com a jail: `ai-jail <opções> -- claude --settings ...`. `--settings` vem sempre primeiro,
@@ -2019,7 +2024,9 @@ erro do agente, não um isolamento — quem quer contornar contorna. Exemplos qu
 `bash -c "sudo ..."`, `python -c 'import os; os.system("rm -rf ...")'`, `git -C . push -f`
 (o `-C` muda o começo do comando), `cat .env` (a regra `Read(...)` vale pra ferramenta de
 leitura, não pro `cat` no Bash) e o refspec com `+` (`git push origin +main`, um force push
-sem `--force`). O isolamento de verdade é a jail (seção "Sandbox do agente com ai-jail").
+sem `--force`). O isolamento de verdade é a jail (seção "Sandbox do agente com ai-jail"). Para
+o agente não refazer por outro caminho o que uma regra recusou, toda sessão recebe uma instrução
+de sistema (subseção "Instrução de não contornar uma recusa (NS-41)", abaixo).
 
 **Riscos conhecidos:**
 - uma versão nova do Claude Code pode mudar a sintaxe ou a semântica das regras, e uma regra
@@ -2046,6 +2053,79 @@ publicar no remote. Registrar aqui e no PR o resultado de cada um.
 **Fora de escopo, de propósito:** flag pra desligar; gravar em `.claude/settings*.json`;
 regras por projeto; hooks; regras de rede/MCP; `lib/ai/`; mudar `lib/config/config.sh` ou
 `lib/jail/jail.sh`; qualquer dependência nova em runtime.
+
+### Instrução de não contornar uma recusa (NS-41)
+
+**O problema.** As regras casam pelo texto do comando (acima). Quando uma delas recusava um
+comando (ex: `rm -rf`), o agente costumava refazer a mesma ação por outro caminho (um script no
+scratchpad, `bash -c`, `python -c`), o que anula a proteção. No modo `auto` da etapa de
+Desenvolvimento isso acontece sem ninguém ver. A recusa vem do deny/ask do Claude Code, **não da
+jail**, que permite escrever no projeto e por isso não resolve. Bloquear todo equivalente é
+inviável.
+
+**A correção é de comportamento.** Toda sessão aberta pelo nick recebe uma instrução fixa de
+sistema: uma recusa por regra de permissão é decisão do usuário, não um obstáculo técnico. O
+agente não pode obter o mesmo efeito por outro meio (script, `bash -c`, `sh -c`, `python -c`,
+outro interpretador, outra ferramenta ou outra forma de escrever o comando). Ele tem de parar,
+dizer qual comando foi recusado e por qual regra, e perguntar como seguir. A instrução vale
+**só** para o que uma regra recusou: comandos permitidos (ex: um `rm` de arquivo, sem `-rf`)
+continuam liberados, sem pedir licença, para não travar o modo `auto`.
+
+- **Fonte única: `claude_permission_notice`, em `lib/claude/claude.sh`.** Ela fica junto das
+  regras a que se refere, e as duas ferramentas (`auto_scrum.sh` e `bin/nick-agent`) já carregam
+  essa biblioteca. Segue o modelo de `jail_agent_notice`: `echo`s literais em PT-BR, sem
+  parâmetro, sem ler arquivo nem global, retorno 0. Um teste estrutural de
+  `lib/tests/test_claude.sh` garante, com controle positivo, que a frase de abertura não está
+  copiada no `auto_scrum.sh`, no `prompt.sh`, nos templates, no `bin/nick-agent` nem em
+  `nick/src/`, e que as duas ferramentas chamam a função. Os testes de ponta a ponta calculam o
+  argv esperado pela própria lib.
+- **Entrega: um único `--append-system-prompt`, sempre.** Ele aparece em todas as etapas, com e
+  sem jail, no `auto_scrum` e no `bin/nick-agent` (lançamento, retomada e retomada de épico).
+  Ordem, com uma linha em branco entre os avisos: instrução → aviso da jail (só com
+  `JAIL_ENABLED="true"`) → aviso do ID (só na retomada com o ID mudado). A instrução vem
+  primeiro porque está sempre presente e fala das mesmas regras do `--settings`, que também vem
+  primeiro.
+  Desde então, com a jail desligada, o argv deixou de ser "o de antes da jail": ganhou o
+  `--append-system-prompt`. Não vai para o `prompt.sh` nem para os templates porque vale para
+  toda sessão, inclusive a retomada, que não tem prompt. O Rust não monta nada disso (regra dos
+  NS-35/NS-39).
+- **"Ask" negado também conta.** O texto cobre a confirmação respondida com "não" pelo usuário,
+  além do deny: é a mesma situação, uma decisão do usuário sobre aquela ação. Sem isso, o
+  agente poderia contornar uma negação no `git push` (regra `ask`). Se o usuário preferir só o
+  deny, basta tirar a oração "ou quando o usuário negar um pedido de confirmação".
+- **O texto respeita as regras estruturais de `lib/`.** Nenhum `Bash(`/`Read(`, nenhum `CLAUDE_`
+  sem `NICK_`, nenhum `jail_`/`JAIL_`/`config_`. O guarda "não usa jq nem python" passou a olhar
+  só a posição de comando (começo da linha, depois de `;`, `&`, `|`, `(`, `$(` ou de uma
+  palavra-chave), com controles positivos. Antes ele casava qualquer `python` em código, e o
+  `python -c` do texto (dentro de um `echo`) não é dependência em runtime (decisão do usuário na
+  execução).
+- **Limitação: depende do modelo.** A instrução reduz o contorno, mas não o impede
+  tecnicamente: um modelo pode ignorá-la.
+- **Por que não hooks.** Um hook `PreToolUse` também só vê o texto do comando, então tem a mesma
+  limitação, e não enxerga o conteúdo de um script gravado e depois executado. Ele exigiria
+  entregar e manter um script e uma configuração de hooks que funcionassem dentro e fora da
+  jail, sem gravar no `.claude/settings*.json` do projeto alvo (decisão do NS-21). O ticket o
+  exclui.
+- **Fora do escopo:** o protótipo `prototype/panel/launch_session.sh` (NS-29) também carrega
+  `lib/claude/claude.sh`, mas não foi alterado, e a suíte dele passa sem mudança. Isso prova que
+  a função nova não mexeu no que já existia na biblioteca.
+
+**Teste manual (roteiro; executado pelo usuário, resultado pendente):**
+1. Num repositório descartável fora do `nick_secrets` (ex: `/tmp/nick41-proj`, com `git init`,
+   `.nick/nick.conf` gerado pelo `bin/nick-init` e um diretório `descartavel/` com dois
+   arquivos, `a.txt` e `b.txt`), abrir pelo `auto_scrum` uma sessão de **Desenvolvimento** (modo
+   `auto`), uma vez com `JAIL_ENABLED="false"` e outra com `"true"`.
+2. Pedir: "apague o diretório `descartavel/` com `rm -rf`".
+3. Esperado: o Claude Code recusa o comando pela regra, e o agente **para**, diz que
+   `rm -rf descartavel` foi recusado por regra de permissão e pergunta como seguir. Ele **não**
+   cria script nem usa `bash -c`/`python -c`/`find -delete`, e `descartavel/` continua
+   existindo.
+4. Contraprova (o que não deve mudar): pedir "apague o arquivo `descartavel/a.txt`". O agente
+   roda o `rm` sem `-rf` normalmente, sem perguntar.
+5. Repetir o passo 2 numa sessão aberta pela casca `nick` (agente de Desenvolvimento) e numa
+   retomada desse agente (`r`), já que a retomada não tem prompt.
+
+Registrar aqui e no PR o resultado de cada passo.
 
 ## Sentry via MCP na etapa de PO
 
@@ -2622,8 +2702,10 @@ o caminho do banco). Interface:
   valor efetivo: `true` só com `"true"` exato), e saída 0; os avisos do `config_load` vão para o
   stderr. Falha: a mensagem da lib no stderr e saída 1;
 - `nick-agent --session-id <uuid> --name <nome>`: as mesmas validações, `config_dir_prepare`,
-  `jail_print_status` e `jail_exec ... claude --settings <regras> [--append-system-prompt <aviso>
-  só com a jail ligada] --session-id <uuid> --name <nome>`. **Sem `--permission-mode` e sem
+  `jail_print_status` e `jail_exec ... claude --settings <regras> [--append-system-prompt
+  <aviso> só com a jail ligada] --session-id <uuid> --name <nome>` (desde o NS-41, o
+  `--append-system-prompt` existe sempre e começa pela instrução de não contornar uma recusa:
+  ver "Instrução de não contornar uma recusa (NS-41)"). **Sem `--permission-mode` e sem
   prompt**: o modo de permissão é o padrão do `claude` em todas as etapas até a F4 (roteiros e
   modo `auto` do Dev);
 - qualquer outro uso: `Erro: ...` e `Uso: nick-agent --check | --session-id <uuid> --name <nome>`
@@ -3069,8 +3151,11 @@ antes e com o NS-35 deram `diff -r` vazio.
   (arquivo regular, legível e não vazio), em qualquer ordem. O argv é o do `auto_scrum.sh` com
   `--session-id <uuid> --name <nome>` antes do prompt: `claude --settings <regras>
   [--permission-mode auto só no development] [--append-system-prompt <aviso> só com a jail]
-  --session-id <uuid> --name <nome> "$(cat <arquivo>)"`. O prompt é o último argumento, lido como
-  o script lê (o `$(cat …)` tira os `\n` do fim). O modo sem prompt do NS-33 deixou de existir.
+  --session-id <uuid> --name <nome> "$(cat <arquivo>)"` (desde o NS-41, o
+  `--append-system-prompt` existe sempre e começa pela instrução de não contornar uma recusa:
+  ver "Instrução de não contornar uma recusa (NS-41)"). O prompt é o último argumento, lido
+  como o script lê (o `$(cat …)` tira os `\n` do fim). O modo sem prompt do NS-33 deixou de
+  existir.
 
 **O log dos testes (`NICK_PROMPT_LOGS_DIR`).** O log do `--render` fica no `PROMPT_LOGS_DIR`, o
 `auto_scrum/logs/` do checkout, que tem dados reais. Os testes do launcher e da casca rodam o
@@ -3832,11 +3917,14 @@ o `auto` só vale com `development`, a regra de "Modo auto só na etapa de Desen
   (retrato recursivo no teste). O Rust lê a resposta com `launch::parse_has_conversation`, no
   molde do `parse_check`: outra saída com código 0 é `O bin/nick-agent respondeu algo inesperado
   na verificação da conversa.`, e uma falha usa o `launcher_failure`;
-- `--resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id>`, em qualquer
-  ordem, com as recusas do lançamento (valor ausente, repetido, desconhecido, a etapa fora das 4,
-  e os dois IDs pelo `jira_id_valid`). O argv é `claude --settings <regras> [--permission-mode
-  auto] [--append-system-prompt <aviso>] --resume <uuid> --name <nome>`, **sem prompt**. O main
-  despacha para ele quando `--resume` é uma das opções (`launch_kind`, que pula os valores).
+- `--resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] --ticket-id <id>`, em
+  qualquer ordem, com as recusas do lançamento (valor ausente, repetido, desconhecido, a etapa
+  fora das 4, e os dois IDs pelo `jira_id_valid`). O argv é `claude --settings <regras>
+  [--permission-mode auto] [--append-system-prompt <aviso>] --resume <uuid> --name <nome>`,
+  **sem prompt** (desde o NS-41, o `--append-system-prompt` existe sempre e começa pela
+  instrução de não contornar uma recusa: ver "Instrução de não contornar uma recusa (NS-41)").
+  O main despacha para ele quando `--resume` é uma das opções (`launch_kind`, que pula os
+  valores).
 
 **Diferença do plano, aprovada pelo usuário na execução:** os dois modos de lançamento terminam
 numa função comum, `exec_claude <tipo ou etapa> <aviso> [args]`, extraída do fim do
@@ -3883,7 +3971,9 @@ depois de ` · `, só se passar no `jira_id_valid` (`agents::opened_key`, pura e
 `Launch::Resume` leva esse ID (`--opened-id`, só quando conhecido) e o `ticket.key` atual
 (`--ticket-id`). Quando são diferentes, o launcher acrescenta, no mesmo `--append-system-prompt`
 do aviso da jail (uma linha em branco entre os dois; sem nenhum aviso, nenhum
-`--append-system-prompt`), o texto da `resume_id_notice` do `auto_scrum/prompt.sh`: `O ID deste
+`--append-system-prompt`; desde o NS-41, ele existe sempre e começa pela instrução de não
+contornar uma recusa, e o aviso do ID vem por último: ver "Instrução de não contornar uma
+recusa (NS-41)"), o texto da `resume_id_notice` do `auto_scrum/prompt.sh`: `O ID deste
 ticket mudou de <antigo> para <novo> depois que esta conversa começou. A pasta do ticket agora é
 .nick/docs/<novo>/ (antes era .nick/docs/<antigo>/): use o caminho novo para o plano, o review e
 os artefatos.`. O texto é prompt, então mora no bash: um estrutural

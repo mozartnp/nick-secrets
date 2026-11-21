@@ -3,9 +3,9 @@
 # nick-agent: opens the claude of one agent of the nick shell (NS-33, NS-35) in the project of the
 # cwd, with the prompt of an auto_scrum stage, by the same path as auto_scrum.sh: the project
 # config (.nick/nick.conf of the cwd, through lib/config/), jail_check, claude_settings_load,
-# jail_agent_notice and jail_exec of lib/, and the prompt assembly of auto_scrum/prompt.sh. The
-# nick shell runs it as `bash <absolute path of this script> ...` with the cwd at the project:
-# --check and --render outside the PTY, then the launch in it.
+# claude_permission_notice, jail_agent_notice and jail_exec of lib/, and the prompt assembly of
+# auto_scrum/prompt.sh. The nick shell runs it as `bash <absolute path of this script> ...` with
+# the cwd at the project: --check and --render outside the PTY, then the launch in it.
 #   nick-agent --check
 #       only validates (the config and the jail), launching nothing and writing nothing. On
 #       success prints exactly three lines on stdout, jail=, jira= and sentry=, each true or
@@ -26,18 +26,21 @@
 #   nick-agent --session-id <uuid> --name <name> --type <type> --prompt-file <file>
 #       the same checks, then config_dir_prepare (as auto_scrum does before launching),
 #       jail_print_status and jail_exec of claude with the argv of auto_scrum.sh plus --session-id
-#       and --name: the deny/ask rules, --permission-mode auto only with --type development, the
-#       jail notice (only with the jail on), --session-id, --name and the content of <file> (the
-#       log of --render) as the last argument.
+#       and --name: the deny/ask rules, --permission-mode auto only with --type development, one
+#       --append-system-prompt, always (NS-41), with the instruction not to work around a refused
+#       command (claude_permission_notice) and, only with the jail on, a blank line and the jail
+#       notice, --session-id, --name and the content of <file> (the log of --render) as the last
+#       argument.
 #   nick-agent --resume <uuid> --name <name> --stage <stage> [--opened-id <id>]
 #              (--ticket-id <id> | --epic-id <id>)
 #       (NS-39) resumes the conversation <uuid> of a stopped agent, by the same path as the launch
 #       (the same checks, config_dir_prepare, jail_print_status and jail_exec, with the config of
 #       now): claude --settings <rules> [--permission-mode auto only with --stage development]
-#       [--append-system-prompt <notice>] --resume <uuid> --name <name>, with no prompt. The
-#       notice is the jail one (only with the jail on) and, when --opened-id (the ticket key the
-#       agent was opened with) differs from --ticket-id (the key of now), a blank line and
-#       resume_id_notice (auto_scrum/prompt.sh): the folder of the ticket changed. The stage, and
+#       --append-system-prompt <notice> --resume <uuid> --name <name>, with no prompt. The
+#       notice always starts with claude_permission_notice (NS-41); then, each after a blank
+#       line, the jail one (only with the jail on) and, when --opened-id (the ticket key the
+#       agent was opened with) differs from --ticket-id (the key of now), resume_id_notice
+#       (auto_scrum/prompt.sh): the folder of the ticket changed. The stage, and
 #       not the type, because the type of an agent is not stored. An agent of an epic (NS-40) gets
 #       --epic-id in the place of --ticket-id (exactly one of the two), and the notice of an epic.
 #   nick-agent --has-conversation <uuid>
@@ -272,23 +275,23 @@ launch_mode() {
 # exec_claude <type or stage> <notice> [args...]: the end of every launch (the launch and the
 # resume, NS-39), after load_and_check: claude by jail_exec with the rules inline, auto mode only
 # in the Development stage (ABOUT.md, "Modo auto só na etapa de Desenvolvimento"; the key of the
-# type and of the stage is the same, development), one --append-system-prompt with the jail
-# notice (only with the jail on) and <notice> after a blank line (when not empty), and [args].
-# Never returns (jail_exec ends with exec).
+# type and of the stage is the same, development), one --append-system-prompt, always (NS-41),
+# with the instruction not to work around a refused command (claude_permission_notice), then the
+# jail notice (only with the jail on) and <notice> (when not empty), each after a blank line, and
+# [args]. Never returns (jail_exec ends with exec).
 exec_claude() {
-  local type="$1" extra_notice="$2" notice="" claude_args
+  local type="$1" extra_notice="$2" notice claude_args
   shift 2
   claude_args=(--settings "$NICK_CLAUDE_SETTINGS")
   [ "$type" = "development" ] && claude_args+=(--permission-mode auto)
+  notice="$(claude_permission_notice)"
   if [ "$JAIL_ENABLED" = "true" ]; then
-    notice="$(jail_agent_notice "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS")"
+    notice+=$'\n\n'"$(jail_agent_notice "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS")"
   fi
   if [ -n "$extra_notice" ]; then
-    notice="${notice:+$notice$'\n\n'}$extra_notice"
+    notice+=$'\n\n'"$extra_notice"
   fi
-  if [ -n "$notice" ]; then
-    claude_args+=(--append-system-prompt "$notice")
-  fi
+  claude_args+=(--append-system-prompt "$notice")
   jail_exec "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" claude "${claude_args[@]}" "$@"
 }
 

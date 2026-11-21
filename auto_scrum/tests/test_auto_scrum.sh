@@ -10,6 +10,7 @@ AUTO_SCRUM_SH="$SCRIPT_DIR/../auto_scrum.sh"
 # The prompt assembly (NS-35): moved from auto_scrum.sh, loaded by it and by bin/nick-agent.
 PROMPT_SH="$SCRIPT_DIR/../prompt.sh"
 JAIL_LIB_SH="$SCRIPT_DIR/../../lib/jail/jail.sh"
+CLAUDE_LIB_SH="$SCRIPT_DIR/../../lib/claude/claude.sh"
 PERMISSIONS_JSON="$SCRIPT_DIR/../../lib/claude/permissions.json"
 
 failures=0
@@ -2064,11 +2065,12 @@ jail_calls() {
 # jail_expected_argv <case_dir> <type> [jail [hosts [ports]]]: o argv que o claude deve
 # receber, um por linha — '--settings <conteúdo de lib/claude/permissions.json>' sempre
 # primeiro (as regras de deny/ask, inline), depois --permission-mode auto na etapa
-# development e, por último, o prompt gravado no log. Com "jail" (a jail ligada), antes do
-# prompt vem também '--append-system-prompt <aviso>', o aviso de jail_agent_notice com
-# [hosts], [ports] e o HOME do caso.
+# development, '--append-system-prompt <avisos>' e, por último, o prompt gravado no log. Os
+# avisos (NS-41) começam sempre pela instrução de não contornar uma recusa
+# (claude_permission_notice, calculada pela própria lib); com "jail" (a jail ligada), vêm depois
+# uma linha em branco e o aviso de jail_agent_notice com [hosts], [ports] e o HOME do caso.
 jail_expected_argv() {
-  local case_dir="$1" type="$2" jail="${3:-}" hosts="${4:-}" ports="${5:-}" log args=()
+  local case_dir="$1" type="$2" jail="${3:-}" hosts="${4:-}" ports="${5:-}" log notice args=()
   log="$(find "$case_dir/logs" -name "${type}_*.md" 2>/dev/null | head -n1)"
   if [ -z "$log" ]; then
     printf 'sem log'
@@ -2076,11 +2078,13 @@ jail_expected_argv() {
   fi
   args+=(--settings "$(cat "$PERMISSIONS_JSON")")
   [ "$type" = "development" ] && args+=(--permission-mode auto)
+  notice="$(bash -c "source '$CLAUDE_LIB_SH'; claude_permission_notice")"
   if [ "$jail" = "jail" ]; then
     # Mesmo ambiente do main() do caso (jail_case_setup): HOME do caso e sem
     # PLAYWRIGHT_BROWSERS_PATH, que dentro da jail o próprio nick define.
-    args+=(--append-system-prompt "$(env -u PLAYWRIGHT_BROWSERS_PATH HOME="$case_dir/home" bash -c "source '$JAIL_LIB_SH'; jail_agent_notice '$hosts' '$ports'")")
+    notice+=$'\n\n'"$(env -u PLAYWRIGHT_BROWSERS_PATH HOME="$case_dir/home" bash -c "source '$JAIL_LIB_SH'; jail_agent_notice '$hosts' '$ports'")"
   fi
+  args+=(--append-system-prompt "$notice")
   printf '%s\n' "${args[@]}" "$(cat "$log")"
 }
 
@@ -2133,7 +2137,7 @@ for jail_variant in vazio false ausente TRUE; do
     jail_rc="$(run_main "$jail_dir" "$jail_conf" "$(jail_input "$jail_type")" "$(jail_case_setup "$jail_dir")")"
     jail_label="JAIL_ENABLED $jail_variant, $jail_type"
     assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
-    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv de antes da jail"
+    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv sem a jail (--settings, a instrução de permissão e o prompt)"
     assert_eq "0" "$(jail_calls "$jail_dir")" "$jail_label: o ai-jail não é chamado nenhuma vez"
     assert_not_exists "$jail_dir/jail/version.calls" "$jail_label: o ai-jail não é chamado nem com --version"
     assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Jail (ai-jail): desligada" "$jail_label: a saída mostra 'Jail (ai-jail): desligada'"
@@ -2156,7 +2160,7 @@ for jail_type in po_discussion development; do
   assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_docs_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + 3 + ${#jail_docs_opts[@]}))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: a 2ª chamada lança 'ai-jail <opções base> --terminal-passthrough -- claude ...'"
   assert_eq "false" "$([ -e "$jail_dir/cwd/.ai-jail" ] && echo true || echo false)" "$jail_label: nenhum .ai-jail gravado no projeto (o prompt não fica salvo)"
   assert_eq "$jail_dir/cwd" "$(cat "$jail_dir/jail/call_2.cwd" 2>/dev/null || true)" "$jail_label: o lançamento roda no cwd do projeto"
-  assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, mais o aviso da jail (--append-system-prompt) antes do prompt"
+  assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, com o aviso da jail depois da instrução, no mesmo --append-system-prompt"
   assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "dentro do sandbox ai-jail" "$jail_label: o aviso diz ao agente que ele está na jail"
   assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Jail (ai-jail): ativa" "$jail_label: a saída mostra 'Jail (ai-jail): ativa'"
   assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "⚠️ Jail (ai-jail): ativa | Landlock: completo | modo de clipboard médio" "$jail_label: a saída mostra o modo médio (JAIL_CLIPBOARD vazio), com o ⚠️"
@@ -2205,7 +2209,7 @@ for jail_clip in medio restrito brando; do
     assert_eq "0" "$jail_rc" "$jail_label: main() termina com código 0"
     assert_eq "$(printf '%s\n' "${jail_clip_options[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "$jail_label: a verificação usa ${jail_clip_options[*]}"
     assert_eq "$(printf '%s\n' "${jail_clip_options[@]}" -- claude)" "$(head -n "$((${#jail_clip_options[@]} + 2))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "$jail_label: o lançamento usa ${jail_clip_options[*]}"
-    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, mais o aviso da jail"
+    assert_eq "$(jail_expected_argv "$jail_dir" "$jail_type" jail)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "$jail_label: o claude recebe o argv do caso desligado, com o aviso da jail depois da instrução"
     assert_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "$jail_clip_line" "$jail_label: a saída mostra a linha do nível"
   done
 done
@@ -2235,7 +2239,7 @@ for jail_mcp in jira sentry ambos; do
   jail_dir="$TEST_TMP/jail_mcp_${jail_mcp}_off"
   jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -vE "^(${jail_mcp_except:-JIRA_ENABLED|SENTRY_ENABLED})=")"$'\n'"$jail_mcp_conf"$'\n''JAIL_ENABLED="false"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
   assert_eq "0" "$(jail_calls "$jail_dir")" "MCP $jail_mcp sem a jail: o ai-jail não é chamado"
-  assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "MCP $jail_mcp sem a jail: o claude recebe o argv de antes da jail"
+  assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "MCP $jail_mcp sem a jail: o claude recebe o argv sem a jail (--settings, a instrução de permissão e o prompt)"
 done
 # Landlock: o estado que o ai-jail informa na verificação entra na linha da jail, resumido.
 for landlock_case in "partially enforced|parcial" "not enforced|inativo" "|inativo"; do
@@ -2291,7 +2295,7 @@ assert_not_contains "$(cat "$jail_dir/output" 2>/dev/null || true)" "Qual tipo d
 jail_dir="$TEST_TMP/jail_ports_off"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_FORWARD_PORTS)"$'\n''JAIL_FORWARD_PORTS="abc"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: segue normalmente (a chave não tem efeito)"
-assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: o claude recebe o argv de antes da jail"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_FORWARD_PORTS \"abc\" com a jail desligada: o claude recebe o argv sem a jail (--settings, a instrução de permissão e o prompt)"
 
 echo
 echo "== main(): JAIL_ALLOW_HOSTS libera hosts na rede da jail (--allow-host), depois dos MCPs =="
@@ -2313,7 +2317,7 @@ assert_not_exists "$jail_dir/logs" "JAIL_ALLOW_HOSTS \"https://...\": nenhum log
 jail_dir="$TEST_TMP/jail_allow_hosts_off"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ALLOW_HOSTS)"$'\n''JAIL_ALLOW_HOSTS="https://x"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
 assert_eq "0" "$jail_rc" "JAIL_ALLOW_HOSTS inválido com a jail desligada: segue normalmente (a chave não tem efeito)"
-assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS inválido com a jail desligada: o claude recebe o argv de antes da jail"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion)" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS inválido com a jail desligada: o claude recebe o argv sem a jail (--settings, a instrução de permissão e o prompt)"
 
 echo
 echo "== main(): JAIL_CLIPBOARD inválido com a jail ligada — para antes do menu, sem log e sem claude =="
@@ -2330,12 +2334,17 @@ jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_CLIPBOARD)"$'\n''JAIL_
 assert_eq "0" "$jail_rc" "JAIL_CLIPBOARD \"total\" com a jail desligada: segue normalmente (a chave não tem efeito)"
 
 echo
-echo "== main(): toda etapa recebe --settings <conteúdo de lib/claude/permissions.json>, com e sem jail =="
+echo "== main(): toda etapa recebe --settings <conteúdo de lib/claude/permissions.json> e a instrução de permissão (NS-41), com e sem jail =="
 # Todas as etapas do menu, com JIRA_ENABLED e SENTRY_ENABLED ligadas (po_jira, po_sentry e
 # tech_leader_jira só aparecem assim). HOME é o do caso (jail_case_setup): nada pode ser
 # criado nele nem no cwd (.claude/settings*.json).
 settings_content="$(cat "$PERMISSIONS_JSON" 2>/dev/null || echo 'sem permissions.json')"
 settings_lines="$(printf '%s\n' "$settings_content" | wc -l)"
+# A 1ª linha da instrução, calculada pela lib (nenhum texto dela copiado aqui).
+settings_notice_opening="$(bash -c "source '$CLAUDE_LIB_SH'; claude_permission_notice" 2>/dev/null || true)"
+settings_notice_opening="${settings_notice_opening%%$'\n'*}"
+# Guarda: com a instrução vazia, o "começa pela instrução" abaixo passaria à toa.
+assert_eq "com texto" "$([ -n "$settings_notice_opening" ] && echo 'com texto' || echo 'vazia')" "guarda: claude_permission_notice imprime a instrução"
 settings_base="$(config_keys_blank | grep -vE '^(JIRA_ENABLED|SENTRY_ENABLED|JAIL_ENABLED)=')"$'\n''JIRA_ENABLED="true"'$'\n''SENTRY_ENABLED="true"'
 for settings_jail in false true; do
   for settings_type in po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review; do
@@ -2345,14 +2354,18 @@ for settings_jail in false true; do
     settings_argv="$(cat "$settings_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')"
     assert_eq "0" "$settings_rc" "$settings_label: main() termina com código 0"
     if [ "$settings_jail" = "true" ]; then
-      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type" jail "mcp.atlassian.com mcp.sentry.dev")" "$settings_argv" "$settings_label: o argv é --settings <regras>, o de antes e o aviso da jail"
+      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type" jail "mcp.atlassian.com mcp.sentry.dev")" "$settings_argv" "$settings_label: o argv inteiro é --settings <regras>, o de sempre e a instrução mais o aviso da jail"
       assert_contains "$(cat "$settings_dir/jail/call_2.argv" 2>/dev/null || true)" $'\n--\nclaude\n--settings\n' "$settings_label: o lançamento é 'ai-jail <opções> -- claude --settings ...'"
     else
-      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type")" "$settings_argv" "$settings_label: o argv é --settings <regras> e o de antes"
+      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type")" "$settings_argv" "$settings_label: o argv inteiro é --settings <regras>, o de sempre e a instrução"
       assert_eq "0" "$(jail_calls "$settings_dir")" "$settings_label: o ai-jail não é chamado"
     fi
     assert_eq "$(printf '%s\n' --settings "$settings_content")" "$(head -n "$((settings_lines + 1))" <<< "$settings_argv")" "$settings_label: --settings é o 1º argumento, seguido do conteúdo do permissions.json (igual ao cat)"
     assert_not_contains "$settings_argv" "permissions.json" "$settings_label: o argumento é o conteúdo, não o caminho do arquivo"
+    # NS-41: exatamente um --append-system-prompt, que começa pela instrução de não contornar uma
+    # recusa (o argv inteiro já foi comparado acima, com a instrução calculada pela lib).
+    assert_eq "1" "$(grep -cx -- '--append-system-prompt' <<< "$settings_argv" || true)" "$settings_label: exatamente um --append-system-prompt"
+    assert_eq "$settings_notice_opening" "$(grep -x -A1 -- '--append-system-prompt' <<< "$settings_argv" | sed -n 2p)" "$settings_label: o --append-system-prompt começa pela instrução de permissão"
     if [ "$settings_type" = "development" ]; then
       assert_eq "1" "$(grep -cx -- '--permission-mode' <<< "$settings_argv" || true)" "$settings_label: --permission-mode auto (só em development)"
     else

@@ -271,6 +271,15 @@ fn an_agent_out_of_the_jail_runs_claude_in_the_project_and_ends() {
         "the prompt is the last argument: {argv}"
     );
     assert!(argv.contains("--permission-mode\nauto\n"), "{argv}");
+    // NS-41: out of the jail too, the launcher sends one --append-system-prompt (the instruction
+    // about the permission rules; its text is the bash library's, so only the flag is checked).
+    assert_eq!(
+        argv.lines()
+            .filter(|l| *l == "--append-system-prompt")
+            .count(),
+        1,
+        "{argv}"
+    );
     let env = read(&logs(&world).env);
     assert!(
         env.lines().any(|l| l == format!("PWD={}", proj.display())),

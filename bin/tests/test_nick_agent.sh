@@ -21,6 +21,7 @@ REAL_LOGS_DIR="$ROOT_DIR/auto_scrum/logs"
 CONFIG_SH="$ROOT_DIR/lib/config/config.sh"
 KEYS_SH="$ROOT_DIR/lib/config/keys.sh"
 JAIL_SH="$ROOT_DIR/lib/jail/jail.sh"
+CLAUDE_SH="$ROOT_DIR/lib/claude/claude.sh"
 PERMISSIONS_JSON="$ROOT_DIR/lib/claude/permissions.json"
 FIXTURES_BIN="$SCRIPT_DIR/fixtures/bin"
 
@@ -120,14 +121,30 @@ env_pwd() {
   grep '^PWD=' "$1/claude.env" 2> /dev/null || true
 }
 
-# lib_call <case_dir> <função> [args...]: roda uma função de lib/jail/jail.sh no mesmo ambiente
-# do launcher do caso (HOME do caso, sem PLAYWRIGHT_BROWSERS_PATH) e imprime a saída.
-lib_call() {
-  local case_dir="$1"
-  shift
+# lib_call_from <lib> <case_dir> <função> [args...]: roda uma função da biblioteca <lib> no mesmo
+# ambiente do launcher do caso (HOME do caso, sem PLAYWRIGHT_BROWSERS_PATH) e imprime a saída.
+lib_call_from() {
+  local lib="$1" case_dir="$2"
+  shift 2
   # Aspas simples intencionais: os $1/$@ são do bash -c, não daqui.
   # shellcheck disable=SC2016
-  env -u PLAYWRIGHT_BROWSERS_PATH HOME="$case_dir/home" "$BASH_BIN" -c 'source "$1"; shift; "$@"' _ "$JAIL_SH" "$@"
+  env -u PLAYWRIGHT_BROWSERS_PATH HOME="$case_dir/home" "$BASH_BIN" -c 'source "$1"; shift; "$@"' _ "$lib" "$@"
+}
+
+# lib_call <case_dir> <função> [args...]: lib_call_from com lib/jail/jail.sh.
+lib_call() {
+  lib_call_from "$JAIL_SH" "$@"
+}
+
+# claude_lib_call <case_dir> <função> [args...]: lib_call_from com lib/claude/claude.sh.
+claude_lib_call() {
+  lib_call_from "$CLAUDE_SH" "$@"
+}
+
+# permission_notice <case_dir>: a instrução de não contornar uma recusa (NS-41), calculada pela
+# própria lib (claude_permission_notice): nenhum texto dela copiado nesta suíte.
+permission_notice() {
+  claude_lib_call "$1" claude_permission_notice
 }
 
 # hosts_of <case_dir> <jira> <sentry> <allow_hosts>: os hosts extras como o launcher (e o
@@ -138,17 +155,20 @@ hosts_of() {
 
 # expected_claude_argv <case_dir> <jail> <hosts> <ports> [type]: o argv que o claude falso deve
 # receber, um por linha: as regras de deny/ask inline, --permission-mode auto (só com [type]
-# development), o aviso da jail (só com <jail> "true"), --session-id, --name e o prompt de
-# exemplo (PROMPT_ARG) por último. [type] padrão: po_discussion.
+# development), um --append-system-prompt sempre (NS-41: a instrução de permissão e, só com <jail>
+# "true", uma linha em branco e o aviso da jail), --session-id, --name e o prompt de exemplo
+# (PROMPT_ARG) por último. [type] padrão: po_discussion.
 expected_claude_argv() {
-  local case_dir="$1" jail="$2" hosts="$3" ports="$4" type="${5:-po_discussion}" args=()
+  local case_dir="$1" jail="$2" hosts="$3" ports="$4" type="${5:-po_discussion}" notice args=()
   args=(--settings "$(cat "$PERMISSIONS_JSON")")
   if [ "$type" = "development" ]; then
     args+=(--permission-mode auto)
   fi
+  notice="$(permission_notice "$case_dir")"
   if [ "$jail" = "true" ]; then
-    args+=(--append-system-prompt "$(lib_call "$case_dir" jail_agent_notice "$hosts" "$ports")")
+    notice+=$'\n\n'"$(lib_call "$case_dir" jail_agent_notice "$hosts" "$ports")"
   fi
+  args+=(--append-system-prompt "$notice")
   args+=(--session-id "$SESSION_ID" --name "$AGENT_NAME" "$PROMPT_ARG")
   printf '%s\n' "${args[@]}"
 }
@@ -223,7 +243,7 @@ else
   failures=$((failures + 1))
 fi
 assert_eq "$(expected_jail_argv "$case_dir" brando "$hosts" "$ports_example")" "$(file_of "$case_dir/jail.argv")" \
-  "o ai-jail recebe jail_options (brando, MCPs + JAIL_ALLOW_HOSTS, portas), --, claude --settings <regras> --append-system-prompt <aviso> --session-id <uuid> --name <nome> <prompt>"
+  "o ai-jail recebe jail_options (brando, MCPs + JAIL_ALLOW_HOSTS, portas), --, claude --settings <regras> --append-system-prompt <instrução + aviso da jail> --session-id <uuid> --name <nome> <prompt>"
 assert_eq "$(expected_claude_argv "$case_dir" true "$hosts" "$ports_example")" "$(file_of "$case_dir/claude.argv")" \
   "o claude falso recebe exatamente o que vem depois do --"
 jail_argv="$(file_of "$case_dir/jail.argv")"
@@ -243,7 +263,7 @@ proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' JIRA_ENABLED='"true"' "JA
 launch "$case_dir" "$proj"
 assert_eq "0" "$(file_of "$case_dir/rc")" "jail desligada: o launcher sai com 0"
 assert_eq "$(expected_claude_argv "$case_dir" false "" "")" "$(file_of "$case_dir/claude.argv")" \
-  "jail desligada: claude --settings <regras> --session-id <uuid> --name <nome> <prompt>"
+  "jail desligada: claude --settings <regras> --append-system-prompt <instrução> --session-id <uuid> --name <nome> <prompt>"
 assert_not_exists "$case_dir/jail.argv" "jail desligada: nenhum lançamento pelo ai-jail"
 assert_eq "claude" "$(file_of "$case_dir/order")" "jail desligada: o ai-jail não é chamado nem pra checar"
 assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): desligada" "jail desligada: o aviso de jail_print_status"
@@ -603,7 +623,7 @@ for type in "${ALL_TYPES[@]}"; do
   launch "$case_dir" "$proj" -- "$type"
   assert_eq "0" "$(file_of "$case_dir/rc")" "lançamento --type $type: sai com 0"
   assert_eq "$(expected_claude_argv "$case_dir" false "" "" "$type")" "$(file_of "$case_dir/claude.argv")" \
-    "lançamento --type $type: claude --settings <regras>$([ "$type" = development ] && echo ' --permission-mode auto') --session-id <uuid> --name <nome> <prompt>"
+    "lançamento --type $type: claude --settings <regras>$([ "$type" = development ] && echo ' --permission-mode auto') --append-system-prompt <instrução> --session-id <uuid> --name <nome> <prompt>"
   if [ "$type" = "development" ]; then
     assert_contains "$(file_of "$case_dir/claude.argv")" "--permission-mode"$'\n'"auto" "lançamento --type development: --permission-mode auto"
   else
@@ -813,25 +833,21 @@ id_notice() {
   printf 'O ID deste ticket mudou de %s para %s depois que esta conversa começou. A pasta do ticket agora é .nick/docs/%s/ (antes era .nick/docs/%s/): use o caminho novo para o plano, o review e os artefatos.' "$1" "$2" "$2" "$1"
 }
 # expected_resume_argv <case_dir> <jail> <hosts> <ports> <stage> <notice do ID>: o argv do claude
-# na retomada: as regras, --permission-mode auto só com development, um --append-system-prompt só
-# (o aviso da jail e/ou o do ID, separados por uma linha em branco) e --resume/--name por último.
+# na retomada: as regras, --permission-mode auto só com development, um --append-system-prompt
+# sempre (a instrução de permissão, NS-41, e depois o aviso da jail e/ou o do ID, cada um depois de
+# uma linha em branco) e --resume/--name por último.
 expected_resume_argv() {
-  local case_dir="$1" jail="$2" hosts="$3" ports="$4" stage="$5" id_text="$6" notice="" args=()
+  local case_dir="$1" jail="$2" hosts="$3" ports="$4" stage="$5" id_text="$6" notice args=()
   args=(--settings "$(cat "$PERMISSIONS_JSON")")
   [ "$stage" = "development" ] && args+=(--permission-mode auto)
+  notice="$(permission_notice "$case_dir")"
   if [ "$jail" = "true" ]; then
-    notice="$(lib_call "$case_dir" jail_agent_notice "$hosts" "$ports")"
+    notice+=$'\n\n'"$(lib_call "$case_dir" jail_agent_notice "$hosts" "$ports")"
   fi
   if [ -n "$id_text" ]; then
-    if [ -n "$notice" ]; then
-      notice="$notice"$'\n\n'"$id_text"
-    else
-      notice="$id_text"
-    fi
+    notice+=$'\n\n'"$id_text"
   fi
-  if [ -n "$notice" ]; then
-    args+=(--append-system-prompt "$notice")
-  fi
+  args+=(--append-system-prompt "$notice")
   args+=(--resume "$SESSION_ID" --name "$AGENT_NAME")
   printf '%s\n' "${args[@]}"
 }
@@ -853,7 +869,7 @@ resume "$case_dir" "$proj" po NS-1 NS-1
 hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
 assert_eq "0" "$(file_of "$case_dir/rc")" "retomada com a jail ligada: sai com 0$(file_of "$case_dir/err")"
 assert_eq "$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" po "")" "$(file_of "$case_dir/claude.argv")" \
-  "jail ligada, mesmo ID: claude --settings <regras> --append-system-prompt <aviso da jail> --resume <uuid> --name <nome>"
+  "jail ligada, mesmo ID: claude --settings <regras> --append-system-prompt <instrução + aviso da jail> --resume <uuid> --name <nome>"
 assert_eq "ai-jail -- true"$'\n'"ai-jail"$'\n'"claude" "$(file_of "$case_dir/order")" "jail ligada: a checagem, depois o lançamento pelo ai-jail"
 assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): ativa" "jail ligada: o jail_print_status no terminal"
 assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "a retomada roda com o cwd no projeto"
@@ -873,7 +889,7 @@ proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
 resume "$case_dir" "$proj" review NS-1 NS-9
 hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
 assert_eq "$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" review "$(id_notice NS-1 NS-9)")" "$(file_of "$case_dir/claude.argv")" \
-  "jail ligada, ID mudou: o aviso da jail, uma linha em branco e o aviso do ID, num --append-system-prompt só"
+  "jail ligada, ID mudou: a instrução, o aviso da jail e o aviso do ID, separados por uma linha em branco, num --append-system-prompt só"
 assert_eq "1" "$(grep -cx -- '--append-system-prompt' "$case_dir/claude.argv" || true)" "um único --append-system-prompt"
 assert_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/NS-9/" "o aviso cita a pasta nova"
 # Jail desligada: só o aviso do ID, ou nenhum.
@@ -882,7 +898,7 @@ proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
 resume "$case_dir" "$proj" tech_leader 3f9a0c7e SC-7
 assert_eq "0" "$(file_of "$case_dir/rc")" "jail desligada: sai com 0"
 assert_eq "$(expected_resume_argv "$case_dir" false "" "" tech_leader "$(id_notice 3f9a0c7e SC-7)")" "$(file_of "$case_dir/claude.argv")" \
-  "jail desligada, ID mudou: só o aviso do ID"
+  "jail desligada, ID mudou: a instrução e o aviso do ID"
 assert_not_exists "$case_dir/jail.argv" "jail desligada: o ai-jail não é chamado"
 assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): desligada" "jail desligada: o jail_print_status"
 for same_case in "NS-1|NS-1" "|NS-1"; do
@@ -891,8 +907,9 @@ for same_case in "NS-1|NS-1" "|NS-1"; do
   proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
   resume "$case_dir" "$proj" po "$same_opened" "$same_ticket"
   assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "")" "$(file_of "$case_dir/claude.argv")" \
-    "jail desligada, --opened-id '${same_opened}' e --ticket-id $same_ticket: nenhum --append-system-prompt"
-  assert_not_contains "$(file_of "$case_dir/claude.argv")" "--append-system-prompt" "sem nenhum aviso, nenhum --append-system-prompt (opened '${same_opened}')"
+    "jail desligada, --opened-id '${same_opened}' e --ticket-id $same_ticket: um --append-system-prompt só com a instrução"
+  assert_eq "1" "$(grep -cx -- '--append-system-prompt' "$case_dir/claude.argv" || true)" "mesmo ID: um único --append-system-prompt (opened '${same_opened}')"
+  assert_not_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/" "mesmo ID: sem o aviso do ID (opened '${same_opened}')"
 done
 # A etapa decide o modo auto: só development.
 for stage in po tech_leader development review; do
@@ -963,7 +980,7 @@ resume_epic "$case_dir" "$proj" tech_leader EPIC-1 EPIC-2
 hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
 assert_eq "0" "$(file_of "$case_dir/rc")" "--epic-id com a jail ligada: sai com 0$(file_of "$case_dir/err")"
 assert_eq "$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" tech_leader "$(epic_id_notice EPIC-1 EPIC-2)")" "$(file_of "$case_dir/claude.argv")" \
-  "--epic-id, ID mudou: o aviso da jail, uma linha em branco e o aviso do épico, num --append-system-prompt só"
+  "--epic-id, ID mudou: a instrução, o aviso da jail e o aviso do épico, separados por uma linha em branco, num --append-system-prompt só"
 assert_eq "1" "$(grep -cx -- '--append-system-prompt' "$case_dir/claude.argv" || true)" "--epic-id: um único --append-system-prompt"
 assert_contains "$(file_of "$case_dir/claude.argv")" "O ID deste épico mudou" "--epic-id: o texto do épico"
 assert_not_contains "$(file_of "$case_dir/claude.argv")" "O ID deste ticket" "--epic-id: não o texto do ticket"
@@ -972,14 +989,15 @@ case_dir="$TEST_TMP/resume_epic_jail_off_id"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
 resume_epic "$case_dir" "$proj" po 3f9a0c7e NS-28
 assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "$(epic_id_notice 3f9a0c7e NS-28)")" "$(file_of "$case_dir/claude.argv")" \
-  "--epic-id com a jail desligada, ID mudou: só o aviso do épico"
+  "--epic-id com a jail desligada, ID mudou: a instrução e o aviso do épico"
 for same_case in "EPIC-1|EPIC-1" "|EPIC-1"; do
   IFS='|' read -r same_opened same_epic <<< "$same_case"
   case_dir="$TEST_TMP/resume_epic_same_${same_opened:-sem}"
   proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
   resume_epic "$case_dir" "$proj" po "$same_opened" "$same_epic"
   assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "")" "$(file_of "$case_dir/claude.argv")" \
-    "--epic-id $same_epic, --opened-id '${same_opened}': nenhum aviso"
+    "--epic-id $same_epic, --opened-id '${same_opened}': só a instrução"
+  assert_not_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/" "--epic-id $same_epic, --opened-id '${same_opened}': sem o aviso do épico"
 done
 # Recusas: os dois juntos, nenhum, repetido, sem valor, inválido e vazio.
 case_dir="$TEST_TMP/resume_epic_args"
@@ -1007,6 +1025,64 @@ assert_not_exists "$proj/.nick/.gitignore" "argumentos inválidos do --epic-id: 
 run_agent "$case_dir" "$proj" -- --epic-id E-2 --stage po --opened-id E-1 --name "$AGENT_NAME" --resume "$SESSION_ID"
 assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: --epic-id em qualquer ordem também vale"
 assert_contains "$(file_of "$case_dir/claude.argv")" "A pasta do épico agora é .nick/docs/E-2/" "controle positivo: o aviso do épico"
+
+echo
+echo "== a instrução de permissão (NS-41): um único --append-system-prompt, começando por ela, em todo lançamento e retomada =="
+# notice_checks <case_dir> <label> <expected argv>: o argv inteiro bate com o esperado, há
+# exatamente um --append-system-prompt e o valor dele começa pela instrução (calculada pela lib).
+notice_checks() {
+  local case_dir="$1" label="$2" expected="$3" argv notice_value instruction
+  argv="$(file_of "$case_dir/claude.argv")"
+  instruction="$(permission_notice "$case_dir")"
+  assert_eq "0" "$(file_of "$case_dir/rc")" "$label: sai com 0$(file_of "$case_dir/err")"
+  assert_eq "$expected" "$argv" "$label: o argv inteiro"
+  assert_eq "1" "$(grep -cx -- '--append-system-prompt' <<< "$argv" || true)" "$label: exatamente um --append-system-prompt"
+  notice_value="${argv#*$'\n'--append-system-prompt$'\n'}"
+  assert_eq "$instruction" "${notice_value:0:${#instruction}}" "$label: o --append-system-prompt começa pela instrução de permissão"
+}
+for notice_jail in false true; do
+  if [ "$notice_jail" = "true" ]; then
+    notice_conf=("${jail_on_conf[@]}")
+  else
+    notice_conf=(JAIL_ENABLED='"false"')
+  fi
+  for type in "${ALL_TYPES[@]}"; do
+    case_dir="$TEST_TMP/notice_launch_${notice_jail}_$type"
+    proj="$(new_project "$case_dir" "${notice_conf[@]}")"
+    launch "$case_dir" "$proj" -- "$type"
+    if [ "$notice_jail" = "true" ]; then
+      hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
+      expected="$(expected_claude_argv "$case_dir" true "$hosts" "$ports_example" "$type")"
+    else
+      expected="$(expected_claude_argv "$case_dir" false "" "" "$type")"
+    fi
+    notice_checks "$case_dir" "lançamento --type $type, jail $notice_jail" "$expected"
+  done
+  for stage in po tech_leader development review; do
+    case_dir="$TEST_TMP/notice_resume_${notice_jail}_$stage"
+    proj="$(new_project "$case_dir" "${notice_conf[@]}")"
+    resume "$case_dir" "$proj" "$stage" NS-1 NS-1
+    if [ "$notice_jail" = "true" ]; then
+      hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
+      expected="$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" "$stage" "")"
+    else
+      expected="$(expected_resume_argv "$case_dir" false "" "" "$stage" "")"
+    fi
+    notice_checks "$case_dir" "retomada --stage $stage, jail $notice_jail" "$expected"
+  done
+  case_dir="$TEST_TMP/notice_epic_$notice_jail"
+  proj="$(new_project "$case_dir" "${notice_conf[@]}")"
+  resume_epic "$case_dir" "$proj" development EPIC-1 EPIC-1
+  if [ "$notice_jail" = "true" ]; then
+    hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
+    expected="$(expected_resume_argv "$case_dir" true "$hosts" "$ports_example" development "")"
+  else
+    expected="$(expected_resume_argv "$case_dir" false "" "" development "")"
+  fi
+  notice_checks "$case_dir" "retomada --epic-id, jail $notice_jail" "$expected"
+done
+# Guarda: a instrução calculada pela lib não está vazia (senão o "começa por" passaria à toa).
+assert_eq "com texto" "$([ -n "$(permission_notice "$TEST_TMP")" ] && echo 'com texto' || echo 'vazia')" "guarda: claude_permission_notice imprime a instrução"
 
 echo
 echo "== resume_id_notice: o texto do ticket byte a byte, e o do épico (NS-40) =="

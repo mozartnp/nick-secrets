@@ -268,6 +268,64 @@ run_claude "$conv_dir" "file=intacto; other=x; claude_conversation_file /c /d s 
 assert_eq "/c/projects/-d/s.jsonl|x" "$(file_of "$conv_dir/out")" "grava só na variável pedida (printf -v)"
 
 echo
+echo "== claude_permission_notice: a instrução de não contornar uma recusa (NS-41) =="
+notice_dir="$(new_case notice)"
+for notice_mode in on off; do
+  run_claude "$notice_dir" "claude_permission_notice" ":" "$notice_mode"
+  assert_eq "0" "$(file_of "$notice_dir/rc")" "set -e $notice_mode: retorna 0"
+  assert_eq "" "$(file_of "$notice_dir/err")" "set -e $notice_mode: nada no stderr"
+  assert_eq "com texto" "$([ -s "$notice_dir/out" ] && echo 'com texto' || echo 'vazio')" "set -e $notice_mode: imprime o texto no stdout"
+done
+notice_text="$(file_of "$notice_dir/out")"
+# Não lê o JSON: funciona com as regras ausentes.
+run_claude "$notice_dir" "NICK_CLAUDE_PERMISSIONS_FILE='$notice_dir/nao existe.json'; claude_permission_notice"
+assert_eq "0" "$(file_of "$notice_dir/rc")" "com NICK_CLAUDE_PERMISSIONS_FILE inexistente: retorna 0"
+assert_eq "$notice_text" "$(file_of "$notice_dir/out")" "com NICK_CLAUDE_PERMISSIONS_FILE inexistente: o mesmo texto (não lê o JSON)"
+assert_eq "" "$(file_of "$notice_dir/err")" "com NICK_CLAUDE_PERMISSIONS_FILE inexistente: nada no stderr"
+# Os pontos obrigatórios (D4 do plano), por trechos curtos.
+for notice_part in \
+  "Regras de permissão: esta sessão foi aberta pelo nick" \
+  "regras de permissão do Claude Code (deny e ask)" \
+  "quando o usuário negar um pedido de confirmação" \
+  "a recusa é uma decisão do usuário" \
+  "não obtenha o mesmo efeito por outro meio" \
+  "com um script" \
+  "bash -c" \
+  "python -c" \
+  "outro interpretador" \
+  "é contornar a regra" \
+  "pare" \
+  "qual comando foi recusado" \
+  "pergunte como ele quer seguir" \
+  "vale só para o que uma regra recusou" \
+  "comandos permitidos continuam liberados" \
+  "não precisa evitá-los nem pedir licença"; do
+  assert_contains "$notice_text" "$notice_part" "a instrução diz: $notice_part"
+done
+# Guarda: a instrução não manda evitar comandos permitidos (um rm comum, por exemplo).
+for notice_bad in "evite rm" "não use rm" "evite o rm" "nunca use rm"; do
+  assert_not_contains "$notice_text" "$notice_bad" "a instrução não diz: $notice_bad"
+done
+# Texto fixo: igual em duas chamadas e sem depender do cwd nem do HOME.
+run_claude "$notice_dir" "claude_permission_notice; claude_permission_notice > '$notice_dir/second'"
+assert_eq "$notice_text" "$(file_of "$notice_dir/second")" "duas chamadas: o mesmo texto"
+run_claude "$notice_dir" "cd /; claude_permission_notice" "export HOME='$notice_dir/outro home'"
+assert_eq "$notice_text" "$(file_of "$notice_dir/out")" "com outro cwd e outro HOME: o mesmo texto"
+
+echo
+echo "== fonte única da instrução: só lib/claude/claude.sh tem o texto, e as ferramentas chamam a função =="
+NICK_ROOT="$(cd "$LIB_DIR/.." && pwd)"
+notice_opening="Regras de permissão: esta sessão foi aberta pelo nick"
+# Controle positivo: a frase está na lib, então o teste morde.
+assert_eq "1" "$(grep -cF -- "$notice_opening" "$CLAUDE_SH" || true)" "controle: a frase de abertura está em lib/claude/claude.sh (uma vez)"
+notice_copies="$(grep -rlF -- "$notice_opening" "$NICK_ROOT/auto_scrum/auto_scrum.sh" "$NICK_ROOT/auto_scrum/prompt.sh" \
+  "$NICK_ROOT/auto_scrum/templates" "$NICK_ROOT/bin/nick-agent" "$NICK_ROOT/nick/src" 2>/dev/null || true)"
+assert_eq "" "$notice_copies" "a frase não está copiada no auto_scrum.sh, no prompt.sh, nos templates, no bin/nick-agent nem em nick/src/"
+for notice_tool in auto_scrum/auto_scrum.sh bin/nick-agent; do
+  assert_contains "$(code_lines "$NICK_ROOT/$notice_tool" 2>/dev/null | grep -wF claude_permission_notice || true)" "claude_permission_notice" "$notice_tool chama claude_permission_notice"
+done
+
+echo
 echo "== carga limpa: source só define nomes claude_/NICK_CLAUDE_, sem imprimir nada =="
 clean_dir="$TEST_TMP/clean"
 mkdir -p "$clean_dir"
@@ -293,7 +351,7 @@ else
 fi
 assert_eq "NICK_CLAUDE_PERMISSIONS_FILE" "$clean_new_vars" "a única variável nova é NICK_CLAUDE_PERMISSIONS_FILE"
 assert_eq "" "$(grep -vE '^claude_' <<< "$clean_new_funcs" | grep . || true)" "toda função nova começa com claude_"
-for clean_func in claude_settings_load claude_print_settings_error; do
+for clean_func in claude_settings_load claude_print_settings_error claude_conversation_file claude_permission_notice; do
   assert_contains "$clean_new_funcs" "$clean_func" "source lib/claude/claude.sh define $clean_func"
 done
 
@@ -330,7 +388,17 @@ echo
 echo "== fonte única: nenhuma regra (Bash(/Read() no código de claude.sh nem do auto_scrum.sh =="
 assert_eq "" "$(grep -nE '(Bash|Read)\(' <<< "$claude_code" || true)" "lib/claude/claude.sh não tem regra fora de comentário"
 assert_eq "" "$(grep -nE '(Bash|Read)\(' <<< "$(code_lines "$AUTO_SCRUM_SH")" || true)" "auto_scrum/auto_scrum.sh não tem regra fora de comentário"
-assert_eq "" "$(grep -nwE 'jq|python3?' <<< "$claude_code" || true)" "lib/claude/claude.sh não usa jq nem python (sem dependência nova em runtime)"
+# jq/python só contam em posição de comando (começo da linha, depois de ; & | ( ou $(, ou de uma
+# palavra-chave): o texto da claude_permission_notice (NS-41) cita "python -c" como exemplo de
+# contorno, dentro de um echo, e isso não é dependência em runtime.
+runtime_tool_uses() {
+  grep -nE '(^|[;&|(]|\$\(|(^|[[:space:]])(if|then|do|else|elif|while|until|!|exec|command)[[:space:]])[[:space:]]*(jq|python3?)([[:space:]]|\)|$)' || true
+}
+assert_eq "" "$(runtime_tool_uses <<< "$claude_code")" "lib/claude/claude.sh não usa jq nem python (sem dependência nova em runtime)"
+for tool_use in "x=\"\$(python3 -c 'print(1)')\"" 'cat f | jq .' '  python3 -m json.tool f' 'if jq -e . f; then' 'a && python -c x' '  command jq .' "y=\$(jq .)"; do
+  assert_contains "$(runtime_tool_uses <<< "$tool_use")" "1:" "controle: o guarda acha o uso em runtime: $tool_use"
+done
+assert_eq "" "$(runtime_tool_uses <<< '  echo "- com um script, bash -c, sh -c, python -c, outro interpretador;"')" "controle: \"python -c\" dentro do texto de um echo não conta como uso"
 
 echo
 if [ "$failures" -gt 0 ]; then

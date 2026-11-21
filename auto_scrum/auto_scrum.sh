@@ -404,13 +404,18 @@ main() {
       # agent actually edits code/runs commands without stepping in at every turn;
       # PO/Tech Leader/Review are text conversations, no reason to let go of the wheel.
       [ "$TYPE" = "development" ] && claude_args+=(--permission-mode auto)
-      # With the jail on, the agent is told so (jail_agent_notice, lib/jail/jail.sh):
-      # otherwise it spends tokens diagnosing the machine for what the jail hides (a
-      # toolchain, a home dir, a localhost service, a website). Off, the argv stays the same
-      # as before the jail existed.
+      # A single --append-system-prompt, always (NS-41): it starts with the instruction not
+      # to work around a command the deny/ask rules refused (claude_permission_notice,
+      # lib/claude/claude.sh), in every stage and with or without the jail. With the jail on,
+      # a blank line and the jail notice follow (jail_agent_notice, lib/jail/jail.sh):
+      # otherwise the agent spends tokens diagnosing the machine for what the jail hides (a
+      # toolchain, a home dir, a localhost service, a website).
+      local notice
+      notice="$(claude_permission_notice)"
       if [ "$JAIL_ENABLED" = "true" ]; then
-        claude_args+=(--append-system-prompt "$(jail_agent_notice "$jail_hosts" "$JAIL_FORWARD_PORTS")")
+        notice+=$'\n\n'"$(jail_agent_notice "$jail_hosts" "$JAIL_FORWARD_PORTS")"
       fi
+      claude_args+=(--append-system-prompt "$notice")
       # Nothing to wire here for Sentry: the MCP server itself lives in the target
       # project's own .mcp.json (Claude Code auto-loads it from the cwd), not in
       # auto_scrum. On the MCP side, SENTRY_ENABLED just shows the po_sentry entry point

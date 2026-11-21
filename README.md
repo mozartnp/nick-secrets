@@ -101,7 +101,9 @@ Rode da raiz do projeto alvo (o diretório atual é o projeto).
 Toda sessão do `claude` aberta pelo nick recebe um conjunto fixo de regras de permissão
 (ações bloqueadas e ações que pedem confirmação), sempre ativas, com ou sem jail. Elas ficam
 em `lib/claude/permissions.json`; sem esse arquivo, o script para antes de abrir o `claude`.
-Um projeto que precise de uma ação bloqueada roda o `claude` fora do nick.
+Um projeto que precise de uma ação bloqueada roda o `claude` fora do nick. Toda sessão também
+recebe a instrução de não contornar uma recusa dessas regras por outro caminho: o agente para e
+pergunta.
 
 O `auto_scrum` lê `JAIL_ENABLED` da configuração do projeto: com `"true"`, o `claude` de
 todas as etapas roda dentro do sandbox ai-jail, e o script para logo depois de carregar a

@@ -56,7 +56,11 @@ regras. Regras a seguir em todo script novo ou alterado:
   suprimir com `# shellcheck disable=SCxxxx` acompanhado do porquê, como já feito no
   `SC2016` da linha do `envsubst` em `main()`.
 - Sabotagem temporária (alterar o script de propósito pra provar que um teste-guarda
-  morde) só numa cópia descartável **fora do repositório**, com só (caminhos a partir da
+  morde) só numa cópia descartável **fora do repositório**, num diretório **novo** criado com
+  `mktemp -d` na hora da sabotagem (ex: `copia="$(mktemp -d)"`), com o caminho anotado.
+  **Proibido** reaproveitar uma cópia de sabotagem anterior, usar um caminho fixo (ex:
+  `/tmp/copia-sabotagem`) ou limpar qualquer cópia antiga, antes ou depois: pra sabotar de novo,
+  crie outro `mktemp -d`. A cópia leva só (caminhos a partir da
   raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/prompt.sh` (desde o
   NS-35), `auto_scrum/templates/`,
   `auto_scrum/tests/`, `bin/`, `lib/`, `README.md` (lido pelo teste README × helper de
@@ -64,8 +68,15 @@ regras. Regras a seguir em todo script novo ou alterado:
   `auto_scrum/tests/test_auto_scrum.sh`) e `nick/` sem `nick/target/` (a casca Rust, desde o
   NS-31), na mesma estrutura (sem copiar `auto_scrum/logs/`,
   que tem dados reais), com um `git init` na cópia e o cwd dentro dela ao rodar a suíte (ou o
-  `make test`). No fim, apagar a cópia e conferir com `git status --short --ignored` que nada
-  mudou no repositório.
+  `make test`). O cwd do Bash tool volta pra raiz entre chamadas, então o `cd "$copia"` vai no
+  **mesmo** comando que roda a suíte (ex: `cd "$copia" && bash tests/run_all.sh`). O cargo da
+  cópia usa um target dentro do mesmo diretório (ex: `CARGO_TARGET_DIR="$copia/target-cargo"`),
+  pra tudo ficar num caminho só. No fim, o agente **não apaga** a cópia: confere, a partir da
+  raiz do repositório, com `git status --short --ignored` que nada mudou ali (obrigatório) e
+  informa o caminho da cópia no relatório final. Com a jail ligada (o agente sabe pelo aviso da
+  jail na instrução de sistema da sessão), a cópia some sozinha quando a sessão termina, porque
+  o `/tmp` da jail é privado. Com a jail desligada, ou sem certeza, a cópia fica no `/tmp` da
+  máquina, e o usuário decide se apaga.
 
 **Por quê:** essas regras evitam as três classes de bug mais comuns em bash —
 variável não citada que quebra com espaço/glob, variável de função vazando pro
@@ -82,10 +93,39 @@ suíte acusaria falha sem relação com a sabotagem (aconteceu na validação do
 `bin/` entra na cópia desde o NS-30: a suíte `bin/tests/test_nick_init.sh` roda o
 `bin/nick-init`, e as mensagens do `auto_scrum.sh` apontam o caminho dele. O `nick/` entra desde
 o NS-31, sem o `nick/target/` (build grande, que o cargo refaz). Rode o cargo da cópia com
-`CARGO_TARGET_DIR` fora do repositório. Ao restaurar um arquivo sabotado, dê `touch` nele: o
+`CARGO_TARGET_DIR` fora do repositório (desde o NS-47, dentro do diretório da cópia). Ao
+restaurar um arquivo sabotado, dê `touch` nele: o
 `.orig` guardado com `cp` tem mtime mais antigo que o build sabotado, e o cargo não recompila
 (o controle "sem sabotagem" passaria a falhar por engano, como aconteceu na validação do
 NS-31).
+
+A regra não manda apagar nada desde o NS-47. Antes ela terminava mandando remover a cópia, e o
+deny de `rm -rf` do nick (`lib/claude/permissions.json`) recusa isso em qualquer caminho. Com a
+instrução de não contornar do NS-41, o agente parava e perguntava em toda validação com
+sabotagem (aconteceu na validação do NS-41). Alternativas descartadas:
+
+- **Exceção no deny pra `/tmp`:** deny vence allow, então um `allow` pra `rm -rf /tmp/*` não
+  furaria o deny. Restringir o próprio deny por caminho também não funciona, porque o casamento
+  é pelo texto do comando (`cd /tmp/x && rm -rf .`, `rm -rf "$copia"` com variável). Ver
+  "Regras de deny/ask do Claude Code (`lib/claude/`)".
+- **Mexer no `/tmp` da jail:** sem jail, o `/tmp` é o da máquina, então mudar a jail não
+  resolveria esse caso. E a jail é opt-in.
+- **Helper (script, função de `lib/` ou alvo de `make`) que apaga a cópia:** seria um caminho
+  aprovado pra contornar o deny, o oposto do NS-41.
+
+A garantia "nada a apagar com a jail" depende de o ai-jail montar um `tmpfs` privado em `/tmp`,
+que some com a sessão. Conferido com `findmnt -T /tmp` dentro da jail no ai-jail 3.5.0 (NS-47,
+2026-11-21): `tmpfs tmpfs rw,nosuid,nodev,relatime,mode=755,uid=1000,gid=1000,inode64`, com o
+`TMPDIR` vazio (o `mktemp -d` cai em `/tmp`). **Rever esta regra quando o ai-jail mudar de
+versão** (subir o `JAIL_VERSION_MIN` ou sair da série 3.x, em `lib/jail/jail.sh`). Se uma versão
+futura deixar de usar `/tmp` privado, as cópias passam a se acumular no host sem ninguém notar.
+
+Impactos aceitos: sem jail, as cópias se acumulam no `/tmp` da máquina até o usuário apagar ou
+até o reboot. Não têm segredos (a cópia não leva `.nick/` nem `auto_scrum/logs/`), mas ocupam
+espaço, por isso o caminho é sempre informado. Com jail, o `/tmp` é `tmpfs`: a cópia e o build do
+cargo ocupam RAM até a sessão acabar, e por isso o target fica dentro da cópia, num caminho só.
+Se o agente ignorar a regra e tentar `rm -rf`, o deny recusa e a instrução do NS-41 faz ele
+parar e perguntar ("Instrução de não contornar uma recusa (NS-41)").
 
 ## Testes: `make test` e `tests/run_all.sh`
 

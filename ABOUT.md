@@ -4195,3 +4195,77 @@ menu exclusivo do nick (`nick/tests/stages.rs`), o `bin/tests/test_nick_agent.sh
 recusas e o `resume_id_notice` dos dois tipos) e, no PTY (`nick/tests/agent.rs`), o épico de ponta
 a ponta, mover com agente vivo, ocultar o ramo, um banco v6 de verdade e os dois estruturais. As
 sabotagens, as telas e o roteiro de verificação manual ficam em `.nick/docs/NS-40/`.
+
+## Rust no projeto: atalhos de letra sem diferença de maiúscula (NS-43)
+
+Um bug filho do épico NS-28. Com o Caps Lock ligado (ou com Shift), o terminal manda a letra
+maiúscula, e o painel só reconhecia a minúscula: `j`/`k`, `a`, `n`, `e`, `o`, `g`, `p`, `m`, `i`,
+`r`, `x`, `f`, `v`, `c`, `t` etc. não faziam nada. Só o `s`/`S` das confirmações, o `q`/`Q` das
+listas e o `n`/`N` do preview aceitavam as duas formas, cada um do seu jeito.
+
+**A regra: atalho de letra não diferencia maiúscula de minúscula.** Nas telas de lista, de escolha
+e de confirmação, `J` (Caps Lock, sem modificador) e Shift+`j` são o mesmo `j`.
+
+**Um ponto só.** `keys::shortcut_key(key)` (no `keys.rs`, junto do `Shortcut`) devolve a letra
+ASCII sem Ctrl nem Alt em minúscula e sem `SHIFT`, mantendo `kind` e `state`. Qualquer outra tecla
+volta igual: dígitos, símbolos, `ç`/`Ç`, teclas especiais e letras com Ctrl ou Alt. É só ASCII de
+propósito: nenhum atalho é letra acentuada, e o `Ç` continua sem efeito. A função é chamada uma
+vez, em `App::handle_key`, logo antes do `match self.dialog.take()`, a menos que o diálogo aberto
+receba texto (`Dialog::takes_text`). O `takes_text` tem `match` **exaustivo, sem `_`**: um diálogo
+novo obriga quem o criar a decidir. Com isso os handlers (`key_tree`, `key_node`,
+`key_ticket_node`, `key_epic_node`, `key_settings`, as listas de escolha, o preview, a conversa
+perdida e as confirmações `(s/N)`) recebem a tecla já normalizada e só citam a minúscula. O
+`is_yes` passou a ser `key.code == Char('s')`, o `is_quit` `Char('q')` sem modificadores e o
+cancelamento do preview `Esc | Char('n')`. Fora do `mod tests`, o `app.rs` não tem
+`Char('<maiúscula>')`.
+
+**O que não passa pela regra** (recebe a tecla como foi digitada):
+- os campos de texto, os sete diálogos de `takes_text() == true`: `AddPath`, `NewTicket` (título
+  e ID do Jira), `EditTitle`, `EditEpicTitle`, `EditEpicId`, `EditId` e `StageForm`. Um `Q`, `S`
+  ou `N` digitado neles é texto, não sai, não confirma e não cancela;
+- o terminal do agente (`key_agent`), atendido antes: os bytes vão ao programa como vieram;
+- a captura do atalho reservado (`Dialog::CaptureShortcut`) e o próprio atalho reservado
+  (`Shortcut::matches`), atendidos antes. O `Shortcut::from_key` já tinha a sua forma canônica
+  (NS-34);
+- as letras com Ctrl ou Alt.
+
+**Proibido atalho com `Shift+letra` diferente da letra** nas telas de lista e de escolha. Um
+atalho novo com Shift usa outra tecla (de função, com Ctrl ou Alt), nunca a maiúscula.
+
+**Borda aceita.** Antes, Ctrl+Shift+`S` e Alt+Shift+`S` confirmavam, porque o `is_yes` ignorava os
+modificadores e aceitava `S`. Agora não confirmam (cancelam, como qualquer outra tecla), porque
+letra com Ctrl/Alt não é normalizada. Ctrl+`s` e Alt+`s` (minúsculas) continuam confirmando, como
+antes. **Conferido na execução:** o nick não liga o protocolo de teclado estendido do crossterm
+(`PushKeyboardEnhancementFlags`), então hoje o terminal manda Ctrl+Shift+S como Ctrl+`s` (o mesmo
+byte 0x13), e ele continua confirmando. A borda vale para o evento com a maiúscula e Ctrl, que só
+chega se esse protocolo for ligado um dia, e é ela que o teste fixa. O Ctrl+J/Ctrl+K da árvore continua movendo a seleção, como antes: os `match`
+dos handlers não olham modificadores, e a normalização não toca neles.
+
+**Não existe campo de filtro.** O ticket citava um campo de texto de filtro, mas o `f` (ocultos) e
+o `v` (só ativos) são alternâncias. Os dois são atalhos e entram na regra.
+
+**Nenhum texto visível mudou:** os rodapés continuam mostrando as minúsculas.
+
+**Por quê:** normalizar num ponto só, depois do que precisa da tecla crua, evita repetir as duas
+letras em cada `KeyCode::Char` dos handlers e esquecer uma tela nova. O `takes_text` exaustivo
+protege o risco principal, que é normalizar um campo de texto.
+
+**Testes:** `keys.rs` (`shortcut_key_lowercases_plain_letters_only`, tabela das 52 letras, das
+teclas que voltam iguais e de `kind`/`state`, comparando os campos crus, porque o `==` do
+`KeyEvent` do crossterm ignora a caixa de uma letra com Shift); `app.rs`
+(`only_the_seven_dialogs_with_a_text_field_take_text`, com um exemplar de cada um dos 24
+diálogos; `capital_letters_do_on_the_tree_what_the_small_ones_do` e
+`capital_letters_do_on_the_lists_of_choice_and_the_settings_what_the_small_ones_do`, que comparam
+duas fixtures iguais, com a pasta temporária, os horários e os session ids tirados do texto, e
+conferem que a minúscula fez alguma coisa; `capital_s_confirms_and_capital_n_cancels_every_confirmation`,
+nas nove confirmações; `capital_letters_are_typed_as_they_are_in_the_text_fields`, com Caps Lock e
+com Shift, até o título gravado no banco;
+`ctrl_or_alt_with_a_capital_s_does_not_confirm_and_with_a_small_s_still_does`;
+`on_the_terminal_the_capital_letters_go_to_the_program_as_they_are`;
+`the_capture_of_the_shortcut_gets_the_capital_letters_as_they_are`) e, no PTY
+(`nick/tests/tui.rs`), `capital_letters_work_as_shortcuts_and_are_typed_as_they_are`: `A` adiciona
+a pasta `Meu` e cria o ticket `TICKET MAIÚSCULO`, e `Q` sai com 0. Os testes que já existiam
+passaram sem edição.
+
+**Fora de escopo:** atalhos configuráveis além do reservado, e atalhos diferentes para maiúscula e
+minúscula (proibidos acima).

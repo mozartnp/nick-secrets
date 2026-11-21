@@ -300,6 +300,29 @@ pub fn shortcut_refusal(shortcut: &Shortcut) -> Option<String> {
     None
 }
 
+/// The key as the shortcuts of the panel see it (NS-43): an ASCII letter without Ctrl nor Alt
+/// is lowercase and without Shift, so Caps Lock and Shift don't change a shortcut (`J` and
+/// Shift+`j` are `j`). Any other key is returned as it is: digits, symbols, non-ASCII letters
+/// (`Ç`), named keys and letters with Ctrl or Alt. The kind and the state are kept. Not for
+/// the text fields nor for the terminal of an agent, which get the key as it was typed.
+pub fn shortcut_key(key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char(c)
+            if c.is_ascii_alphabetic()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            KeyEvent {
+                code: KeyCode::Char(c.to_ascii_lowercase()),
+                modifiers: key.modifiers - KeyModifiers::SHIFT,
+                ..key
+            }
+        }
+        _ => key,
+    }
+}
+
 /// A cursor key (arrows, Home, End): CSI or SS3 by DECCKM, CSI 1;m with modifiers.
 fn cursor_key(final_byte: char, modifiers: KeyModifiers, modes: TermModes) -> Vec<u8> {
     match modifier_param(modifiers) {
@@ -1164,5 +1187,70 @@ mod tests {
             ),
             Some(vec![0x1b, b'[', b'M', 32 + 3, 32 + 10, 32 + 5])
         );
+    }
+
+    /// The fields of a key as they are: `KeyEvent`'s `==` ignores the case of a letter with
+    /// Shift (`J` and Shift+`j` are equal), which would hide a wrong case.
+    fn raw(event: KeyEvent) -> (KeyCode, KeyModifiers, KeyEventKind, KeyEventState) {
+        (event.code, event.modifiers, event.kind, event.state)
+    }
+
+    #[test]
+    fn shortcut_key_lowercases_plain_letters_only() {
+        let none = KeyModifiers::NONE;
+        let shift = KeyModifiers::SHIFT;
+        let small_j = key(KeyCode::Char('j'), none);
+        for event in [
+            key(KeyCode::Char('J'), none),
+            key(KeyCode::Char('J'), shift),
+            key(KeyCode::Char('j'), shift),
+        ] {
+            assert_eq!(raw(shortcut_key(event)), raw(small_j), "{event:?}");
+        }
+        for (small, capital) in ('a'..='z').zip('A'..='Z') {
+            let expected = key(KeyCode::Char(small), none);
+            for event in [
+                key(KeyCode::Char(small), none),
+                key(KeyCode::Char(capital), none),
+            ] {
+                assert_eq!(raw(shortcut_key(event)), raw(expected), "{event:?}");
+            }
+        }
+        for event in [
+            key(KeyCode::Char('j'), none),
+            key(KeyCode::Char('J'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('J'), KeyModifiers::ALT),
+            key(KeyCode::Char('j'), KeyModifiers::CONTROL | shift),
+            key(KeyCode::Char('1'), none),
+            key(KeyCode::Char('!'), shift),
+            key(KeyCode::Char('ç'), none),
+            key(KeyCode::Char('Ç'), shift),
+            key(KeyCode::Char(' '), none),
+            key(KeyCode::Enter, none),
+            key(KeyCode::Esc, none),
+            key(KeyCode::Up, none),
+            key(KeyCode::Tab, none),
+            key(KeyCode::BackTab, shift),
+        ] {
+            assert_eq!(raw(shortcut_key(event)), raw(event), "{event:?}");
+        }
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            let event = KeyEvent {
+                code: KeyCode::Char('J'),
+                modifiers: shift,
+                kind,
+                state: KeyEventState::CAPS_LOCK,
+            };
+            let expected = KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: none,
+                ..event
+            };
+            assert_eq!(raw(shortcut_key(event)), raw(expected), "{event:?}");
+        }
     }
 }

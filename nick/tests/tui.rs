@@ -893,3 +893,42 @@ fn editing_the_id_onto_an_existing_folder_is_refused_and_changes_nothing() {
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
+
+// ---- the capital letters on the shortcuts (NS-43) ----
+
+/// With Caps Lock on the terminal sends the capital letter: `A` adds the project and creates the
+/// ticket, the path and the title keep their capitals, and `Q` quits.
+#[test]
+fn capital_letters_work_as_shortcuts_and_are_typed_as_they_are() {
+    let world = World::new();
+    let proj = world.dir("Meu", true);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_projects(&mut nick);
+    nick.send("A");
+    nick.wait_for("Caminho da pasta do projeto:");
+    nick.send(proj.to_str().unwrap());
+    nick.wait_for("Meu");
+    nick.keep_screen("NS-43: caminho com maiúscula, aberto pelo A");
+    nick.send(ENTER);
+    nick.wait_for(&format!("Projeto cadastrado: Meu ({}).", proj.display()));
+    assert_eq!(world.stored(), std::slice::from_ref(&proj));
+
+    open_tickets(&mut nick, "Meu");
+    nick.send("A");
+    nick.wait_for("ID do Jira (opcional; vazio gera um ID provisório):");
+    nick.send("TICKET MAIÚSCULO");
+    nick.wait_for("TICKET MAIÚSCULO");
+    nick.keep_screen("NS-43: título em maiúsculas, aberto pelo A");
+    nick.send(ENTER);
+    nick.wait_for("Ticket criado com o ID provisório");
+    nick.keep_screen("NS-43: ticket criado com o título em maiúsculas");
+    let stored = world.tickets(Some(&proj));
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        (stored[0].1.as_str(), stored[0].2),
+        ("TICKET MAIÚSCULO", false)
+    );
+
+    nick.send("Q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}

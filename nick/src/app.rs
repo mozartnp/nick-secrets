@@ -239,6 +239,40 @@ impl Dialog {
             Dialog::CaptureShortcut { .. } => false,
         }
     }
+
+    /// Whether the action the dialog confirms has no way back (NS-46): its border is red
+    /// (`ui::IRREVERSIBLE_COLOR`). Exhaustive, without `_`: a new dialog must decide.
+    pub fn irreversible(&self) -> bool {
+        match self {
+            // Deletes the project from the database with its tickets, epics, agents and history.
+            Dialog::ConfirmRemove { .. } => true,
+            // Hiding, archiving, editing an ID, ending an agent (resumable, NS-39) and quitting
+            // have a way back; the others are forms, choices and alerts.
+            Dialog::AddPath { .. }
+            | Dialog::NeedsConfig { .. }
+            | Dialog::NewTicket { .. }
+            | Dialog::EditTitle { .. }
+            | Dialog::ConfirmHide { .. }
+            | Dialog::EditEpicTitle { .. }
+            | Dialog::ConfirmHideEpic { .. }
+            | Dialog::EditEpicId { .. }
+            | Dialog::ConfirmEditEpicId { .. }
+            | Dialog::MoveTicket { .. }
+            | Dialog::ChooseType { .. }
+            | Dialog::StageForm { .. }
+            | Dialog::ConfirmPrompt { .. }
+            | Dialog::AgentError { .. }
+            | Dialog::ConfirmEndAgent { .. }
+            | Dialog::ConversationLost { .. }
+            | Dialog::ConfirmArchive { .. }
+            | Dialog::ConfirmQuit
+            | Dialog::CaptureShortcut { .. }
+            | Dialog::ChooseTicketStage { .. }
+            | Dialog::ConfirmStageChange { .. }
+            | Dialog::EditId { .. }
+            | Dialog::ConfirmEditId { .. } => false,
+        }
+    }
 }
 
 /// What the loop must do after a key.
@@ -3069,7 +3103,7 @@ fn is_quit(key: KeyEvent) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The ticket of an agent owned by a ticket (the tests of before the NS-40 have only those).
     fn owner_ticket(owner: Owner) -> i64 {
         match owner {
@@ -8847,7 +8881,7 @@ mod tests {
 
     /// One dialog of each variant (`Dialog::takes_text`), with the values of a fixture with a
     /// project, a ticket, an epic and a stopped agent.
-    fn one_of_each_dialog() -> Vec<Dialog> {
+    pub(crate) fn one_of_each_dialog() -> Vec<Dialog> {
         let (mut f, _, id) = stopped_agent();
         assert_eq!(f.new_epic("Plano longo", "EPIC-1"), Action::None);
         let project = f.app.rows[0].project.clone();
@@ -8976,7 +9010,7 @@ mod tests {
     }
 
     /// The name of the variant of a dialog (`AddPath`, `ConfirmQuit`, ...).
-    fn variant(dialog: &Dialog) -> String {
+    pub(crate) fn variant(dialog: &Dialog) -> String {
         format!("{dialog:?}")
             .split([' ', '{', '('])
             .next()
@@ -9004,6 +9038,23 @@ mod tests {
                 "EditId"
             ]
         );
+        // Every variant is in the list (the 24 of the enum), each once.
+        let mut names: Vec<String> = dialogs.iter().map(variant).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 24);
+        assert_eq!(dialogs.len(), 24);
+    }
+
+    #[test]
+    fn only_the_removal_of_a_project_is_irreversible() {
+        let dialogs = one_of_each_dialog();
+        let irreversible: Vec<String> = dialogs
+            .iter()
+            .filter(|dialog| dialog.irreversible())
+            .map(variant)
+            .collect();
+        assert_eq!(irreversible, ["ConfirmRemove"]);
         // Every variant is in the list (the 24 of the enum), each once.
         let mut names: Vec<String> = dialogs.iter().map(variant).collect();
         names.sort();

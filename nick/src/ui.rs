@@ -68,11 +68,46 @@ fn pane_block(focused: bool) -> Block<'static> {
     }
 }
 
+/// The color of the border of a dialog of an irreversible action (NS-46).
+pub const IRREVERSIBLE_COLOR: Color = Color::Red;
+
+/// The block of an open dialog (NS-46): it has the focus, so `pane_block(true)`; in
+/// `IRREVERSIBLE_COLOR` when its action has no way back (`Dialog::irreversible`).
+fn dialog_block(dialog: &Dialog) -> Block<'static> {
+    let block = pane_block(true);
+    if dialog.irreversible() {
+        block.border_style(Style::new().fg(IRREVERSIBLE_COLOR))
+    } else {
+        block
+    }
+}
+
+/// Who gets the keys, and so the focus border (NS-46): the open dialog, else the terminal of
+/// the shown agent (`App::on_terminal`), else the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focused {
+    Dialog,
+    Terminal,
+    List,
+}
+
+/// Who has the focus border (`Focused`). The dialog comes first even if one ever opens with the
+/// focus on the terminal: only one border is highlighted.
+fn focused(app: &App) -> Focused {
+    if app.dialog.is_some() {
+        Focused::Dialog
+    } else if app.on_terminal() {
+        Focused::Terminal
+    } else {
+        Focused::List
+    }
+}
+
 /// The block of the column on the left (the tree, or the settings): always `pane_block` since
-/// the NS-38 (always side by side), focused unless the focus is on the terminal
-/// (`App::on_terminal`, the same rule as the help).
+/// the NS-38 (always side by side), focused when it gets the keys (`focused`: not with a dialog
+/// open nor with the focus on the terminal, NS-46).
 fn list_block(app: &App) -> Block<'static> {
-    pane_block(!app.on_terminal())
+    pane_block(focused(app) == Focused::List)
 }
 
 /// Where the cat Nick goes inside the column on the left (`inner`, inside its border; NS-51):
@@ -309,7 +344,7 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
             areas.panel,
             &agent.name,
             agent.jail,
-            app.on_terminal(),
+            focused(app) == Focused::Terminal,
             terminal,
         );
     } else {
@@ -328,14 +363,17 @@ pub fn draw_with_terminal(frame: &mut Frame, app: &App, terminal: Option<&vt100:
     );
     match &app.dialog {
         // The preview of the prompt takes almost the whole screen (NS-35).
-        Some(Dialog::ConfirmPrompt {
-            precheck,
-            rendered,
-            scroll,
-            ..
-        }) => draw_prompt(
+        Some(
+            dialog @ Dialog::ConfirmPrompt {
+                precheck,
+                rendered,
+                scroll,
+                ..
+            },
+        ) => draw_prompt(
             frame,
             prompt_area(frame.area(), areas),
+            dialog,
             precheck,
             rendered,
             *scroll,
@@ -1705,7 +1743,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
         return;
     }
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().title(title);
+    let block = dialog_block(dialog).title(title);
     let inner = block.inner(popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1929,6 +1967,7 @@ pub fn prompt_window(app: &App, area: Rect) -> Option<(usize, usize)> {
 fn draw_prompt(
     frame: &mut Frame,
     area: Rect,
+    dialog: &Dialog,
     precheck: &Precheck,
     rendered: &Rendered,
     scroll: usize,
@@ -1938,7 +1977,7 @@ fn draw_prompt(
     if layout.outer.width < 3 || layout.outer.height < 3 {
         return;
     }
-    frame.render_widget(Block::bordered().title(" Prompt final "), layout.outer);
+    frame.render_widget(dialog_block(dialog).title(" Prompt final "), layout.outer);
     frame.render_widget(Paragraph::new(layout.top.clone()), layout.top_area);
     let rows = usize::from(layout.body.height);
     let scroll = scroll.min(layout.prompt.len().saturating_sub(rows));
@@ -2126,7 +2165,7 @@ mod tests {
             .unwrap()
             .to_string();
         let inside: String = line.chars().skip(usize::from(label_x)).collect();
-        let inside = inside.split('│').next().unwrap().trim_end().to_string();
+        let inside = inside.split('┃').next().unwrap().trim_end().to_string();
         assert!(inside.starts_with('…'), "{inside:?}");
         assert!(inside.ends_with("/fim-do-caminho"), "{inside:?}");
         assert!(path.ends_with(&inside[inside.char_indices().nth(1).unwrap().0..]));
@@ -2136,7 +2175,7 @@ mod tests {
             .nth(usize::from(label_y) + 2)
             .unwrap()
             .to_string();
-        assert!(below.contains('└'), "{below:?}");
+        assert!(below.contains('┗'), "{below:?}");
         let width = u16::try_from(inside.chars().count()).unwrap();
         assert!(terminal.backend().cursor_visible(), "the cursor is shown");
         terminal
@@ -2204,12 +2243,7 @@ mod tests {
             epics: 0,
         });
         let buffer = render(&f.app);
-        let flat: String = text(&buffer)
-            .lines()
-            .map(|l| l.replace('│', "").trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let flat = flat(&buffer);
         assert!(
             flat.contains(
                 "Remover o projeto alfa (/w/alfa) do nick? Os arquivos do projeto não são \
@@ -3327,13 +3361,24 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    /// The border at (`x`, `y`) is thick and in `FOCUS_COLOR` (`thick`), or plain, dim and
-    /// without a color.
-    fn assert_border(buffer: &Buffer, (x, y): (u16, u16), thick: bool, symbol: &str) {
+    /// The border at `pos` is `symbol`, thick and in `FOCUS_COLOR` (`thick`), or plain, dim and
+    /// without a color: `assert_border_color` with `FOCUS_COLOR` when `thick` (NS-46).
+    fn assert_border(buffer: &Buffer, pos: (u16, u16), thick: bool, symbol: &str) {
+        assert_border_color(buffer, pos, symbol, thick.then_some(FOCUS_COLOR));
+    }
+
+    /// The border at (`x`, `y`) is `symbol`, thick and in `color` without DIM (`Some`), or plain,
+    /// dim and without a color (`None`; NS-46).
+    fn assert_border_color(
+        buffer: &Buffer,
+        (x, y): (u16, u16),
+        symbol: &str,
+        color: Option<Color>,
+    ) {
         let cell = &buffer[(x, y)];
         assert_eq!(cell.symbol(), symbol, "({x}, {y})\n{}", text(buffer));
-        if thick {
-            assert_eq!(cell.fg, FOCUS_COLOR, "({x}, {y})");
+        if let Some(color) = color {
+            assert_eq!(cell.fg, color, "({x}, {y})");
             assert!(!cell.modifier.contains(Modifier::DIM), "({x}, {y})");
         } else {
             assert_eq!(cell.fg, Color::Reset, "({x}, {y}) without a color");
@@ -3506,6 +3551,161 @@ mod tests {
                 Action::None,
                 "({column}, {row})"
             );
+        }
+    }
+
+    // ---- the focus border on the dialogs (NS-46) ----
+
+    use crate::app::tests::{one_of_each_dialog, variant};
+
+    /// The symbols of a thick border.
+    const THICK: [&str; 6] = ["┏", "┓", "┗", "┛", "━", "┃"];
+
+    /// Where `symbol` is on the screen, every time.
+    fn all_of(buffer: &Buffer, symbol: &str) -> Vec<(u16, u16)> {
+        let area = buffer.area;
+        (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&pos| buffer[pos].symbol() == symbol)
+            .collect()
+    }
+
+    /// The color of the border of `dialog`.
+    fn color_of(dialog: &Dialog) -> Color {
+        if dialog.irreversible() {
+            IRREVERSIBLE_COLOR
+        } else {
+            FOCUS_COLOR
+        }
+    }
+
+    #[test]
+    fn the_dialog_block_is_the_focused_pane_block_cyan_or_red() {
+        assert_eq!(IRREVERSIBLE_COLOR, Color::Red);
+        let dialogs = one_of_each_dialog();
+        let common = dialogs
+            .iter()
+            .find(|d| variant(d) == "ConfirmQuit")
+            .unwrap();
+        let removal = dialogs
+            .iter()
+            .find(|d| variant(d) == "ConfirmRemove")
+            .unwrap();
+        // A common dialog: the very block of the focused panel, not a copied style.
+        assert_eq!(dialog_block(common), pane_block(true));
+        for (dialog, color) in [(common, FOCUS_COLOR), (removal, IRREVERSIBLE_COLOR)] {
+            let buffer = render_block(dialog_block(dialog), 6, 4);
+            for (pos, symbol) in [
+                ((0, 0), "┏"),
+                ((5, 0), "┓"),
+                ((0, 3), "┗"),
+                ((5, 3), "┛"),
+                ((2, 0), "━"),
+                ((3, 3), "━"),
+                ((0, 1), "┃"),
+                ((5, 2), "┃"),
+            ] {
+                assert_border_color(&buffer, pos, symbol, Some(color));
+            }
+            // The red replaces the cyan: no cell of the border is left cyan under it.
+            if color == IRREVERSIBLE_COLOR {
+                assert!(buffer.content.iter().all(|cell| cell.fg != FOCUS_COLOR));
+            }
+            // The same size as any border.
+            let area = Rect::new(3, 2, 10, 8);
+            assert_eq!(
+                dialog_block(dialog).inner(area),
+                Block::bordered().inner(area)
+            );
+        }
+    }
+
+    #[test]
+    fn every_dialog_has_the_focus_border_and_only_it() {
+        let (mut running, _) = with_running(&["proj"]);
+        running.app.focus = Focus::List;
+        let (mut alone, _) = with_tree();
+        for (f, agent) in [(&mut running, true), (&mut alone, false)] {
+            for dialog in one_of_each_dialog() {
+                let name = variant(&dialog);
+                let color = color_of(&dialog);
+                let prompt = matches!(dialog, Dialog::ConfirmPrompt { .. });
+                f.app.dialog = Some(dialog);
+                let buffer = render_at(&f.app, 100, 30, None);
+                // One focus border on the screen: the dialog's.
+                let corners = all_of(&buffer, "┏");
+                assert_eq!(corners.len(), 1, "{name} {agent}\n{}", text(&buffer));
+                let corner = corners[0];
+                assert_border_color(&buffer, corner, "┏", Some(color));
+                if prompt {
+                    // It covers the screen: the box from (1, 1), and nothing thick outside it.
+                    assert_eq!(corner, (1, 1), "{name}");
+                    let end = all_of(&buffer, "┛");
+                    assert_eq!(end.len(), 1, "{name}");
+                    let (right, bottom) = end[0];
+                    for symbol in THICK {
+                        for (x, y) in all_of(&buffer, symbol) {
+                            assert!(
+                                (1..=right).contains(&x) && (1..=bottom).contains(&y),
+                                "{name}: {symbol} at ({x}, {y})\n{}",
+                                text(&buffer)
+                            );
+                        }
+                    }
+                    let (x, y) = corner;
+                    assert_border_color(&buffer, (x, y + 1), "┃", Some(color));
+                } else {
+                    // The list and the panel on the right, behind it, without the focus.
+                    assert_border(&buffer, (0, 0), false, "┌");
+                    assert_border(&buffer, (40, 0), false, "┌");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_focus_border_goes_back_when_the_dialog_closes() {
+        let (mut f, _) = with_running(&["proj"]);
+        // The focus on the list.
+        f.app.focus = Focus::List;
+        f.app.dialog = Some(Dialog::ConfirmQuit);
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_border(&buffer, (0, 0), false, "┌");
+        assert_border(&buffer, (40, 0), false, "┌");
+        f.app.dialog = None;
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_border(&buffer, (0, 0), true, "┏");
+        assert_border(&buffer, (40, 0), false, "┌");
+        // The focus on the terminal (forced: the App opens no dialog there today): the dialog
+        // comes first anyway, and the panel gets the border back when it closes.
+        f.app.focus = Focus::Terminal;
+        f.app.dialog = Some(Dialog::ConfirmQuit);
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_border(&buffer, (0, 0), false, "┌");
+        assert_border(&buffer, (40, 0), false, "┌");
+        assert_eq!(all_of(&buffer, "┏").len(), 1, "{}", text(&buffer));
+        f.app.dialog = None;
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_border(&buffer, (0, 0), false, "┌");
+        assert_border(&buffer, (40, 0), true, "┏");
+    }
+
+    #[test]
+    fn the_removal_dialog_is_red_and_the_others_cyan() {
+        let (mut f, _) = with_running(&["proj"]);
+        f.app.focus = Focus::List;
+        for dialog in one_of_each_dialog() {
+            let name = variant(&dialog);
+            let color = match name.as_str() {
+                "ConfirmRemove" => Color::Red,
+                "ConfirmHide" => Color::Cyan,
+                _ => continue,
+            };
+            f.app.dialog = Some(dialog);
+            let buffer = render_at(&f.app, 100, 30, None);
+            let (y, x) = find(&buffer, "┏").expect(&name);
+            assert_border_color(&buffer, (x, y), "┏", Some(color));
+            assert_border_color(&buffer, (x, y + 1), "┃", Some(color));
         }
     }
 

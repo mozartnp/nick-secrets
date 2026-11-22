@@ -3610,6 +3610,12 @@ o `claude` quando queria navegar na lista.
   canto `┌` sem DIM e sem cor, e nenhuma célula grossa ou ciano na tela;
 - os diálogos não mudaram: diálogo não é painel de foco.
 
+> **Mudou no NS-46** (seção "Rust no projeto: borda de foco nos diálogos (NS-46)"): o diálogo
+> aberto recebe a borda de foco (vermelha quando a ação é irreversível), e a lista e o painel do
+> agente ficam sem ela enquanto ele está aberto. As bordas não leem mais o `App::on_terminal`
+> direto: passam pelo `ui::focused`, que olha primeiro o diálogo. O rodapé continua no
+> `on_terminal`.
+
 O ciano não se confunde com as outras cores da TUI: o vermelho (FORA DA JAIL), o amarelo (avisos
 de diálogo) e o verde (Concluído). **A cor não é a única pista, de propósito.** Num terminal de
 16 cores ou num tema claro, o ciano pode ficar fraco, e a espessura (`┏━┓` × `┌─┐`) continua
@@ -5167,3 +5173,106 @@ o vazio com a etapa atual, o diálogo com `> Aberto (atual)`); o estrutural; e, 
 `opening_new_agents_advances_the_stage_and_each_stage_has_its_color` (`tests/agent.rs`: o épico
 roxo, o Aberto branco, o avanço para PO azul e para Dev laranja com a mensagem e o histórico, e o
 PO de novo sem mudança). As sabotagens e as telas ficam em `.nick/docs/NS-45/`.
+
+## Rust no projeto: borda de foco nos diálogos (NS-46)
+
+Bug filho do épico NS-28. O NS-37 deixou os diálogos fora da borda de foco ("diálogo não é painel
+de foco"). Com um diálogo aberto, as teclas vão para ele, mas a lista continuava desenhada com a
+borda grossa ciano, e o diálogo ficava com a borda simples.
+
+**A regra: o foco é de quem recebe as teclas, incluindo os diálogos.** Ela fica num ponto só do
+desenho, `ui::focused(app) -> Focused { Dialog, Terminal, List }`, nesta ordem: o diálogo aberto,
+senão o terminal do agente exibido (`App::on_terminal`), senão a lista. O `list_block` desenha a
+borda de foco só com `Focused::List`, e o `draw_agent` só com `Focused::Terminal`. O painel do nó
+continua com `pane_block(false)`. **O `App::on_terminal`, o `handle_key` e o `toggle_focus` não
+mudaram:** o roteamento das teclas, o paste e o rodapé são os mesmos. Hoje os diálogos só abrem
+com o foco na lista, e o campo `focus` não muda ao abrir nem ao fechar um diálogo. Por isso
+"voltar o foco para onde estava" não precisa de estado novo no `App`: fechado o diálogo, a regra
+de desenho devolve a borda a quem a tinha. Pôr o diálogo antes do terminal é defensivo: se um dia
+um diálogo abrir com o foco no terminal, mesmo assim só a borda dele fica destacada.
+
+**A borda do diálogo vem de `pane_block(true)`**, via `ui::dialog_block(dialog)`, sem estilo
+copiado. O `draw_dialog` e o `draw_prompt` (o "Prompt final") usam essa função. A espessura e o
+tamanho são os mesmos de qualquer borda (`Thick` e `Plain` ocupam uma célula), então o
+`dialog_area`, o `prompt_layout` e o cursor dos campos de texto não mudaram.
+
+**Borda vermelha só para ação irreversível.** Cada diálogo declara se é irreversível num ponto
+só, `Dialog::irreversible` (`app.rs`, ao lado do `takes_text`), com `match` exaustivo e sem `_`:
+um diálogo novo não compila sem decidir. Hoje só o `ConfirmRemove` é `true`, porque apaga do banco
+o projeto com tickets, épicos, agentes e histórico. Nesse caso, o `dialog_block` troca só a cor
+por `ui::IRREVERSIBLE_COLOR` (`Color::Red`). O `border_style` do ratatui 0.30 substitui o estilo,
+então não sobra ciano por baixo, e o teste cobra isso. **Ficam ciano, por terem volta:** ocultar
+(`ConfirmHide`, `ConfirmHideEpic`), arquivar (`ConfirmArchive`), editar o ID (`ConfirmEditId`,
+`ConfirmEditEpicId`), encerrar um agente (`ConfirmEndAgent`, porque o agente encerrado pode ser
+retomado, NS-39) e sair (`ConfirmQuit`). Também ficam ciano a troca de etapa, a conversa perdida,
+o "Prompt final", os formulários, as escolhas e os alertas. O vermelho do `[FORA DA JAIL]`
+(`header_lines`, `agent_spans`, `prompt_top`) continua com o `Color::Red` literal, e não com o
+`IRREVERSIBLE_COLOR`: são regras diferentes que hoje coincidem na cor.
+
+**Ajuste em relação ao ticket: o "histórico" não é diálogo.** O ticket citava "escolha de etapa,
+histórico e Prompt final". O histórico de etapas é desenhado no painel do nó, que nunca tem o
+foco, e não num diálogo. A escolha de etapa é o `ChooseTicketStage`, e a confirmação, o
+`ConfirmStageChange`. O critério virou "todo diálogo (as 24 variantes de `Dialog`)".
+
+**O catálogo dos diálogos é compartilhado com os testes do `ui`.** No `app.rs`, o
+`one_of_each_dialog()` e o `variant()` passaram a `pub(crate)`, dentro de um
+`#[cfg(test)] pub(crate) mod tests`, e o `ui::tests` os importa de lá. **O detector de escrita em
+projeto foi ajustado junto** (decisão do usuário na implementação, registrada no plano): o
+`production()` de `tests/agent.rs` cortava o código de produção só no texto exato
+`"#[cfg(test)]\nmod tests"`. Com o `pub(crate)`, os `fs::write`/`remove_file` dos testes do
+`app.rs` passaram a contar como produção. Agora ele corta no primeiro de
+`"#[cfg(test)]\nmod tests"` e `"#[cfg(test)]\npub(crate) mod tests"`, só nesses textos exatos.
+Cortar no primeiro `#[cfg(test)]` qualquer não serve: o `#[cfg(test)] #[path = ...]` do topo do
+`projects.rs` deixaria quase todo esse arquivo fora da checagem, sem nenhum teste falhar. O
+`production_sources()` já corta no primeiro `#[cfg(test)]` e não precisou de ajuste. Também
+avaliamos o re-export (`#[cfg(test)] pub(crate) use tests::{...}`, com o `mod tests` privado) e o
+`test_support`, que arrastaria os fixtures de que o catálogo depende.
+
+**Testes novos:**
+- `app`: `only_the_removal_of_a_project_is_irreversible`.
+- `ui`: `the_dialog_block_is_the_focused_pane_block_cyan_or_red` (`dialog_block == pane_block(true)`
+  para um diálogo comum; símbolos grossos em ciano ou vermelho, sem DIM; nenhuma célula ciano no
+  vermelho; `inner` igual); `every_dialog_has_the_focus_border_and_only_it` (as 24 variantes, com
+  e sem agente: um único `┏` na tela, na cor certa, e a lista e o painel `┌` sem foco; no "Prompt
+  final", nada grosso fora da caixa); `the_focus_border_goes_back_when_the_dialog_closes` (com o
+  foco na lista e, forçado, no terminal); `the_removal_dialog_is_red_and_the_others_cyan`.
+- PTY: `a_dialog_takes_the_focus_border_and_gives_it_back` (`tests/agent.rs`, o `q` com um agente
+  vivo: o `┏` ciano no topo da caixa, a lista e o painel `┌`, e a borda volta à lista ao cancelar)
+  e `the_removal_dialog_has_the_red_focus_border` (`tests/tui.rs`: o `┏` e o `┃` em `Idx(1)`, que
+  é o `Color::Red` do crossterm, e o projeto continua lá depois de cancelar).
+- O autoteste do detector (`the_stage_is_only_written_by_the_confirmation_of_the_operator`)
+  ganhou dois casos: o `pub(crate) mod tests` some, e um `#[cfg(test)]` de `#[path]` não corta
+  nada.
+- Helper novo em `tests/common/mod.rs`: `Nick::cells_of(symbol)`, as células com o símbolo e a cor,
+  num parse só.
+
+Os testes PTY e os de desenho morderam numa sabotagem feita numa cópia fora do repositório: o
+desenho voltou ao de antes e, em outra rodada, o vermelho foi desligado. O log está em
+`.nick/docs/NS-46/review_sabotagens.txt`.
+
+**Testes adaptados (só o caractere da borda do diálogo, `│ └` → `┃ ┗`):**
+- `ui::a_long_path_in_the_text_field_keeps_its_end_and_the_cursor_visible`: o lado da caixa lido
+  é o `┃`, e o fundo, o `┗`;
+- `tests/agent.rs`, `menu_labels` (usado por `the_menu_follows_jira_and_sentry_of_the_project`):
+  o rótulo sozinho na linha aceita o `┃` depois dele;
+- `ui::the_removal_confirmation_names_the_project_and_s_n` e
+  `tests/tui.rs::a_missing_init_shows_the_path_and_the_tui_goes_on` (review do NS-46, O1). Eles
+  passavam sem edição porque o texto cobrado cabe numa linha da caixa. Mas o `replace('│', "")`
+  deles não tirava mais a borda do diálogo, e um texto quebrado em duas linhas falharia por um
+  motivo enganoso. Agora usam os helpers que já tiram `│` e `┃`: o `flat(&buffer)` do `ui` (o
+  trecho era uma cópia dele) e o `Nick::flat_screen()`, que também junta as linhas com espaço (o
+  `collect()` antigo juntava sem separador).
+
+Passaram sem edição os testes do NS-37 sem diálogo (`the_focused_panel_has_the_thick_cyan_border`,
+`every_list_screen_shows_where_the_focus_is`,
+`without_an_agent_the_tree_is_on_the_left_focused_and_the_panel_on_the_right` e, no PTY,
+`toggling_the_focus_moves_the_thick_border_at_once`), os de tamanho e cursor, o
+`the_preview_covers_the_screen_above_the_help_and_the_keys_show_once` e todos os do `app.rs`. O
+`assert_border` dos testes do `ui` passou a delegar ao `assert_border_color` novo (`Some(cor)`:
+grossa nessa cor; `None`: simples e DIM), sem mudar as chamadas.
+
+Prints da conferência em `.nick/docs/NS-46/prints/` (texto, ANSI e PNG): um diálogo comum ciano
+("Sair do nick", com agente vivo) e o "Remover projeto" vermelho. Nenhuma dependência nova, e o
+README não mudou (regra "README genérico").
+
+**Fora de escopo:** escurecer o fundo atrás do diálogo e mudar o texto ou o tamanho dos diálogos.

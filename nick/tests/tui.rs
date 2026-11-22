@@ -485,11 +485,7 @@ fn a_missing_init_shows_the_path_and_the_tui_goes_on() {
     let mut nick = world.spawn(&world.root, &[("NICK_INIT_BIN", missing_text.as_str())]);
     press_create(&mut nick, &bare);
     nick.wait_for("Não encontrei o bin/nick-init em");
-    let flat: String = nick
-        .screen()
-        .lines()
-        .map(|l| l.replace('│', "").trim().to_string())
-        .collect();
+    let flat = nick.flat_screen();
     assert!(
         flat.contains(&format!(
             "Não encontrei o bin/nick-init em {missing_text}. Nada foi feito."
@@ -531,6 +527,43 @@ fn removing_keeps_every_file_of_the_project() {
     assert_eq!(nick.wait_exit(), Some(0));
     assert_eq!(world.stored(), Vec::<std::path::PathBuf>::new());
     assert_eq!(common::snapshot(&proj), before);
+}
+
+/// NS-46: the removal of a project has no way back, so its dialog has the focus border in red
+/// (`ui::IRREVERSIBLE_COLOR`, SGR 31: `Idx(1)`), the only `┏` on the screen; cancelling keeps
+/// the project.
+#[test]
+fn the_removal_dialog_has_the_red_focus_border() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_projects(&mut nick);
+    nick.select("proj");
+    nick.send("r");
+    nick.wait_for("(s/N)");
+    nick.wait_until("the list without the focus", || {
+        nick.cell(0, 0) == ("┌".into(), vt100::Color::Default)
+    });
+    let corners = nick.cells_of("┏");
+    assert_eq!(corners.len(), 1, "{}", nick.screen());
+    let (row, col, color) = corners[0];
+    assert_eq!(color, vt100::Color::Idx(1), "red");
+    assert_eq!(nick.cell(row + 1, col), ("┃".into(), vt100::Color::Idx(1)));
+    assert!(
+        nick.cells_of("━")
+            .iter()
+            .all(|(_, _, c)| *c == vt100::Color::Idx(1))
+    );
+    nick.keep_screen("NS-46: Remover projeto (vermelho)");
+    nick.send("n");
+    nick.wait_for_flat("r remover");
+    nick.wait_until("the list with the focus again", || {
+        nick.cell(0, 0) == ("┏".into(), vt100::Color::Idx(6))
+    });
+    assert_eq!(world.stored(), std::slice::from_ref(&proj));
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
 }
 
 #[test]

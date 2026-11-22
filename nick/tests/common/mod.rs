@@ -547,6 +547,21 @@ impl Nick {
         self.cell(row, col).1
     }
 
+    /// Every cell of the screen whose symbol is `symbol` (row, column and the color of its text),
+    /// from the top, in a single parse (NS-46: the one `┏` of the open dialog).
+    pub fn cells_of(&self, symbol: &str) -> Vec<(u16, u16, vt100::Color)> {
+        let parser = self.parser();
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows)
+            .flat_map(|row| (0..cols).map(move |col| (row, col)))
+            .filter_map(|(row, col)| {
+                let cell = screen.cell(row, col)?;
+                (cell.contents() == symbol).then(|| (row, col, cell.fgcolor()))
+            })
+            .collect()
+    }
+
     /// Waits until `needle` is in the panel of the shown agent (`panel`).
     pub fn wait_for_panel(&self, needle: &str) {
         self.wait_until(&format!("{needle:?} in the panel"), || {

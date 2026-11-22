@@ -460,7 +460,7 @@ fn menu_labels(nick: &Nick) -> Vec<&'static str> {
             let rest = line
                 .find(label)
                 .map(|at| line[at + label.len()..].trim_start_matches(' '));
-            if rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('│')) {
+            if rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['│', '┃'])) {
                 found.push((row, label));
             }
         }
@@ -1165,6 +1165,48 @@ fn toggling_the_focus_moves_the_thick_border_at_once() {
     assert_eq!(nick.wait_exit(), Some(0));
 }
 
+/// NS-46: an open dialog takes the focus border (the one `┏` on the screen, cyan: going out has
+/// a way back) from the list and the panel, and gives it back to the list when it closes.
+#[test]
+fn a_dialog_takes_the_focus_border_and_gives_it_back() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    wait_for_focus_border(&nick, true);
+    nick.send(SHORTCUT);
+    wait_for_focus_border(&nick, false);
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
+    nick.wait_until("the list and the panel without the focus", || {
+        border_at(&nick, 0, 0) == ("┌".into(), false)
+            && border_at(&nick, 0, PANEL_COL) == ("┌".into(), false)
+    });
+    let corners = nick.cells_of("┏");
+    assert_eq!(corners.len(), 1, "{}", nick.screen());
+    let (row, col, color) = corners[0];
+    assert_eq!(color, vt100::Color::Idx(6), "cyan");
+    // The top of the box of the dialog, above its question.
+    let (question, _) = nick
+        .screen()
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Encerrar e sair?"))
+        .expect("the question");
+    assert!(usize::from(row) < question, "{}", nick.screen());
+    assert_eq!(border_at(&nick, row + 1, col), ("┃".into(), true));
+    nick.keep_screen("NS-46: diálogo comum (ciano)");
+    // Anything but `s` cancels: the list has the focus border again.
+    nick.send("n");
+    wait_for_focus_border(&nick, false);
+    assert_eq!(nick.cells_of("┏").len(), 1, "only the list's");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
 /// NS-37 (review, N2): `Nick::panel` cuts only the border of the panel. A rule and a box row the
 /// program draws across its whole width (as the real claude does) stay whole, ends included.
 #[test]
@@ -1668,14 +1710,21 @@ fn no_rust_source_builds_the_prompt_nor_reads_the_config() {
 
 // ---- structure: the stage of a ticket and the writes in a project (NS-36) ----
 
-/// The production code of a source: without its `#[cfg(test)] mod tests` (the unit tests write
-/// files and call everything on purpose) and without comment lines.
+/// The production code of a source: without its `#[cfg(test)] mod tests`, private or
+/// `pub(crate)` (NS-46) (the unit tests write files and call everything on purpose), and without
+/// comment lines. Only those exact starts cut: another `#[cfg(test)]` (the `#[path]` of
+/// projects.rs) would leave the production code after it out of the check.
 fn production(source: &str) -> String {
-    let code = source
-        .split("#[cfg(test)]\nmod tests")
-        .next()
-        .unwrap_or_default();
-    code.lines()
+    let end = [
+        "#[cfg(test)]\nmod tests",
+        "#[cfg(test)]\npub(crate) mod tests",
+    ]
+    .into_iter()
+    .filter_map(|start| source.find(start))
+    .min()
+    .unwrap_or(source.len());
+    source[..end]
+        .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -1867,6 +1916,16 @@ fn the_stage_is_only_written_by_the_operator_or_by_opening_a_new_agent() {
             "// tickets::change_stage(db, &t, d)\n#[cfg(test)]\nmod tests { change_stage(); }"
         ),
         ""
+    );
+    // The tests shared with another module (NS-46: the catalog of the dialogs of app.rs) are
+    // cut too; a `#[cfg(test)]` elsewhere (a `#[path]` of projects.rs) cuts nothing.
+    assert_eq!(
+        production("fn a() {}\n#[cfg(test)]\npub(crate) mod tests { fs::write(); }"),
+        "fn a() {}"
+    );
+    assert_eq!(
+        production("#[cfg(test)]\n#[path = \"x.rs\"]\nmod x;\nfn a() {}"),
+        "#[cfg(test)]\n#[path = \"x.rs\"]\nmod x;\nfn a() {}"
     );
 }
 

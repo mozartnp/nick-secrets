@@ -1054,7 +1054,9 @@ fn a_hidden_agent_whose_text_changed_is_marked_until_it_is_shown() {
     nick.wait_for("Tech Leader  ● saída nova");
     wait_flat(&nick, "v mostrar tudo (2, 1 com saída nova)");
     // Shown, it is seen: the mark goes.
-    nick.select("Tech Leader");
+    // The agent row, marked or not once shown (NS-45: the ticket row has `[Tech Leader]` now,
+    // advanced by the opening).
+    nick.select("Tech Leader  ●");
     nick.wait_for_panel("alfa · Tech Leader · NS-1 · na jail");
     nick.wait_for_panel("NOVO");
     nick.wait_until("the mark gone", || !nick.screen().contains("saída nova"));
@@ -1679,11 +1681,12 @@ fn production(source: &str) -> String {
         .join("\n")
 }
 
-/// The violations of the stage rule (plan D2/D9 of NS-36) in the production code of the file
-/// `name` (a path ending in `src/...`): `change_ticket_stage` only in db/mod.rs (its
-/// definition) and in tickets.rs (`change_stage`); `change_stage(` only in tickets.rs and, in
-/// app.rs, a single call inside the confirmation of the dialog; no write of the stage nor of
-/// its history outside src/db/.
+/// The violations of the stage rule (plan D2/D9 of NS-36, D5 of NS-45) in the production code of
+/// the file `name` (a path ending in `src/...`): `change_ticket_stage` only in db/mod.rs (its
+/// definition) and in tickets.rs (`change_stage` and `advance_on_agent_opening`); `change_stage(`
+/// only in tickets.rs and, in app.rs, a single call inside the confirmation of the dialog;
+/// `advance_on_agent_opening(` only in tickets.rs and, in app.rs, a single call inside
+/// `open_agent` after the spawn; no write of the stage nor of its history outside src/db/.
 fn stage_violations(name: &str, code: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let file = name.rsplit("src/").next().unwrap_or(name);
@@ -1713,6 +1716,39 @@ fn stage_violations(name: &str, code: &str) -> Vec<String> {
         _ if !calls.is_empty() => violations.push(format!("change_stage in {file}")),
         _ => {}
     }
+    // NS-45: the other writer, the advance on the opening of a new agent: only in tickets.rs (its
+    // definition) and, in app.rs, a single call inside `fn open_agent`, after `launcher.spawn(`.
+    let advances: Vec<usize> = code
+        .match_indices("advance_on_agent_opening(")
+        .map(|(at, _)| at)
+        .collect();
+    match file {
+        "tickets.rs" => {}
+        "app.rs" => {
+            if advances.len() != 1 {
+                violations.push(format!(
+                    "{} calls of advance_on_agent_opening in app.rs",
+                    advances.len()
+                ));
+            }
+            for at in &advances {
+                let before = &code[..*at];
+                let function = before.rfind("fn ").map(|f| &before[f..]);
+                match function {
+                    Some(body) if body.starts_with("fn open_agent(") => {
+                        if !body.contains("launcher.spawn(") {
+                            violations.push("advance_on_agent_opening before the spawn".into());
+                        }
+                    }
+                    _ => violations.push("advance_on_agent_opening outside open_agent".into()),
+                }
+            }
+        }
+        _ if !advances.is_empty() => {
+            violations.push(format!("advance_on_agent_opening in {file}"));
+        }
+        _ => {}
+    }
     if !file.starts_with("db/") {
         for needle in ["UPDATE tickets SET stage", "ticket_stage_changes"] {
             if code.contains(needle) {
@@ -1724,8 +1760,9 @@ fn stage_violations(name: &str, code: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_stage_is_only_written_by_the_confirmation_of_the_operator() {
+fn the_stage_is_only_written_by_the_operator_or_by_opening_a_new_agent() {
     let mut app_calls = 0;
+    let mut app_advances = 0;
     for (name, source) in sources() {
         let code = production(&source);
         assert_eq!(
@@ -1735,15 +1772,54 @@ fn the_stage_is_only_written_by_the_confirmation_of_the_operator() {
         );
         if name.ends_with("src/app.rs") {
             app_calls = code.matches("tickets::change_stage(").count();
+            app_advances = code.matches("advance_on_agent_opening(").count();
         }
     }
     assert_eq!(app_calls, 1, "the confirmation calls it");
+    assert_eq!(app_advances, 1, "open_agent calls it (NS-45)");
     // Positive control: the filter sees each kind of violation, and not a comment nor a test.
     let confirmation = "Some(Dialog::ConfirmStageChange { ticket, to }) => {\n    if is_yes(key) \
                         { tickets::change_stage(&self.db, &ticket, to); }\n}";
+    // NS-45: the advance, once, in `open_agent` after the spawn. Every app.rs of the control has
+    // it, so each bad one breaks only its own rule.
+    let opening = "pub fn open_agent(&mut self) {\n    if let Err(err) = launcher.spawn(&l, p) \
+                   { return; }\n    tickets::advance_on_agent_opening(&self.db, id, stage);\n}";
+    let good = format!("{confirmation}\n{opening}");
+    assert_eq!(stage_violations("src/app.rs", &good), Vec::<String>::new());
     assert_eq!(
         stage_violations("src/app.rs", confirmation),
-        Vec::<String>::new()
+        ["0 calls of advance_on_agent_opening in app.rs"]
+    );
+    let in_resume = "pub fn resume_agent(&mut self) {\n    if let Err(err) = launcher.spawn(&l, p) \
+                     { return; }\n    tickets::advance_on_agent_opening(&self.db, id, stage);\n}";
+    let before_spawn = "pub fn open_agent(&mut self) {\n    \
+                        tickets::advance_on_agent_opening(&self.db, id, stage);\n    \
+                        launcher.spawn(&l, p);\n}";
+    let in_ended = "pub fn open_agent(&mut self) { launcher.spawn(&l, p); }\n\
+                    pub fn agent_ended(&mut self) { advance_on_agent_opening(&db, id, s); }";
+    for bad in [
+        format!("{confirmation}\n{in_resume}"),
+        format!("{confirmation}\n{before_spawn}"),
+        format!("{confirmation}\n{in_ended}"),
+        format!("{confirmation}\n{opening}\n{opening}"),
+    ] {
+        assert!(!stage_violations("src/app.rs", &bad).is_empty(), "{bad}");
+    }
+    assert!(
+        !stage_violations(
+            "src/agents.rs",
+            "tickets::advance_on_agent_opening(db, id, s)"
+        )
+        .is_empty(),
+        "in another source"
+    );
+    assert_eq!(
+        stage_violations(
+            "src/tickets.rs",
+            "pub fn advance_on_agent_opening(db: &Db) {}"
+        ),
+        Vec::<String>::new(),
+        "its definition"
     );
     for (name, bad) in [
         (
@@ -1771,12 +1847,17 @@ fn the_stage_is_only_written_by_the_confirmation_of_the_operator() {
             "\"INSERT INTO ticket_stage_changes VALUES (1)\"",
         ),
     ] {
+        let bad = if name == "src/app.rs" {
+            format!("{bad}\n{opening}")
+        } else {
+            bad.to_string()
+        };
         assert!(
-            !stage_violations(name, &production(bad)).is_empty(),
+            !stage_violations(name, &production(&bad)).is_empty(),
             "{bad}"
         );
     }
-    let two = format!("{confirmation}\n{confirmation}");
+    let two = format!("{confirmation}\n{confirmation}\n{opening}");
     assert!(
         !stage_violations("src/app.rs", &two).is_empty(),
         "two calls"
@@ -1971,8 +2052,8 @@ fn the_dev_form_without_a_plan_warns_and_opens_anyway() {
     assert_eq!(world.agents().len(), 1);
     assert_eq!(
         stage_of(&world, "NS-1"),
-        "po",
-        "opening a Dev changes no stage"
+        "development",
+        "opening a Dev advances the stage (NS-45)"
     );
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
@@ -2176,7 +2257,8 @@ fn each_kind_of_node_has_its_panel_and_its_help() {
     // The filters: the hidden ticket shows; only the live branches.
     nick.send("f");
     nick.wait_for(" Navegação (com ocultos) ");
-    nick.wait_for("NS-2  [PO]  Segundo  [oculto]");
+    // The end cut at 40 columns (NS-34): `[Aberto]` is longer than the `[PO]` of before (NS-45).
+    nick.wait_for("NS-2  [Aberto]  Segundo  [ocul");
     nick.keep_screen("filtro de ocultos");
     nick.send("v");
     nick.wait_for(" Navegação (com ocultos) (só ativos) ");
@@ -2882,8 +2964,90 @@ fn a_real_version_6_database_opens_migrated_with_the_tree_of_before() {
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(world.agents()[0].3, "stopped");
+}
+
+// ---- the stage "Aberto", the colors and the advance on the opening (NS-45) ----
+
+/// The colors of the 16 and of the 256 palettes, as `vt100` reads them from crossterm.
+const WHITE: vt100::Color = vt100::Color::Idx(15);
+const BLUE: vt100::Color = vt100::Color::Idx(12);
+const ORANGE: vt100::Color = vt100::Color::Idx(208);
+const PURPLE: vt100::Color = vt100::Color::Idx(5);
+
+#[test]
+fn opening_new_agents_advances_the_stage_and_each_stage_has_its_color() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    world.epic(&proj, "EPIC-1", "Plano longo", &[]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    nick.open_project("proj");
+    // The epic: the ID and the title in purple, `[épico]` with no color.
+    nick.wait_for_tree("EPIC-1  [épico]  Plano longo");
+    assert_eq!(nick.color_at("EPIC-1  [épico]", 0), PURPLE, "the ID");
+    assert_eq!(
+        nick.color_at("EPIC-1  [épico]  Plano", 17),
+        PURPLE,
+        "the title"
+    );
+    assert_eq!(nick.color_at("EPIC-1  [épico]", 8), vt100::Color::Default);
+    // The ticket created before: in Aberto, white.
+    nick.select("NS-1");
+    nick.wait_for_tree("NS-1  [Aberto]  Primeiro");
+    assert_eq!(nick.color_at("NS-1  [Aberto]", 6), WHITE);
+    assert_eq!(nick.color_at("NS-1  [Aberto]", 0), vt100::Color::Default);
+    nick.wait_for("Etapa atual: Aberto");
+    assert_eq!(nick.color_at("Etapa atual: Aberto", 13), WHITE);
+    nick.keep_screen("ticket em Aberto (branco) e épico (roxo)");
+    // A new PO agent: the ticket goes to PO, in blue, by the opening of the agent.
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    wait_flat(
+        &nick,
+        "Etapa do ticket NS-1: Aberto → PO (abertura de agente).",
+    );
+    nick.send(SHORTCUT);
+    nick.wait_for_tree("NS-1  [PO]  Primeiro");
+    assert_eq!(nick.color_at("NS-1  [PO]", 6), BLUE);
+    nick.select("NS-1  [PO]");
+    nick.wait_for("Aberto → PO  (abertura de");
+    assert_eq!(nick.color_at("Etapa atual: PO", 13), BLUE);
+    nick.keep_screen("ticket em PO (azul) depois de abrir o agente PO");
+    // A new Dev agent: to Dev, in orange.
+    open_agent(&mut nick, 2);
+    nick.wait_for("READY");
+    wait_flat(
+        &nick,
+        "Etapa do ticket NS-1: PO → Dev (abertura de agente).",
+    );
+    nick.send(SHORTCUT);
+    nick.wait_for_tree("NS-1  [Dev]  Primeiro");
+    assert_eq!(nick.color_at("NS-1  [Dev]", 6), ORANGE);
+    nick.select("NS-1  [Dev]");
+    nick.wait_for("PO → Dev  (abertura de");
+    assert_eq!(nick.color_at("Etapa atual: Dev", 13), ORANGE);
+    nick.keep_screen("ticket em Dev (laranja) depois de abrir o agente Dev");
+    assert_eq!(stage_of(&world, "NS-1"), "development");
+    // A new PO agent again: an earlier stage, nothing changes.
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    nick.send(SHORTCUT);
+    nick.wait_for_flat("Enter ir ao terminal");
+    assert!(
+        nick.flat_screen().contains("NS-1  [Dev]"),
+        "{}",
+        nick.screen()
+    );
+    assert_eq!(stage_of(&world, "NS-1"), "development");
+    nick.send("q");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+    assert_eq!(
+        stage_of(&world, "NS-1"),
+        "development",
+        "the way out changes nothing"
+    );
 }
 
 /// A fixed piece of the notice of the new ID of an epic (NS-40): prompt, so only in bash.

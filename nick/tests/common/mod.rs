@@ -530,6 +530,23 @@ impl Nick {
             })
     }
 
+    /// The color of the cell `offset` characters after the start of the first `needle` on the
+    /// screen (NS-45: the colors of the stages and of the epic, by `cell`).
+    pub fn color_at(&self, needle: &str, offset: u16) -> vt100::Color {
+        let screen = self.screen();
+        let (row, col) = screen
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find(needle)
+                    .map(|byte| (row, line[..byte].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not on the screen:\n{screen}"));
+        let row = u16::try_from(row).unwrap();
+        let col = u16::try_from(col).unwrap() + offset;
+        self.cell(row, col).1
+    }
+
     /// Waits until `needle` is in the panel of the shown agent (`panel`).
     pub fn wait_for_panel(&self, needle: &str) {
         self.wait_until(&format!("{needle:?} in the panel"), || {

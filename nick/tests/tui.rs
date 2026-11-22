@@ -610,7 +610,7 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
 
     new_ticket(&mut nick, "Corrigir o login", "NS-7");
     nick.wait_for("Ticket criado: NS-7 — Corrigir o login.");
-    nick.wait_for("NS-7  [PO]  Corrigir o login");
+    nick.wait_for("NS-7  [Aberto]  Corrigir o log");
 
     new_ticket(&mut nick, "Sem ID ainda", "");
     nick.wait_for("Ticket criado com o ID provisório");
@@ -623,7 +623,7 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     // ticket has the marks.
     assert!(
         nick.screen()
-            .contains(&format!("{provisional}  [PO]  Sem ID ainda")),
+            .contains(&format!("{provisional}  [Aberto]  Sem ID")),
         "{}",
         nick.screen()
     );
@@ -651,20 +651,20 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     nick.send("senha");
     nick.send(ENTER);
     nick.wait_for("Título atualizado: NS-7.");
-    nick.wait_for("NS-7  [PO]  Corrigir o senha");
+    nick.wait_for("NS-7  [Aberto]  Corrigir o sen");
 
     // Hide it: `n` cancels, `s` confirms and it leaves the list.
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("n");
     nick.wait_for_flat("f mostrar ocultos");
-    assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
+    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o sen"));
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("s");
     nick.wait_for("Ticket ocultado: NS-7.");
     assert!(
-        !nick.screen().contains("Corrigir o senha"),
+        !nick.screen().contains("Corrigir o sen"),
         "{}",
         nick.screen()
     );
@@ -672,20 +672,20 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     // The filter shows it as [oculto], and `o` restores it.
     nick.send("f");
     nick.wait_for("(com ocultos)");
-    nick.wait_for("NS-7  [PO]  Corrigir o senha");
+    nick.wait_for("NS-7  [Aberto]  Corrigir o sen");
     nick.wait_for_flat("f esconder ocultos");
     nick.send("\x1b[A");
     nick.send("o");
     nick.wait_for("Ticket restaurado: NS-7.");
     nick.send("f");
     nick.wait_for_flat("f mostrar ocultos");
-    assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
+    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o sen"));
     assert!(!nick.screen().contains("[oculto]"));
 
     // Up to the project, with it still there.
     nick.send(ESC);
     nick.wait_for_flat("a novo ticket");
-    assert!(nick.screen().contains("NS-7  [PO]  Corrigir o senha"));
+    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o sen"));
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 
@@ -749,7 +749,7 @@ fn the_tickets_of_a_project_do_not_show_in_another() {
     world.ticket(&alfa, "NS-1", "Só do alfa");
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "alfa");
-    nick.wait_for("NS-1  [PO]  Só do alfa");
+    nick.wait_for("NS-1  [Aberto]  Só do alfa");
     // alfa closed (←), beta open: its tickets are the only ones on the tree.
     nick.send(LEFT);
     nick.wait_until("alfa closed", || !nick.screen().contains("Só do alfa"));
@@ -844,19 +844,26 @@ fn the_operator_changes_the_stage_and_done_stays_on_the_list() {
     let mut nick = world.spawn(&world.root, &[]);
     open_tickets(&mut nick, "proj");
     new_ticket(&mut nick, "Corrigir o login", "NS-7");
-    nick.wait_for("NS-7  [PO]  Corrigir o login");
+    nick.wait_for("NS-7  [Aberto]  Corrigir o");
+    // NS-45: a new ticket is born in Aberto, in white.
+    assert_eq!(nick.color_at("NS-7  [Aberto]", 6), vt100::Color::Idx(15));
     nick.keep_screen("árvore com a etapa do ticket");
     // The new ticket is selected: its panel on the right (NS-38; before, Enter opened it).
     nick.wait_for_flat("p épico");
-    nick.wait_for("Etapa atual: PO");
-    nick.wait_for("Nenhuma mudança: o ticket começou em PO.");
+    nick.wait_for("Etapa atual: Aberto");
+    nick.wait_for("Nenhuma mudança: o ticket começou em Aberto.");
     nick.keep_screen("painel do ticket sem histórico");
     change_stage(&mut nick, "Review");
-    nick.wait_for("Etapa do ticket NS-7: PO → Review.");
+    nick.wait_for("Etapa do ticket NS-7: Aberto → Review.");
     nick.wait_for("Etapa atual: Review");
-    nick.wait_for("UTC  PO → Review");
+    nick.wait_for("UTC  Aberto → Review  (operador)");
     assert_eq!(stage_of(&world, "NS-7"), "review");
     nick.wait_for("NS-7  [Review]  Corrigir o");
+    assert_eq!(nick.color_at("NS-7  [Review]", 6), vt100::Color::Idx(208));
+    assert_eq!(
+        nick.color_at("Etapa atual: Review", 13),
+        vt100::Color::Idx(208)
+    );
     change_stage(&mut nick, "Concluído");
     nick.wait_for("Etapa do ticket NS-7: Review → Concluído.");
     nick.wait_for("UTC  Review → Concluído");
@@ -865,6 +872,10 @@ fn the_operator_changes_the_stage_and_done_stays_on_the_list() {
     nick.send(ESC);
     nick.wait_for_flat("a novo ticket");
     nick.wait_for("NS-7  [✓ Concluído]  Corrigir");
+    assert_eq!(
+        nick.color_at("NS-7  [✓ Concluído]", 6),
+        vt100::Color::Idx(2)
+    );
     nick.keep_screen("árvore com um ticket concluído");
     assert_eq!(stage_of(&world, "NS-7"), "done");
     nick.send("q");

@@ -1,10 +1,11 @@
 //! Finding and running bin/nick-agent (NS-33), the only way the shell opens an agent: the
 //! launcher loads the project config and launches claude through lib/ (the jail and the rules
-//! of the nick), and the shell never builds that command itself. The path is fixed at compile
-//! time (the checkout the binary was built from, as bin/nick-init) and, unlike the init, no
-//! variable swaps it: one would let something else run in place of the path that guarantees
-//! the jail and the rules. Before the PTY, the shell runs `bash <launcher> --check` (outside
-//! the PTY, so an error of the config or of the jail reaches the TUI) and learns from its three
+//! of the nick), and the shell never builds that command itself. The path is under the root of
+//! the files of the nick (resources.rs, NS-52: found by where the binary is, as bin/nick-init)
+//! and, unlike the init, no variable swaps it: one would let something else run in place of the
+//! path that guarantees the jail and the rules. Before the PTY, the shell runs
+//! `bash <launcher> --check` (outside the PTY, so an error of the config or of the jail reaches
+//! the TUI) and learns from its three
 //! lines whether the agent runs in the jail and which stage types the project offers (Jira,
 //! Sentry). Then `bash <launcher> --render <type> <answers>` (NS-35) builds the prompt by bash,
 //! into its log, and the shell only reads that log for the preview: no Rust builds a prompt, reads
@@ -21,9 +22,6 @@ use crate::agent_session::{AgentEvent, AgentSession};
 use crate::agents::Stage;
 use crate::paths::normalize;
 use crate::stages::StageType;
-
-/// bin/nick-agent of the checkout this binary was built from, before normalization.
-const DEFAULT_LAUNCHER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-agent");
 
 /// When `--check` exits with 0 but its stdout is not exactly the three lines `jail=`, `jira=`
 /// and `sentry=`: nothing is ever presumed.
@@ -100,9 +98,10 @@ impl Launch<'_> {
     }
 }
 
-/// The launcher: bin/nick-agent of the checkout, normalized (without `..`).
-pub fn launcher_path() -> PathBuf {
-    normalize(Path::new(DEFAULT_LAUNCHER))
+/// The launcher: bin/nick-agent under `root` (resources.rs, NS-52: the prefix of an installation
+/// or the checkout), normalized (without `..`).
+pub fn launcher_path(root: &Path) -> PathBuf {
+    normalize(&root.join("bin/nick-agent"))
 }
 
 /// What a successful `--check` said.
@@ -272,6 +271,10 @@ pub struct RenderRequest {
     pub kind: StageType,
     /// The `--render` arguments and their values, in order (stages::render_args).
     pub answers: Vec<(&'static str, String)>,
+    /// Where the log of the prompt goes (NS-52: `paths::prompt_logs_dir`), given to the launcher
+    /// as NICK_PROMPT_LOGS_DIR over any value in the environment; None leaves the environment as
+    /// it is (the tests that point it at a temporary dir themselves).
+    pub logs_dir: Option<PathBuf>,
 }
 
 /// What a successful `--render` gave: the log with the prompt, read for the preview.
@@ -357,6 +360,10 @@ pub(crate) fn run_render_with_env(
     }
     for (key, value) in env {
         command.env(key, value);
+    }
+    // After the environment: the dir of the request always wins (NS-52).
+    if let Some(dir) = &request.logs_dir {
+        command.env("NICK_PROMPT_LOGS_DIR", dir);
     }
     let output = command
         .output()
@@ -498,8 +505,14 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
 mod tests {
     use super::*;
     use crate::agents::Stage;
+    use crate::resources::Resources;
     use std::fs;
     use std::path::Component;
+
+    /// `launcher_path` on the checkout (the root of the tests).
+    fn launcher_path() -> PathBuf {
+        super::launcher_path(Resources::checkout().root())
+    }
 
     /// Moving the crate without fixing the path breaks the agents: this pins it to
     /// <repository root>/bin/nick-agent, and the file must exist.
@@ -759,6 +772,7 @@ mod tests {
         let request = RenderRequest {
             kind: StageType::PoDiscussion,
             answers: vec![("--title", "Assunto de teste".into())],
+            logs_dir: None,
         };
         let rendered = run_render_with_env(&launcher_path(), &proj, &request, &env).unwrap();
         assert_eq!(rendered.log.parent(), Some(logs.as_path()), "{rendered:?}");
@@ -793,6 +807,7 @@ mod tests {
         let bad = RenderRequest {
             kind: StageType::Po,
             answers: vec![("--title", "x".into())],
+            logs_dir: None,
         };
         let err = run_render_with_env(&launcher_path(), &proj, &bad, &env).unwrap_err();
         assert!(
@@ -806,6 +821,34 @@ mod tests {
         );
     }
 
+    /// NS-52: the dir of the request wins over a NICK_PROMPT_LOGS_DIR of the environment (the
+    /// nick installed must never write in its prefix, nor in auto_scrum/logs/).
+    #[test]
+    fn run_render_writes_the_log_in_the_dir_of_the_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let proj = root.join("proj");
+        let wanted = root.join("state/nick/logs/proj-1");
+        let other = root.join("other");
+        fs::create_dir_all(proj.join(".nick")).unwrap();
+        fs::write(proj.join(".nick/nick.conf"), "JAIL_ENABLED=\"false\"\n").unwrap();
+        let other_env = other.display().to_string();
+        let env = [("NICK_PROMPT_LOGS_DIR", other_env.as_str())];
+        let request = RenderRequest {
+            kind: StageType::PoDiscussion,
+            answers: vec![("--title", "Assunto de teste".into())],
+            logs_dir: Some(wanted.clone()),
+        };
+        let rendered = run_render_with_env(&launcher_path(), &proj, &request, &env).unwrap();
+        assert_eq!(
+            rendered.log.parent(),
+            Some(wanted.as_path()),
+            "{rendered:?}"
+        );
+        assert!(rendered.log.is_file());
+        assert!(!other.exists(), "nothing in the dir of the environment");
+    }
+
     #[test]
     fn a_log_that_cannot_be_read_is_an_error_with_its_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -815,6 +858,7 @@ mod tests {
         let request = RenderRequest {
             kind: StageType::Po,
             answers: Vec::new(),
+            logs_dir: None,
         };
         let err = run_render(&fake, tmp.path(), &request).unwrap_err();
         assert!(

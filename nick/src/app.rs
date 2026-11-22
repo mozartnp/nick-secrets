@@ -27,16 +27,18 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::agents::{self, Agent, AgentState, Holder, OpenAgent, Owner};
 use crate::db::{Db, Epic, SETTING_RESERVED_SHORTCUT, SessionSwap, StageChangeRow};
+use crate::deps::{self, Deps};
 use crate::docs::{self, Artifacts};
 use crate::editor::{EditorOutcome, EditorRunner};
 use crate::epics;
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
-use crate::launch::{self, AgentLauncher, HolderKey, Launch, Precheck, RenderRequest, Rendered};
+use crate::launch::{AgentLauncher, HolderKey, Launch, Precheck, RenderRequest, Rendered};
 use crate::mascot::{Mascot, Palette, SystemDice};
 use crate::modules::ModuleKind;
-use crate::paths::printable;
+use crate::paths::{self, printable};
 use crate::projects::{self, Availability, Check, Project};
+use crate::resources::Resources;
 use crate::stages::{self, Input, Rule, StageType};
 use crate::tickets::{self, Ticket, TicketStage};
 use crate::tree::{LiveAgent, NodeId, Tree, TreeData, Visible};
@@ -418,6 +420,12 @@ pub struct App {
     pub(crate) launcher: PathBuf,
     /// Where the locks of the agents live (agents.rs); None until `with_agents`.
     pub(crate) agents_dir: Option<PathBuf>,
+    /// The state directory the prompt logs go under (NS-52: `paths::prompt_logs_dir`); None
+    /// until `with_prompt_logs`.
+    pub(crate) prompt_logs: Option<PathBuf>,
+    /// The programs of the PATH (NS-52, deps.rs): without claude no agent opens. Everything
+    /// present until `with_deps`.
+    pub(crate) deps: Deps,
     /// The agents running, in the order they were opened.
     pub(crate) agents: Vec<RunningAgent>,
     /// The id of the agent shown on the right, if any.
@@ -474,8 +482,10 @@ impl App {
             dialog: None,
             status: None,
             rows: Vec::new(),
-            launcher: launch::launcher_path(),
+            launcher: Resources::checkout().launcher(),
             agents_dir: None,
+            prompt_logs: None,
+            deps: Deps::default(),
             agents: Vec::new(),
             shown: None,
             focus: Focus::List,
@@ -558,6 +568,29 @@ impl App {
     pub fn with_agents(mut self, launcher: PathBuf, agents_dir: PathBuf) -> App {
         self.launcher = launcher;
         self.agents_dir = Some(agents_dir);
+        self
+    }
+
+    /// The prompt logs (NS-52): under `<state_dir>/logs/<name>-<id>` of the project of the
+    /// ticket or the epic, never in auto_scrum/logs/ nor in the prefix of an installation.
+    pub fn with_prompt_logs(mut self, state_dir: PathBuf) -> App {
+        self.prompt_logs = Some(state_dir);
+        self
+    }
+
+    /// The dir of the prompt logs of the project of `holder` (`with_prompt_logs`); a project
+    /// gone from the list is named by its id alone (`projeto-<id>`).
+    fn prompt_logs_of(&self, holder: &Holder) -> Option<PathBuf> {
+        let state_dir = self.prompt_logs.as_deref()?;
+        let name = self
+            .project_of_holder(holder)
+            .map_or("", |project| project.name.as_str());
+        Some(paths::prompt_logs_dir(state_dir, name, holder.project_id))
+    }
+
+    /// The programs found in the PATH when the nick opened (NS-52).
+    pub fn with_deps(mut self, deps: Deps) -> App {
+        self.deps = deps;
         self
     }
 
@@ -1999,7 +2032,7 @@ impl App {
         holder: &Holder,
         launcher: &mut dyn AgentLauncher,
     ) {
-        if !self.launcher_found() {
+        if !self.claude_found() || !self.launcher_found() {
             return;
         }
         match launcher.check(&self.launcher, project) {
@@ -2018,6 +2051,16 @@ impl App {
             }
             Err(message) => self.agent_failed(&message),
         }
+    }
+
+    /// Whether claude was in the PATH when the nick opened (NS-52); when not, the refusal on the
+    /// bar, before any call to the launcher (not even `--check`).
+    fn claude_found(&mut self) -> bool {
+        if self.deps.claude {
+            return true;
+        }
+        self.status = Some(deps::NO_CLAUDE_MESSAGE.to_string());
+        false
     }
 
     /// Whether the launcher is a file; when not, the alert with its path (the check of `g` and of
@@ -2047,7 +2090,7 @@ impl App {
         agent: &Agent,
         launcher: &mut dyn AgentLauncher,
     ) {
-        if !self.launcher_found() {
+        if !self.claude_found() || !self.launcher_found() {
             return;
         }
         let precheck = match launcher.check(&self.launcher, project) {
@@ -2398,7 +2441,11 @@ impl App {
                 return;
             }
         };
-        let request = RenderRequest { kind, answers };
+        let request = RenderRequest {
+            kind,
+            answers,
+            logs_dir: self.prompt_logs_of(&holder),
+        };
         match launcher.render(&self.launcher, &project, &request) {
             Ok(rendered) => {
                 self.dialog = Some(Dialog::ConfirmPrompt {
@@ -4208,6 +4255,7 @@ pub(crate) mod tests {
     // ---- agents (NS-33; the flow of the stages, NS-35) ----
 
     use crate::agents::{self, Stage};
+    use crate::deps::{Deps, NO_CLAUDE_MESSAGE};
     use crate::editor::{EditorOutcome, EditorRunner};
     use crate::launch::{AgentLauncher, Precheck, RenderRequest, Rendered};
     use crate::stages::StageType;
@@ -4379,6 +4427,7 @@ pub(crate) mod tests {
         fs::write(&launcher, "#!/usr/bin/env bash\n").unwrap();
         f.app.launcher = launcher;
         f.app.agents_dir = Some(f.root.join("state/agents"));
+        f.app.prompt_logs = Some(f.root.join("state"));
         f.key(KeyCode::Up);
         assert_eq!(f.keys(), ["NS-1", "NS-2"]);
         (f, p)
@@ -4824,13 +4873,45 @@ pub(crate) mod tests {
                     p.clone(),
                     RenderRequest {
                         kind,
-                        answers: expected
+                        answers: expected,
+                        logs_dir: Some(f.root.join(format!("state/logs/proj-{}", f.pid("proj")))),
                     }
                 )],
                 "{kind:?}"
             );
             assert_eq!(f.scroll(), 0, "{kind:?}: the preview opens at the top");
         }
+    }
+
+    /// NS-52: the render of a ticket and of an epic gets the dir of the prompt logs of their
+    /// project, `<state>/logs/<name>-<id>`.
+    #[test]
+    fn the_render_gets_the_prompt_logs_of_the_project() {
+        let (mut f, _) = with_agents();
+        let expected = Some(f.root.join(format!("state/logs/proj-{}", f.pid("proj"))));
+        let mut launcher = FakeLauncher::new(false);
+        f.g(&mut launcher);
+        f.pick(StageType::PoDiscussion);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        assert_eq!(launcher.renders.len(), 1);
+        assert_eq!(launcher.renders[0].2.logs_dir, expected, "of a ticket");
+
+        let (mut f, _) = with_epic();
+        let expected = Some(f.root.join(format!("state/logs/proj-{}", f.pid("proj"))));
+        let mut launcher = FakeLauncher::new(false);
+        match f.ch('g') {
+            Action::CheckAgent { project, holder } => {
+                assert!(matches!(holder.owner, Owner::Epic(_)));
+                f.app.check_agent(&project, &holder, &mut launcher);
+            }
+            other => panic!("no CheckAgent: {other:?}"),
+        }
+        f.pick(StageType::PoDiscussion);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        assert_eq!(launcher.renders.len(), 1);
+        assert_eq!(launcher.renders[0].2.logs_dir, expected, "of an epic");
     }
 
     #[test]
@@ -8756,6 +8837,78 @@ pub(crate) mod tests {
             f.status(),
             Some("O projeto não tem épicos. Crie um com n no nó do projeto.")
         );
+    }
+
+    // ---- NS-52: no agent without claude in the PATH ----
+
+    /// The deps with claude missing (the rest present).
+    fn no_claude() -> Deps {
+        Deps {
+            claude: false,
+            ..Deps::default()
+        }
+    }
+
+    /// `g` without claude: the refusal on the bar and no call to the launcher, not even the
+    /// check; with claude (the default), the check of today.
+    #[test]
+    fn without_claude_a_new_agent_is_refused_before_the_launcher() {
+        for epic in [false, true] {
+            let (mut f, _) = if epic { with_epic() } else { with_agents() };
+            f.app.deps = no_claude();
+            let mut launcher = FakeLauncher::new(false);
+            if !epic {
+                f.on_ticket();
+            }
+            match f.ch('g') {
+                Action::CheckAgent { project, holder } => {
+                    assert_eq!(matches!(holder.owner, Owner::Epic(_)), epic);
+                    f.app.check_agent(&project, &holder, &mut launcher);
+                }
+                other => panic!("no CheckAgent: {other:?}"),
+            }
+            assert_eq!(f.status(), Some(NO_CLAUDE_MESSAGE), "epic: {epic}");
+            assert_eq!(f.app.dialog, None, "epic: {epic}");
+            assert!(launcher.checks.is_empty(), "epic: {epic}");
+            assert!(launcher.renders.is_empty() && launcher.spawns.is_empty());
+            // With claude: the check, and the menu.
+            f.app.deps = Deps::default();
+            f.app.status = None;
+            match f.ch('g') {
+                Action::CheckAgent { project, holder } => {
+                    f.app.check_agent(&project, &holder, &mut launcher);
+                }
+                other => panic!("no CheckAgent: {other:?}"),
+            }
+            assert_eq!(launcher.checks.len(), 1, "epic: {epic}");
+            assert!(matches!(f.app.dialog, Some(Dialog::ChooseType { .. })));
+        }
+    }
+
+    /// `r` without claude, of an agent of a ticket and of an epic: the refusal and no call to the
+    /// launcher (neither the check nor the conversation); with claude, the resume of today.
+    #[test]
+    fn without_claude_a_resume_is_refused_before_the_launcher() {
+        for epic in [false, true] {
+            let (mut f, mut launcher, id) = if epic {
+                stopped_epic_agent()
+            } else {
+                stopped_agent()
+            };
+            let checks = launcher.checks.len();
+            f.app.deps = no_claude();
+            assert!(f.r(&mut launcher), "epic: {epic}");
+            assert_eq!(f.status(), Some(NO_CLAUDE_MESSAGE), "epic: {epic}");
+            assert_eq!(launcher.checks.len(), checks, "epic: {epic}");
+            assert!(launcher.conversations.is_empty(), "epic: {epic}");
+            assert!(launcher.resumes.is_empty(), "epic: {epic}");
+            assert_eq!(f.state_of(id), "stopped");
+            f.app.deps = Deps::default();
+            f.select(NodeId::Agent(id));
+            assert!(f.r(&mut launcher));
+            assert_eq!(launcher.resumes.len(), 1, "epic: {epic}");
+            assert_eq!(f.state_of(id), "active");
+        }
     }
 
     /// An agent of the epic EPIC-1 (Tech Leader), opened and ended: stopped, its node selected.

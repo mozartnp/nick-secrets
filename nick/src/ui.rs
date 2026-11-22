@@ -27,6 +27,7 @@ use crate::projects;
 use crate::stages::{self, Input, Rule};
 use crate::tickets::{self, Ticket, TicketStage};
 use crate::tree::{NodeId, Visible};
+use crate::version;
 
 /// The widest the list gets beside an agent (NS-34); never more than half the window.
 pub const LIST_WIDTH: u16 = 40;
@@ -715,19 +716,24 @@ fn selected_style() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-/// "Configurações": the reserved shortcut, with `(padrão)` when the database has none.
+/// "Configurações": the reserved shortcut, with `(padrão)` when the database has none, and the
+/// version of this nick (NS-52).
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let default = if app.shortcut_stored {
         ""
     } else {
         " (padrão)"
     };
-    let line = format!(
-        "Atalho para alternar entre a lista e o terminal: {}{default}",
-        app.shortcut().label()
-    );
+    let lines = vec![
+        Line::raw(format!(
+            "Atalho para alternar entre a lista e o terminal: {}{default}",
+            app.shortcut().label()
+        )),
+        // The version and the commit of this nick (NS-52).
+        Line::raw(format!("Versão: {}", version::long())),
+    ];
     let content = left_column(frame, app, area, " Configurações ");
-    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), content);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
 }
 
 /// The mark of a stage on the tree: `[<label>]`, and `[✓ Concluído]` for the done ones (which
@@ -3086,6 +3092,23 @@ mod tests {
         let buffer = render(&f.app);
         assert!(column(&buffer).contains("Atalho para alternar entre a lista e o terminal: Alt+X"));
         assert!(find(&buffer, "(padrão)").is_none());
+    }
+
+    #[test]
+    fn the_settings_show_the_version_under_the_shortcut() {
+        let mut f = fixture();
+        f.app.screen = Screen::Settings;
+        let buffer = render(&f.app);
+        let rows: Vec<String> = (1..8).map(|y| list_row(&buffer, y)).collect();
+        let shortcut = rows
+            .iter()
+            .position(|row| row.contains("Atalho para alternar"))
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        let version = rows
+            .iter()
+            .position(|row| row.trim() == format!("Versão: {}", crate::version::long()))
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert!(version > shortcut, "{rows:?}");
     }
 
     #[test]

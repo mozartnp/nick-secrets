@@ -1,6 +1,6 @@
 //! Finding and running bin/nick-init (NS-30), the only source of the project config: the
-//! shell runs it as it is, never copies its logic. The path is fixed at compile time (the
-//! checkout the binary was built from, until the F6 slice packages the nick) and can be
+//! shell runs it as it is, never copies its logic. The path is under the root of the files of
+//! the nick (resources.rs, NS-52: the prefix of an installation or the checkout) and can be
 //! replaced by NICK_INIT_BIN. Running it goes through the `InitRunner` trait, so the TUI state
 //! (app.rs) is tested with a fake one that only records the calls.
 
@@ -11,9 +11,6 @@ use std::process::Command;
 
 use crate::paths::{normalize, printable};
 use crate::terminal::{self, IgnoreTerminalSignals, InputGate, TerminalGuard};
-
-/// bin/nick-init of the checkout this binary was built from, before normalization.
-const DEFAULT_INIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bin/nick-init");
 
 /// How a run of the init ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,19 +92,25 @@ fn run_in_terminal(init: &Path, project: &Path) -> InitOutcome {
 }
 
 /// The init to run: NICK_INIT_BIN when it is set and not empty (made absolute against the cwd
-/// of the nick, since the init runs with the cwd at the project), or bin/nick-init of the
-/// checkout, normalized (without `..`).
-pub fn init_path(override_path: Option<&OsStr>) -> PathBuf {
+/// of the nick, since the init runs with the cwd at the project), or bin/nick-init under `root`
+/// (resources.rs: the prefix of an installation or the checkout), normalized (without `..`).
+pub fn init_path(override_path: Option<&OsStr>, root: &Path) -> PathBuf {
     match override_path.filter(|path| !path.is_empty()) {
         Some(path) => std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path)),
-        None => normalize(Path::new(DEFAULT_INIT)),
+        None => normalize(&root.join("bin/nick-init")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::Resources;
     use std::path::Component;
+
+    /// `init_path` on the checkout (the root of the tests).
+    fn init_path(override_path: Option<&OsStr>) -> PathBuf {
+        super::init_path(override_path, Resources::checkout().root())
+    }
 
     /// Moving the crate without fixing the path breaks the button: this pins it to
     /// <repository root>/bin/nick-init, and the file must exist.

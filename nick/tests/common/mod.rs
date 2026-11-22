@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use nick::mascot::MASCOT_COLS;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+pub mod menu;
 pub mod snapshot;
 
 pub use snapshot::snapshot;
@@ -231,6 +232,12 @@ impl World {
             .collect()
     }
 
+    /// The id of the registered project at `dir`, read from the database.
+    pub fn project_id_at(&self, dir: &Path) -> i64 {
+        let db = nick::db::Db::open(&self.db_path()).unwrap();
+        self.project_id(&db, dir)
+    }
+
     /// The id of the registered project at `dir`.
     fn project_id(&self, db: &nick::db::Db, dir: &Path) -> i64 {
         let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -317,6 +324,11 @@ impl World {
         Nick::spawn_as(cwd, &self.env_with(extra), Keyboard::Kitty)
     }
 
+    /// `spawn` of the binary at `bin` (NS-52: the nick installed by `make install`).
+    pub fn spawn_bin(&self, bin: &Path, cwd: &Path, extra: &[(&str, &str)]) -> Nick {
+        Nick::spawn_bin(bin, cwd, &self.env_with(extra), Keyboard::Legacy)
+    }
+
     /// The default environment plus `extra` (a key of `extra` replaces the default).
     fn env_with(&self, extra: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut env = self.env();
@@ -361,6 +373,11 @@ impl Nick {
 
     /// `spawn` on a terminal with the `keyboard`.
     pub fn spawn_as(cwd: &Path, env: &[(String, String)], keyboard: Keyboard) -> Nick {
+        Nick::spawn_bin(Path::new(env!("CARGO_BIN_EXE_nick")), cwd, env, keyboard)
+    }
+
+    /// `spawn_as` of the binary at `bin` (NS-52: the nick installed by `make install`).
+    pub fn spawn_bin(bin: &Path, cwd: &Path, env: &[(String, String)], keyboard: Keyboard) -> Nick {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -369,7 +386,7 @@ impl Nick {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_nick"));
+        let mut command = CommandBuilder::new(bin);
         command.env_clear();
         command.cwd(cwd);
         command.env("PATH", std::env::var_os("PATH").unwrap_or_default());

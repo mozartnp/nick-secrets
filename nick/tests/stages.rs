@@ -177,9 +177,13 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
         let values = raw_values(kind);
         let answers = stages::render_args(kind, &values).expect("the answers pass");
         let rendered = launch::run_render(
-            &launch::launcher_path(),
+            &nick::resources::Resources::checkout().launcher(),
             &project,
-            &RenderRequest { kind, answers },
+            &RenderRequest {
+                kind,
+                answers,
+                logs_dir: None,
+            },
         )
         .unwrap_or_else(|err| panic!("{}: {err}", kind.key()));
         let (script_log, script_argv) = run_script(&project, kind, &values, &root);
@@ -210,7 +214,7 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
         let _ = fs::remove_file(&agent_argv);
         let (tx, rx) = mpsc::channel::<AgentEvent>();
         let mut session = AgentSession::spawn(
-            &launch::launcher_path(),
+            &nick::resources::Resources::checkout().launcher(),
             &project,
             1,
             SESSION_ID,
@@ -273,9 +277,13 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
             .collect();
         let answers = stages::render_args(kind, &values).expect("the answers pass");
         let rendered = launch::run_render(
-            &launch::launcher_path(),
+            &nick::resources::Resources::checkout().launcher(),
             &project,
-            &RenderRequest { kind, answers },
+            &RenderRequest {
+                kind,
+                answers,
+                logs_dir: None,
+            },
         )
         .unwrap_or_else(|err| panic!("{} of an epic: {err}", kind.key()));
         let (script_log, _) = run_script(&project, kind, &values, &epic_root);

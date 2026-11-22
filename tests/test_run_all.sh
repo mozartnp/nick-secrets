@@ -315,7 +315,16 @@ assert_eq "true" "$(grep -qx '\.PHONY: test' <<< "$makefile_text" && echo true |
 assert_eq "true" "$(grep -qx '\.NOTPARALLEL:' <<< "$makefile_text" && echo true || echo false)" "o Makefile tem .NOTPARALLEL:"
 assert_eq "true" "$(grep -qx '\.DEFAULT_GOAL := test' <<< "$makefile_text" && echo true || echo false)" "o Makefile tem .DEFAULT_GOAL := test"
 assert_eq "true" "$(grep -qx '	@bash tests/run_all.sh' <<< "$makefile_text" && echo true || echo false)" "a receita do test só chama bash tests/run_all.sh"
-assert_eq "1" "$(grep -c '^	' <<< "$makefile_text" || true)" "o Makefile tem uma linha de receita só (a lógica fica no script)"
+# Desde o NS-52 o Makefile tem os alvos install e uninstall: a regra passou de "uma linha de
+# receita no arquivo" para "uma linha de receita por alvo" (a lógica continua nos scripts).
+# recipe_lines_by_target: "<alvo> <linhas de receita>" de cada alvo com receita, do stdin.
+recipe_lines_by_target() {
+  awk '/^[^\t#][^:=]*:([^=]|$)/ { target = $1; sub(/:.*/, "", target) }
+       /^\t/ { count[target]++ }
+       END { for (t in count) print t, count[t] }' | LC_ALL=C sort
+}
+assert_eq "$(printf 'install 1\ntest 1\nuninstall 1')" "$(recipe_lines_by_target <<< "$makefile_text")" "o Makefile tem uma linha de receita por alvo (a lógica fica nos scripts)"
+assert_eq "a 2" "$(printf 'a:\n\techo 1\n\techo 2\n' | recipe_lines_by_target)" "controle positivo: uma receita de duas linhas é contada"
 assert_eq "#!/usr/bin/env bash" "$(head -n 1 "$RUN_ALL_SH")" "tests/run_all.sh começa com o shebang #!/usr/bin/env bash"
 assert_eq "set -euo pipefail" "$(code_lines "$RUN_ALL_SH" | grep -m 1 -v '^$')" "a 1ª linha de código do tests/run_all.sh é set -euo pipefail"
 assert_eq "true" "$([ -x "$RUN_ALL_SH" ] && [ -x "$SCRIPT_DIR/test_run_all.sh" ] && echo true || echo false)" "tests/run_all.sh e tests/test_run_all.sh têm bit de execução"

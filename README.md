@@ -10,15 +10,15 @@ selecionado. Por enquanto o único módulo é o auto_scrum, e a TUI cadastra pro
 lista de tickets de cada um. O resto do fluxo continua no
 `auto_scrum.sh` (abaixo).
 
-Requisito: Rust ([rustup](https://rustup.rs)). Para instalar, rode na raiz do repositório:
+Para instalar, rode na raiz do repositório (sem `sudo`):
 
 ```bash
-cargo install --path nick
+make install
 ```
 
-O binário vai para `~/.cargo/bin/nick`. Depois, é só rodar `nick` em qualquer terminal. O
-diretório de onde ele é aberto não muda nada. As teclas de cada item da árvore aparecem no rodapé
-da TUI.
+O passo a passo, com os requisitos, o `PATH`, a atualização e a desinstalação (`make uninstall`),
+está no [INSTALL.md](INSTALL.md). Depois, é só rodar `nick` em qualquer terminal. O diretório de
+onde ele é aberto não muda nada. As teclas de cada item da árvore aparecem no rodapé da TUI.
 
 - **Projetos:** são cadastrados na TUI, informando o caminho da pasta. Todo projeto cadastrado
   precisa ter `.nick/nick.conf`. Quando a pasta não tem o arquivo, a TUI oferece criá-lo pelo
@@ -57,8 +57,13 @@ da TUI.
   ```
 - **Banco:** o cadastro fica num SQLite em `$XDG_STATE_HOME/nick/nick.db`, ou em
   `~/.local/state/nick/nick.db` quando `XDG_STATE_HOME` não está definida.
-- **Checkout:** o `nick` instalado usa o `bin/nick-init` e o `bin/nick-agent` do checkout de onde
-  foi compilado. Se você mover o checkout, rode o `cargo install --path nick` de novo.
+- **Logs dos prompts:** os prompts que o nick monta ficam em
+  `$XDG_STATE_HOME/nick/logs/<projeto>-<id>/` (ou `~/.local/state/nick/logs/...`), uma pasta por
+  projeto. O `auto_scrum.sh` continua gravando os dele em `auto_scrum/logs/`.
+- **Instalação e repositório:** o `nick` instalado pelo `make install` leva junto os arquivos de
+  que precisa e não depende mais da pasta do repositório (pode movê-la ou apagá-la; para
+  atualizar ou desinstalar, um clone novo serve, veja o [INSTALL.md](INSTALL.md)). Rodado de
+  dentro do repositório (`cargo run`), ele usa os arquivos do próprio repositório.
 
 ## Módulos
 

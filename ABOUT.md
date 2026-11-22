@@ -32,7 +32,7 @@ conteúdo voltado a ele, e trocar isso pra inglês só atrapalharia sem ganho re
 ## Qualidade de código bash
 
 As ferramentas e as bibliotecas do nick (`lib/`, `bin/nick-init`, `bin/nick-agent`, `auto_scrum`)
-são em bash. O
+e o instalador (`install/install.sh`, NS-52) são em bash. O
 Rust entra em dois lugares, com regras próprias: a casca `nick`, em `nick/` (ver a regra de
 linguagem em "Rust no projeto: a casca `nick` (NS-31)"), e o protótipo descartável do painel,
 em `prototype/panel/` (ver "Rust no projeto: protótipo do painel (NS-29)"). Os scripts bash de
@@ -61,7 +61,7 @@ regras. Regras a seguir em todo script novo ou alterado:
   **Proibido** reaproveitar uma cópia de sabotagem anterior, usar um caminho fixo (ex:
   `/tmp/copia-sabotagem`) ou limpar qualquer cópia antiga, antes ou depois: pra sabotar de novo,
   crie outro `mktemp -d`. A cópia leva só (caminhos a partir da
-  raiz) `Makefile`, `tests/`, `auto_scrum/auto_scrum.sh`, `auto_scrum/prompt.sh` (desde o
+  raiz) `Makefile`, `tests/`, `install/` (o instalador e a suíte dele, desde o NS-52), `auto_scrum/auto_scrum.sh`, `auto_scrum/prompt.sh` (desde o
   NS-35), `auto_scrum/templates/`,
   `auto_scrum/tests/`, `bin/`, `lib/`, `README.md` (lido pelo teste README × helper de
   `lib/tests/test_jail.sh`), `.gitignore` (lido pelos testes de `.gitignore` de
@@ -157,13 +157,16 @@ e o `Makefile` só o chama. As regras:
   que o `set -e` não enxerga falha dentro de uma process substitution.
 - **Script bash e `Makefile` fino:** numa receita de `make` (que roda em `/bin/sh`, com `$$` e
   `\`), o `shellcheck` não enxerga o código e as regras de "Qualidade de código bash" não
-  valem. No script elas valem sem exceção, ele tem a própria suíte e roda sem `make`. Fica em
+  valem. Cada alvo tem uma linha de receita só, que chama o script (desde o NS-52, a suíte do
+  runner confere isso por alvo, e não mais "uma linha no arquivo todo", decisão do usuário quando
+  entraram o `install` e o `uninstall`). No script elas valem sem exceção, ele tem a própria suíte e roda sem `make`. Fica em
   `tests/` da raiz, o lugar dos testes do repositório como um todo; `lib/` é só pra
   bibliotecas carregadas com `source`.
-- **`make` sem alvo roda o `test`** (`.DEFAULT_GOAL := test`): é o único alvo, rodar os testes
-  não grava nada no repositório (as suítes usam `mktemp`), e um alvo de ajuda seria uma lista
-  a manter à mão (o problema da seção "README genérico"). Quando entrar um segundo alvo (ex:
-  `shellcheck`), a escolha deve ser revista. `test` é `.PHONY`, pra um arquivo chamado `test`
+- **`make` sem alvo roda o `test`** (`.DEFAULT_GOAL := test`): rodar os testes não grava nada no
+  repositório (as suítes usam `mktemp`), e um alvo de ajuda seria uma lista a manter à mão (o
+  problema da seção "README genérico"). **Revista no NS-52**, quando entraram o `install` e o
+  `uninstall`: continua `test`, porque `make` sem alvo nunca deve instalar nem desinstalar nada
+  (grava fora do repositório). A suíte do instalador confere que `make -n` sem alvo é o runner. `test` é `.PHONY`, pra um arquivo chamado `test`
   na raiz não fazer o `make` achar o alvo em dia. O `.NOTPARALLEL:` é garantia explícita:
   hoje a receita é uma só, e o `make -j4 test` já roda tudo em série, mas o alvo pode um dia
   ser dividido em um por suíte.
@@ -2368,6 +2371,12 @@ pela verificação manual do `nick` no NS-31).
 
 ## Rust no projeto: a casca `nick` (NS-31)
 
+> **Mudou no NS-52** (seção "Rust no projeto: instalador local (NS-52)"): o caminho do
+> `bin/nick-init` não é mais fixado só na compilação. A raiz dos arquivos sai da localização do
+> binário (o prefixo de uma instalação do `make install`, ou o checkout), e o operador instala com
+> `make install`, não com `cargo install --path nick`. O `NICK_INIT_BIN` continua igual. A
+> política de migrações (o banco mais novo recusado) ganhou um teste de integração com o binário.
+
 > **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): as telas Módulos e
 > Projetos viraram a árvore (Módulo > Projeto > Ticket > Agente), sempre lado a lado com o painel do
 > nó selecionado. O cadastro (`a`) e as Configurações (`c`) ficam no nó do módulo, a remoção (`r`)
@@ -2705,6 +2714,12 @@ a estimativa do `wrapped_rows` dos diálogos, para não sobrar linha vazia. O
   rodapé), nunca um texto que já estava na tela.
 
 ## Rust no projeto: agentes na casca `nick` (NS-33)
+
+> **Mudou no NS-52** (seção "Rust no projeto: instalador local (NS-52)"): o launcher não é mais
+> fixado na compilação. Ele fica sob a raiz dos arquivos do nick, achada pela localização do
+> binário (`resources.rs`). A regra de segurança continua: nenhuma variável de ambiente troca o
+> `bin/nick-agent`. Sem o `claude` no PATH, abrir e retomar agente são recusados antes de qualquer
+> chamada ao launcher.
 
 > **Mudou no NS-50** (seção "Rust no projeto: retomada segue a troca de sessão do claude
 > (NS-50)"): o ID de sessão "escolhido pelo nick e único" continua valendo para o `session_id`,
@@ -3115,6 +3130,12 @@ para o analista executar fora dela.
 
 ## Rust no projeto: etapas do auto_scrum na casca `nick` (NS-35)
 
+> **Mudou no NS-52** (seção "Rust no projeto: instalador local (NS-52)"): os logs do `--render`
+> do nick saem do `auto_scrum/logs/` e vão para `$XDG_STATE_HOME/nick/logs/<nome>-<id>/`. O nick
+> passa o diretório pelo `NICK_PROMPT_LOGS_DIR` de sempre e sobrepõe um valor herdado do ambiente.
+> Os testes de integração passaram a esperar o log no state dir temporário. O `auto_scrum.sh` não
+> mudou.
+
 A fatia F4a do épico NS-28. O `g` sobre um ticket deixa de abrir o `claude` sem prompt e passa a
 seguir o fluxo do `auto_scrum.sh`: os mesmos tipos de conversa, as mesmas perguntas, o mesmo
 prompt, a mesma confirmação e o mesmo argv do `claude`.
@@ -3222,6 +3243,7 @@ template e não monta prompt: ele coleta as respostas, mostra o log (ler o log p
 `no_rust_source_builds_the_prompt_nor_reads_the_config`) proíbe em `nick/src/` (fora de
 comentário) `templates/`, `envsubst`, `exchange_block`, `build_`, `_BLOCK`, o nome de um template
 (`po.md`, …) e um `read_to_string`/`fs::read` do `nick.conf`, com controle positivo de cada filtro.
+(Desde o NS-52, o `envsubst` é isento só em `src/deps.rs`, que o procura no PATH.)
 
 **Os tipos e os formulários (`nick/src/stages.rs`).** Um módulo sem tela, no molde do
 `tickets.rs`: `StageType` (8 variantes) com `key()` (o `$TYPE`), `label()` (o texto do menu),
@@ -5276,3 +5298,150 @@ Prints da conferência em `.nick/docs/NS-46/prints/` (texto, ANSI e PNG): um di�
 README não mudou (regra "README genérico").
 
 **Fora de escopo:** escurecer o fundo atrás do diálogo e mudar o texto ou o tamanho dos diálogos.
+
+## Rust no projeto: instalador local (NS-52)
+
+A fatia F6a do épico NS-28: `make install`/`make uninstall` instalam o nick num prefixo (padrão
+`~/.local`, sem `sudo`), e o nick instalado roda sem o checkout.
+
+**A árvore instalada e a regra de seleção.** A lógica fica em `install/install.sh` (diretório novo:
+`lib/` é só para bibliotecas carregadas com `source`, e `tests/` da raiz é dos testes), e o
+`Makefile` só o chama (`PREFIX ?= $(HOME)/.local`, uma linha de receita por alvo). A instalação
+replica a estrutura relativa do checkout, então nenhum script bash mudou o jeito de achar `lib/`
+(`SCRIPT_DIR/../lib`) nem os templates (ao lado do `prompt.sh`):
+
+```
+$PREFIX/bin/nick                              (0755, gravado por último)
+$PREFIX/share/nick/.nick-install              (o manifesto)
+$PREFIX/share/nick/bin/nick-agent, nick-init  (0755)
+$PREFIX/share/nick/lib/<dir>/*                (0644)
+$PREFIX/share/nick/auto_scrum/prompt.sh       (0644)
+$PREFIX/share/nick/auto_scrum/templates/*.md  (0644)
+```
+
+A seleção é uma regra, não uma lista (um template ou uma lib nova entra sozinha): todo arquivo
+regular **direto** em `bin/` (não `bin/tests/`), em cada `lib/<dir>/` menos `lib/tests/`, o
+`auto_scrum/prompt.sh` e os `auto_scrum/templates/*.md`. **Não** vão: o `auto_scrum.sh` (o legado
+roda do checkout e continua gravando em `auto_scrum/logs/`), logs, testes, fixtures, `prototype/` e
+`nick/`. Sem `--binary`, o script roda `cargo build --release --locked --manifest-path
+<raiz>/nick/Cargo.toml` e instala `${CARGO_TARGET_DIR:-<raiz>/nick/target}/release/nick`. Um
+`CARGO_TARGET_DIR` relativo é recusado (o cargo o leria contra outro cwd), e o `--binary` existe
+para a suíte rodar sem compilar. Um prefixo relativo é recusado, para nunca gravar num caminho
+relativo ao cwd. No fim, se `$PREFIX/bin` não está no `PATH`, ele mostra a linha do bash/zsh e a do
+fish, com o prefixo real. Limite conhecido: o `PREFIX ?= $(HOME)/.local` do `make` vira `/.local`
+quando o `HOME` está vazio. O script não tem como distinguir esse caso de um `--prefix /.local`, e
+a gravação falha por permissão. O `install.sh` chamado direto, sem `--prefix` e sem `HOME`,
+recusa com mensagem.
+
+**Como o nick acha os arquivos: pela localização do binário** (`nick/src/resources.rs`). O
+`main.rs` passa o `std::env::current_exe()` (que no Linux resolve symlinks) para a função pura
+`resources::locate`. Se `<dir do binário>/../share/nick/.nick-install` existe, é o **modo
+instalado** (a raiz é aquele `share/nick/`). Senão, é o **modo checkout** (`CARGO_MANIFEST_DIR/..`,
+normalizado), que vale para `cargo run`, `cargo test` e o `cargo install --path nick` antigo
+(`~/.cargo/bin/nick` não tem `~/.cargo/share/nick/.nick-install`). O `init::init_path` e o
+`launch::launcher_path` recebem a raiz. Ficou um módulo próprio, e não funções em `paths.rs`,
+porque o modo e os dois caminhos andam juntos (`Resources::{root, init, launcher}`), e o
+`paths.rs` é de caminhos do estado e de texto. Decisões:
+- **sem prefixo fixado na compilação** (`option_env!`): o teste de instalação e o futuro pacote do
+  AUR (F6b, com `DESTDIR`) precisariam recompilar o binário para cada prefixo. Pela localização,
+  a instalação é relocável e o binário é o mesmo;
+- **sem fallback do modo instalado para o checkout:** o binário e um checkout podem ser de versões
+  diferentes, e o Rust de uma com o bash de outra quebraria o protocolo do `--check`/`--render`
+  sem aviso. Um arquivo faltando no prefixo dá a mensagem de arquivo ausente que já existia, com o
+  caminho do prefixo (controle positivo em `nick/tests/install.rs`);
+- **segurança (regra do NS-33):** nenhuma variável de ambiente troca o `bin/nick-agent`. A
+  localização do binário não é variável: quem grava em `$PREFIX/share/nick/` também troca o
+  próprio `$PREFIX/bin/nick`. O `NICK_INIT_BIN` continua como antes (ele só troca o init);
+- o binário de `cargo test` (`nick/target/debug/nick`) não tem `nick/target/share/nick/.nick-install`:
+  os testes rodam no modo checkout. Nenhum teste cria esse arquivo.
+
+**Manifesto e desinstalação sem `rm -rf`.** O `.nick-install` é texto: a primeira linha é
+`# <saída do binário --version>`, que precisa ser uma linha só começando com `nick ` (senão o
+`install` recusa, sem gravar nada: uma saída de várias linhas punha caminhos soltos no manifesto,
+e o `uninstall` passaria a recusar a instalação inteira; review do NS-52), e depois um caminho relativo ao prefixo por linha, de tudo que
+foi instalado (o `bin/nick` e o próprio manifesto inclusive). O `uninstall` sem manifesto diz
+`Não há instalação do nick em <prefixo>. Nada foi feito.` e sai com 0 (idempotente, e nunca apaga
+um `$PREFIX/bin/nick` que não instalou). Com manifesto, ele confere **todas** as linhas antes de
+remover qualquer coisa: só `bin/nick` ou `share/nick/...` sem `..` (um manifesto alterado nunca
+remove arquivo fora do prefixo; decisão deste ticket, que o plano não previa). Depois, `rm -f`
+de cada arquivo (o binário primeiro, o manifesto por último) e `rmdir` dos diretórios das
+entradas, do mais fundo para cima (`LC_ALL=C sort -r`), até `share/nick` (nunca `share/` nem
+`bin/`). Um diretório que fica por causa de algo que o nick não instalou (um arquivo, ou uma pasta
+que não está no manifesto, como `share/nick/extra/`) recebe o aviso `Mantive <dir>: tem arquivos
+que não foram instalados pelo nick.`; um pai que só ficou porque um subdiretório do manifesto ficou
+não recebe (o aviso vai para o subdiretório). O caso da pasta fora do manifesto entrou no review do
+NS-52: antes, ela ficava sem aviso nenhum. Nunca
+toca no state dir: a mensagem final diz onde estão o banco e os logs, calculado como no Rust. O
+`install` por cima de uma instalação roda a mesma remoção antes, sem aviso, para que um arquivo que
+saiu da lista não fique órfão. A ordem da cópia é `share/nick/`, manifesto e o binário por último:
+um binário nunca existe sem os arquivos dele.
+
+**Logs de prompt em `$XDG_STATE_HOME/nick/logs/<nome>-<id>/`** (a Q5 do épico, decidida com o
+analista). O `<nome>` é o `projects.name` e o `<id>` o `projects.id`: legível, e dois projetos com
+o mesmo nome de pasta não se misturam. `paths::prompt_logs_dir` saneia o nome (um componente só:
+`/` e caracteres de controle viram `_`; vazio, `.`, `..` e o `/` que o `register` grava para a
+raiz viram `projeto`). O canal é o `NICK_PROMPT_LOGS_DIR` que já existia no `prompt.sh` (NS-35), sem
+nenhuma linha de bash nova: o `App` calcula o diretório do projeto do ticket ou do épico
+(`RenderRequest::logs_dir`) e o `launch::run_render` o põe no ambiente do `bash <launcher>
+--render`, **depois** do ambiente herdado. Mudança aceita: um `NICK_PROMPT_LOGS_DIR` do ambiente do
+operador deixa de valer para o nick (o instalado não pode gravar em
+`$PREFIX/share/nick/auto_scrum/logs/`). O `mkdir -p` continua o do `nick-agent`, dentro do state
+dir, que já nasce `0700`. Os logs antigos ficam em `auto_scrum/logs/`.
+
+**Dependências: aviso ao abrir, e a jail nunca é desligada pelo nick** (`nick/src/deps.rs`). Ao
+abrir, o `main.rs` passa o `PATH` para `Deps::check`, que procura `claude`, `envsubst`, `ai-jail` e
+`bwrap` (arquivo regular com bit de execução, link seguido; entradas vazias do `PATH` ignoradas,
+porque seriam o cwd). Sem `which` e sem crate. Faltando algo, a barra de status ganha (junto das
+outras mensagens) `Faltam no PATH: <lista>.` com uma frase por efeito e `Veja o INSTALL.md.`. Nada
+trava: sem `claude`, abrir e retomar agente são recusados antes de qualquer chamada ao launcher
+(nem `--check`), com `Não dá para abrir agentes: o claude não foi encontrado no PATH. Instale o
+Claude Code e abra o nick de novo.`, e o resto da TUI funciona. Sem `ai-jail`/`bwrap`, o nick
+**não** desliga a jail: um projeto com `JAIL_ENABLED="false"` abre agentes com o aviso de jail
+desligada que já existia, e um com `JAIL_ENABLED="true"` continua recebendo o erro do `jail_check`
+(regra "There is no fallback"). Sem `envsubst`, só o aviso (o erro do `--render` já chega na TUI).
+O `App` nasce com tudo presente (`Deps::default`), então os testes antigos não mudaram. O teste
+estrutural do NS-35 (`no_rust_source_builds_the_prompt_nor_reads_the_config`), que proíbe
+`envsubst` em `nick/src/`, ganhou uma isenção só dessa palavra e só em `src/deps.rs` (decisão do
+usuário no NS-52, no molde da do `review.md` em `src/docs.rs`): o `deps.rs` só procura o programa
+no PATH, nunca o roda. A mesma palavra em outro arquivo continua sendo pega (asserção no teste).
+
+**Versão e commit.** `nick/build.rs` exporta `NICK_GIT_COMMIT` (o `git rev-parse --short HEAD` do
+crate, ou `desconhecido` sem git, sem repositório ou sem commit), sem nunca falhar o build. Ele
+pede recompilação quando muda o `HEAD`, o ref para onde ele aponta (ou o diretório dele, enquanto o
+ref não existe) e o `packed-refs`, achados pelo próprio git (`--git-dir`, `--git-common-dir`,
+`symbolic-ref`), o que funciona em worktree. Sem marca de "sujo" (recompilaria a cada mudança do
+índice) e sem `vergen`. **Limite conhecido (para o F6b):** o `build.rs` pega o `HEAD` de qualquer
+repositório que contenha o crate. Num build do AUR, o `$srcdir` do `makepkg` costuma ficar dentro
+do clone do pacote AUR, e a versão mostraria o commit do PKGBUILD. Quando chegar o F6b, comparar
+`git rev-parse --show-toplevel` com `CARGO_MANIFEST_DIR/..` e cair em `desconhecido` se forem
+diferentes. `version::long()` dá `0.1.0 (commit abc1234)`: o `nick --version` imprime
+`nick <long>` e a tela Configurações mostra `Versão: <long>` abaixo do atalho. Sem tags de versão.
+
+**Duas instalações, um banco.** O instalado e o do checkout usam o mesmo `nick.db`. Um nick mais
+velho recusa um banco migrado por um mais novo, sem gravá-lo (a "Política de migrações" do NS-31).
+O NS-52 acrescentou o teste de integração com o binário
+(`a_database_newer_than_this_nick_is_refused_untouched`, em `nick/tests/cli.rs`), com a prova de
+que ele morde feita numa cópia descartável.
+
+**Testes.** Suíte bash `install/tests/test_install.sh` (achada pelo runner pelo nome e pelo lugar),
+que nunca roda o cargo real: o binário vem de `--binary` (um nick falso que só responde ao
+`--version`) ou de um `cargo` falso, num PATH mínimo com um `sudo` falso que nunca pode ser
+chamado. Ela compara a árvore instalada com a lista gerada pela regra **escrita no teste** (não lida
+do script), os modos e o manifesto, e cobre o prefixo padrão, sem `HOME`, relativo, o cargo
+(argv, cwd, ausente, falhando, alvo padrão e relativo), o aviso do PATH, o uninstall (estado
+mantido, arquivo alheio, sem manifesto, manifesto com caminho de fora), a reinstalação, o
+`make -n` dos alvos e do padrão e o `shellcheck -x`. Rust: `version`, `resources`, `deps` e
+`paths::prompt_logs_dir` com testes de unidade; o `app` (o render com o diretório do projeto de
+ticket e de épico, e as recusas sem `claude`, de agente novo e de retomada, sem chamar o launcher);
+o `launch` (o diretório do pedido vence o do ambiente, com o launcher real); e integração no PTY:
+o log no state dir e não no `auto_scrum/logs/` (retrato antes e depois), o PATH vazio, a falta só
+da jail com `JAIL_ENABLED` `false` e `true`, e o `nick/tests/install.rs`, de ponta a ponta: copia o
+que a instalação precisa para um temporário com `git init` sem commit, roda o `make install` com um
+`CARGO_TARGET_DIR` próprio em `CARGO_TARGET_TMPDIR` (cache entre execuções, sem disputar a trava do
+build do `cargo test`), **renomeia a cópia**, roda o `--version` (`commit desconhecido`) e abre um
+agente no nick instalado, apaga o `prompt.sh` do prefixo para o controle positivo e roda o
+`make uninstall` da cópia movida. Os helpers do menu dos tipos no PTY (`open_menu`, `choose_type`,
+`TYPE_LABELS`) ficam em `nick/tests/common/menu.rs`, usados por `agent.rs` e `install.rs` (review
+do NS-52: estavam copiados). Com cache, leva uns 5 s; o primeiro build release, uns 20 s
+nesta máquina. Os testes de `bin/tests/test_nick_agent.sh` e `auto_scrum/tests/test_auto_scrum.sh`
+não mudaram.

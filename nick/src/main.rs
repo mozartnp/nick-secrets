@@ -1,8 +1,8 @@
 //! Entry point of `nick`: the command line, the state directory and the database (before the
 //! TUI: an error there is printed on the normal terminal), the cleanup of the agents left by a
 //! dead nick, the panic hook, and the loop of the TUI. Only this file reads the environment
-//! (HOME, XDG_STATE_HOME, NICK_INIT_BIN, EDITOR, COLORTERM and the test hooks NICK_TEST_PANIC
-//! and NICK_TEST_MASCOT).
+//! (HOME, XDG_STATE_HOME, NICK_INIT_BIN, EDITOR, COLORTERM, PATH and the test hooks
+//! NICK_TEST_PANIC and NICK_TEST_MASCOT) and asks where the binary is (`current_exe`, NS-52).
 //!
 //! The loop is driven by a channel (finding of NS-29): an input thread reads the terminal
 //! (paused by its gate while bin/nick-init runs), a signal thread turns SIGTERM and SIGHUP into
@@ -27,12 +27,14 @@ use nick::agent_session::{self, AgentEvent, AgentSession, SessionEvent};
 use nick::agents;
 use nick::app::{Action, AgentTerm, App, Focus};
 use nick::db::Db;
+use nick::deps::Deps;
 use nick::editor::TerminalEditorRunner;
 use nick::init::{self, TerminalInitRunner};
 use nick::keys::TermModes;
-use nick::launch::{self, TerminalAgentLauncher};
+use nick::launch::TerminalAgentLauncher;
 use nick::mascot::Mascot;
 use nick::paths::{self, DB_FILE_NAME};
+use nick::resources;
 use nick::terminal::{self, InputGate, TerminalGuard};
 use nick::ui;
 use ratatui::layout::Rect;
@@ -92,18 +94,34 @@ fn main() -> ExitCode {
     // The agents whose nick died (even by kill -9) are ended before the TUI; one whose lock
     // another live nick holds stays active (agents.rs). An error here goes to the status bar.
     let agents_dir = agents::agents_dir(&state_dir);
+    // The files of the nick (NS-52): in the prefix of an installation, or in the checkout, by
+    // where this binary is (never by a variable).
+    let resources = resources::locate(std::env::current_exe().ok().as_deref());
+    // The programs of the PATH (NS-52), checked once: a missing one never stops the nick.
+    let deps = Deps::check(std::env::var_os("PATH").as_deref());
     let cleanup = agents::cleanup(&db, &agents_dir);
     let mut app = App::new(
         db,
         home.filter(|home| !home.is_empty()).map(PathBuf::from),
         std::env::current_dir().ok(),
-        init::init_path(std::env::var_os("NICK_INIT_BIN").as_deref()),
+        init::init_path(
+            std::env::var_os("NICK_INIT_BIN").as_deref(),
+            resources.root(),
+        ),
     )
-    .with_agents(launch::launcher_path(), agents_dir);
+    .with_agents(resources.launcher(), agents_dir)
+    .with_prompt_logs(state_dir.clone())
+    .with_deps(deps);
     // The reserved shortcut of the database (NS-34): an invalid one, or an error, falls back
-    // to the default with a message. The status has a single line: both messages are joined.
+    // to the default with a message. The status has a single line: every message is joined
+    // (the cleanup, the shortcut and the programs missing from the PATH, NS-52).
     let shortcut = app.load_shortcut();
-    let messages: Vec<String> = cleanup.err().into_iter().chain(shortcut).collect();
+    let messages: Vec<String> = cleanup
+        .err()
+        .into_iter()
+        .chain(shortcut)
+        .chain(deps.warning())
+        .collect();
     if !messages.is_empty() {
         app.set_status(messages.join(" "));
     }
@@ -127,13 +145,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--version` alone prints the version; any other argument is refused with the usage, in
-/// the pattern of bin/nick-init. Returns the exit code when the program must end here.
+/// `--version` alone prints the version and the commit (NS-52); any other argument is refused
+/// with the usage, in the pattern of bin/nick-init. Returns the exit code when the program must
+/// end here.
 fn handle_args(args: &[OsString]) -> Option<ExitCode> {
     match args {
         [] => None,
         [only] if only == "--version" => {
-            println!("nick {}", env!("CARGO_PKG_VERSION"));
+            println!("nick {}", nick::version::long());
             Some(ExitCode::SUCCESS)
         }
         _ => {

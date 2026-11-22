@@ -51,9 +51,26 @@ pub fn create_state_dir(dir: &Path) -> io::Result<()> {
         .create(dir)
 }
 
+/// The directory of the prompt logs of the project `name` (its `projects.name`) with the id
+/// `id`, in the state directory (NS-52): `<state>/logs/<name>-<id>`. Readable, and two projects
+/// with the same folder name do not share it. The name is one path component: `/` and the
+/// control characters (`\0` among them) become `_`, and an empty one, `.` or `..` (the root is
+/// registered as `/`) becomes `projeto`.
+pub fn prompt_logs_dir(state_dir: &Path, name: &str, id: i64) -> PathBuf {
+    let clean: String = match name {
+        "" | "." | ".." | "/" => "projeto".to_string(),
+        _ => name
+            .chars()
+            .map(|c| if c == '/' || c.is_control() { '_' } else { c })
+            .collect(),
+    };
+    state_dir.join("logs").join(format!("{clean}-{id}"))
+}
+
 /// Removes `.` and `..` from an absolute path without touching the disk (the program it names
-/// may be missing, and the message then shows this path). Used for the paths fixed at build
-/// time: bin/nick-init (init.rs) and bin/nick-agent (launch.rs).
+/// may be missing, and the message then shows this path). Used for the root of the files of the
+/// nick (resources.rs, NS-52) and the paths under it: bin/nick-init (init.rs) and bin/nick-agent
+/// (launch.rs).
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -169,6 +186,44 @@ mod tests {
             normalize(Path::new("/nao/existe/../y")),
             PathBuf::from("/nao/y")
         );
+    }
+
+    #[test]
+    fn the_prompt_logs_of_a_project_are_its_name_and_id_in_the_state_dir() {
+        let state = Path::new("/x/state/nick");
+        assert_eq!(
+            prompt_logs_dir(state, "meu app", 3),
+            PathBuf::from("/x/state/nick/logs/meu app-3")
+        );
+        assert_eq!(
+            prompt_logs_dir(state, "meu-app", 12),
+            PathBuf::from("/x/state/nick/logs/meu-app-12")
+        );
+    }
+
+    #[test]
+    fn the_name_of_the_prompt_logs_is_sanitized() {
+        let state = Path::new("/s");
+        let name = |name: &str, id: i64| {
+            prompt_logs_dir(state, name, id)
+                .strip_prefix("/s/logs")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        // projects::register stores "/" as the name of the root.
+        assert_eq!(name("/", 1), "projeto-1");
+        assert_eq!(name("", 2), "projeto-2");
+        assert_eq!(name(".", 3), "projeto-3");
+        assert_eq!(name("..", 4), "projeto-4");
+        assert_eq!(name("a/b", 5), "a_b-5");
+        assert_eq!(name("a\0b\x1b[2J\nc", 6), "a_b_[2J_c-6");
+        assert_eq!(name("ação", 7), "ação-7");
+        // Never leaves logs/: one component, never `..`.
+        for raw in ["/", "..", "../..", "a/../../b", "\0"] {
+            let dir = prompt_logs_dir(state, raw, 9);
+            assert_eq!(dir.parent(), Some(Path::new("/s/logs")), "{raw:?}");
+        }
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Integration tests of the agents (NS-33): the real `nick` binary in a PTY (tests/common), with
 //! the real bin/nick-agent and the fake claude and ai-jail of bin/tests/fixtures/bin first in the
 //! PATH, the fake EDITOR of tests/fixtures/bin, a temporary HOME and XDG_STATE_HOME (never the
-//! operator's database), the logs of the prompts in the world (NICK_PROMPT_LOGS_DIR, never
-//! auto_scrum/logs/) and a clean environment. Nothing real is launched. Since the NS-35 every
-//! agent opens through the menu of the types, the form and the preview of the prompt
-//! (`open_agent`). Rule of the NS-32: after an ESC, wait for a text that only exists in the next
-//! state.
+//! operator's database), the logs of the prompts in the world (since the NS-52 in
+//! `<XDG_STATE_HOME>/nick/logs/<name>-<id>/`, never auto_scrum/logs/; a NICK_PROMPT_LOGS_DIR of
+//! the environment is ignored) and a clean environment. Nothing real is launched. Since the NS-35
+//! every agent opens through the menu of the types (tests/common/menu.rs), the form and the
+//! preview of the prompt (`open_agent`). Rule of the NS-32: after an ESC, wait for a text that
+//! only exists in the next state.
 
 mod common;
 
@@ -13,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
+use common::menu::{TYPE_LABELS, choose_type, open_menu};
 use common::{
     DOWN, ENTER, ESC, KITTY_OFF, KITTY_ON, Keyboard, LEFT, Nick, PANEL_COL, RIGHT, TAB, World,
     assert_in_order,
@@ -45,9 +47,16 @@ fn logs(world: &World) -> Logs {
     }
 }
 
-/// The directory of the logs of the prompts of a world (NICK_PROMPT_LOGS_DIR).
+/// The directory of the logs of the prompts of a world (NS-52): `<state>/nick/logs`, with a
+/// directory per project (`<name>-<id>`).
 fn prompt_logs(world: &World) -> PathBuf {
-    world.root.join("prompt_logs")
+    world.state().join("nick/logs")
+}
+
+/// A NICK_PROMPT_LOGS_DIR in the environment of the nick (as an operator could have it): the nick
+/// gives the launcher its own dir over it (NS-52), so nothing ever goes there.
+fn inherited_prompt_logs(world: &World) -> PathBuf {
+    world.root.join("inherited_prompt_logs")
 }
 
 /// The fake EDITOR (tests/fixtures/bin/editor).
@@ -76,7 +85,7 @@ fn spawn_as(world: &World, mode: &str, extra: &[(&str, &str)], keyboard: Keyboar
         l.jail.display().to_string(),
         l.pids.display().to_string(),
     );
-    let prompts = prompt_logs(world).display().to_string();
+    let prompts = inherited_prompt_logs(world).display().to_string();
     let editor = fake_editor().display().to_string();
     let mut all = vec![
         ("PATH", path.as_str()),
@@ -121,51 +130,6 @@ const TYPE_OF_STAGE: [&str; 4] = [
     "Review",
 ];
 
-/// `g` and the check: true when the menu of the types opened, false on the alert.
-fn open_menu(nick: &mut Nick) -> bool {
-    nick.send("g");
-    nick.wait_until("the menu or the alert", || {
-        let screen = nick.screen();
-        screen.contains("Qual tipo de conversa") || screen.contains("Agente não aberto")
-    });
-    nick.screen().contains("Qual tipo de conversa")
-}
-
-/// Every label of the menu of the types, the longest first (one is the start of another).
-const TYPE_LABELS: [&str; 8] = [
-    "Tech Leader - Criar plano a partir do Jira",
-    "PO - Criar ticket a partir do Sentry",
-    "PO - Conversar para definir ticket",
-    "PO - Criar ticket a partir do Jira",
-    "Tech Leader - Criar plano",
-    "PO - Criar ticket",
-    "Desenvolvimento",
-    "Review",
-];
-
-/// The type selected on the menu.
-fn selected_type(nick: &Nick) -> Option<&'static str> {
-    let screen = nick.screen();
-    TYPE_LABELS
-        .into_iter()
-        .find(|label| screen.contains(&format!("> {label}")))
-}
-
-/// On the menu, ↓ until `label` is selected (each ↓ waits for the selection to move), and
-/// Enter: its form.
-fn choose_type(nick: &mut Nick, label: &str) {
-    nick.wait_until("a type selected", || selected_type(nick).is_some());
-    while selected_type(nick) != Some(label) {
-        let before = selected_type(nick);
-        nick.send(DOWN);
-        nick.wait_until(&format!("the selection to leave {before:?}"), || {
-            selected_type(nick) != before
-        });
-    }
-    nick.send(ENTER);
-    nick.wait_for(&format!("Tipo: {label}"));
-}
-
 /// `g`, the type of the stage `downs` and its form answered (the ID comes from the ticket; the
 /// long text from the fake EDITOR), then `s` on the preview: opens the agent of that stage on
 /// the selected ticket (NS-35). Stops on the alert when the check fails.
@@ -195,11 +159,19 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-/// The logs of the prompts of the world.
+/// The logs of the prompts of the world, of every project.
 fn prompt_files(world: &World) -> Vec<PathBuf> {
-    fs::read_dir(prompt_logs(world))
-        .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
-        .unwrap_or_default()
+    let list = |dir: &Path| -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    };
+    let mut files: Vec<PathBuf> = list(&prompt_logs(world))
+        .iter()
+        .flat_map(|project| list(project))
+        .collect();
+    files.sort();
+    files
 }
 
 /// The only log of a prompt of the world.
@@ -1677,12 +1649,21 @@ fn no_rust_source_builds_the_prompt_nor_reads_the_config() {
         if Path::new(&name).ends_with("src/docs.rs") {
             violations.retain(|v| v != "review.md");
         }
+        // NS-52 (decision of the user): src/deps.rs looks envsubst up in the PATH, to warn when
+        // it is missing; it never runs it. Only that word is exempt there.
+        if Path::new(&name).ends_with("src/deps.rs") {
+            violations.retain(|v| v != "envsubst");
+        }
         assert_eq!(violations, Vec::<String>::new(), "{name}");
     }
-    // The exemption is only of docs.rs: the same name elsewhere is still caught.
+    // The exemptions are only of docs.rs and deps.rs: the same names elsewhere are still caught.
     assert_eq!(
         prompt_violations("pub const REVIEW_FILE_NAME: &str = \"review.md\";"),
         ["review.md"]
+    );
+    assert_eq!(
+        prompt_violations("let found = find_in_path(\"envsubst\", path);"),
+        ["envsubst"]
     );
     // Positive control: the filter sees each kind of violation, and not a comment.
     for bad in [
@@ -3428,6 +3409,161 @@ fn the_fast_cat_sends_no_sigwinch_to_claude() {
     nick.wait_for("SIZE 34 78");
     nick.send("\x03");
     nick.wait_for("O agente proj · PO · NS-1 terminou");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// NS-52: the log of the prompt goes to `<XDG_STATE_HOME>/nick/logs/<name>-<id>/`, not to the
+/// NICK_PROMPT_LOGS_DIR of the environment nor to auto_scrum/logs/ of the checkout (a snapshot
+/// before and after, as the bash suite does).
+#[test]
+fn the_log_of_the_prompt_goes_to_the_state_dir_of_the_project() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let checkout_logs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../auto_scrum/logs");
+    let before = checkout_logs
+        .is_dir()
+        .then(|| common::snapshot(&checkout_logs));
+    let mut nick = spawn(&world, "exit", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    let id = world.project_id_at(&proj);
+    let log = only_log(&world);
+    assert_eq!(
+        log.parent(),
+        Some(world.state().join(format!("nick/logs/proj-{id}")).as_path()),
+        "{}",
+        log.display()
+    );
+    assert!(read(&log).contains("Assunto de teste"));
+    assert!(
+        !inherited_prompt_logs(&world).exists(),
+        "the NICK_PROMPT_LOGS_DIR of the environment is not used"
+    );
+    let after = checkout_logs
+        .is_dir()
+        .then(|| common::snapshot(&checkout_logs));
+    assert!(
+        before == after,
+        "auto_scrum/logs/ of the checkout did not change"
+    );
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- NS-52: the programs of the PATH, checked when the nick opens ----
+
+/// A PATH of one directory with a link to every program of the PATH of the tests except
+/// `without`, and the fake claude when `fake_claude` (so the launcher works, but the programs
+/// `without` are missing for real, even when this machine has them).
+fn path_without(world: &World, without: &[&str], fake_claude: bool) -> String {
+    let bin = world.root.join("path_without");
+    fs::create_dir_all(&bin).unwrap();
+    if fake_claude {
+        symlink(common::fake_bin().join("claude"), bin.join("claude")).unwrap();
+    }
+    let real = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&real) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let skip = without.iter().any(|w| name == *w) || name == "claude";
+            let target = bin.join(&name);
+            if !skip && fs::symlink_metadata(&target).is_err() {
+                symlink(entry.path(), target).unwrap();
+            }
+        }
+    }
+    bin.display().to_string()
+}
+
+/// An empty PATH (the nick needs nothing from it to open): the TUI opens with the four missing
+/// on the bar, `g` is refused without calling the launcher, and `q` quits with 0.
+#[test]
+fn with_an_empty_path_the_tui_opens_and_no_agent_opens() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let empty = world.root.join("empty_path");
+    fs::create_dir_all(&empty).unwrap();
+    let empty = empty.display().to_string();
+    let before = common::snapshot(&proj);
+    let mut nick = spawn(&world, "exit", &[("PATH", &empty)]);
+    nick.wait_for_flat("Faltam no PATH: claude, envsubst, ai-jail, bwrap.");
+    let flat = nick.flat_screen();
+    for text in [
+        "Sem o claude, o nick não abre agentes.",
+        "Sem o envsubst (pacote gettext), o prompt não é montado.",
+        "Sem a jail, só abrem agentes os projetos com JAIL_ENABLED=\"false\".",
+        "Veja o INSTALL.md.",
+    ] {
+        assert!(flat.contains(text), "{text}: {flat}");
+    }
+    nick.keep_screen("NS-52: PATH vazio, aviso ao abrir");
+    open_tickets(&mut nick, "proj");
+    nick.send("g");
+    nick.wait_for_flat(
+        "Não dá para abrir agentes: o claude não foi encontrado no PATH. Instale o Claude Code e \
+         abra o nick de novo.",
+    );
+    nick.keep_screen("NS-52: PATH vazio, g recusado");
+    assert!(!nick.screen().contains("Qual tipo de conversa"));
+    assert!(!nick.screen().contains("Agente não aberto"));
+    assert_eq!(world.agents(), []);
+    assert!(!logs(&world).claude.exists(), "claude never ran");
+    assert!(prompt_files(&world).is_empty(), "no render");
+    assert_eq!(common::snapshot(&proj), before, "nothing in the project");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Without ai-jail and bwrap, a project with the jail off opens its agent with the notice of the
+/// jail off: the nick warns, and does not stop.
+#[test]
+fn without_the_jail_a_project_with_the_jail_off_opens_its_agent() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let path = path_without(&world, &["ai-jail", "bwrap"], true);
+    let mut nick = spawn(&world, "exit", &[("PATH", &path)]);
+    nick.wait_for_flat("Faltam no PATH: ai-jail, bwrap.");
+    assert!(!nick.flat_screen().contains("Sem o claude"));
+    open_tickets(&mut nick, "proj");
+    assert!(open_menu(&mut nick), "{}", nick.screen());
+    choose_type(&mut nick, TYPE_OF_STAGE[0]);
+    nick.send("Assunto de teste");
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    nick.wait_for_flat("Jail (ai-jail): desligada");
+    nick.keep_screen("NS-52: sem ai-jail e bwrap, jail desligada abre");
+    nick.send("s");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    assert!(logs(&world).claude.exists(), "the fake claude ran");
+    assert!(!logs(&world).jail.exists(), "no ai-jail");
+    assert_eq!(world.agents().len(), 1);
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Without ai-jail and bwrap, a project with the jail on keeps the error of `jail_check`: the
+/// nick never turns the jail off by itself, and nothing is launched.
+#[test]
+fn without_the_jail_a_project_with_the_jail_on_keeps_the_error() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"true\""]);
+    let path = path_without(&world, &["ai-jail", "bwrap"], true);
+    let before = common::snapshot(&proj);
+    let mut nick = spawn(&world, "exit", &[("PATH", &path)]);
+    nick.wait_for_flat("Faltam no PATH: ai-jail, bwrap.");
+    open_tickets(&mut nick, "proj");
+    assert!(!open_menu(&mut nick), "the alert, not the menu");
+    let flat = nick.flat_screen();
+    assert!(flat.contains("ai-jail não encontrado no PATH."), "{flat}");
+    assert!(flat.contains("Nada foi aberto."), "{flat}");
+    nick.keep_screen("NS-52: sem ai-jail e bwrap, jail ligada recusa");
+    assert_eq!(world.agents(), []);
+    assert!(!logs(&world).claude.exists(), "claude never ran");
+    assert!(prompt_files(&world).is_empty(), "no render");
+    assert_eq!(common::snapshot(&proj), before);
+    nick.send(ESC);
+    nick.wait_for_flat("g abrir agente");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }

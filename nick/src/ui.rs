@@ -34,6 +34,25 @@ pub const LIST_WIDTH: u16 = 40;
 /// The color of the border of the focused panel beside an agent (NS-37).
 pub const FOCUS_COLOR: Color = Color::Cyan;
 
+/// The blue of PO and Tech Leader (NS-45): of the 16 colors, and not the cyan of `FOCUS_COLOR`.
+pub const STAGE_BLUE: Color = Color::LightBlue;
+
+/// The orange of Dev and Review (NS-45): the 208 of the 256 palette (approximated with 16 colors).
+pub const STAGE_ORANGE: Color = Color::Indexed(208);
+
+/// The color of the ID and of the title of an epic on the tree (NS-45).
+pub const EPIC_COLOR: Color = Color::Magenta;
+
+/// The color of each stage of a ticket (NS-45), on the tree and on the panel.
+pub fn stage_color(stage: TicketStage) -> Color {
+    match stage {
+        TicketStage::Open => Color::White,
+        TicketStage::Po | TicketStage::TechLeader => STAGE_BLUE,
+        TicketStage::Development | TicketStage::Review => STAGE_ORANGE,
+        TicketStage::Done => Color::Green,
+    }
+}
+
 /// The block of a panel beside an agent (NS-37): thick and in `FOCUS_COLOR` with the focus,
 /// plain and dim without it. Both take one cell, so toggling the focus resizes nothing; the
 /// thickness alone tells them apart where the color is weak (16 colors, a light theme).
@@ -673,17 +692,26 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), content);
 }
 
-/// The mark of a stage on the tree and on the panel of a ticket: `[<label>]`, and `[✓ Concluído]`
-/// in green for the done ones (which stay on the tree: only `o` hides a ticket).
+/// The mark of a stage on the tree: `[<label>]`, and `[✓ Concluído]` for the done ones (which
+/// stay on the tree: only `o` hides a ticket), in the color of the stage (NS-45).
 fn stage_mark(key: &str) -> Span<'static> {
-    if key == TicketStage::Done.key() {
-        Span::styled(
-            format!("[✓ {}]", TicketStage::Done.label()),
-            Style::new().fg(Color::Green),
-        )
-    } else {
-        Span::raw(format!("[{}]", printable(&tickets::stage_label(key))))
-    }
+    stage_span(key, true)
+}
+
+/// A stage in its color (`stage_color`, NS-45): `[<label>]` with `brackets` (the tree), the label
+/// alone without (the "Etapa atual:" of the panel); Done is always `[✓ Concluído]`. An unknown key
+/// shows raw, with no color.
+fn stage_span(key: &str, brackets: bool) -> Span<'static> {
+    let Some(stage) = TicketStage::from_key(key) else {
+        let raw = printable(key);
+        return Span::raw(if brackets { format!("[{raw}]") } else { raw });
+    };
+    let text = match stage {
+        TicketStage::Done => format!("[✓ {}]", stage.label()),
+        _ if brackets => format!("[{}]", stage.label()),
+        _ => stage.label().to_string(),
+    };
+    Span::styled(text, Style::new().fg(stage_color(stage)))
 }
 
 /// `AAAA-MM-DD HH:MM UTC` from the RFC 3339 of the database, by string slicing (no date
@@ -735,15 +763,16 @@ fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
 }
 
 /// The label of an epic (NS-40): `<ID>  [épico]  <título>  [provisório]  [oculto]`, the
-/// `[épico]` in bold (no new color) right after the ID, so the 34 columns of depth 2 keep it;
-/// dimmed when hidden, as a ticket.
+/// `[épico]` in bold right after the ID, so the 34 columns of depth 2 keep it; the ID and the
+/// title in `EPIC_COLOR` (NS-45), the marks with no color; dimmed when hidden, as a ticket.
 fn epic_spans(epic: &Epic) -> (Vec<Span<'static>>, Style) {
+    let purple = Style::new().fg(EPIC_COLOR);
     let mut spans = vec![
-        Span::raw(printable(&epic.key)),
+        Span::styled(printable(&epic.key), purple),
         Span::raw("  "),
         Span::styled("[épico]", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::raw(printable(&epic.title)),
+        Span::styled(printable(&epic.title), purple),
     ];
     if epic.is_provisional {
         spans.push(Span::raw("  [provisório]"));
@@ -1078,11 +1107,7 @@ fn draw_ticket_detail(
     if ticket.hidden_at.is_some() {
         head.push(Span::raw("  [oculto]"));
     }
-    let stage = if ticket.stage == TicketStage::Done.key() {
-        stage_mark(&ticket.stage)
-    } else {
-        Span::raw(printable(&tickets::stage_label(&ticket.stage)))
-    };
+    let stage = stage_span(&ticket.stage, false);
     let exists = |there: bool| if there { "(existe)" } else { "(não existe)" };
     let mut top = vec![Line::from(head)];
     if let Some(epic) = epic {
@@ -1124,7 +1149,11 @@ fn draw_ticket_detail(
     };
     let mut history = vec![Line::from("Histórico de etapas")];
     if detail.changes.is_empty() {
-        history.push(Line::from("Nenhuma mudança: o ticket começou em PO."));
+        // With no change, the stage it started in is the current one (NS-45).
+        history.push(Line::from(format!(
+            "Nenhuma mudança: o ticket começou em {}.",
+            printable(&tickets::stage_label(&ticket.stage))
+        )));
     } else {
         let slots = usize::from(history_area.height.saturating_sub(1));
         let mut shown = &detail.changes[..];
@@ -1135,11 +1164,13 @@ fn draw_ticket_detail(
             shown = &shown[older..];
         }
         for change in shown {
+            // The source at the end (NS-45): the date and the stages are not cut at 40 columns.
             history.push(Line::from(format!(
-                "  {}  {} → {}",
+                "  {}  {} → {}  ({})",
                 short_date(&change.changed_at),
                 printable(&tickets::stage_label(&change.from_stage)),
-                printable(&tickets::stage_label(&change.to_stage))
+                printable(&tickets::stage_label(&change.to_stage)),
+                printable(&tickets::source_label(&change.source))
             )));
         }
     }
@@ -3181,9 +3212,14 @@ mod tests {
     }
 
     fn change(from: &str, to: &str, at: &str) -> StageChangeRow {
+        sourced(from, to, "operator", at)
+    }
+
+    fn sourced(from: &str, to: &str, source: &str, at: &str) -> StageChangeRow {
         StageChangeRow {
             from_stage: from.into(),
             to_stage: to.into(),
+            source: source.into(),
             changed_at: at.into(),
         }
     }
@@ -3194,12 +3230,15 @@ mod tests {
         let t = staged(1, "NS-12", "Título do ticket", "development", false);
         f.app.dialog = Some(Dialog::ChooseTicketStage {
             ticket: t.clone(),
-            index: 3,
+            index: 4,
         });
         let buffer = render(&f.app);
         assert_has(&buffer, " Mudar etapa ");
         assert_has(&buffer, "Ticket NS-12 — Título do ticket");
-        assert_has(&buffer, "  PO");
+        // Aberto first (NS-45), the six in the order of the flow.
+        let (open, _) = find(&buffer, "  Aberto").unwrap();
+        let (po, _) = find(&buffer, "  PO").unwrap();
+        assert_eq!(po, open + 1);
         assert_has(&buffer, "  Dev (atual)");
         assert_has(&buffer, "> Review");
         assert_has(&buffer, "  Concluído");
@@ -3607,7 +3646,7 @@ mod tests {
                 "          Dev  parado  2026-11-19 21:46",
                 "          PO  ativo em outro nick  2026-11-20 00:00",
                 "        NS-2  [✓ Concluído]  Dois",
-                "        abcd1234  [PO]  Quatro  [provisório]",
+                "        abcd1234  [Aberto]  Quatro  [provisório]",
                 "      beta  [indisponível: pasta não encontrada]",
                 "",
             ]
@@ -3634,7 +3673,7 @@ mod tests {
         let dim = |(y, x): (u16, u16)| buffer[(x, y)].modifier.contains(Modifier::DIM);
         assert!(!dim(at("alfa")));
         assert!(dim(at("beta  [indisponível")), "unavailable: dimmed");
-        assert!(dim(at("NS-3  [PO]  Três  [oculto]")), "hidden: dimmed");
+        assert!(dim(at("NS-3  [Aberto]  Três  [oculto]")), "hidden: dimmed");
         assert!(!dim(at("NS-2")));
         assert!(dim(at("Dev  parado")), "not live: dimmed");
         assert!(dim(at("PO  ativo em outro nick")));
@@ -3756,7 +3795,8 @@ mod tests {
             &format!("Review (não existe):  {}", docs::review_path("NS-1")),
         );
         assert_has(&buffer, "Histórico de etapas");
-        assert_has(&buffer, "Nenhuma mudança: o ticket começou em PO.");
+        // NS-45: with no change, the stage it started in is the current one.
+        assert_has(&buffer, "Nenhuma mudança: o ticket começou em Tech Leader.");
         assert!(find(&buffer, "Agentes do ticket").is_none(), "on the tree");
         assert_eq!(
             help_text(&f.app),
@@ -3771,8 +3811,12 @@ mod tests {
             change("tech_leader", "development", "ontem"),
         ];
         let buffer = render_at(&f.app, 140, 30, None);
-        let (first, _) = find(&buffer, "2026-11-19 21:46 UTC  PO → Tech Leader").unwrap();
-        let (second, _) = find(&buffer, "ontem  Tech Leader → Dev").unwrap();
+        let (first, _) = find(
+            &buffer,
+            "2026-11-19 21:46 UTC  PO → Tech Leader  (operador)",
+        )
+        .unwrap();
+        let (second, _) = find(&buffer, "ontem  Tech Leader → Dev  (operador)").unwrap();
         assert!(first < second);
         // Done, hidden and provisional, with the marks of the list.
         let mut t = staged(1, "abcd1234", "Fim", "done", true);
@@ -4356,7 +4400,10 @@ mod tests {
         assert_eq!(spans_text(&spans), "EPIC-1  [épico]  Plano");
         assert_eq!(spans[2].content, "[épico]");
         assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[2].style.fg, None, "no new color");
+        assert_eq!(spans[2].style.fg, None, "the mark only bold");
+        // NS-45: the ID and the title in purple.
+        assert_eq!(spans[0].style.fg, Some(EPIC_COLOR));
+        assert_eq!(spans[4].style.fg, Some(EPIC_COLOR));
         assert!(!style.add_modifier.contains(Modifier::DIM));
         epic.is_provisional = true;
         epic.hidden_at = Some("x".into());
@@ -4366,6 +4413,8 @@ mod tests {
             "EPIC-1  [épico]  Plano  [provisório]  [oculto]"
         );
         assert!(style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(spans[5].style.fg, None, "[provisório] with no color");
+        assert_eq!(spans[6].style.fg, None, "[oculto] with no color");
         epic.title = "\x1b[2J".into();
         assert_eq!(
             spans_text(&epic_spans(&epic).0),
@@ -4378,8 +4427,8 @@ mod tests {
         let (f, db, _) = with_epic_tree();
         let buffer = render(&f.app);
         let (epic_row, _) = find(&buffer, "EPIC-1  [épico]").expect("the epic");
-        let (inside, _) = find(&buffer, "NS-1  [PO]").expect("its ticket");
-        let (outside, _) = find(&buffer, "NS-2  [PO]").expect("the loose ticket");
+        let (inside, _) = find(&buffer, "NS-1  [Aberto]").expect("its ticket");
+        let (outside, _) = find(&buffer, "NS-2  [Aberto]").expect("the loose ticket");
         assert!(epic_row < inside && inside < outside, "{}", text(&buffer));
         // The highlight symbol (2), three levels (6) and a leaf (2).
         assert!(
@@ -4896,5 +4945,155 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|s| *s == seen[0]), "{seen:?}");
+    }
+
+    // ---- the colors of the stages and of the epic (NS-45) ----
+
+    #[test]
+    fn the_colors_of_the_stages_and_of_the_epic() {
+        assert_eq!(stage_color(TicketStage::Open), Color::White);
+        assert_eq!(STAGE_BLUE, Color::LightBlue);
+        assert_ne!(STAGE_BLUE, FOCUS_COLOR, "not the cyan of the focus (NS-37)");
+        assert_eq!(STAGE_ORANGE, Color::Indexed(208));
+        assert_eq!(EPIC_COLOR, Color::Magenta);
+        assert_eq!(
+            TicketStage::ALL.map(stage_color),
+            [
+                Color::White,
+                STAGE_BLUE,
+                STAGE_BLUE,
+                STAGE_ORANGE,
+                STAGE_ORANGE,
+                Color::Green
+            ]
+        );
+        for stage in TicketStage::ALL {
+            let mark = stage_mark(stage.key());
+            assert_eq!(mark.style.fg, Some(stage_color(stage)), "{stage:?}");
+        }
+        assert_eq!(stage_mark("open").content, "[Aberto]");
+        assert_eq!(stage_mark("done").content, "[✓ Concluído]");
+        // An unknown key shows raw, with no color.
+        let raw = stage_mark("archived");
+        assert_eq!((raw.content.as_ref(), raw.style.fg), ("[archived]", None));
+        // On the panel (no brackets), raw and with no color too, as before the NS-45.
+        let raw = stage_span("archived", false);
+        assert_eq!((raw.content.as_ref(), raw.style.fg), ("archived", None));
+    }
+
+    /// The mark of each stage on the tree and the "Etapa atual:" of the panel, in its color; a
+    /// hidden ticket keeps the color, dimmed.
+    #[test]
+    fn each_stage_shows_in_its_color_on_the_tree_and_on_the_panel() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let NodeId::Ticket(id) = tnode(&f.app, "NS-1") else {
+            unreachable!()
+        };
+        f.app.select(NodeId::Ticket(id));
+        for stage in TicketStage::ALL {
+            db.connection()
+                .execute(
+                    "UPDATE tickets SET stage = ?2 WHERE id = ?1",
+                    rusqlite::params![id, stage.key()],
+                )
+                .unwrap();
+            f.app.refresh_tree();
+            let buffer = render_at(&f.app, 140, 30, None);
+            let mark = stage_mark(stage.key()).content.to_string();
+            let (y, x) = find(&buffer, &format!("NS-1  {mark}")).unwrap();
+            for i in 0..mark.chars().count() as u16 {
+                assert_eq!(
+                    buffer[(x + 6 + i, y)].fg,
+                    stage_color(stage),
+                    "{stage:?} tree"
+                );
+            }
+            assert_eq!(buffer[(x, y)].fg, Color::Reset, "the ID with no color");
+            let label = if stage == TicketStage::Done {
+                mark.clone()
+            } else {
+                stage.label().to_string()
+            };
+            let (y, x) = find(&buffer, &format!("Etapa atual: {label}")).unwrap();
+            assert_eq!(
+                buffer[(x + 13, y)].fg,
+                stage_color(stage),
+                "{stage:?} panel"
+            );
+            assert_eq!(buffer[(x, y)].fg, Color::Reset);
+        }
+        // The hidden NS-3, in Aberto: white and dimmed.
+        f.app.tree.show_hidden = true;
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let (y, x) = find(&buffer, "NS-3  [Aberto]").unwrap();
+        assert_eq!(buffer[(x + 6, y)].fg, Color::White);
+        assert!(buffer[(x + 6, y)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn the_id_and_the_title_of_the_epic_are_purple_on_the_tree() {
+        let (mut f, db, _) = with_epic_tree();
+        let buffer = render(&f.app);
+        let (y, x) = find(&buffer, "EPIC-1  [épico]  Plano").unwrap();
+        assert_eq!(buffer[(x, y)].fg, EPIC_COLOR, "the ID");
+        assert_eq!(buffer[(x + 17, y)].fg, EPIC_COLOR, "the title");
+        assert_eq!(buffer[(x + 8, y)].fg, Color::Reset, "[épico] with no color");
+        assert!(buffer[(x + 8, y)].modifier.contains(Modifier::BOLD));
+        // Hidden: still purple, dimmed.
+        let epic = db
+            .list_epics(f.app.project_rows()[0].project.id, true)
+            .unwrap()[0]
+            .clone();
+        db.hide_epic(epic.id).unwrap();
+        f.app.tree.show_hidden = true;
+        f.app.refresh_tree();
+        let buffer = render(&f.app);
+        let (y, x) = find(&buffer, "EPIC-1  [épico]").unwrap();
+        assert_eq!(buffer[(x, y)].fg, EPIC_COLOR);
+        assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn the_history_shows_the_source_and_the_empty_one_the_current_stage() {
+        let (mut f, _) = with_tree();
+        f.app.select(tnode(&f.app, "NS-1"));
+        f.app.refresh_tree();
+        let detail = f.app.ticket_detail.as_mut().unwrap();
+        detail.changes = vec![
+            sourced("open", "po", "agent_opening", "2026-11-21T10:19:00Z"),
+            sourced("po", "open", "operator", "2026-11-21T10:20:00Z"),
+            sourced("open", "review", "cron", "2026-11-21T10:21:00Z"),
+        ];
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(
+            &buffer,
+            "  2026-11-21 10:19 UTC  Aberto → PO  (abertura de agente)",
+        );
+        assert_has(&buffer, "  2026-11-21 10:20 UTC  PO → Aberto  (operador)");
+        assert_has(&buffer, "  2026-11-21 10:21 UTC  Aberto → Review  (cron)");
+        // Empty: the stage it started in is the current one, for a new and for an old ticket.
+        for (stage, label) in [("open", "Aberto"), ("po", "PO")] {
+            let detail = f.app.ticket_detail.as_mut().unwrap();
+            detail.changes.clear();
+            detail.ticket.stage = stage.into();
+            assert_has(
+                &render_at(&f.app, 140, 30, None),
+                &format!("Nenhuma mudança: o ticket começou em {label}."),
+            );
+        }
+    }
+
+    #[test]
+    fn the_dialog_of_the_stage_marks_aberto_as_the_current_one() {
+        let mut f = fixture();
+        f.app.dialog = Some(Dialog::ChooseTicketStage {
+            ticket: staged(1, "NS-12", "Título", "open", false),
+            index: 0,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, "> Aberto (atual)");
+        assert_has(&buffer, "  Concluído");
     }
 }

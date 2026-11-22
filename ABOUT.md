@@ -3368,6 +3368,16 @@ A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nic
 
 ## Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)
 
+> **Mudou no NS-45** (seção "Rust no projeto: etapa Aberto, cores e avanço ao abrir agente
+> (NS-45)"): as etapas passaram a ser **seis**, com **Aberto** (`open`) antes de PO, e os tickets
+> novos nascem em Aberto. A regra "o nick nunca muda a etapa sozinho" foi **substituída**: abrir um
+> agente **novo** de uma etapa **posterior** à do ticket move o ticket para essa etapa
+> (`tickets::advance_on_agent_opening`, só no `App::open_agent`, depois do `spawn`), e o histórico
+> guarda a origem de cada mudança (`operator` ou `agent_opening`). O fim do agente, o encerramento,
+> a saída, a retomada e a troca de foco continuam sem mexer na etapa. O estrutural virou
+> `the_stage_is_only_written_by_the_operator_or_by_opening_a_new_agent`, e o histórico vazio diz a
+> etapa atual (`Nenhuma mudança: o ticket começou em <etapa>.`).
+
 > **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): o "Editar ID" recusa
 > também o ID de um épico do projeto, e o miolo (renomear, gravar, desfazer) virou
 > `tickets::rename_key_with`, usado também pelo "Editar ID" do épico. O rodapé do nó do ticket
@@ -3576,6 +3586,12 @@ recusado com agente vivo e o formulário do Dev sem plano). As sabotagens e as t
 `.nick/docs/NS-36/`.
 
 ## Rust no projeto: foco evidente no painel (NS-37)
+
+> **Mudou no NS-45** (seção "Rust no projeto: etapa Aberto, cores e avanço ao abrir agente
+> (NS-45)"): a TUI ganhou as cores das etapas (Aberto em branco, PO e Tech Leader em azul
+> `LightBlue`, Dev e Review em laranja `Indexed(208)`, Concluído em verde) e o roxo (`Magenta`) do
+> ID e do título do épico. O azul das etapas é **diferente** do ciano do foco (`FOCUS_COLOR`), e um
+> teste cobra isso.
 
 > **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): as bordas de foco valem
 > sempre, também sem agente vivo (a árvore com a borda grossa ciano e o painel `Plain` + DIM); o
@@ -4123,6 +4139,12 @@ em outro nick, o ID trocado e os dois estruturais. As sabotagens ficam em
 `claude` real (que não roda dentro da jail do nick) em `.nick/docs/NS-39/verificacao_manual.md`.
 
 ## Rust no projeto: épicos opcionais (NS-40)
+
+> **Mudou no NS-45** (seção "Rust no projeto: etapa Aberto, cores e avanço ao abrir agente
+> (NS-45)"): o ID e o título do épico ficam em roxo (`ui::EPIC_COLOR`, `Color::Magenta`) na
+> árvore. O "sem cor nova" desta seção deixou de valer para eles; o `[épico]` continua só em
+> negrito, e o `[provisório]`, o `[oculto]` e o DIM do épico oculto não mudaram. A migração 9
+> reconstrói `tickets` e recria os seis gatilhos desta migração com o mesmo texto.
 
 A fatia F7 do épico NS-28. O **épico** é um nível **opcional** entre o projeto e o ticket, para
 guardar conversas longas: um plano que vive mais que um ticket (como o `migracao_tui.md`). A
@@ -4973,3 +4995,175 @@ truecolor) ficam em `.nick/docs/NS-51/prints/`, em texto, ANSI e PNG.
 - o nit do `main.rs` (com `terminal::panicking()`, o ramo ocioso acorda no `next_wake` e volta ao
   topo, em vez de ficar no `recv()`) ficou como está, como o review propôs: o laço não desenha nada
   e o hook do panic encerra o processo.
+
+## Rust no projeto: etapa Aberto, cores e avanço ao abrir agente (NS-45)
+
+História filha do épico NS-28. Três ajustes nas etapas do ticket do NS-36: a etapa **Aberto**
+antes de PO, as **cores** das etapas e do épico, e o **avanço da etapa** quando se abre um agente
+novo de uma etapa posterior. Fora do escopo: cores configuráveis, etapa nos épicos e cor da etapa
+nas linhas de agente, no diálogo "Mudar etapa" e nas linhas do histórico.
+
+**As seis etapas** (`tickets::TicketStage`): Aberto (`open`) → PO → Tech Leader → Dev → Review →
+Concluído. `TicketStage` ganhou a variante `Open` e `derive(PartialOrd, Ord)`: a ordem de
+declaração é a do fluxo, e um teste cobra que `ALL` já sai ordenado. `key()` e `label()` viraram
+um `match` com as seis variantes (as quatro do meio pegam o texto de `agents::Stage`, sem repetir),
+e `agent_stage()` devolve `None` para `Open` e `Done`, as etapas só do ticket. `agents::Stage`
+**não** ganhou `Open`: não existe agente de Aberto, e o `CHECK` de `agents.stage` não mudou. Os
+tickets novos nascem em Aberto pelo `DEFAULT 'open'` da migração 9 (o `insert_ticket` não mudou),
+e os que já existiam ficam na etapa que tinham. O diálogo "Mudar etapa" percorre `ALL`, então o
+Aberto aparece em primeiro e o operador pode voltar o ticket para ele de qualquer etapa.
+
+**A origem da mudança** (`tickets::StageSource`, no molde de `TicketStage`): `operator`
+(`operador`) ou `agent_opening` (`abertura de agente`), gravada em `ticket_stage_changes.source`.
+`source_label` devolve a chave crua quando ela é desconhecida, como o `stage_label`.
+`Db::change_ticket_stage(id, from, to, source)` continua sendo o **único escritor** da etapa no
+banco, para os dois casos; `tickets::change_stage` (o operador) passa `operator`, com as mesmas
+mensagens e recusas de antes.
+
+**A regra do avanço** (`tickets::advance_on_agent_opening(db, ticket_id, stage)`): relê o ticket
+do banco (a etapa pode ter mudado em outro nick) e, só quando a etapa do agente é **posterior** à
+do ticket (pelo `Ord`), grava a mudança com `agent_opening`, mesmo pulando etapas (Aberto →
+Review). Etapa igual ou anterior, Concluído, chave desconhecida e ticket que sumiu não mudam nada
+(`Ok(None)`). Se outro nick mudou a etapa entre a leitura e a escrita (`Moved`), a barra diz `A
+etapa do ticket <ID> mudou em outro nick. A etapa não avançou.`; erro do banco vira a mensagem do
+banco. No sucesso, a barra diz `Etapa do ticket <ID>: <de> → <para> (abertura de agente).`. A
+leitura do ticket vem por parâmetro num `advance_on_agent_opening_with` privado (o molde do
+`create_with`/`edit_id_with`), para o teste simular o outro nick. **Quem chama:** só o
+`App::open_agent`, depois do `launcher.spawn` com sucesso e só para um agente de ticket, **antes**
+do `start_running` (que relê a árvore, já com a etapa nova, e limpa a barra; a mensagem do avanço
+é posta depois dele). Uma falha no avanço não encerra o agente, que já está rodando: só a barra
+avisa. Cada tipo de etapa (PO discussão, PO Jira…) avança pelo `kind.stage()`. **Não avançam:**
+`agents::open` ou `spawn` que falha, a retomada (`resume_agent`, NS-39), a troca de foco, o
+`Enter` num agente vivo, o agente de épico, o fim do agente, o encerramento pelo operador e a
+saída. A etapa continua sem fechar nem esconder agente (mudar para Concluído deixa o agente vivo
+como estava).
+
+**Estrutural** (`the_stage_is_only_written_by_the_operator_or_by_opening_a_new_agent`, o antigo
+`the_stage_is_only_written_by_the_confirmation_of_the_operator`): `change_ticket_stage` só no
+`db/mod.rs` e no `tickets.rs`; `tickets::change_stage(` com uma chamada no `app.rs`, dentro da
+confirmação do diálogo; `advance_on_agent_opening(` só no `tickets.rs` e, no `app.rs`, com **uma**
+chamada, dentro de `fn open_agent` e depois de `launcher.spawn(`; nenhum `UPDATE tickets SET
+stage` nem `ticket_stage_changes` fora de `src/db/`. O controle positivo pega a chamada no
+`resume_agent`, antes do `spawn`, no `agent_ended`, duas chamadas e a chamada em outro fonte. Como
+o `app.rs` precisa ter o avanço, cada caso ruim antigo do controle ganhou a abertura boa, para
+quebrar só a própria regra (a confirmação sozinha agora dá `0 calls of advance_on_agent_opening`).
+
+**Banco: migração 9.** No plano ela era a 8, mas o NS-50 publicou a `MIGRATION_8`
+(`resume_session_id`) antes; por decisão do usuário, o texto do plano virou a `MIGRATION_9` sem
+outra mudança, e os testes passaram a ser v8 → v9. O SQLite não altera um `CHECK`, então
+`tickets` e `ticket_stage_changes` são **reconstruídas** (`CREATE TABLE x_new`, `INSERT ...
+SELECT` com o `id`, `DROP`, `RENAME`, o molde do `agents` da migração 7), com as colunas na mesma
+ordem (`TICKET_COLUMNS` não mudou). A etapa ganhou `open` no `CHECK` das duas tabelas e o `DEFAULT
+'open'`; o histórico ganhou `source TEXT NOT NULL CHECK (source IN ('operator',
+'agent_opening'))`, **sem `DEFAULT`** (todo `INSERT` diz a origem). As linhas antigas viram
+`operator`, porque até o NS-45 só o operador mudava a etapa. A migração 5 (com o "the nick never
+does it alone") não foi editada: migração publicada é fixada por teste, e a regra nova fica no
+comentário da 9. **As três armadilhas, que a migração 7 não teve porque nada apontava para
+`agents`:**
+1. **`DROP TABLE tickets` com a FK ligada apaga os filhos**: o `DROP` faz um `DELETE` implícito, e
+   o `ON DELETE CASCADE` de `agents.ticket_id` e do histórico levaria tudo. O `PRAGMA
+   foreign_keys` é ignorado dentro de uma transação, então o laço do `Db::open_with` foi adaptado
+   (o procedimento de 12 passos do SQLite): **só quando há migração pendente**, a FK é desligada
+   antes do laço; cada migração roda na sua transação, e o `PRAGMA foreign_key_check` roda antes
+   do `user_version` e do commit (qualquer linha recusa a migração com `referência quebrada na
+   tabela <tabela> (para <pai>)`, e a transação desfaz); depois do laço a FK volta ligada,
+   **também quando uma migração falha** (o erro da migração tem prioridade sobre um erro ao
+   religar). Vale para **todas** as migrações: para as antigas o resultado é o mesmo, porque elas
+   não criam referência quebrada, e se criassem o `foreign_key_check` recusaria como a FK ligada
+   recusava. Os testes de migração v1 → v8 passaram sem mudança;
+2. **os seis gatilhos da migração 7 caem com a tabela** (quatro em `tickets` e os dois de `epics`
+   que leem `tickets`), e o `RENAME` confere o esquema inteiro: a migração 9 faz o `DROP TRIGGER`
+   dos seis antes e os recria depois do `RENAME`, **com o texto idêntico** ao da migração 7. O
+   `sqlite_master` de um banco na versão 8 foi conferido antes: além deles, só o autoindex do
+   `UNIQUE (project_id, key)`, que a tabela nova recria;
+3. **os `id`s são preservados**, então `agents.ticket_id`, o histórico e `tickets.epic_id`
+   continuam válidos, e o `foreign_key_check` prova isso.
+
+**Histórico no painel:** `  <data>  <de> → <para>  (<origem>)`, com a origem no fim de propósito:
+com agente vivo a coluna tem 40 colunas, e o corte leva a origem, não a data nem as etapas. O
+histórico vazio diz a etapa atual, que é a etapa em que o ticket começou (`Nenhuma mudança: o
+ticket começou em <etapa>.`): um ticket antigo diz PO, e um novo diz Aberto.
+
+**Cores** (`ui.rs`, sem módulo de tema nem enum novo): `stage_color(TicketStage)` dá Aberto em
+`Color::White`, PO e Tech Leader em `STAGE_BLUE` (`Color::LightBlue`, o índice 12 das 16 cores,
+diferente do `Color::Cyan` do `FOCUS_COLOR` do NS-37), Dev e Review em `STAGE_ORANGE`
+(`Color::Indexed(208)`) e Concluído em `Color::Green`. `EPIC_COLOR` (`Color::Magenta`, o índice 5)
+pinta o ID e o título do épico; o `[épico]` continua só em negrito, e o `[provisório]` e o
+`[oculto]` ficam sem cor. A marca da etapa na árvore (`stage_mark`) e o `Etapa atual:` do painel
+saem de uma função só (`stage_span`, com ou sem colchetes; o Concluído é sempre `[✓ Concluído]`),
+e a chave desconhecida sai crua e sem cor, como antes: `[archived]` na árvore e `archived` no
+painel, sem colchetes (corrigido no review). O DIM do ticket ou do épico oculto convive com o `fg`
+do span (conferido no teste). No PTY, o `vt100` lê as cores do crossterm como `Idx(15)` (branco),
+`Idx(12)` (azul), `Idx(208)` (laranja), `Idx(2)` (verde) e `Idx(5)` (roxo); o harness ganhou o
+`Nick::color_at(texto, deslocamento)`, sobre o `cell` que já existia.
+
+**Impactos conhecidos** (aceitos no ticket ou no plano):
+- num terminal de 16 cores, o laranja 208 sai aproximado; o azul e o roxo são da paleta de 16;
+- num tema claro, o branco do Aberto pode sumir (o ticket fixou o branco);
+- um avanço por engano (abrir um agente de etapa posterior sem querer) é corrigido à mão pelo
+  operador (`m`), e o histórico guarda as duas mudanças com a origem de cada uma;
+- `[Aberto]` é mais longo que `[PO]`: com 40 colunas, o fim da linha de um ticket novo é cortado
+  mais cedo (o corte é o comportamento aceito desde o NS-34). O ID e a etapa continuam inteiros.
+
+**Testes adaptados, com o motivo:**
+- `nick/src/db/mod.rs`: `a_new_database_gets_version_8_…` → `a_new_database_gets_version_9_…`
+  (renomeado), `opening_twice_duplicates_nothing` (9), `a_newer_database_is_refused_without_being_written`
+  e `a_database_one_version_newer_is_refused_too` (citam a `(9)`, e o "um a mais" é a 10) e
+  `migration_1_is_pinned` (nove migrações e o texto da 9); `a_version_7_database_with_agents_migrates_to_8_with_no_session_of_resume`
+  passou a abrir só até a migração 8 (a 9 tem o teste dela); o helper `raw_change` grava a origem
+  `operator` (a coluna é `NOT NULL` sem `DEFAULT`), com o irmão `raw_sourced_change`;
+  `change_ticket_stage_stores_the_stage_and_one_history_row`, `change_ticket_stage_gone_and_moved_store_nothing`
+  e `change_ticket_stage_is_all_or_nothing` passam a origem, partem de `open` (o ticket nasce em
+  Aberto) e cobram a origem gravada (o último também cobra que uma origem recusada pelo `CHECK`
+  não grava nada). Nenhum teste de migração antigo lia o histórico pelo `list_stage_changes` num
+  banco anterior à 9, então nenhum precisou passar para SQL cru;
+- `nick/src/tickets.rs`: `ticket_stage_has_the_five_stages_…` → `…_six_stages_…` (Aberto, `Ord`);
+  `change_stage_goes_forwards_backwards_and_to_and_from_done` parte de Aberto, vai **para** e
+  **de** Aberto e cobra a origem `operator`; `the_same_stage_is_refused_and_nothing_is_stored` e
+  `a_ticket_gone_or_moved_by_another_nick_stores_nothing` partem de Aberto;
+- `nick/src/app.rs`: `the_stage_never_changes_alone_and_done_closes_no_agent` foi **substituído**
+  por `opening_a_new_agent_of_a_later_stage_advances_the_ticket` (com a parte "Concluído não fecha
+  nem esconde agente") e `the_stage_does_not_change_in_the_other_cases`;
+  `m_lists_the_five_stages_…` → `m_lists_the_six_stages_…` (os índices andam um, e a etapa atual
+  de um ticket novo é Aberto); `the_ticket_screen_shows_the_history_the_agents_and_the_artifacts_read_now`
+  (as aberturas do PO e do Dev avançam a etapa: o histórico tem as duas, e a mudança do operador
+  vira a terceira);
+- `nick/src/ui.rs`: o helper `change` ganhou a origem (só sintaxe, com o irmão `sourced`);
+  `the_dialogs_of_the_stage_and_of_the_id` (o índice do Review é 4, e o Aberto vem antes do PO);
+  `the_label_of_an_epic_has_the_mark_bold_and_dims_when_hidden` (o ID e o título em roxo; as
+  marcas sem cor); `the_rows_are_indented_with_the_arrows_and_the_label_of_each_node`,
+  `the_styles_of_the_nodes` e `the_tree_shows_the_epic_before_the_tickets_and_a_long_id_fits_with_its_mark`
+  (o ticket novo mostra `[Aberto]`); `the_panel_of_a_ticket_shows_the_stage_the_artifacts_and_the_history`
+  (o histórico vazio diz a etapa atual, Tech Leader na fixture, e as linhas ganharam `(operador)`);
+- `nick/tests/agent.rs`: o estrutural (acima); `a_real_version_6_database_opens_migrated_with_the_tree_of_before`
+  (versão 9); `the_dev_form_without_a_plan_warns_and_opens_anyway` (abrir o Dev agora leva o
+  ticket a `development`); `a_hidden_agent_whose_text_changed_is_marked_until_it_is_shown` (o
+  `select("Tech Leader")` parava na linha do ticket, que agora mostra `[Tech Leader]`: passou a
+  `select("Tech Leader  ●")`, a linha do agente com ou sem a marca); `each_kind_of_node_has_its_panel_and_its_help`
+  (`NS-2  [Aberto]  Segundo  [ocul`, cortado a 40 colunas). O `NS-1  [PO]` de
+  `hiding_an_epic_is_refused_with_a_live_agent_…` não mudou: o agente PO aberto ali leva o ticket a
+  PO;
+- `nick/tests/tui.rs`: `the_ticket_flow_works_and_touches_no_file_of_the_project` e
+  `the_tickets_of_a_project_do_not_show_in_another` (`[Aberto]`; com o corte, o título esperado é o
+  pedaço que cabe, `Corrigir o log` × `Corrigir o sen`, para continuar provando o título novo);
+  `the_operator_changes_the_stage_and_done_stays_on_the_list` (Aberto, `começou em Aberto`,
+  `Aberto → Review  (operador)`, e as cores do Aberto, do Review e do Concluído).
+
+Os testes do NS-40 (gatilhos e épicos), da troca manual e do "Editar ID" do NS-36, do foco do
+NS-37, da retomada do NS-39, do Ctrl+Z do NS-44 e da sessão de retomada do NS-50 passaram sem
+mudança. Nenhum teste foi apagado sem substituto.
+
+**Testes novos:** `tickets` (as seis etapas e o `Ord`, o `StageSource`, o avanço de Aberto para
+cada etapa, pulando etapas, a mesma etapa, a anterior e o Concluído, o ticket sumido e a chave
+desconhecida, o `Moved` pelo outro nick, o erro do banco); `db` (a reconstrução de uma tabela-pai
+que mantém os filhos, a migração com referência quebrada recusada e desfeita, a FK ligada depois
+de migrar e depois de uma migração que falha, o banco v8 populado migrando para a 9 com todas as
+linhas campo a campo, os `id`s, a origem `operator`, o `foreign_key_check` vazio, os seis gatilhos
+iguais e o cascade, os gatilhos da migração 7 recusando depois da 9, o ticket novo em `open` e os
+`CHECK`s novos); `app` (o avanço, os casos sem mudança, a retomada, o agente de épico e o operador
+voltando a Aberto de qualquer etapa); `ui` (as cores das etapas e do épico, cada etapa na árvore e
+no painel, o ticket oculto com cor e DIM, o épico roxo e oculto com DIM, o histórico com a origem e
+o vazio com a etapa atual, o diálogo com `> Aberto (atual)`); o estrutural; e, no PTY,
+`opening_new_agents_advances_the_stage_and_each_stage_has_its_color` (`tests/agent.rs`: o épico
+roxo, o Aberto branco, o avanço para PO azul e para Dev laranja com a mensagem e o histórico, e o
+PO de novo sem mudança). As sabotagens e as telas ficam em `.nick/docs/NS-45/`.

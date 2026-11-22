@@ -247,11 +247,13 @@ pub fn gone_message(ticket: &Ticket) -> String {
     format!("O ticket {} não existe mais no banco.", ticket.key)
 }
 
-/// The stage of a ticket (NS-36): the four stages of the agents, then "Concluído". Only a
-/// record, changed only by the operator (`change_stage`), to any stage: it opens, closes and
-/// hides no agent, and nothing of the agents changes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The stage of a ticket (NS-36): "Aberto" (NS-45), the four stages of the agents, then
+/// "Concluído". The declaration order is the order of the flow, and `Ord` follows it. Changed by
+/// the operator (`change_stage`), to any stage, and by the opening of a new agent of a later stage
+/// (`advance_on_agent_opening`, NS-45): it opens, closes and hides no agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TicketStage {
+    Open,
     Po,
     TechLeader,
     Development,
@@ -272,7 +274,8 @@ impl From<Stage> for TicketStage {
 
 impl TicketStage {
     /// Every stage, in the order of the flow (the order of the dialog).
-    pub const ALL: [TicketStage; 5] = [
+    pub const ALL: [TicketStage; 6] = [
+        TicketStage::Open,
         TicketStage::Po,
         TicketStage::TechLeader,
         TicketStage::Development,
@@ -280,25 +283,40 @@ impl TicketStage {
         TicketStage::Done,
     ];
 
-    /// The stage of the agents with the same key and label; None for `Done`.
+    /// The stage of the agents with the same key and label; None for `Open` and `Done`, the
+    /// stages only of the ticket.
     pub fn agent_stage(self) -> Option<Stage> {
         match self {
             TicketStage::Po => Some(Stage::Po),
             TicketStage::TechLeader => Some(Stage::TechLeader),
             TicketStage::Development => Some(Stage::Development),
             TicketStage::Review => Some(Stage::Review),
-            TicketStage::Done => None,
+            TicketStage::Open | TicketStage::Done => None,
         }
     }
 
     /// The key stored in `tickets.stage` and in the history.
     pub fn key(self) -> &'static str {
-        self.agent_stage().map_or("done", Stage::key)
+        match self {
+            TicketStage::Open => "open",
+            TicketStage::Po => Stage::Po.key(),
+            TicketStage::TechLeader => Stage::TechLeader.key(),
+            TicketStage::Development => Stage::Development.key(),
+            TicketStage::Review => Stage::Review.key(),
+            TicketStage::Done => "done",
+        }
     }
 
     /// What the screen shows.
     pub fn label(self) -> &'static str {
-        self.agent_stage().map_or("Concluído", Stage::label)
+        match self {
+            TicketStage::Open => "Aberto",
+            TicketStage::Po => Stage::Po.label(),
+            TicketStage::TechLeader => Stage::TechLeader.label(),
+            TicketStage::Development => Stage::Development.label(),
+            TicketStage::Review => Stage::Review.label(),
+            TicketStage::Done => "Concluído",
+        }
     }
 
     /// The stage of a stored key.
@@ -315,20 +333,66 @@ pub fn stage_label(key: &str) -> String {
     TicketStage::from_key(key).map_or_else(|| key.to_string(), |stage| stage.label().into())
 }
 
+/// Who changed the stage of a ticket (NS-45), stored in `ticket_stage_changes.source`: the
+/// operator, by the dialog, or the opening of a new agent of a later stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageSource {
+    Operator,
+    AgentOpening,
+}
+
+impl StageSource {
+    /// Every source.
+    pub const ALL: [StageSource; 2] = [StageSource::Operator, StageSource::AgentOpening];
+
+    /// The key stored in the history.
+    pub fn key(self) -> &'static str {
+        match self {
+            StageSource::Operator => "operator",
+            StageSource::AgentOpening => "agent_opening",
+        }
+    }
+
+    /// What the screen shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            StageSource::Operator => "operador",
+            StageSource::AgentOpening => "abertura de agente",
+        }
+    }
+
+    /// The source of a stored key.
+    pub fn from_key(key: &str) -> Option<StageSource> {
+        StageSource::ALL
+            .into_iter()
+            .find(|source| source.key() == key)
+    }
+}
+
+/// The label of a stored source key, or the key itself when it is unknown (as `stage_label`).
+pub fn source_label(key: &str) -> String {
+    StageSource::from_key(key).map_or_else(|| key.to_string(), |source| source.label().into())
+}
+
 /// The refusal of changing the ticket to the stage it is already at.
 pub fn same_stage_message(ticket: &Ticket, to: TicketStage) -> String {
     format!("O ticket {} já está em {}.", ticket.key, to.label())
 }
 
-/// Changes the stage of the ticket to `to`, with its row in the history (one transaction:
-/// `Db::change_ticket_stage`). The only path that writes the stage; only the confirmation of
-/// the dialog of the node of a ticket calls it. The same stage is refused; a ticket gone, or moved
-/// by another nick meanwhile, stores nothing.
+/// Changes the stage of the ticket to `to`, with its row in the history, by the operator (one
+/// transaction: `Db::change_ticket_stage`). Only the confirmation of the dialog of the node of a
+/// ticket calls it; the other writer is `advance_on_agent_opening` (NS-45). The same stage is
+/// refused; a ticket gone, or moved by another nick meanwhile, stores nothing.
 pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String, String> {
     if ticket.stage == to.key() {
         return Err(same_stage_message(ticket, to));
     }
-    match db.change_ticket_stage(ticket.id, &ticket.stage, to.key()) {
+    match db.change_ticket_stage(
+        ticket.id,
+        &ticket.stage,
+        to.key(),
+        StageSource::Operator.key(),
+    ) {
         Ok(StageChange::Changed) => Ok(format!(
             "Etapa do ticket {}: {} → {}.",
             ticket.key,
@@ -340,6 +404,60 @@ pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String,
             "A etapa do ticket {} mudou em outro nick. Nada foi gravado.",
             ticket.key
         )),
+        Err(err) => Err(db_error_message(&err)),
+    }
+}
+
+/// The advance of the stage on the opening of a new agent (NS-45, plan D4): a new agent of a
+/// stage later than the one of the ticket moves the ticket to it, even skipping stages, with the
+/// source `agent_opening` in the history. The same or an earlier stage, `Done`, an unknown key and
+/// a ticket gone change nothing (`Ok(None)`). Called only by `App::open_agent`, after the agent
+/// was spawned, for an agent of a ticket. The message is for the status bar.
+pub fn advance_on_agent_opening(
+    db: &Db,
+    ticket_id: i64,
+    stage: Stage,
+) -> Result<Option<String>, String> {
+    advance_on_agent_opening_with(db, ticket_id, stage, &mut |id| db.get_ticket(id))
+}
+
+/// `advance_on_agent_opening` with the read of the ticket received by parameter (the tests make
+/// another nick move it between the read and the write). The ticket is read from the database,
+/// because the stage may have changed in another nick.
+fn advance_on_agent_opening_with(
+    db: &Db,
+    ticket_id: i64,
+    stage: Stage,
+    read: &mut dyn FnMut(i64) -> rusqlite::Result<Option<Ticket>>,
+) -> Result<Option<String>, String> {
+    let Some(ticket) = read(ticket_id).map_err(|err| db_error_message(&err))? else {
+        return Ok(None);
+    };
+    let Some(current) = TicketStage::from_key(&ticket.stage) else {
+        return Ok(None);
+    };
+    let to = TicketStage::from(stage);
+    if current == TicketStage::Done || to <= current {
+        return Ok(None);
+    }
+    match db.change_ticket_stage(
+        ticket.id,
+        current.key(),
+        to.key(),
+        StageSource::AgentOpening.key(),
+    ) {
+        Ok(StageChange::Changed) => Ok(Some(format!(
+            "Etapa do ticket {}: {} → {} ({}).",
+            ticket.key,
+            current.label(),
+            to.label(),
+            StageSource::AgentOpening.label()
+        ))),
+        Ok(StageChange::Moved) => Err(format!(
+            "A etapa do ticket {} mudou em outro nick. A etapa não avançou.",
+            ticket.key
+        )),
+        Ok(StageChange::Gone) => Ok(None),
         Err(err) => Err(db_error_message(&err)),
     }
 }
@@ -815,24 +933,24 @@ mod tests {
     use crate::db::StageChange;
 
     #[test]
-    fn ticket_stage_has_the_five_stages_in_the_order_of_the_flow() {
+    fn ticket_stage_has_the_six_stages_in_the_order_of_the_flow() {
         use TicketStage::*;
         assert_eq!(
             TicketStage::ALL,
-            [Po, TechLeader, Development, Review, Done]
+            [Open, Po, TechLeader, Development, Review, Done]
         );
         assert_eq!(
             TicketStage::ALL.map(TicketStage::key),
-            ["po", "tech_leader", "development", "review", "done"]
+            ["open", "po", "tech_leader", "development", "review", "done"]
         );
         assert_eq!(
             TicketStage::ALL.map(TicketStage::label),
-            ["PO", "Tech Leader", "Dev", "Review", "Concluído"]
+            ["Aberto", "PO", "Tech Leader", "Dev", "Review", "Concluído"]
         );
         for stage in TicketStage::ALL {
             assert_eq!(TicketStage::from_key(stage.key()), Some(stage));
         }
-        for bad in ["", "PO", "dev", "Done", "concluido"] {
+        for bad in ["", "PO", "dev", "Done", "concluido", "Open", "aberto"] {
             assert_eq!(TicketStage::from_key(bad), None, "{bad:?}");
         }
         // The four of the agents are the same as `Stage` (no repeated text).
@@ -841,10 +959,40 @@ mod tests {
             assert_eq!((ticket.key(), ticket.label()), (stage.key(), stage.label()));
             assert_eq!(ticket.agent_stage(), Some(stage));
         }
+        assert_eq!(Open.agent_stage(), None);
         assert_eq!(Done.agent_stage(), None);
+        // `ALL` is the order of the flow, and `Ord` follows it (the rule of the advance, NS-45).
+        let mut sorted = TicketStage::ALL;
+        sorted.sort();
+        assert_eq!(sorted, TicketStage::ALL);
+        assert!(TicketStage::ALL.windows(2).all(|w| w[0] < w[1]));
         // A key the CHECK should never let in shows raw, without a panic.
         assert_eq!(stage_label("po"), "PO");
+        assert_eq!(stage_label("open"), "Aberto");
         assert_eq!(stage_label("archived"), "archived");
+    }
+
+    #[test]
+    fn stage_source_has_the_operator_and_the_agent_opening() {
+        use StageSource::*;
+        assert_eq!(StageSource::ALL, [Operator, AgentOpening]);
+        assert_eq!(
+            StageSource::ALL.map(StageSource::key),
+            ["operator", "agent_opening"]
+        );
+        assert_eq!(
+            StageSource::ALL.map(StageSource::label),
+            ["operador", "abertura de agente"]
+        );
+        for source in StageSource::ALL {
+            assert_eq!(StageSource::from_key(source.key()), Some(source));
+        }
+        for bad in ["", "Operator", "agent", "operador"] {
+            assert_eq!(StageSource::from_key(bad), None, "{bad:?}");
+        }
+        assert_eq!(source_label("operator"), "operador");
+        assert_eq!(source_label("agent_opening"), "abertura de agente");
+        assert_eq!(source_label("cron"), "cron");
     }
 
     impl Fixture {
@@ -853,11 +1001,19 @@ mod tests {
         }
 
         fn history(&self, id: i64) -> Vec<(String, String)> {
+            self.sourced_history(id)
+                .into_iter()
+                .map(|(from, to, _)| (from, to))
+                .collect()
+        }
+
+        /// The history with the source of each change (NS-45).
+        fn sourced_history(&self, id: i64) -> Vec<(String, String, String)> {
             self.db
                 .list_stage_changes(id)
                 .unwrap()
                 .into_iter()
-                .map(|c| (c.from_stage, c.to_stage))
+                .map(|c| (c.from_stage, c.to_stage, c.source))
                 .collect()
         }
     }
@@ -868,6 +1024,7 @@ mod tests {
         let t = f.create("t", "NS-1").unwrap();
         let mut steps = Vec::new();
         for (to, message) in [
+            (TicketStage::Po, "Etapa do ticket NS-1: Aberto → PO."),
             (TicketStage::Review, "Etapa do ticket NS-1: PO → Review."),
             (
                 TicketStage::Development,
@@ -878,13 +1035,25 @@ mod tests {
                 TicketStage::TechLeader,
                 "Etapa do ticket NS-1: Concluído → Tech Leader.",
             ),
+            (
+                TicketStage::Open,
+                "Etapa do ticket NS-1: Tech Leader → Aberto.",
+            ),
+            (
+                TicketStage::Done,
+                "Etapa do ticket NS-1: Aberto → Concluído.",
+            ),
         ] {
             let current = f.stored(t.id);
             assert_eq!(change_stage(&f.db, &current, to), Ok(message.into()));
             assert_eq!(f.stored(t.id).stage, to.key());
-            steps.push((current.stage, to.key().to_string()));
+            steps.push((current.stage, to.key().to_string(), "operator".to_string()));
         }
-        assert_eq!(f.history(t.id), steps);
+        assert_eq!(
+            f.sourced_history(t.id),
+            steps,
+            "every change by the operator"
+        );
     }
 
     #[test]
@@ -892,8 +1061,8 @@ mod tests {
         let f = fixture();
         let t = f.create("t", "NS-1").unwrap();
         assert_eq!(
-            change_stage(&f.db, &t, TicketStage::Po),
-            Err("O ticket NS-1 já está em PO.".into())
+            change_stage(&f.db, &t, TicketStage::Open),
+            Err("O ticket NS-1 já está em Aberto.".into())
         );
         assert_eq!(f.history(t.id), []);
     }
@@ -902,9 +1071,10 @@ mod tests {
     fn a_ticket_gone_or_moved_by_another_nick_stores_nothing() {
         let f = fixture();
         let t = f.create("t", "NS-1").unwrap();
-        // Another nick moved it to Review; this one still shows it in PO.
+        // Another nick moved it to Review; this one still shows it in Aberto.
         assert_eq!(
-            f.db.change_ticket_stage(t.id, "po", "review").unwrap(),
+            f.db.change_ticket_stage(t.id, "open", "review", "operator")
+                .unwrap(),
             StageChange::Changed
         );
         assert_eq!(
@@ -925,6 +1095,153 @@ mod tests {
         fn stored_or(&self, t: Ticket) -> Ticket {
             self.all().into_iter().find(|s| s.id == t.id).unwrap_or(t)
         }
+    }
+
+    // ---- the advance on the opening of a new agent (NS-45) ----
+
+    impl Fixture {
+        /// A ticket of the fixture moved to `stage` by the operator (from Aberto).
+        fn in_stage(&self, key: &str, stage: TicketStage) -> Ticket {
+            let t = self.create("t", key).unwrap();
+            if stage != TicketStage::Open {
+                change_stage(&self.db, &t, stage).unwrap();
+            }
+            self.stored(t.id)
+        }
+    }
+
+    #[test]
+    fn opening_an_agent_of_a_later_stage_advances_the_ticket_to_it() {
+        let f = fixture();
+        for (n, stage) in Stage::ALL.into_iter().enumerate() {
+            let t = f.in_stage(&format!("NS-{n}"), TicketStage::Open);
+            let to = TicketStage::from(stage);
+            assert_eq!(
+                advance_on_agent_opening(&f.db, t.id, stage),
+                Ok(Some(format!(
+                    "Etapa do ticket NS-{n}: Aberto → {} (abertura de agente).",
+                    to.label()
+                )))
+            );
+            assert_eq!(f.stored(t.id).stage, to.key());
+            assert_eq!(
+                f.sourced_history(t.id),
+                [("open".into(), to.key().into(), "agent_opening".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn the_advance_skips_stages_and_goes_on_from_any_earlier_one() {
+        let f = fixture();
+        let t = f.in_stage("NS-1", TicketStage::Open);
+        assert_eq!(
+            advance_on_agent_opening(&f.db, t.id, Stage::Review),
+            Ok(Some(
+                "Etapa do ticket NS-1: Aberto → Review (abertura de agente).".into()
+            ))
+        );
+        let t = f.in_stage("NS-2", TicketStage::Po);
+        assert_eq!(
+            advance_on_agent_opening(&f.db, t.id, Stage::Development),
+            Ok(Some(
+                "Etapa do ticket NS-2: PO → Dev (abertura de agente).".into()
+            ))
+        );
+        assert_eq!(
+            f.sourced_history(t.id),
+            [
+                ("open".into(), "po".into(), "operator".into()),
+                ("po".into(), "development".into(), "agent_opening".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_or_an_earlier_stage_and_done_do_not_advance() {
+        let f = fixture();
+        for (key, current, opened) in [
+            ("NS-1", TicketStage::Review, Stage::Review),
+            ("NS-2", TicketStage::Development, Stage::Po),
+            ("NS-3", TicketStage::Po, Stage::Po),
+            ("NS-4", TicketStage::Done, Stage::Review),
+            ("NS-5", TicketStage::Done, Stage::Po),
+        ] {
+            let t = f.in_stage(key, current);
+            let before = f.sourced_history(t.id);
+            assert_eq!(
+                advance_on_agent_opening(&f.db, t.id, opened),
+                Ok(None),
+                "{key}"
+            );
+            assert_eq!(f.stored(t.id).stage, current.key(), "{key}");
+            assert_eq!(f.sourced_history(t.id), before, "{key}: nothing stored");
+        }
+    }
+
+    #[test]
+    fn a_ticket_gone_or_with_an_unknown_stage_does_not_advance() {
+        let f = fixture();
+        let t = f.in_stage("NS-1", TicketStage::Open);
+        let mut unknown = |id: i64| {
+            f.db.get_ticket(id).map(|t| {
+                t.map(|t| Ticket {
+                    stage: "archived".into(),
+                    ..t
+                })
+            })
+        };
+        assert_eq!(
+            advance_on_agent_opening_with(&f.db, t.id, Stage::Po, &mut unknown),
+            Ok(None)
+        );
+        assert_eq!(f.stored(t.id).stage, "open");
+        f.db.delete_project(f.project).unwrap();
+        assert_eq!(advance_on_agent_opening(&f.db, t.id, Stage::Po), Ok(None));
+    }
+
+    #[test]
+    fn a_ticket_moved_by_another_nick_meanwhile_does_not_advance() {
+        let f = fixture();
+        let t = f.in_stage("NS-1", TicketStage::Open);
+        // Read in Aberto; another nick moves it to Review before the write.
+        let mut read_then_moved = |id: i64| {
+            let read = f.db.get_ticket(id);
+            f.db.change_ticket_stage(id, "open", "review", "operator")
+                .unwrap();
+            read
+        };
+        assert_eq!(
+            advance_on_agent_opening_with(&f.db, t.id, Stage::Po, &mut read_then_moved),
+            Err("A etapa do ticket NS-1 mudou em outro nick. A etapa não avançou.".into())
+        );
+        assert_eq!(f.stored(t.id).stage, "review");
+        assert_eq!(
+            f.sourced_history(t.id),
+            [("open".into(), "review".into(), "operator".into())],
+            "only the change of the other nick"
+        );
+    }
+
+    #[test]
+    fn a_database_error_in_the_advance_is_the_message_of_the_database() {
+        let f = fixture();
+        let t = f.in_stage("NS-1", TicketStage::Open);
+        let mut failing = |_: i64| Err(rusqlite::Error::InvalidQuery);
+        let err = advance_on_agent_opening_with(&f.db, t.id, Stage::Po, &mut failing).unwrap_err();
+        assert!(err.starts_with("Erro no banco do nick: "), "{err}");
+        f.db.connection()
+            .execute_batch(
+                "CREATE TRIGGER no_history BEFORE INSERT ON ticket_stage_changes \
+                 BEGIN SELECT RAISE(ABORT, 'no history'); END;",
+            )
+            .unwrap();
+        let err = advance_on_agent_opening(&f.db, t.id, Stage::Po).unwrap_err();
+        assert!(
+            err.starts_with("Erro no banco do nick: ") && err.contains("no history"),
+            "{err}"
+        );
+        assert_eq!(f.stored(t.id).stage, "open");
     }
 
     // ---- editing the ID (NS-36) ----

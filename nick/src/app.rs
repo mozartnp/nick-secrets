@@ -2444,7 +2444,9 @@ impl App {
     /// generates the session ID and the name (the stage of the type and the ID of the ticket),
     /// takes the lock and stores the `active` row (agents.rs), and only then starts the PTY. A
     /// failing start ends the row and releases the lock. The agent joins the running ones, its
-    /// node is selected (its branches open), and it is shown with the focus on its terminal.
+    /// node is selected (its branches open), and it is shown with the focus on its terminal. An
+    /// agent of a ticket, once started, advances the stage of the ticket to its own when it is a
+    /// later one (`tickets::advance_on_agent_opening`, NS-45), with the message on the bar.
     pub fn open_agent(
         &mut self,
         project: &Path,
@@ -2498,12 +2500,26 @@ impl App {
             self.status = Some(message);
             return;
         }
+        // A new agent of a later stage moves its ticket to it (NS-45, plan D4), before the
+        // `start_running`, which reads the tree again and clears the bar. A failing advance ends
+        // no agent: it already runs, and only the bar says so.
+        let advance = match holder.owner {
+            Owner::Ticket(ticket_id) => {
+                tickets::advance_on_agent_opening(&self.db, ticket_id, stage)
+            }
+            Owner::Epic(_) => Ok(None),
+        };
         self.start_running(record, name, holder, check);
+        self.status = match advance {
+            Ok(message) => message,
+            Err(message) => Some(message),
+        };
     }
 
     /// An agent whose PTY started (opened, or resumed: NS-39) joins the running ones, with the
     /// jail and the warning of its `check`; its node is selected (its branches open: reading
-    /// only, the stage does not change), and it is shown with the focus on its terminal.
+    /// only; the stage changes only in `open_agent`, NS-45), and it is shown with the focus on its
+    /// terminal.
     fn start_running(&mut self, record: OpenAgent, name: String, holder: &Holder, check: Precheck) {
         let id = record.agent.id;
         let project = self
@@ -6033,18 +6049,9 @@ mod tests {
         }
 
         fn history_of(&self, key: &str) -> Vec<(String, String)> {
-            let id = self
-                .all_tickets()
+            self.sourced_history_of(key)
                 .into_iter()
-                .find(|t| t.key == key)
-                .unwrap()
-                .id;
-            self.app
-                .db
-                .list_stage_changes(id)
-                .unwrap()
-                .into_iter()
-                .map(|c| (c.from_stage, c.to_stage))
+                .map(|(from, to, _)| (from, to))
                 .collect()
         }
 
@@ -6107,7 +6114,15 @@ mod tests {
         f.key(KeyCode::Char('z'));
         let detail = f.detail();
         assert_eq!(detail.ticket.key, "NS-1");
-        assert_eq!(detail.changes, []);
+        // The openings of PO and of Dev advanced the stage (NS-45).
+        assert_eq!(
+            detail
+                .changes
+                .iter()
+                .map(|c| (c.to_stage.as_str(), c.source.as_str()))
+                .collect::<Vec<_>>(),
+            [("po", "agent_opening"), ("development", "agent_opening")]
+        );
         // The agents of the ticket are on the tree now (NS-38), every stage and state.
         let id = detail.ticket.id;
         assert_eq!(
@@ -6136,7 +6151,8 @@ mod tests {
         );
         f.choose_ticket_stage(TicketStage::Review);
         f.ch('s');
-        assert_eq!(f.detail().changes.len(), 1);
+        assert_eq!(f.detail().changes.len(), 3);
+        assert_eq!(f.detail().changes[2].source, "operator");
         assert_eq!(f.detail().ticket.stage, "review");
     }
 
@@ -6210,7 +6226,7 @@ mod tests {
     }
 
     #[test]
-    fn m_lists_the_five_stages_and_only_s_changes_the_stage() {
+    fn m_lists_the_six_stages_and_only_s_changes_the_stage() {
         let (mut f, _) = with_agents();
         f.key(KeyCode::Enter);
         assert_eq!(f.ch('m'), Action::None);
@@ -6223,7 +6239,7 @@ mod tests {
         );
         // Enter on the current one refuses, with the dialog open.
         f.key(KeyCode::Enter);
-        assert_eq!(f.status(), Some("O ticket NS-1 já está em PO."));
+        assert_eq!(f.status(), Some("O ticket NS-1 já está em Aberto."));
         assert!(matches!(
             f.app.dialog,
             Some(Dialog::ChooseTicketStage { .. })
@@ -6233,7 +6249,7 @@ mod tests {
         }
         assert!(matches!(
             f.app.dialog,
-            Some(Dialog::ChooseTicketStage { index: 4, .. })
+            Some(Dialog::ChooseTicketStage { index: 5, .. })
         ));
         f.key(KeyCode::Enter);
         assert_eq!(
@@ -6246,14 +6262,17 @@ mod tests {
         // Any other key cancels, nothing stored.
         assert_eq!(f.ch('n'), Action::None);
         assert_eq!(f.app.dialog, None);
-        assert_eq!(f.stage_of("NS-1"), "po");
+        assert_eq!(f.stage_of("NS-1"), "open");
         f.choose_ticket_stage(TicketStage::Done);
         assert_eq!(f.key(KeyCode::Enter), Action::None);
-        assert_eq!(f.stage_of("NS-1"), "po");
+        assert_eq!(f.stage_of("NS-1"), "open");
         // s stores it, with its history; S too, and backwards.
         f.choose_ticket_stage(TicketStage::Done);
         f.ch('s');
-        assert_eq!(f.status(), Some("Etapa do ticket NS-1: PO → Concluído."));
+        assert_eq!(
+            f.status(),
+            Some("Etapa do ticket NS-1: Aberto → Concluído.")
+        );
         assert_eq!(f.stage_of("NS-1"), "done");
         f.choose_ticket_stage(TicketStage::Review);
         f.ch('S');
@@ -6261,7 +6280,7 @@ mod tests {
         assert_eq!(
             f.history_of("NS-1"),
             [
-                ("po".to_string(), "done".to_string()),
+                ("open".to_string(), "done".to_string()),
                 ("done".to_string(), "review".to_string())
             ]
         );
@@ -6269,7 +6288,7 @@ mod tests {
         f.ch('m');
         assert!(matches!(
             f.app.dialog,
-            Some(Dialog::ChooseTicketStage { index: 3, .. })
+            Some(Dialog::ChooseTicketStage { index: 4, .. })
         ));
         f.key(KeyCode::Esc);
         assert_eq!(f.app.dialog, None);
@@ -6281,31 +6300,221 @@ mod tests {
         assert_eq!(f.keys(), ["NS-1", "NS-2"]);
     }
 
-    /// The nick never changes the stage alone (plan D9): opening, the end of an agent, ending
-    /// it by the operator or on the way out change neither the stage nor the history; and
-    /// moving to Done ends and hides no agent.
+    impl Fixture {
+        /// The history of the ticket `key` with the source of each change (NS-45).
+        fn sourced_history_of(&self, key: &str) -> Vec<(String, String, String)> {
+            let id = self
+                .all_tickets()
+                .into_iter()
+                .find(|t| t.key == key)
+                .unwrap()
+                .id;
+            self.app
+                .db
+                .list_stage_changes(id)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.from_stage, c.to_stage, c.source))
+                .collect()
+        }
+
+        /// The stage of the ticket `key` as the tree has it (read again by `refresh_tree`).
+        fn tree_stage_of(&self, key: &str) -> String {
+            self.app
+                .tickets
+                .values()
+                .flatten()
+                .find(|t| t.key == key)
+                .unwrap_or_else(|| panic!("no ticket {key}"))
+                .stage
+                .clone()
+        }
+
+        /// From any node of the ticket `key`: the operator moves it to `to` (`m`, `s`).
+        fn operator_moves(&mut self, key: &str, to: TicketStage) {
+            self.select(self.tnode(key));
+            self.choose_ticket_stage(to);
+            self.ch('s');
+            assert_eq!(self.stage_of(key), to.key());
+        }
+    }
+
+    fn triple(from: &str, to: &str, source: &str) -> (String, String, String) {
+        (from.into(), to.into(), source.into())
+    }
+
+    /// Replaces `the_stage_never_changes_alone_and_done_closes_no_agent` (NS-45, plan D4): a new
+    /// agent of a later stage moves the ticket to it, with the source `agent_opening`, the message
+    /// on the bar and the tree read with the new stage; and moving to Done still ends and hides no
+    /// agent.
     #[test]
-    fn the_stage_never_changes_alone_and_done_closes_no_agent() {
+    fn opening_a_new_agent_of_a_later_stage_advances_the_ticket() {
         let (mut f, _) = with_agents();
+        assert_eq!(f.stage_of("NS-1"), "open", "born in Aberto");
         let mut launcher = FakeLauncher::new(true);
-        f.open_kind(StageType::Development, &mut launcher);
-        f.app.agent_ended(launcher.ids[0], 0);
-        f.open_kind(StageType::Development, &mut launcher);
-        f.app.agent_ended_by_operator(launcher.ids[1]);
-        f.open_kind(StageType::Review, &mut launcher);
-        f.app.end_all_records().unwrap();
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
         assert_eq!(f.stage_of("NS-1"), "po");
-        assert_eq!(f.history_of("NS-1"), []);
-        // Done does not end nor hide the live agent of the ticket.
+        assert_eq!(f.tree_stage_of("NS-1"), "po", "the tree has the new stage");
+        assert_eq!(
+            f.sourced_history_of("NS-1"),
+            [triple("open", "po", "agent_opening")]
+        );
+        assert_eq!(
+            f.status(),
+            Some("Etapa do ticket NS-1: Aberto → PO (abertura de agente).")
+        );
+        assert_eq!(f.app.focus, Focus::Terminal, "the agent shown, as always");
+        assert_eq!(f.app.shown(), Some(launcher.ids[0]));
+        // Skipping a stage: PO → Dev.
+        f.shortcut();
         f.open_kind(StageType::Development, &mut launcher);
+        assert_eq!(f.stage_of("NS-1"), "development");
+        assert_eq!(f.tree_stage_of("NS-1"), "development");
+        assert_eq!(
+            f.status(),
+            Some("Etapa do ticket NS-1: PO → Dev (abertura de agente).")
+        );
+        assert_eq!(
+            f.sourced_history_of("NS-1"),
+            [
+                triple("open", "po", "agent_opening"),
+                triple("po", "development", "agent_opening")
+            ]
+        );
+        assert_eq!(f.stage_of("NS-2"), "open", "only that ticket");
+        // Every type of a stage advances by its stage (PO by Jira too).
+        f.shortcut();
+        f.select(f.tnode("NS-2"));
+        if let Ok(check) = launcher.check.as_mut() {
+            check.jira = true;
+        }
+        f.open_kind(StageType::PoJira, &mut launcher);
+        assert_eq!(f.stage_of("NS-2"), "po");
+        // Done does not end nor hide the live agent of the ticket.
         f.shortcut();
         let before = f.names_running();
-        f.on_ticket();
-        f.choose_ticket_stage(TicketStage::Done);
-        f.ch('s');
-        assert_eq!(f.stage_of("NS-1"), "done");
+        f.operator_moves("NS-1", TicketStage::Done);
         assert_eq!(f.names_running(), before);
-        assert_eq!(f.agent_rows().last().unwrap().3, "active");
+        assert_eq!(f.agent_rows()[1].3, "active");
+    }
+
+    /// NS-45, plan D4: nothing but a new agent of a later stage changes the stage, one case per
+    /// item of the ticket.
+    #[test]
+    fn the_stage_does_not_change_in_the_other_cases() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(true);
+        f.operator_moves("NS-1", TicketStage::Development);
+        let history = f.sourced_history_of("NS-1");
+        assert_eq!(history, [triple("open", "development", "operator")]);
+        // A new agent of an earlier stage, then of the same one.
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
+        assert_eq!(f.status(), None, "no message of the stage");
+        f.shortcut();
+        f.open_kind(StageType::Development, &mut launcher);
+        assert_eq!(f.stage_of("NS-1"), "development");
+        // Switching the focus to an existing agent: the shortcut, and Enter on a live one.
+        f.shortcut();
+        f.shortcut();
+        assert_eq!(f.app.focus, Focus::Terminal);
+        f.shortcut();
+        f.select(NodeId::Agent(launcher.ids[0]));
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.app.shown(), Some(launcher.ids[0]));
+        assert_eq!(f.stage_of("NS-1"), "development");
+        // The end of an agent, its end by the operator and the way out.
+        f.app.agent_ended(launcher.ids[0], 0);
+        f.app.agent_ended_by_operator(launcher.ids[1]);
+        f.select(f.tnode("NS-1"));
+        f.open_kind(StageType::Review, &mut launcher);
+        f.operator_moves("NS-1", TicketStage::Done);
+        let history = f.sourced_history_of("NS-1");
+        assert_eq!(
+            history,
+            [
+                triple("open", "development", "operator"),
+                triple("development", "review", "agent_opening"),
+                triple("review", "done", "operator")
+            ]
+        );
+        f.app.end_all_records().unwrap();
+        assert_eq!(f.sourced_history_of("NS-1"), history);
+        // A ticket in Concluído: a new agent of any stage leaves it there.
+        f.select(f.tnode("NS-1"));
+        f.open_kind(StageType::Review, &mut launcher);
+        f.shortcut();
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
+        assert_eq!(f.stage_of("NS-1"), "done");
+        assert_eq!(f.sourced_history_of("NS-1"), history);
+        // A failing spawn: the agent did not open, the stage stays.
+        f.shortcut();
+        f.select(f.tnode("NS-2"));
+        launcher.spawn = Err("sem PTY".into());
+        f.open_kind(StageType::Review, &mut launcher);
+        assert_eq!(f.status(), Some("Não consegui abrir o agente: sem PTY."));
+        assert_eq!(f.stage_of("NS-2"), "open");
+        // A failing `agents::open` (the folder of the locks can't be made).
+        launcher.spawn = Ok(());
+        let file = f.root.join("not-a-dir");
+        fs::write(&file, "").unwrap();
+        f.app.agents_dir = Some(file.join("agents"));
+        let spawns = launcher.spawns.len();
+        f.open_kind(StageType::Review, &mut launcher);
+        assert_eq!(launcher.spawns.len(), spawns, "no spawn");
+        assert_eq!(f.stage_of("NS-2"), "open");
+        assert_eq!(f.sourced_history_of("NS-2"), []);
+    }
+
+    /// NS-45: the resume of a stopped agent (NS-39) does not change the stage.
+    #[test]
+    fn resuming_an_agent_does_not_change_the_stage() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        assert_eq!(f.stage_of("NS-2"), "tech_leader", "its opening advanced it");
+        f.operator_moves("NS-2", TicketStage::Open);
+        let history = f.sourced_history_of("NS-2");
+        f.select(Fixture::anode(id));
+        assert!(f.r(&mut launcher));
+        assert_eq!(f.state_of(id), "active");
+        assert_eq!(f.stage_of("NS-2"), "open");
+        assert_eq!(f.sourced_history_of("NS-2"), history);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado.")
+        );
+    }
+
+    /// NS-45: an agent of an epic changes the stage of no ticket (the epic has none).
+    #[test]
+    fn an_agent_of_an_epic_changes_no_stage() {
+        let (mut f, _) = with_epic();
+        let mut launcher = FakeLauncher::new(true);
+        f.open_kind(StageType::TechLeader, &mut launcher);
+        assert_eq!(launcher.ids.len(), 1, "it opened");
+        assert_eq!(f.status(), None);
+        for key in ["NS-1", "NS-2"] {
+            let t = f.app.db.get_ticket(f.tnode_id(key)).unwrap().unwrap();
+            assert_eq!(t.stage, "open", "{key}");
+            assert_eq!(f.app.db.list_stage_changes(t.id).unwrap(), [], "{key}");
+        }
+    }
+
+    /// NS-45: the manual change (NS-36) goes to Aberto from any stage, by the operator.
+    #[test]
+    fn the_operator_moves_the_ticket_to_open_from_any_stage() {
+        let (mut f, _) = with_agents();
+        for stage in TicketStage::ALL.into_iter().skip(1) {
+            f.operator_moves("NS-1", stage);
+            f.choose_ticket_stage(TicketStage::Open);
+            f.ch('s');
+            assert_eq!(
+                f.status(),
+                Some(format!("Etapa do ticket NS-1: {} → Aberto.", stage.label()).as_str())
+            );
+            assert_eq!(f.stage_of("NS-1"), "open");
+        }
+        let history = f.sourced_history_of("NS-1");
+        assert_eq!(history.len(), 10);
+        assert!(history.iter().all(|(_, _, source)| source == "operator"));
     }
 
     /// Adapted from `g_and_v_work_from_the_ticket_screen` (NS-38: `v` is the filter of the

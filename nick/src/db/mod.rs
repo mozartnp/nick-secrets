@@ -181,11 +181,14 @@ impl Owner {
     }
 }
 
-/// A change of the stage of a ticket, as stored (migration 5): the raw keys of the stages.
+/// A change of the stage of a ticket, as stored (migrations 5 and 9): the raw keys of the stages
+/// and of the source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageChangeRow {
     pub from_stage: String,
     pub to_stage: String,
+    /// Who changed it: `operator` or `agent_opening` (`tickets::StageSource`, NS-45).
+    pub source: String,
     /// RFC 3339, in UTC.
     pub changed_at: String,
 }
@@ -365,20 +368,57 @@ impl Db {
                 known,
             });
         }
-        for (version, sql) in (current + 1..).zip(&migrations[current as usize..]) {
-            let migrate_error = |err: rusqlite::Error| OpenError::Migrate {
+        let pending = &migrations[current as usize..];
+        if pending.is_empty() {
+            return Ok(Db { conn });
+        }
+        // The migrations run with the foreign keys off (NS-45, plan D2; the 12 steps of "Making
+        // Other Kinds Of Table Schema Changes" of SQLite): rebuilding a parent table drops it, and
+        // with them on the DROP deletes the rows of its children (ON DELETE CASCADE). The pragma
+        // is ignored inside a transaction, so it is set around the loop, and back on also when a
+        // migration fails. The `foreign_key_check` of each one takes the place of the check.
+        conn.pragma_update(None, "foreign_keys", false)
+            .map_err(open_error)?;
+        let migrated = Db::migrate(&mut conn, path, current, pending);
+        let on = conn.pragma_update(None, "foreign_keys", true);
+        migrated?;
+        on.map_err(open_error)?;
+        Ok(Db { conn })
+    }
+
+    /// Runs the `pending` migrations, from the version `current` on, each with its version in one
+    /// transaction (all or nothing), refusing one that leaves a broken reference.
+    fn migrate(
+        conn: &mut Connection,
+        path: &Path,
+        current: u32,
+        pending: &[&str],
+    ) -> Result<(), OpenError> {
+        for (version, sql) in (current + 1..).zip(pending) {
+            let migrate_error = |message: String| OpenError::Migrate {
                 path: path.to_path_buf(),
                 version,
-                message: err.to_string(),
+                message,
             };
-            // The migration and its version in one transaction: all or nothing.
-            let tx = conn.transaction().map_err(migrate_error)?;
-            tx.execute_batch(sql).map_err(migrate_error)?;
+            let sql_error = |err: rusqlite::Error| migrate_error(err.to_string());
+            let tx = conn.transaction().map_err(sql_error)?;
+            tx.execute_batch(sql).map_err(sql_error)?;
+            if let Some((table, parent)) = tx
+                .query_row("PRAGMA foreign_key_check", [], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(2)?))
+                })
+                .optional()
+                .map_err(sql_error)?
+            {
+                return Err(migrate_error(format!(
+                    "referência quebrada na tabela {table} (para {parent})"
+                )));
+            }
             tx.pragma_update(None, "user_version", version)
-                .map_err(migrate_error)?;
-            tx.commit().map_err(migrate_error)?;
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
         }
-        Ok(Db { conn })
+        Ok(())
     }
 
     /// The connection, for the tests.
@@ -876,15 +916,17 @@ impl Db {
         Ok(())
     }
 
-    /// Changes the stage of the ticket from `from` to `to` and writes the row of the history,
-    /// in one transaction: both or neither. Only when the ticket is still at `from`; otherwise
-    /// nothing is written, and the result says whether the ticket is gone or was moved (by
-    /// another nick). The only writer of the stage is `tickets::change_stage`.
+    /// Changes the stage of the ticket from `from` to `to` and writes the row of the history with
+    /// its `source`, in one transaction: both or neither. Only when the ticket is still at `from`;
+    /// otherwise nothing is written, and the result says whether the ticket is gone or was moved
+    /// (by another nick). The only writer of the stage, called only by `tickets::change_stage`
+    /// (the operator) and `tickets::advance_on_agent_opening` (NS-45).
     pub fn change_ticket_stage(
         &self,
         id: i64,
         from: &str,
         to: &str,
+        source: &str,
     ) -> rusqlite::Result<StageChange> {
         // The Db has &self, so the transaction is unchecked; it rolls back when dropped.
         let tx = self.conn.unchecked_transaction()?;
@@ -905,9 +947,9 @@ impl Db {
             });
         }
         tx.execute(
-            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, changed_at) \
-             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-            params![id, from, to],
+            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, source, \
+             changed_at) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![id, from, to, source],
         )?;
         tx.commit()?;
         Ok(StageChange::Changed)
@@ -916,14 +958,15 @@ impl Db {
     /// The history of the stage of the ticket, oldest first.
     pub fn list_stage_changes(&self, ticket_id: i64) -> rusqlite::Result<Vec<StageChangeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT from_stage, to_stage, changed_at FROM ticket_stage_changes \
+            "SELECT from_stage, to_stage, source, changed_at FROM ticket_stage_changes \
              WHERE ticket_id = ?1 ORDER BY id",
         )?;
         stmt.query_map(params![ticket_id], |row| {
             Ok(StageChangeRow {
                 from_stage: row.get(0)?,
                 to_stage: row.get(1)?,
-                changed_at: row.get(2)?,
+                source: row.get(2)?,
+                changed_at: row.get(3)?,
             })
         })?
         .collect()
@@ -988,7 +1031,7 @@ impl Db {
 mod tests {
     use super::migrations::{
         MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7,
-        MIGRATION_8, MIGRATIONS,
+        MIGRATION_8, MIGRATION_9, MIGRATIONS,
     };
     use super::*;
 
@@ -1021,12 +1064,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_8_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_9_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 8);
+        assert_eq!(user_version(db.connection()), 9);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -1061,7 +1104,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 8);
+        assert_eq!(user_version(db.connection()), 9);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -1099,7 +1142,7 @@ mod tests {
         let path = tmp.path().join("nick.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 9;")
+            conn.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 10;")
                 .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
@@ -1108,7 +1151,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 9, mais nova que a deste nick (8). \
+                "Erro: o banco {} está na versão 10, mais nova que a deste nick (9). \
                  Atualize o nick.",
                 path.display()
             )
@@ -1160,6 +1203,120 @@ mod tests {
         assert_eq!(tables(&conn), Vec::<String>::new());
     }
 
+    fn foreign_keys(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// The rebuild of a parent table (the 12 steps of SQLite) in a migration: with the foreign keys
+    /// on, the DROP would delete the rows of its children (ON DELETE CASCADE). NS-45, plan D2.
+    #[test]
+    fn a_migration_that_rebuilds_a_parent_table_keeps_its_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        {
+            let db = Db::open_with(&path, &MIGRATIONS[..2]).unwrap();
+            let project = db.insert_project("auto_scrum", "p", "/p").unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO tickets (project_id, key, is_provisional, title, created_at) \
+                     VALUES (?1, 'NS-1', 0, 't', '2026-01-01T00:00:00Z')",
+                    params![project.id],
+                )
+                .unwrap();
+        }
+        let rebuild = "\
+CREATE TABLE projects_new (
+    id         INTEGER PRIMARY KEY,
+    module_id  INTEGER NOT NULL REFERENCES modules(id),
+    name       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (module_id, path)
+);
+INSERT INTO projects_new SELECT id, module_id, name, path, created_at FROM projects;
+DROP TABLE projects;
+ALTER TABLE projects_new RENAME TO projects;
+";
+        let db = Db::open_with(&path, &[MIGRATION_1, MIGRATION_2, rebuild]).unwrap();
+        assert_eq!(user_version(db.connection()), 3);
+        assert_eq!(count(db.connection(), "projects"), 1);
+        assert_eq!(count(db.connection(), "tickets"), 1, "the ticket stays");
+        assert_eq!(foreign_keys(db.connection()), 1, "on again after migrating");
+    }
+
+    /// With the foreign keys off in the migrations, a broken reference is caught by the
+    /// `foreign_key_check` before the commit: the migration is undone (NS-45, plan D2).
+    #[test]
+    fn a_migration_that_leaves_a_broken_reference_is_refused_and_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        Db::open_with(&path, &MIGRATIONS[..2]).unwrap();
+        let broken = "\
+CREATE TABLE half (x);
+INSERT INTO tickets (project_id, key, is_provisional, title, created_at)
+    VALUES (99, 'NS-1', 0, 't', '2026-01-01T00:00:00Z');
+";
+        let err = Db::open_with(&path, &[MIGRATION_1, MIGRATION_2, broken])
+            .err()
+            .expect("it fails");
+        assert!(
+            matches!(err, OpenError::Migrate { version: 3, .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Erro: não consegui atualizar o banco do nick {} para a versão 3: referência \
+                 quebrada na tabela tickets (para projects).",
+                path.display()
+            )
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), 2);
+        assert_eq!(tables(&conn), ["modules", "projects", "tickets"]);
+        assert_eq!(count(&conn, "tickets"), 0);
+    }
+
+    /// The foreign keys are on after migrating an old database, after opening one with no
+    /// pending migration, and on the next opening after a failing migration (NS-45, plan D2).
+    #[test]
+    fn foreign_keys_are_on_after_migrating_and_after_a_failing_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        Db::open_with(&path, &MIGRATIONS[..2]).unwrap();
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(db.connection()), MIGRATIONS.len() as u32);
+        assert_eq!(foreign_keys(db.connection()), 1, "after migrating");
+        drop(db);
+        assert_eq!(
+            foreign_keys(Db::open(&path).unwrap().connection()),
+            1,
+            "none pending"
+        );
+
+        let other = tmp.path().join("other.db");
+        let broken = [
+            MIGRATION_1,
+            "CREATE TABLE half (x); INSERT INTO nope VALUES (1);",
+        ];
+        assert!(Db::open_with(&other, &broken).is_err());
+        let db = Db::open(&other).unwrap();
+        assert_eq!(foreign_keys(db.connection()), 1, "the next opening");
+        let orphan = db.connection().execute(
+            "INSERT INTO projects (module_id, name, path, created_at) VALUES (99, 'x', '/x', 'now')",
+            [],
+        );
+        assert!(orphan.is_err(), "a project of a missing module is refused");
+    }
+
     #[test]
     fn a_directory_in_place_of_the_file_is_an_open_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1183,7 +1340,7 @@ mod tests {
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            8,
+            9,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -1340,6 +1497,74 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
 "
         );
         assert_eq!(MIGRATIONS[7], MIGRATION_8);
+        assert_eq!(
+            MIGRATION_9,
+            "\
+DROP TRIGGER epics_key_not_a_ticket_insert;
+DROP TRIGGER epics_key_not_a_ticket_update;
+DROP TRIGGER tickets_key_not_an_epic_insert;
+DROP TRIGGER tickets_key_not_an_epic_update;
+DROP TRIGGER tickets_epic_of_the_project_insert;
+DROP TRIGGER tickets_epic_of_the_project_update;
+CREATE TABLE tickets_new (
+    id             INTEGER PRIMARY KEY,
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,     -- the Jira ID, or the provisional short UUID
+    is_provisional INTEGER NOT NULL CHECK (is_provisional IN (0, 1)),
+    title          TEXT NOT NULL CHECK (trim(title) <> ''),
+    created_at     TEXT NOT NULL,     -- RFC 3339, in UTC
+    hidden_at      TEXT,              -- RFC 3339, in UTC; NULL while visible
+    stage          TEXT NOT NULL DEFAULT 'open'
+                   CHECK (stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done')),
+    epic_id        INTEGER REFERENCES epics(id),  -- NULL: no epic
+    UNIQUE (project_id, key)
+);
+INSERT INTO tickets_new (id, project_id, key, is_provisional, title, created_at, hidden_at,
+                         stage, epic_id)
+    SELECT id, project_id, key, is_provisional, title, created_at, hidden_at, stage, epic_id
+    FROM tickets;
+CREATE TABLE ticket_stage_changes_new (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    from_stage TEXT NOT NULL
+               CHECK (from_stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done')),
+    to_stage   TEXT NOT NULL
+               CHECK (to_stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done')),
+    source     TEXT NOT NULL CHECK (source IN ('operator', 'agent_opening')),
+    changed_at TEXT NOT NULL,   -- RFC 3339, in UTC
+    CHECK (from_stage <> to_stage)
+);
+INSERT INTO ticket_stage_changes_new (id, ticket_id, from_stage, to_stage, source, changed_at)
+    SELECT id, ticket_id, from_stage, to_stage, 'operator', changed_at FROM ticket_stage_changes;
+DROP TABLE ticket_stage_changes;
+DROP TABLE tickets;
+ALTER TABLE tickets_new RENAME TO tickets;
+ALTER TABLE ticket_stage_changes_new RENAME TO ticket_stage_changes;
+-- the key is unique across the tickets and the epics of a project (both use .nick/docs/<key>/)
+CREATE TRIGGER epics_key_not_a_ticket_insert BEFORE INSERT ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER epics_key_not_a_ticket_update BEFORE UPDATE OF key ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER tickets_key_not_an_epic_insert BEFORE INSERT ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+CREATE TRIGGER tickets_key_not_an_epic_update BEFORE UPDATE OF key ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+-- a ticket only goes to an epic of its own project
+CREATE TRIGGER tickets_epic_of_the_project_insert BEFORE INSERT ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+"
+        );
+        assert_eq!(MIGRATIONS[8], MIGRATION_9);
     }
 
     #[test]
@@ -1348,13 +1573,13 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
         let path = tmp.path().join("nick.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 9;")
+            .execute_batch("PRAGMA user_version = 10;")
             .unwrap();
         let err = Db::open(&path).err().expect("a newer database is refused");
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 9, mais nova que a deste nick (8). \
+                "Erro: o banco {} está na versão 10, mais nova que a deste nick (9). \
                  Atualize o nick.",
                 path.display()
             )
@@ -2116,11 +2341,22 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
             .unwrap()
     }
 
+    /// A row of the history by hand, with the source `operator` (the column of the migration 9).
     fn raw_change(conn: &Connection, ticket: i64, from: &str, to: &str) -> rusqlite::Result<usize> {
+        raw_sourced_change(conn, ticket, from, to, Some("operator"))
+    }
+
+    fn raw_sourced_change(
+        conn: &Connection,
+        ticket: i64,
+        from: &str,
+        to: &str,
+        source: Option<&str>,
+    ) -> rusqlite::Result<usize> {
         conn.execute(
-            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, changed_at) \
-             VALUES (?1, ?2, ?3, 'now')",
-            params![ticket, from, to],
+            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, source, \
+             changed_at) VALUES (?1, ?2, ?3, ?4, 'now')",
+            params![ticket, from, to, source],
         )
     }
 
@@ -2271,24 +2507,32 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
         let (db, project, ticket) = with_ticket(&tmp);
         let other = db.insert_ticket(project, "NS-2", false, "t", None).unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "po", "review").unwrap(),
+            db.change_ticket_stage(ticket, "open", "review", "operator")
+                .unwrap(),
             StageChange::Changed
         );
         assert_eq!(
-            db.change_ticket_stage(ticket, "review", "development")
+            db.change_ticket_stage(ticket, "review", "development", "agent_opening")
                 .unwrap(),
             StageChange::Changed,
             "backwards too"
         );
         assert_eq!(stage_of(&db, ticket), "development");
-        assert_eq!(stage_of(&db, other.id), "po", "only that ticket");
+        assert_eq!(stage_of(&db, other.id), "open", "only that ticket");
         let changes = db.list_stage_changes(ticket).unwrap();
         assert_eq!(
             changes
                 .iter()
-                .map(|c| (c.from_stage.as_str(), c.to_stage.as_str()))
+                .map(|c| (
+                    c.from_stage.as_str(),
+                    c.to_stage.as_str(),
+                    c.source.as_str()
+                ))
                 .collect::<Vec<_>>(),
-            [("po", "review"), ("review", "development")]
+            [
+                ("open", "review", "operator"),
+                ("review", "development", "agent_opening")
+            ]
         );
         for change in &changes {
             assert_rfc3339_utc(&change.changed_at);
@@ -2302,17 +2546,20 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
     fn change_ticket_stage_gone_and_moved_store_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, project, ticket) = with_ticket(&tmp);
-        // Another nick moved it to review: this one still believes it is in po.
-        db.change_ticket_stage(ticket, "po", "review").unwrap();
+        // Another nick moved it to review: this one still believes it is in open.
+        db.change_ticket_stage(ticket, "open", "review", "operator")
+            .unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "po", "done").unwrap(),
+            db.change_ticket_stage(ticket, "open", "done", "operator")
+                .unwrap(),
             StageChange::Moved
         );
         assert_eq!(stage_of(&db, ticket), "review");
         assert_eq!(db.list_stage_changes(ticket).unwrap().len(), 1);
         db.delete_project(project).unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "review", "done").unwrap(),
+            db.change_ticket_stage(ticket, "review", "done", "agent_opening")
+                .unwrap(),
             StageChange::Gone
         );
         assert_eq!(stage_changes(db.connection()), []);
@@ -2330,18 +2577,28 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
                  BEGIN SELECT RAISE(ABORT, 'no history'); END;",
             )
             .unwrap();
-        let err = db.change_ticket_stage(ticket, "po", "review").unwrap_err();
+        let err = db
+            .change_ticket_stage(ticket, "open", "review", "operator")
+            .unwrap_err();
         assert!(err.to_string().contains("no history"), "{err}");
-        assert_eq!(stage_of(&db, ticket), "po");
+        assert_eq!(stage_of(&db, ticket), "open");
         assert_eq!(stage_changes(db.connection()), []);
         // The connection is usable afterwards (no transaction left open).
         db.connection()
             .execute_batch("DROP TRIGGER no_history;")
             .unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "po", "review").unwrap(),
+            db.change_ticket_stage(ticket, "open", "review", "operator")
+                .unwrap(),
             StageChange::Changed
         );
+        // A source the CHECK refuses stores nothing either: the stage stays.
+        let err = db
+            .change_ticket_stage(ticket, "review", "done", "cron")
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{err}");
+        assert_eq!(stage_of(&db, ticket), "review");
+        assert_eq!(stage_changes(db.connection()).len(), 1);
     }
 
     #[test]
@@ -3406,7 +3663,8 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
             let c = v6_insert_agent(conn, t, "review", "s-3", "archived", Some("NS-1"));
             (raw_agents(conn), [a, b, c])
         };
-        let db = Db::open(&path).unwrap();
+        // Only up to the migration 8: the test of the migration 9 is its own (NS-45).
+        let db = Db::open_with(&path, &MIGRATIONS[..8]).unwrap();
         assert_eq!(user_version(db.connection()), 8);
         assert_eq!(raw_agents(db.connection()), before, "every row is kept");
         for id in ids {
@@ -3538,5 +3796,273 @@ CREATE UNIQUE INDEX agents_resume_session_id ON agents(resume_session_id);
         assert_eq!(state_of(&db, a.id), "active", "resumed anyway");
         assert_eq!(resume_session_of(&db, a.id), None, "by the session it had");
         assert_eq!(resume_session_of(&db, b.id).as_deref(), Some("s-9"));
+    }
+
+    // ---- migration 9: the stage "Aberto" and the source of the history (NS-45) ----
+
+    /// Every row of a query, every column as a raw value.
+    fn dump(conn: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The name and the text of every trigger.
+    fn triggers(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        dump(
+            conn,
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+    }
+
+    /// Every row of every table but the history, whose columns change (by `id`).
+    fn every_row(conn: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        [
+            "modules", "projects", "epics", "tickets", "agents", "settings",
+        ]
+        .map(|table| dump(conn, &format!("SELECT * FROM {table} ORDER BY rowid")))
+        .into()
+    }
+
+    const OLD_HISTORY: &str = "SELECT id, ticket_id, from_stage, to_stage, changed_at FROM ticket_stage_changes ORDER BY id";
+
+    /// A version 8 database with a bit of everything: two projects, epics (hidden and
+    /// provisional), tickets in and out of an epic (hidden, provisional, in every stage of before,
+    /// with a gap in the ids), agents of a ticket and of an epic in every state (one resumed by
+    /// another session), the history and a setting. Returns the ids of the projects.
+    fn populated_v8(path: &Path) -> (i64, i64) {
+        let old = Db::open_with(path, &MIGRATIONS[..8]).unwrap();
+        assert_eq!(user_version(old.connection()), 8);
+        let conn = old.connection();
+        let a = old.insert_project("auto_scrum", "a", "/a").unwrap().id;
+        let b = old.insert_project("auto_scrum", "b", "/b").unwrap().id;
+        let epic = |project: i64, key: &str, provisional: bool, hidden: bool| -> i64 {
+            conn.query_row(
+                "INSERT INTO epics (project_id, key, is_provisional, title, created_at, \
+                 hidden_at) VALUES (?1, ?2, ?3, 'épico', '2026-01-01T00:00:00Z', \
+                 CASE WHEN ?4 THEN '2026-01-02T00:00:00Z' END) RETURNING id",
+                params![project, key, provisional, hidden],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let ea = epic(a, "EP-1", false, false);
+        let eb = epic(a, "0a1b2c3d", true, true);
+        let ec = epic(b, "EP-1", false, false);
+        let ticket = |project: i64,
+                      key: &str,
+                      provisional: bool,
+                      hidden: bool,
+                      stage: &str,
+                      epic: Option<i64>|
+         -> i64 {
+            conn.query_row(
+                "INSERT INTO tickets (project_id, key, is_provisional, title, created_at, \
+                 hidden_at, stage, epic_id) VALUES (?1, ?2, ?3, 'título', \
+                 '2026-01-03T00:00:00Z', CASE WHEN ?4 THEN '2026-01-04T00:00:00Z' END, ?5, ?6) \
+                 RETURNING id",
+                params![project, key, provisional, hidden, stage, epic],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let t1 = ticket(a, "NS-1", false, false, "po", Some(ea));
+        let gone = ticket(a, "NS-0", false, false, "po", None);
+        conn.execute("DELETE FROM tickets WHERE id = ?1", [gone])
+            .unwrap();
+        let t2 = ticket(a, "9f8e7d6c", true, true, "done", None);
+        let t3 = ticket(a, "NS-3", false, false, "development", Some(eb));
+        let t4 = ticket(b, "NS-1", false, false, "review", Some(ec));
+        let t5 = ticket(b, "NS-5", false, true, "tech_leader", None);
+        let agent = |ticket: Option<i64>,
+                     epic: Option<i64>,
+                     stage: &str,
+                     session: &str,
+                     state: &str,
+                     resume: Option<&str>| {
+            conn.execute(
+                "INSERT INTO agents (ticket_id, epic_id, stage, session_id, name, opened_at, \
+                 state, opened_key, resume_session_id) VALUES (?1, ?2, ?3, ?4, 'n', \
+                 '2026-01-05T00:00:00Z', ?5, 'NS-1', ?6)",
+                params![ticket, epic, stage, session, state, resume],
+            )
+            .unwrap();
+        };
+        agent(Some(t1), None, "po", "s-1", "active", None);
+        agent(
+            Some(t1),
+            None,
+            "tech_leader",
+            "s-2",
+            "stopped",
+            Some("s-2b"),
+        );
+        agent(Some(t3), None, "development", "s-3", "archived", None);
+        agent(Some(t4), None, "review", "s-4", "stopped", None);
+        agent(None, Some(ea), "po", "s-5", "active", None);
+        agent(None, Some(ec), "tech_leader", "s-6", "archived", None);
+        let change = |ticket: i64, from: &str, to: &str, at: &str| {
+            conn.execute(
+                "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, changed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![ticket, from, to, at],
+            )
+            .unwrap();
+        };
+        change(t2, "po", "review", "2026-01-06T00:00:00Z");
+        change(t2, "review", "done", "2026-01-07T00:00:00Z");
+        change(t3, "po", "development", "2026-01-08T00:00:00Z");
+        change(t4, "po", "review", "2026-01-09T00:00:00Z");
+        change(t5, "po", "tech_leader", "2026-01-10T00:00:00Z");
+        old.set_setting(SETTING_RESERVED_SHORTCUT, "f7").unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn a_version_8_database_populated_migrates_to_9_keeping_every_row_and_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (a, b) = populated_v8(&path);
+        let (rows, history, before_triggers) = {
+            let conn = Connection::open(&path).unwrap();
+            (every_row(&conn), dump(&conn, OLD_HISTORY), triggers(&conn))
+        };
+        assert_eq!(rows[3].len(), 5, "five tickets");
+        assert_eq!(rows[4].len(), 6, "six agents");
+        assert_eq!(history.len(), 5);
+        assert_eq!(before_triggers.len(), 6);
+
+        let db = Db::open(&path).unwrap();
+        let conn = db.connection();
+        assert_eq!(user_version(conn), 9);
+        assert_eq!(
+            every_row(conn),
+            rows,
+            "every row, field by field, with its id"
+        );
+        assert_eq!(dump(conn, OLD_HISTORY), history, "the history, with its id");
+        let sources: Vec<String> = conn
+            .prepare("SELECT source FROM ticket_stage_changes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            sources, ["operator"; 5],
+            "only the operator changed it before"
+        );
+        assert_eq!(checks(conn), (0, "ok".to_string()), "no broken link");
+        assert_eq!(triggers(conn), before_triggers, "the same six triggers");
+        assert_eq!(foreign_keys(conn), 1);
+
+        // The cascade from the project still works, and takes only what is its own.
+        db.delete_project(a).unwrap();
+        let left = |table: &str| -> Vec<i64> {
+            conn.prepare(&format!(
+                "SELECT DISTINCT project_id FROM {table} ORDER BY project_id"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        assert_eq!(left("tickets"), [b]);
+        assert_eq!(left("epics"), [b]);
+        let sessions: Vec<String> = conn
+            .prepare("SELECT session_id FROM agents ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(sessions, ["s-4", "s-6"]);
+        assert_eq!(count(conn, "ticket_stage_changes"), 2);
+        assert_eq!(checks(conn), (0, "ok".to_string()));
+    }
+
+    #[test]
+    fn the_triggers_of_the_migration_7_still_refuse_after_the_migration_9() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (a, b) = populated_v8(&path);
+        let db = Db::open(&path).unwrap();
+        let conn = db.connection();
+        // The key of an epic in a ticket, and the key of a ticket in an epic.
+        let err = raw_ticket(conn, a, "EP-1", 0, "t").unwrap_err();
+        assert!(is_trigger_abort(&err, KEY_OF_AN_EPIC), "{err:?}");
+        let err = raw_epic(conn, a, "NS-1").unwrap_err();
+        assert!(is_trigger_abort(&err, KEY_OF_A_TICKET), "{err:?}");
+        // An epic of another project.
+        let epic_of_b: i64 = conn
+            .query_row("SELECT id FROM epics WHERE project_id = ?1", [b], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let err = conn
+            .execute(
+                "UPDATE tickets SET epic_id = ?2 WHERE project_id = ?1",
+                params![a, epic_of_b],
+            )
+            .unwrap_err();
+        assert!(is_trigger_abort(&err, EPIC_OF_ANOTHER_PROJECT), "{err:?}");
+    }
+
+    #[test]
+    fn a_new_ticket_is_born_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project, ticket) = with_ticket(&tmp);
+        assert_eq!(stage_of(&db, ticket), "open");
+        assert_eq!(db.list_tickets(project, true).unwrap()[0].stage, "open");
+    }
+
+    #[test]
+    fn the_open_stage_and_the_source_of_the_history_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let conn = db.connection();
+        for stage in ["po", "open"] {
+            conn.execute(
+                "UPDATE tickets SET stage = ?2 WHERE id = ?1",
+                params![ticket, stage],
+            )
+            .unwrap();
+        }
+        for stage in ["Open", "aberto", "Aberto", ""] {
+            assert!(
+                conn.execute(
+                    "UPDATE tickets SET stage = ?2 WHERE id = ?1",
+                    params![ticket, stage],
+                )
+                .is_err(),
+                "ticket stage {stage:?}"
+            );
+            assert!(
+                raw_change(conn, ticket, stage, "po").is_err(),
+                "from {stage:?}"
+            );
+            assert!(
+                raw_change(conn, ticket, "po", stage).is_err(),
+                "to {stage:?}"
+            );
+        }
+        assert!(
+            raw_change(conn, ticket, "open", "open").is_err(),
+            "same stage"
+        );
+        for source in [Some("cron"), Some("Operator"), Some(""), None] {
+            assert!(
+                raw_sourced_change(conn, ticket, "open", "po", source).is_err(),
+                "source {source:?}"
+            );
+        }
+        assert_eq!(stage_changes(conn), []);
+        raw_sourced_change(conn, ticket, "open", "po", Some("operator")).unwrap();
+        raw_sourced_change(conn, ticket, "po", "open", Some("agent_opening")).unwrap();
+        assert_eq!(stage_changes(conn).len(), 2);
     }
 }

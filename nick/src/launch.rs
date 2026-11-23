@@ -5,9 +5,10 @@
 //! and, unlike the init, no variable swaps it: one would let something else run in place of the
 //! path that guarantees the jail and the rules. Before the PTY, the shell runs
 //! `bash <launcher> --check` (outside the PTY, so an error of the config or of the jail reaches
-//! the TUI) and learns from its three
-//! lines whether the agent runs in the jail and which stage types the project offers (Jira,
-//! Sentry). Then `bash <launcher> --render <type> <answers>` (NS-35) builds the prompt by bash,
+//! the TUI) and learns from its four
+//! lines whether the agent runs in the jail, which stage types the project offers (Jira,
+//! Sentry) and the base of the Jira links (NS-53). `bash <launcher> --jira-url` (NS-53) gives only
+//! that base, without the jail, for the panels of the list. Then `bash <launcher> --render <type> <answers>` (NS-35) builds the prompt by bash,
 //! into its log, and the shell only reads that log for the preview: no Rust builds a prompt, reads
 //! a template or reads the config of the project. The launch goes through the `AgentLauncher`
 //! trait, so the TUI state (app.rs) is tested with a fake one that only records the calls.
@@ -23,8 +24,9 @@ use crate::agents::Stage;
 use crate::paths::normalize;
 use crate::stages::StageType;
 
-/// When `--check` exits with 0 but its stdout is not exactly the three lines `jail=`, `jira=`
-/// and `sentry=`: nothing is ever presumed.
+/// When `--check` exits with 0 but its stdout is not exactly the four lines `jail=`, `jira=`,
+/// `sentry=` and `jira_url=` (NS-53): nothing is ever presumed, and a launcher of another version
+/// (the three lines of before) is refused.
 pub const UNEXPECTED_CHECK_MESSAGE: &str =
     "O bin/nick-agent respondeu algo inesperado na verificação.";
 
@@ -113,6 +115,9 @@ pub struct Precheck {
     pub jira: bool,
     /// Whether the project uses Sentry (`sentry=true`): the type with Sentry is offered.
     pub sentry: bool,
+    /// The JIRA_URL of the config (`jira_url=<value>`, NS-53), the base of the Jira links;
+    /// `None` when empty.
+    pub jira_url: Option<String>,
     /// What the check wrote on stderr (the warnings of the config), when anything.
     pub warning: Option<String>,
 }
@@ -141,12 +146,20 @@ fn flag_line(line: &[u8], name: &str) -> Option<bool> {
     }
 }
 
+/// The value of the line `jira_url=<value>` (NS-53): the rest of the line, literally, when it is
+/// UTF-8 (`Some("")` when empty).
+fn jira_url_line(line: &[u8]) -> Option<String> {
+    let value = line.strip_prefix(b"jira_url=")?;
+    String::from_utf8(value.to_vec()).ok()
+}
+
 /// Reads the result of `--check`: the exit code (None when killed by a signal), its stdout and
-/// its stderr. Exit 0 with exactly the three lines `jail=`, `jira=` and `sentry=`, in this
-/// order, each `true` or `false` (with or without the final line break), is a success, with the
-/// stderr as a warning; anything else on stdout is an error, so nothing is ever presumed. A
-/// failure is the stderr of the launcher (the message of the lib), or a message with the code
-/// when it said nothing.
+/// its stderr. Exit 0 with exactly the four lines `jail=`, `jira=`, `sentry=` and `jira_url=`, in
+/// this order, the first three `true` or `false` and the last one with the rest of the line as
+/// the value, maybe empty (with or without the final line break), is a success, with the stderr as
+/// a warning; anything else on stdout is an error, so nothing is ever presumed (NS-53: the three
+/// lines of before included). A failure is the stderr of the launcher (the message of the lib),
+/// or a message with the code when it said nothing.
 pub fn parse_check(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<Precheck, String> {
     let stderr = String::from_utf8_lossy(stderr).trim_end().to_string();
     if code != Some(0) {
@@ -154,15 +167,16 @@ pub fn parse_check(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<Pr
     }
     let stdout = stdout.strip_suffix(b"\n").unwrap_or(stdout);
     let lines: Vec<&[u8]> = stdout.split(|b| *b == b'\n').collect();
-    let flags = match lines.as_slice() {
-        [jail, jira, sentry] => (
+    let fields = match lines.as_slice() {
+        [jail, jira, sentry, jira_url] => (
             flag_line(jail, "jail"),
             flag_line(jira, "jira"),
             flag_line(sentry, "sentry"),
+            jira_url_line(jira_url),
         ),
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
-    let (Some(jail), Some(jira), Some(sentry)) = flags else {
+    let (Some(jail), Some(jira), Some(sentry), Some(jira_url)) = fields else {
         return Err(UNEXPECTED_CHECK_MESSAGE.to_string());
     };
     let warning = (!stderr.trim().is_empty()).then_some(stderr);
@@ -170,8 +184,39 @@ pub fn parse_check(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<Pr
         jail,
         jira,
         sentry,
+        jira_url: (!jira_url.is_empty()).then_some(jira_url),
         warning,
     })
+}
+
+/// Reads the result of `--jira-url` (NS-53): exit 0 with exactly the line `jira_url=<value>`
+/// (with or without the final line break) is the value, `None` when empty. Anything else (another
+/// code, another stdout, a value that is not UTF-8) is `None` too, without a message: the panel
+/// only stops showing the links, and the real error shows up in the `g` (`--check`).
+pub fn parse_jira_url(code: Option<i32>, stdout: &[u8]) -> Option<String> {
+    if code != Some(0) {
+        return None;
+    }
+    let line = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+    if line.contains(&b'\n') {
+        return None;
+    }
+    jira_url_line(line).filter(|url| !url.is_empty())
+}
+
+/// Runs `bash <launcher> --jira-url` with the cwd at `project`, the stdin closed and the output
+/// captured (outside the PTY), and reads it with `parse_jira_url` (NS-53). Its stderr (the
+/// warnings of the config) is ignored: they show up in the preview of the `g`. Without the jail
+/// check, so a broken jail never hides the links; synchronous, like `run_check`.
+pub fn run_jira_url(launcher: &Path, project: &Path) -> Option<String> {
+    let output = Command::new("bash")
+        .arg(launcher)
+        .arg("--jira-url")
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    parse_jira_url(output.status.code(), &output.stdout)
 }
 
 /// Runs `bash <launcher> --check` with the cwd at `project`, the stdin closed and the output
@@ -529,12 +574,13 @@ mod tests {
         );
     }
 
-    /// A precheck without a warning.
+    /// A precheck without a warning and without a Jira URL.
     fn pre(jail: bool, jira: bool, sentry: bool) -> Precheck {
         Precheck {
             jail,
             jira,
             sentry,
+            jira_url: None,
             warning: None,
         }
     }
@@ -542,13 +588,53 @@ mod tests {
     #[test]
     fn jail_true_and_jail_false_are_read() {
         assert_eq!(
-            parse_check(Some(0), b"jail=true\njira=false\nsentry=false\n", b""),
+            parse_check(
+                Some(0),
+                b"jail=true\njira=false\nsentry=false\njira_url=\n",
+                b""
+            ),
             Ok(pre(true, false, false))
         );
         assert_eq!(
-            parse_check(Some(0), b"jail=false\njira=false\nsentry=false\n", b""),
+            parse_check(
+                Some(0),
+                b"jail=false\njira=false\nsentry=false\njira_url=\n",
+                b""
+            ),
             Ok(pre(false, false, false))
         );
+    }
+
+    /// NS-53: the 4th line is the JIRA_URL of the config, literally (the rest of the line); an
+    /// empty value is no URL.
+    #[test]
+    fn the_jira_url_is_the_rest_of_the_fourth_line() {
+        for (line, url) in [
+            (&b"jira_url="[..], None),
+            (b"jira_url=https://j/browse/", Some("https://j/browse/")),
+            (
+                b"jira_url=https://x  a=b $(id) \\n",
+                Some("https://x  a=b $(id) \\n"),
+            ),
+            (b"jira_url= ", Some(" ")),
+            (b"jira_url=n\xc3\xa3o", Some("não")),
+        ] {
+            let mut stdout = b"jail=false\njira=true\nsentry=false\n".to_vec();
+            stdout.extend_from_slice(line);
+            for end in [&b"\n"[..], b""] {
+                let mut stdout = stdout.clone();
+                stdout.extend_from_slice(end);
+                assert_eq!(
+                    parse_check(Some(0), &stdout, b""),
+                    Ok(Precheck {
+                        jira_url: url.map(str::to_string),
+                        ..pre(false, true, false)
+                    }),
+                    "{:?}",
+                    String::from_utf8_lossy(&stdout)
+                );
+            }
+        }
     }
 
     #[test]
@@ -556,7 +642,7 @@ mod tests {
         for jail in [true, false] {
             for jira in [true, false] {
                 for sentry in [true, false] {
-                    let stdout = format!("jail={jail}\njira={jira}\nsentry={sentry}\n");
+                    let stdout = format!("jail={jail}\njira={jira}\nsentry={sentry}\njira_url=\n");
                     assert_eq!(
                         parse_check(Some(0), stdout.as_bytes(), b""),
                         Ok(pre(jail, jira, sentry)),
@@ -575,23 +661,34 @@ mod tests {
             // The one line of the NS-33, alone.
             b"jail=true\n",
             b"jail=false\n",
-            b"jail=TRUE\njira=false\nsentry=false\n",
-            b"jail=1\njira=false\nsentry=false\n",
+            // The three lines of the NS-35 (NS-53: a launcher of another version is refused).
+            b"jail=true\njira=false\nsentry=false\n",
+            b"jail=false\njira=true\nsentry=false",
+            b"jail=TRUE\njira=false\nsentry=false\njira_url=\n",
+            b"jail=1\njira=false\nsentry=false\njira_url=\n",
             b"jail=true\njail=true\n",
-            b"Configura\xc3\xa7\xc3\xa3o carregada\njail=true\njira=false\nsentry=false\n",
+            b"Configura\xc3\xa7\xc3\xa3o carregada\njail=true\njira=false\nsentry=false\njira_url=\n",
             b"jail=true\njira=false\nsentry=false\nmais\n",
-            b" jail=true\njira=false\nsentry=false\n",
-            b"jail=truex\njira=false\nsentry=false\n",
+            b"jail=true\njira=false\nsentry=false\njira_url=\nmais\n",
+            b" jail=true\njira=false\nsentry=false\njira_url=\n",
+            b"jail=truex\njira=false\nsentry=false\njira_url=\n",
             // The order swapped, a line missing, a value not exact, a line too many.
-            b"jira=false\njail=true\nsentry=false\n",
-            b"jail=true\nsentry=false\njira=false\n",
-            b"jail=true\njira=false\n",
-            b"jail=true\nsentry=false\n",
-            b"jail=true\njira=TRUE\nsentry=false\n",
-            b"jail=true\njira=false\nsentry=sim\n",
-            b"jail=true\njira=false\nsentry=false\n\n",
-            b"jail=true\njira=false\nsentry=false\njail=true\n",
-            b"jail=true\r\njira=false\r\nsentry=false\r\n",
+            b"jira=false\njail=true\nsentry=false\njira_url=\n",
+            b"jail=true\nsentry=false\njira=false\njira_url=\n",
+            b"jira_url=\njail=true\njira=false\nsentry=false\n",
+            b"jail=true\njira=false\njira_url=\nsentry=false\n",
+            b"jail=true\njira=false\njira_url=\n",
+            b"jail=true\nsentry=false\njira_url=\n",
+            b"jail=true\njira=TRUE\nsentry=false\njira_url=\n",
+            b"jail=true\njira=false\nsentry=sim\njira_url=\n",
+            b"jail=true\njira=false\nsentry=false\njira_url=\n\n",
+            b"jail=true\njira=false\nsentry=false\njira_url=\njail=true\n",
+            b"jail=true\r\njira=false\r\nsentry=false\r\njira_url=\r\n",
+            // The 4th line not exactly jira_url=<value>.
+            b"jail=true\njira=false\nsentry=false\njira_url\n",
+            b"jail=true\njira=false\nsentry=false\nJIRA_URL=x\n",
+            b"jail=true\njira=false\nsentry=false\n jira_url=x\n",
+            b"jail=true\njira=false\nsentry=false\njira_url=\xff\n",
         ] {
             assert_eq!(
                 parse_check(Some(0), stdout, b""),
@@ -601,7 +698,14 @@ mod tests {
             );
         }
         // Without the final line break, the lines are still the lines.
-        assert!(parse_check(Some(0), b"jail=false\njira=true\nsentry=false", b"").is_ok());
+        assert!(
+            parse_check(
+                Some(0),
+                b"jail=false\njira=true\nsentry=false\njira_url=",
+                b""
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -609,7 +713,7 @@ mod tests {
         assert_eq!(
             parse_check(
                 Some(0),
-                b"jail=false\njira=false\nsentry=false\n",
+                b"jail=false\njira=false\nsentry=false\njira_url=\n",
                 b"Aviso: chave ausente\n  X=\"\"\n"
             ),
             Ok(Precheck {
@@ -618,7 +722,11 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_check(Some(0), b"jail=true\njira=false\nsentry=false\n", b"  \n"),
+            parse_check(
+                Some(0),
+                b"jail=true\njira=false\nsentry=false\njira_url=\n",
+                b"  \n"
+            ),
             Ok(pre(true, false, false)),
             "blank stderr is no warning"
         );
@@ -630,11 +738,11 @@ mod tests {
             parse_check(Some(1), b"", b"Erro: a jail falhou.\nDetalhe\n"),
             Err("Erro: a jail falhou.\nDetalhe".into())
         );
-        // Even with the three lines: a non-zero exit never opens.
+        // Even with the four lines: a non-zero exit never opens.
         assert_eq!(
             parse_check(
                 Some(1),
-                b"jail=false\njira=false\nsentry=false\n",
+                b"jail=false\njira=false\nsentry=false\njira_url=\n",
                 b"Erro: x\n"
             ),
             Err("Erro: x".into())
@@ -737,6 +845,7 @@ mod tests {
         assert!(!check.jail);
         assert!(check.jira, "jira=true with \"true\"");
         assert!(!check.sentry, "sentry=false with \"TRUE\" (not exact)");
+        assert_eq!(check.jira_url, None, "no JIRA_URL in the config: no URL");
         assert!(
             check
                 .warning
@@ -747,6 +856,108 @@ mod tests {
         assert!(
             !proj.join(".nick/.gitignore").exists(),
             "--check writes nothing in the project"
+        );
+    }
+
+    /// NS-53: the 4th line of the real `--check` carries the JIRA_URL of the config.
+    #[test]
+    fn run_check_gives_the_jira_url_of_the_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(proj.join(".nick")).unwrap();
+        fs::write(
+            proj.join(".nick/nick.conf"),
+            "JAIL_ENABLED=\"false\"\nJIRA_URL=\"https://j/browse/ $(id)\"\n",
+        )
+        .unwrap();
+        let check = run_check(&launcher_path(), &proj).unwrap();
+        assert_eq!(check.jira_url.as_deref(), Some("https://j/browse/ $(id)"));
+    }
+
+    #[test]
+    fn parse_jira_url_reads_one_line_or_gives_none() {
+        assert_eq!(
+            parse_jira_url(Some(0), b"jira_url=https://j/browse/\n"),
+            Some("https://j/browse/".into())
+        );
+        assert_eq!(
+            parse_jira_url(Some(0), b"jira_url=https://j/browse/"),
+            Some("https://j/browse/".into()),
+            "without the final line break"
+        );
+        assert_eq!(
+            parse_jira_url(Some(0), b"jira_url=a b=c $(id)\n"),
+            Some("a b=c $(id)".into()),
+            "the rest of the line, literally"
+        );
+        for (code, stdout) in [
+            (Some(0), &b"jira_url=\n"[..]),
+            (Some(0), b"jira_url="),
+            (Some(0), b""),
+            (Some(0), b"\n"),
+            (Some(0), b"https://j/browse/\n"),
+            (Some(0), b"JIRA_URL=https://j/browse/\n"),
+            (Some(0), b" jira_url=x\n"),
+            (Some(0), b"jira_url=x\njira_url=y\n"),
+            (Some(0), b"jira_url=x\n\n"),
+            (Some(0), b"jira_url=\xff\n"),
+            (Some(1), b"jira_url=x\n"),
+            (None, b"jira_url=x\n"),
+        ] {
+            assert_eq!(
+                parse_jira_url(code, stdout),
+                None,
+                "{code:?} {:?}",
+                String::from_utf8_lossy(stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn run_jira_url_runs_the_real_launcher_without_the_jail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = fs::canonicalize(tmp.path()).unwrap();
+        // No config: the launcher fails, and that is no URL (the error shows up in the g).
+        assert_eq!(run_jira_url(&launcher_path(), &proj), None);
+        assert!(!proj.join(".nick").exists(), "nothing created");
+        fs::create_dir_all(proj.join(".nick")).unwrap();
+        // Without the key: no URL (and the warning of a missing key is ignored).
+        fs::write(proj.join(".nick/nick.conf"), "JAIL_ENABLED=\"false\"\n").unwrap();
+        assert_eq!(run_jira_url(&launcher_path(), &proj), None);
+        // With the key.
+        fs::write(
+            proj.join(".nick/nick.conf"),
+            "JAIL_ENABLED=\"false\"\nJIRA_URL=\"https://j/browse/\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_jira_url(&launcher_path(), &proj),
+            Some("https://j/browse/".into())
+        );
+        // The jail on and broken (an invalid clipboard level, which jail_check refuses before
+        // anything else): the URL all the same, while --check fails.
+        fs::write(
+            proj.join(".nick/nick.conf"),
+            "JAIL_ENABLED=\"true\"\nJAIL_CLIPBOARD=\"xyz\"\nJIRA_URL=\"https://j/browse/\"\n",
+        )
+        .unwrap();
+        assert!(run_check(&launcher_path(), &proj).is_err(), "control");
+        assert_eq!(
+            run_jira_url(&launcher_path(), &proj),
+            Some("https://j/browse/".into())
+        );
+        assert!(
+            !proj.join(".nick/.gitignore").exists(),
+            "--jira-url writes nothing in the project"
+        );
+    }
+
+    #[test]
+    fn run_jira_url_of_a_missing_launcher_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_jira_url(&tmp.path().join("nao-existe"), tmp.path()),
+            None
         );
     }
 

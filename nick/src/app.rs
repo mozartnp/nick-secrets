@@ -385,6 +385,9 @@ pub struct TicketDetail {
     /// The history of its stage, oldest first.
     pub changes: Vec<StageChangeRow>,
     pub artifacts: Artifacts,
+    /// Its link in the Jira (NS-53: `tickets::jira_link` of the JIRA_URL of its project and its
+    /// key); None without a JIRA_URL or with a provisional key.
+    pub jira_link: Option<String>,
 }
 
 /// The selected epic (NS-40), read again after every action, as the `TicketDetail`: the artifacts
@@ -393,6 +396,8 @@ pub struct TicketDetail {
 pub struct EpicDetail {
     pub epic: Epic,
     pub artifacts: Artifacts,
+    /// Its link in the Jira, as the one of the `TicketDetail` (NS-53).
+    pub jira_link: Option<String>,
     /// Its tickets, the hidden ones included, and how many of them are hidden.
     pub tickets: usize,
     pub hidden_tickets: usize,
@@ -403,7 +408,16 @@ pub struct EpicDetail {
 pub struct Row {
     pub project: Project,
     pub availability: Availability,
+    /// The JIRA_URL of its config (NS-53), from `bin/nick-agent --jira-url` (the reader of
+    /// `with_jira_url_reader`) or from the last `--check` of a `g`; None when empty, unknown or
+    /// when the project is not available. Read only when the project enters the list or becomes
+    /// available (decision of the user in the NS-53: the refresh runs after every key, and a
+    /// bash per project per key would slow the tree down); kept from the row of before otherwise.
+    pub jira_url: Option<String>,
 }
+
+/// Reads the JIRA_URL of a project (NS-53): `(launcher, project dir)`, as `launch::run_jira_url`.
+pub type JiraUrlReader = Box<dyn FnMut(&Path, &Path) -> Option<String>>;
 
 /// The state of the TUI.
 pub struct App {
@@ -418,6 +432,8 @@ pub struct App {
     pub(crate) rows: Vec<Row>,
     /// bin/nick-agent (launch.rs).
     pub(crate) launcher: PathBuf,
+    /// Reads the JIRA_URL of a project (NS-53); the one of `new` reads nothing (None).
+    jira_url_reader: JiraUrlReader,
     /// Where the locks of the agents live (agents.rs); None until `with_agents`.
     pub(crate) agents_dir: Option<PathBuf>,
     /// The state directory the prompt logs go under (NS-52: `paths::prompt_logs_dir`); None
@@ -483,6 +499,7 @@ impl App {
             status: None,
             rows: Vec::new(),
             launcher: Resources::checkout().launcher(),
+            jira_url_reader: Box::new(|_, _| None),
             agents_dir: None,
             prompt_logs: None,
             deps: Deps::default(),
@@ -568,7 +585,43 @@ impl App {
     pub fn with_agents(mut self, launcher: PathBuf, agents_dir: PathBuf) -> App {
         self.launcher = launcher;
         self.agents_dir = Some(agents_dir);
+        self.read_all_jira_urls();
         self
+    }
+
+    /// The reader of the JIRA_URL of a project (NS-53; the `main.rs` gives
+    /// `launch::run_jira_url`). The available projects are read now, and then each one when it
+    /// enters the list or becomes available.
+    pub fn with_jira_url_reader(mut self, reader: JiraUrlReader) -> App {
+        self.jira_url_reader = reader;
+        self.read_all_jira_urls();
+        self
+    }
+
+    /// The JIRA_URL of the project at `path` by the reader (NS-53), only when the launcher is a
+    /// file: None otherwise.
+    fn read_jira_url(&mut self, path: &Path) -> Option<String> {
+        if !self.launcher.is_file() {
+            return None;
+        }
+        (self.jira_url_reader)(&self.launcher, path)
+    }
+
+    /// Reads again the JIRA_URL of every available project (when the reader or the launcher
+    /// changes), and the details that show it.
+    fn read_all_jira_urls(&mut self) {
+        for index in 0..self.rows.len() {
+            let row = &self.rows[index];
+            let url = if row.availability == Availability::Available {
+                let path = row.project.path.clone();
+                self.read_jira_url(&path)
+            } else {
+                None
+            };
+            self.rows[index].jira_url = url;
+        }
+        self.read_ticket_detail();
+        self.read_epic_detail();
     }
 
     /// The prompt logs (NS-52): under `<state_dir>/logs/<name>-<id>` of the project of the
@@ -1008,11 +1061,6 @@ impl App {
         self.project_row(project).map(|row| &row.project)
     }
 
-    /// The project of `ticket`, from the list of the module.
-    fn project_of(&self, ticket: &Ticket) -> Option<&Project> {
-        self.project_row(ticket.project_id).map(|row| &row.project)
-    }
-
     /// The project of the ticket or the epic `holder` (NS-40).
     fn project_of_holder(&self, holder: &Holder) -> Option<&Project> {
         self.project_row(holder.project_id).map(|row| &row.project)
@@ -1150,10 +1198,10 @@ impl App {
             self.epic_detail = None;
             return;
         };
-        let Some(path) = self
+        let Some((path, jira_url)) = self
             .epic(id)
             .and_then(|epic| self.project_row(epic.project_id))
-            .map(|row| row.project.path.clone())
+            .map(|row| (row.project.path.clone(), row.jira_url.clone()))
         else {
             self.epic_detail = None;
             return;
@@ -1163,6 +1211,11 @@ impl App {
                 let tickets = self.epic_tickets(id);
                 let hidden_tickets = tickets.iter().filter(|t| t.hidden_at.is_some()).count();
                 self.epic_detail = Some(EpicDetail {
+                    jira_link: tickets::jira_link(
+                        jira_url.as_deref(),
+                        &epic.key,
+                        epic.is_provisional,
+                    ),
                     artifacts: docs::artifacts(&path, &epic.key),
                     tickets: tickets.len(),
                     hidden_tickets,
@@ -1181,10 +1234,10 @@ impl App {
             self.ticket_detail = None;
             return;
         };
-        let Some(path) = self
+        let Some((path, jira_url)) = self
             .ticket(id)
-            .and_then(|ticket| self.project_of(ticket))
-            .map(|project| project.path.clone())
+            .and_then(|ticket| self.project_row(ticket.project_id))
+            .map(|row| (row.project.path.clone(), row.jira_url.clone()))
         else {
             self.ticket_detail = None;
             return;
@@ -1196,6 +1249,11 @@ impl App {
             Ok(Some(TicketDetail {
                 changes: self.db.list_stage_changes(id)?,
                 artifacts: docs::artifacts(&path, &ticket.key),
+                jira_link: tickets::jira_link(
+                    jira_url.as_deref(),
+                    &ticket.key,
+                    ticket.is_provisional,
+                ),
                 ticket,
             }))
         };
@@ -2037,6 +2095,14 @@ impl App {
         }
         match launcher.check(&self.launcher, project) {
             Ok(precheck) => {
+                // The JIRA_URL of now (NS-53): the panels follow it from here.
+                if let Some(row) = self
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.project.id == holder.project_id)
+                {
+                    row.jira_url = precheck.jira_url.clone();
+                }
                 let types = match holder.owner {
                     Owner::Ticket(_) => StageType::menu(precheck.jira, precheck.sentry),
                     Owner::Epic(_) => StageType::epic_menu(precheck.jira, precheck.sentry),
@@ -2301,7 +2367,13 @@ impl App {
             KeyCode::Esc => return Action::None,
             KeyCode::Enter => {
                 if let Some(kind) = types.get(index).copied() {
-                    let values = kind.initial_values(&holder.key);
+                    // The link from the check of this `g` (NS-53), never from the row.
+                    let link = tickets::jira_link(
+                        precheck.jira_url.as_deref(),
+                        &holder.key,
+                        holder.provisional,
+                    );
+                    let values = kind.initial_values(&holder.key, link.as_deref());
                     self.dialog = Some(Dialog::StageForm {
                         plan_missing: plan_missing(&project, kind, &values),
                         values,
@@ -3032,17 +3104,34 @@ impl App {
         self.refresh_tree();
     }
 
-    /// Reads the projects of the module again and computes their availability.
+    /// Reads the projects of the module again and computes their availability. The JIRA_URL of
+    /// an available project (NS-53) is kept from the row of before when it was available then
+    /// too, and read (`read_jira_url`) when it enters the list or becomes available.
     fn refresh(&mut self) {
         match self.db.list_projects(self.module().key()) {
             Ok(list) => {
-                self.rows = list
-                    .into_iter()
-                    .map(|project| Row {
-                        availability: projects::availability(&project.path),
+                let before = std::mem::take(&mut self.rows);
+                let mut rows = Vec::with_capacity(list.len());
+                for project in list {
+                    let availability = projects::availability(&project.path);
+                    let jira_url = if availability != Availability::Available {
+                        None
+                    } else if let Some(old) = before.iter().find(|row| {
+                        row.project.id == project.id
+                            && row.project.path == project.path
+                            && row.availability == Availability::Available
+                    }) {
+                        old.jira_url.clone()
+                    } else {
+                        self.read_jira_url(&project.path)
+                    };
+                    rows.push(Row {
+                        availability,
+                        jira_url,
                         project,
-                    })
-                    .collect();
+                    });
+                }
+                self.rows = rows;
             }
             Err(err) => {
                 self.rows.clear();
@@ -4311,6 +4400,7 @@ pub(crate) mod tests {
                     jail,
                     jira: false,
                     sentry: false,
+                    jira_url: None,
                     warning: None,
                 }),
                 render: Ok(rendered(3)),
@@ -4618,6 +4708,7 @@ pub(crate) mod tests {
                 jail: false,
                 jira,
                 sentry,
+                jira_url: None,
                 warning: None,
             });
             f.g(&mut launcher);
@@ -4846,6 +4937,7 @@ pub(crate) mod tests {
             jail: false,
             jira: true,
             sentry: true,
+            jira_url: None,
             warning: None,
         };
         for kind in StageType::ALL {
@@ -5520,6 +5612,7 @@ pub(crate) mod tests {
             jail: false,
             jira: false,
             sentry: false,
+            jira_url: None,
             warning: Some("Aviso: falta chave.\n  X=\"\"".into()),
         });
         f.open_agent(0, &mut launcher);
@@ -5573,6 +5666,7 @@ pub(crate) mod tests {
             jail: false,
             jira: false,
             sentry: false,
+            jira_url: None,
             warning: None,
         });
         f.open_agent(2, &mut launcher);
@@ -7915,6 +8009,7 @@ pub(crate) mod tests {
             jail: true,
             jira: true,
             sentry: true,
+            jira_url: None,
             warning: None,
         });
         f.r(&mut launcher);
@@ -7987,6 +8082,7 @@ pub(crate) mod tests {
                 jail: false,
                 jira,
                 sentry,
+                jira_url: None,
                 warning: None,
             });
             f.r(&mut launcher);
@@ -9047,6 +9143,7 @@ pub(crate) mod tests {
             jail: false,
             jira: false,
             sentry: false,
+            jira_url: None,
             warning: None,
         };
         let kind = StageType::PoDiscussion;
@@ -9114,7 +9211,7 @@ pub(crate) mod tests {
                 holder: holder.clone(),
                 precheck: precheck.clone(),
                 kind,
-                values: kind.initial_values(&holder.key),
+                values: kind.initial_values(&holder.key, None),
                 focus: 0,
                 plan_missing: false,
             },
@@ -9690,5 +9787,368 @@ pub(crate) mod tests {
         assert_eq!(f.first(), Shortcut::from_db("alt+shift+j"));
         f.mods(KeyCode::Char('j'), KeyModifiers::ALT | KeyModifiers::SHIFT);
         assert_eq!(f.stored_shortcut().as_deref(), Some("alt+shift+j"));
+    }
+
+    // ---- the Jira link (NS-53) ----
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The base the fake readers give.
+    const BASE: &str = "https://j/browse/";
+
+    /// A reader that records the project of each call and gives `url`.
+    fn recording_reader(
+        calls: &Rc<RefCell<Vec<PathBuf>>>,
+        url: Option<&'static str>,
+    ) -> JiraUrlReader {
+        let calls = Rc::clone(calls);
+        Box::new(move |_, project| {
+            calls.borrow_mut().push(project.to_path_buf());
+            url.map(str::to_string)
+        })
+    }
+
+    /// The fixture with `reader` installed by `with_jira_url_reader`, as the `main.rs` does.
+    fn with_reader(f: Fixture, reader: JiraUrlReader) -> Fixture {
+        let Fixture { _tmp, root, app } = f;
+        Fixture {
+            _tmp,
+            root,
+            app: app.with_jira_url_reader(reader),
+        }
+    }
+
+    /// `with_tickets("proj")` with a reader that gives `url`.
+    fn with_jira_url(url: Option<&'static str>) -> (Fixture, PathBuf) {
+        let (f, p) = with_tickets("proj");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        (with_reader(f, recording_reader(&calls, url)), p)
+    }
+
+    impl Fixture {
+        fn jira_url_of(&self, rel: &str) -> Option<String> {
+            let path = self.root.join(rel);
+            self.app
+                .rows
+                .iter()
+                .find(|row| row.project.path == path)
+                .expect("registered")
+                .jira_url
+                .clone()
+        }
+
+        fn epic_detail(&self) -> &EpicDetail {
+            self.app.epic_detail.as_ref().expect("on an epic")
+        }
+
+        /// `i` on the selected node, the old ID erased, `new` typed, Enter and `s`.
+        fn edit_id_to(&mut self, new: &str) {
+            self.ch('i');
+            for _ in 0..60 {
+                self.key(KeyCode::Backspace);
+            }
+            self.type_text(new);
+            self.key(KeyCode::Enter);
+            self.ch('s');
+            assert!(
+                self.status()
+                    .is_some_and(|s| s.starts_with("ID atualizado:")),
+                "{:?}",
+                self.status()
+            );
+        }
+    }
+
+    #[test]
+    fn the_reader_of_new_reads_nothing() {
+        // The launcher of `new` is the real one, and the config has a JIRA_URL: the real reader
+        // would find it, the one of `new` gives None without running anything.
+        let mut f = fixture();
+        let p = f.dir("proj", true);
+        fs::write(projects::config_file(&p), "JIRA_URL=\"https://real/\"\n").unwrap();
+        f.add(p.to_str().unwrap());
+        f.key(KeyCode::Down);
+        assert!(f.app.launcher.is_file());
+        assert_eq!(f.jira_url_of("proj"), None);
+    }
+
+    #[test]
+    fn the_reader_runs_once_per_project_when_it_becomes_available() {
+        let mut f = fixture();
+        let a = f.dir("a", true);
+        let b = f.dir("b", true);
+        f.add(a.to_str().unwrap());
+        f.add(b.to_str().unwrap());
+        fs::remove_file(projects::config_file(&b)).unwrap();
+        // The refresh that sees b unavailable.
+        f.key(KeyCode::Down);
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut f = with_reader(f, recording_reader(&calls, Some(BASE)));
+        // Only the available project, at once.
+        assert_eq!(*calls.borrow(), std::slice::from_ref(&a));
+        assert_eq!(f.jira_url_of("a").as_deref(), Some(BASE));
+        assert_eq!(f.jira_url_of("b"), None, "unavailable: never read");
+        // The refresh after each key keeps the value, without reading again.
+        for _ in 0..3 {
+            f.key(KeyCode::Down);
+            f.key(KeyCode::Up);
+        }
+        assert_eq!(*calls.borrow(), std::slice::from_ref(&a));
+        assert_eq!(f.jira_url_of("a").as_deref(), Some(BASE));
+        // b becomes available: read once.
+        fs::write(projects::config_file(&b), "").unwrap();
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Up);
+        assert_eq!(*calls.borrow(), [a.clone(), b.clone()]);
+        assert_eq!(f.jira_url_of("b").as_deref(), Some(BASE));
+        // a becomes unavailable (no value) and then available again (read again).
+        fs::remove_file(projects::config_file(&a)).unwrap();
+        f.key(KeyCode::Down);
+        assert_eq!(f.jira_url_of("a"), None);
+        assert_eq!(calls.borrow().len(), 2);
+        fs::write(projects::config_file(&a), "").unwrap();
+        f.key(KeyCode::Up);
+        assert_eq!(*calls.borrow(), [a.clone(), b.clone(), a.clone()]);
+        // Without the launcher (not a file), the reader is never called.
+        f.app.launcher = f.root.join("nao-existe");
+        fs::remove_file(projects::config_file(&b)).unwrap();
+        f.key(KeyCode::Down);
+        fs::write(projects::config_file(&b), "").unwrap();
+        f.key(KeyCode::Up);
+        assert_eq!(calls.borrow().len(), 3);
+        assert_eq!(f.jira_url_of("b"), None);
+    }
+
+    #[test]
+    fn the_reader_gets_the_launcher_and_the_dir_of_the_project() {
+        let mut f = fixture();
+        let p = f.dir("proj", true);
+        f.add(p.to_str().unwrap());
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&seen);
+        let f = with_reader(
+            f,
+            Box::new(move |launcher, project| {
+                record
+                    .borrow_mut()
+                    .push((launcher.to_path_buf(), project.to_path_buf()));
+                None
+            }),
+        );
+        assert_eq!(*seen.borrow(), [(f.app.launcher.clone(), p)]);
+    }
+
+    #[test]
+    fn the_ticket_has_a_link_only_with_a_jira_url_and_a_real_id() {
+        let (mut f, _) = with_jira_url(Some(BASE));
+        f.new_ticket("Real", "NS-1");
+        assert_eq!(
+            f.detail().jira_link.as_deref(),
+            Some("https://j/browse/NS-1")
+        );
+        f.new_ticket("Provisório", "");
+        assert!(f.detail().ticket.is_provisional);
+        assert_eq!(f.detail().jira_link, None, "provisional: no link");
+        let (mut f, _) = with_jira_url(None);
+        f.new_ticket("Real", "NS-1");
+        assert_eq!(f.detail().jira_link, None, "no JIRA_URL: no link");
+    }
+
+    #[test]
+    fn the_epic_has_a_link_only_with_a_jira_url_and_a_real_id() {
+        let (mut f, _) = with_jira_url(Some(BASE));
+        f.new_epic("Épico", "EPIC-1");
+        f.app.select(f.epic_node("EPIC-1"));
+        f.app.refresh_tree();
+        assert_eq!(
+            f.epic_detail().jira_link.as_deref(),
+            Some("https://j/browse/EPIC-1")
+        );
+        f.new_epic("Provisório", "");
+        let provisional = f
+            .app
+            .project_epics(f.app.selected_project().unwrap().id)
+            .iter()
+            .find(|e| e.is_provisional)
+            .unwrap()
+            .id;
+        f.app.select(NodeId::Epic(provisional));
+        f.app.refresh_tree();
+        assert_eq!(f.epic_detail().jira_link, None, "provisional: no link");
+        let (mut f, _) = with_jira_url(None);
+        f.new_epic("Épico", "EPIC-1");
+        f.app.select(f.epic_node("EPIC-1"));
+        f.app.refresh_tree();
+        assert_eq!(f.epic_detail().jira_link, None, "no JIRA_URL: no link");
+    }
+
+    #[test]
+    fn after_editing_the_id_the_link_uses_the_new_one() {
+        let (mut f, _) = with_jira_url(Some(BASE));
+        f.new_ticket("Real", "NS-1");
+        f.edit_id_to("NS-10");
+        assert_eq!(f.detail().ticket.key, "NS-10");
+        assert_eq!(
+            f.detail().jira_link.as_deref(),
+            Some("https://j/browse/NS-10")
+        );
+        // A provisional one that got an ID gets a link.
+        f.new_ticket("Provisório", "");
+        assert_eq!(f.detail().jira_link, None);
+        f.edit_id_to("NS-20");
+        assert_eq!(
+            f.detail().jira_link.as_deref(),
+            Some("https://j/browse/NS-20")
+        );
+    }
+
+    #[test]
+    fn after_editing_the_id_of_an_epic_the_link_uses_the_new_one() {
+        let (mut f, _) = with_jira_url(Some(BASE));
+        f.new_epic("Épico", "EPIC-1");
+        f.app.select(f.epic_node("EPIC-1"));
+        f.app.refresh_tree();
+        f.edit_id_to("EPIC-2");
+        assert_eq!(
+            f.epic_detail().jira_link.as_deref(),
+            Some("https://j/browse/EPIC-2")
+        );
+        f.new_epic("Provisório", "");
+        let provisional = f
+            .app
+            .project_epics(f.app.selected_project().unwrap().id)
+            .iter()
+            .find(|e| e.is_provisional)
+            .unwrap()
+            .id;
+        f.app.select(NodeId::Epic(provisional));
+        f.app.refresh_tree();
+        assert_eq!(f.epic_detail().jira_link, None);
+        f.edit_id_to("EPIC-3");
+        assert_eq!(
+            f.epic_detail().jira_link.as_deref(),
+            Some("https://j/browse/EPIC-3")
+        );
+    }
+
+    /// A launcher whose check offers Jira and gives `url` as the JIRA_URL.
+    fn jira_launcher(url: Option<&str>) -> FakeLauncher {
+        let mut launcher = FakeLauncher::new(false);
+        launcher.check = Ok(Precheck {
+            jail: false,
+            jira: true,
+            sentry: false,
+            jira_url: url.map(str::to_string),
+            warning: None,
+        });
+        launcher
+    }
+
+    #[test]
+    fn the_link_field_starts_with_the_link_of_the_check() {
+        for kind in [StageType::TechLeaderJira, StageType::PoJira] {
+            let (mut f, _) = with_agents();
+            f.app.rows[0].jira_url = Some("https://antes/".into());
+            let mut launcher = jira_launcher(Some("https://check/"));
+            f.select_key("NS-1");
+            f.g(&mut launcher);
+            // The check of the g updates the row.
+            assert_eq!(f.jira_url_of("proj").as_deref(), Some("https://check/"));
+            // Then the row changes (another g, a refresh): the form still takes the value of
+            // the check of this g, never the one of the row.
+            f.app.rows[0].jira_url = Some("https://row/".into());
+            f.pick(kind);
+            assert_eq!(f.form().1, ["https://check/NS-1", ""], "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_link_field_starts_empty_without_a_url_or_with_a_provisional_id() {
+        let (mut f, _) = with_agents();
+        let mut launcher = jira_launcher(None);
+        f.select_key("NS-1");
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeaderJira);
+        assert_eq!(f.form().1, ["", ""], "no JIRA_URL");
+        assert_eq!(f.jira_url_of("proj"), None);
+        f.key(KeyCode::Esc);
+        f.new_ticket("Provisório", "");
+        let mut launcher = jira_launcher(Some(BASE));
+        f.g(&mut launcher);
+        f.pick(StageType::PoJira);
+        assert_eq!(f.form().1, ["", ""], "provisional ID");
+    }
+
+    #[test]
+    fn the_id_field_still_starts_with_the_key() {
+        let (mut f, _) = with_agents();
+        for (kind, expected) in [
+            (StageType::TechLeader, vec!["NS-1", "", ""]),
+            (StageType::Development, vec!["NS-1", ""]),
+            (StageType::Review, vec!["NS-1", ""]),
+        ] {
+            let mut launcher = jira_launcher(Some(BASE));
+            f.select_key("NS-1");
+            f.g(&mut launcher);
+            f.pick(kind);
+            assert_eq!(f.form().1, expected, "{kind:?}");
+            f.key(KeyCode::Esc);
+        }
+        // Even a provisional key (NS-35), with no link.
+        f.new_ticket("Provisório", "");
+        let key = f.selected_key().unwrap();
+        let mut launcher = jira_launcher(Some(BASE));
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeader);
+        assert_eq!(f.form().1, [key.as_str(), "", ""]);
+    }
+
+    #[test]
+    fn the_link_field_is_editable_and_its_value_goes_to_the_render() {
+        // As it came.
+        let (mut f, _) = with_agents();
+        let mut launcher = jira_launcher(Some(BASE));
+        f.select_key("NS-1");
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeaderJira);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        let answers = &launcher.renders.last().unwrap().2.answers;
+        assert_eq!(answers[0], ("--jira-link", "https://j/browse/NS-1".into()));
+        // Erased and typed again.
+        let (mut f, _) = with_agents();
+        let mut launcher = jira_launcher(Some(BASE));
+        f.select_key("NS-1");
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeaderJira);
+        assert_eq!(f.form().2, 0, "the focus on the link");
+        for _ in 0..40 {
+            f.key(KeyCode::Backspace);
+        }
+        assert_eq!(f.form().1[0], "");
+        // Erased, it is required again.
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some("Esse campo é obrigatório: Link do ticket no Jira.")
+        );
+        f.type_text("https://outro/X-9");
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        let answers = &launcher.renders.last().unwrap().2.answers;
+        assert_eq!(answers[0], ("--jira-link", "https://outro/X-9".into()));
+    }
+
+    #[test]
+    fn the_link_field_of_an_epic_starts_with_its_link() {
+        let (mut f, _) = with_agents();
+        f.new_epic("Épico", "EPIC-1");
+        f.app.select(f.epic_node("EPIC-1"));
+        f.app.refresh_tree();
+        let mut launcher = jira_launcher(Some(BASE));
+        f.g(&mut launcher);
+        f.pick(StageType::TechLeaderJira);
+        assert_eq!(f.form().1, ["https://j/browse/EPIC-1", ""]);
     }
 }

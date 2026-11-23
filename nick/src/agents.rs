@@ -117,6 +117,8 @@ pub struct Holder {
     /// "Abrir agente" show `Ticket <ID> — <título>`, NS-35).
     pub title: String,
     pub hidden: bool,
+    /// Whether the key is a provisional UUID (NS-53: such a key has no Jira link).
+    pub provisional: bool,
 }
 
 impl From<&Ticket> for Holder {
@@ -127,6 +129,7 @@ impl From<&Ticket> for Holder {
             key: ticket.key.clone(),
             title: ticket.title.clone(),
             hidden: ticket.hidden_at.is_some(),
+            provisional: ticket.is_provisional,
         }
     }
 }
@@ -139,6 +142,7 @@ impl From<&Epic> for Holder {
             key: epic.key.clone(),
             title: epic.title.clone(),
             hidden: epic.hidden_at.is_some(),
+            provisional: epic.is_provisional,
         }
     }
 }

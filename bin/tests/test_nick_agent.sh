@@ -39,7 +39,7 @@ BASH_BIN="$(command -v bash)"
 # Um UUID e um nome de exemplo, como a casca passa.
 SESSION_ID="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60"
 AGENT_NAME="proj · Dev · NS-1"
-USAGE="Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>"
+USAGE="Uso: nick-agent --check | --jira-url | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>"
 # Os 8 tipos do choose_type do auto_scrum.sh, na ordem do menu com tudo ligado.
 ALL_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
 # O texto que o EDITOR falso grava (po e tech_leader) e a DESCRIPTION que sai dele ($(cat), sem
@@ -296,10 +296,10 @@ assert_eq "PWD=$proj_a" "$(env_pwd "$case_a")" "projeto A: o claude roda no cwd 
 assert_eq "PWD=$proj_b" "$(env_pwd "$case_b")" "projeto B: o claude roda no cwd de B"
 
 echo
-echo "== --check: só valida, imprime as três linhas jail=/jira=/sentry= e não grava nada =="
+echo "== --check: só valida, imprime as quatro linhas jail=/jira=/sentry=/jira_url= (NS-53) e não grava nada =="
 for check_case in "true|jail=true" "false|jail=false" "TRUE|jail=false" "|jail=false"; do
   IFS='|' read -r check_value check_expected <<< "$check_case"
-  check_expected="$check_expected"$'\n'"jira=true"$'\n'"sentry=false"
+  check_expected="$check_expected"$'\n'"jira=true"$'\n'"sentry=false"$'\n'"jira_url="
   case_dir="$TEST_TMP/check_${check_value:-vazio}"
   proj="$(new_project "$case_dir" "JAIL_ENABLED=\"$check_value\"" JIRA_ENABLED='"true"' "JAIL_ALLOW_HOSTS=\"$hosts_example\"")"
   # Sem .nick/.gitignore, troca/ nem docs/: o lançamento os criaria (config_dir_prepare).
@@ -307,7 +307,7 @@ for check_case in "true|jail=true" "false|jail=false" "TRUE|jail=false" "|jail=f
   run_agent "$case_dir" "$proj" -- --check
   label="--check com JAIL_ENABLED=\"$check_value\""
   assert_eq "0" "$(file_of "$case_dir/rc")" "$label: sai com 0"
-  assert_eq "$check_expected" "$(file_of "$case_dir/out")" "$label: o stdout são as três linhas, nesta ordem: ${check_expected//$'\n'/ }"
+  assert_eq "$check_expected" "$(file_of "$case_dir/out")" "$label: o stdout são as quatro linhas, nesta ordem: ${check_expected//$'\n'/ }"
   if [ "$check_value" = "TRUE" ]; then
     assert_contains "$(file_of "$case_dir/err")" "valor \"TRUE\" inválido para JAIL_ENABLED" "$label: o aviso de valor inválido do config_load vai pro stderr, sem mudar o resultado"
   else
@@ -327,7 +327,7 @@ case_dir="$TEST_TMP/check_warning"
 proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
 grep -v '^STACK_DESCRIPTION=' "$proj/.nick/nick.conf" > "$case_dir/conf" && mv "$case_dir/conf" "$proj/.nick/nick.conf"
 run_agent "$case_dir" "$proj" -- --check
-assert_eq "0|jail=false"$'\n'"jira=false"$'\n'"sentry=false" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com chave ausente: sai com 0 e o stdout continua só as três linhas"
+assert_eq "0|jail=false"$'\n'"jira=false"$'\n'"sentry=false"$'\n'"jira_url=" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com chave ausente: sai com 0 e o stdout continua só as quatro linhas"
 assert_contains "$(file_of "$case_dir/err")" "Aviso: $proj/.nick/nick.conf não tem todas as chaves" "--check com chave ausente: o aviso do config_load vai pro stderr"
 # jira=/sentry=: true só com "true" exato (a regra do choose_type e do jail_exec).
 for flag_case in "true|true|true" "TRUE|false|false" " true|false|false" "|false|false" "false|false|true"; do
@@ -338,9 +338,29 @@ for flag_case in "true|true|true" "TRUE|false|false" " true|false|false" "|false
   proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' "JIRA_ENABLED=\"$flag_value\"" "SENTRY_ENABLED=\"$sentry_value\"")"
   before="$(tree_snapshot "$proj")"
   run_agent "$case_dir" "$proj" -- --check
-  assert_eq "0|jail=false"$'\n'"jira=$flag_jira"$'\n'"sentry=$flag_sentry" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com JIRA_ENABLED=\"$flag_value\" e SENTRY_ENABLED=\"$sentry_value\": jira=$flag_jira, sentry=$flag_sentry"
+  assert_eq "0|jail=false"$'\n'"jira=$flag_jira"$'\n'"sentry=$flag_sentry"$'\n'"jira_url=" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com JIRA_ENABLED=\"$flag_value\" e SENTRY_ENABLED=\"$sentry_value\": jira=$flag_jira, sentry=$flag_sentry"
   assert_eq "$before" "$(tree_snapshot "$proj")" "--check com JIRA_ENABLED=\"$flag_value\": nenhum arquivo do projeto muda"
 done
+
+# A 4ª linha (NS-53): jira_url=<valor>, o valor literal da JIRA_URL (vazio sem a chave).
+# shellcheck disable=SC2016 # o $(id) é literal de propósito: o valor nunca é expandido.
+for url_value in 'https://j/browse/' 'https://x  $(id) `id` \n %s b=c' ''; do
+  case_dir="$TEST_TMP/check_url_$(printf '%s' "$url_value" | md5sum | cut -c1-8)"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' "JIRA_URL=\"$url_value\"")"
+  run_agent "$case_dir" "$proj" -- --check
+  assert_eq "0|jail=false"$'\n'"jira=false"$'\n'"sentry=false"$'\n'"jira_url=$url_value" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check com JIRA_URL=\"$url_value\": a 4ª linha é jira_url= com o valor literal"
+  assert_eq "" "$(file_of "$case_dir/err")" "--check com JIRA_URL=\"$url_value\": nada no stderr"
+done
+case_dir="$TEST_TMP/check_url_missing"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+grep -v '^JIRA_URL=' "$proj/.nick/nick.conf" > "$case_dir/conf" && mv "$case_dir/conf" "$proj/.nick/nick.conf"
+run_agent "$case_dir" "$proj" -- --check
+assert_eq "0|jail=false"$'\n'"jira=false"$'\n'"sentry=false"$'\n'"jira_url=" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--check sem a chave JIRA_URL: sai com 0 e jira_url= vazio"
+assert_contains "$(file_of "$case_dir/err")" '  JIRA_URL=""' "--check sem a chave JIRA_URL: o aviso de chave ausente sugere JIRA_URL=\"\""
+# Uma JIRA_URL herdada do ambiente nunca conta: só o arquivo.
+run_agent "$case_dir" "$proj" JIRA_URL=https://do-ambiente/ -- --check
+assert_contains "$(file_of "$case_dir/out")" $'\n'"jira_url=" "--check com JIRA_URL no ambiente e sem a chave no arquivo: a 4ª linha existe"
+assert_not_contains "$(file_of "$case_dir/out")" "do-ambiente" "--check com JIRA_URL no ambiente: o valor do ambiente não conta"
 
 echo
 echo "== lançamento: cria o que o config_dir_prepare cria (paridade com o auto_scrum) =="
@@ -440,6 +460,66 @@ proj="$(new_project "$case_dir" JAIL_ENABLED='"true"')"
 launch "$case_dir" "$proj" PATH="$min_with_jail_bin"
 assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: o mesmo PATH mínimo com o ai-jail falso: o launcher sai com 0$(file_of "$case_dir/err")"
 assert_exists "$case_dir/claude.argv" "controle positivo: com o ai-jail falso, o claude falso é chamado"
+
+echo
+echo "== --jira-url (NS-53): só a configuração, sem jail nem regras do claude, e uma linha jira_url= =="
+# shellcheck disable=SC2016 # o $(id) é literal de propósito.
+for url_value in 'https://j/browse/' 'https://x  $(id) `id` \n %s b=c' ''; do
+  case_dir="$TEST_TMP/jira_url_$(printf '%s' "$url_value" | md5sum | cut -c1-8)"
+  proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' "JIRA_URL=\"$url_value\"")"
+  before="$(tree_snapshot "$proj")"
+  run_agent "$case_dir" "$proj" -- --jira-url
+  assert_eq "0|jira_url=$url_value" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--jira-url com JIRA_URL=\"$url_value\": sai com 0 e imprime só jira_url= com o valor literal"
+  assert_eq "1" "$(grep -c '' "$case_dir/out" 2> /dev/null || true)" "--jira-url com JIRA_URL=\"$url_value\": exatamente uma linha no stdout"
+  assert_eq "" "$(file_of "$case_dir/err")" "--jira-url com JIRA_URL=\"$url_value\": nada no stderr"
+  assert_eq "" "$(file_of "$case_dir/order")" "--jira-url com JIRA_URL=\"$url_value\": nem o ai-jail nem o claude"
+  assert_eq "$before" "$(tree_snapshot "$proj")" "--jira-url com JIRA_URL=\"$url_value\": nenhum arquivo do projeto muda"
+  assert_not_exists "$case_dir/logs" "--jira-url com JIRA_URL=\"$url_value\": nenhum log de prompt"
+done
+# A jail ligada e quebrada não importa: o --jira-url não roda o jail_check.
+for broken in "sem ai-jail no PATH|PATH=$min_bin|" "ai-jail antigo|FAKE_JAIL_VERSION=2.14.0|" "JAIL_CLIPBOARD inválido||JAIL_CLIPBOARD=\"xyz\"" "host inválido||JAIL_ALLOW_HOSTS=\"https://x.io\""; do
+  IFS='|' read -r broken_label broken_env broken_conf <<< "$broken"
+  case_dir="$TEST_TMP/jira_url_jail_$(printf '%s' "$broken_label" | md5sum | cut -c1-8)"
+  conf_args=(JAIL_ENABLED='"true"' JIRA_URL='"https://j/browse/"')
+  [ -z "$broken_conf" ] || conf_args+=("$broken_conf")
+  proj="$(new_project "$case_dir" "${conf_args[@]}")"
+  env_args=()
+  [ -z "$broken_env" ] || env_args+=("$broken_env")
+  run_agent "$case_dir" "$proj" "${env_args[@]}" -- --jira-url
+  assert_eq "0|jira_url=https://j/browse/" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--jira-url com a jail ligada e quebrada ($broken_label): sai com 0 e dá o valor"
+  assert_eq "" "$(file_of "$case_dir/order")" "--jira-url com a jail ligada e quebrada ($broken_label): o ai-jail não é chamado"
+  # Controle positivo: o mesmo projeto e ambiente quebram o --check.
+  run_agent "$case_dir" "$proj" "${env_args[@]}" -- --check
+  assert_eq "1" "$(file_of "$case_dir/rc")" "controle positivo ($broken_label): o --check do mesmo projeto falha no jail_check"
+done
+case_dir="$TEST_TMP/jira_url_missing_key"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+grep -v '^JIRA_URL=' "$proj/.nick/nick.conf" > "$case_dir/conf" && mv "$case_dir/conf" "$proj/.nick/nick.conf"
+run_agent "$case_dir" "$proj" -- --jira-url
+assert_eq "0|jira_url=" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--jira-url sem a chave: sai com 0 e jira_url= vazio"
+assert_contains "$(file_of "$case_dir/err")" '  JIRA_URL=""' "--jira-url sem a chave: o aviso de chave ausente vai pro stderr"
+case_dir="$TEST_TMP/jira_url_no_conf"
+mkdir -p "$case_dir/proj"
+run_agent "$case_dir" "$case_dir/proj" -- --jira-url
+assert_eq "1|" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--jira-url sem .nick/nick.conf: sai com 1, nada no stdout"
+assert_eq "Erro: não há configuração do projeto em $case_dir/proj/.nick/nick.conf. Rode na raiz do projeto: $NICK_INIT" "$(file_of "$case_dir/err")" "--jira-url sem .nick/nick.conf: a mensagem de hoje"
+assert_not_exists "$case_dir/proj/.nick" "--jira-url sem .nick/nick.conf: nada criado no projeto"
+case_dir="$TEST_TMP/jira_url_legacy"
+mkdir -p "$case_dir/proj"
+config_lines > "$case_dir/proj/.nick.conf"
+run_agent "$case_dir" "$case_dir/proj" -- --jira-url
+assert_eq "1|" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "--jira-url só com o .nick.conf antigo: sai com 1, nada no stdout"
+assert_contains "$(file_of "$case_dir/err")" "Erro: a configuração do projeto agora fica em .nick/nick.conf, e $case_dir/proj/.nick.conf não é mais lido." "--jira-url só com o .nick.conf antigo: a mensagem de migração"
+case_dir="$TEST_TMP/jira_url_args"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"' JIRA_URL='"https://j/browse/"')"
+for args in "--jira-url x" "--jira-url --check" "--jira-url --jira-url"; do
+  # Lista de propósito: cada palavra é um argumento.
+  # shellcheck disable=SC2086
+  run_agent "$case_dir" "$proj" -- $args
+  assert_eq "1|" "$(file_of "$case_dir/rc")|$(file_of "$case_dir/out")" "argumentos '$args': sai com 1, nada no stdout"
+  assert_eq "Erro: o --jira-url não aceita outros argumentos."$'\n'"$USAGE" "$(file_of "$case_dir/err")" "argumentos '$args': o erro e o uso no stderr"
+done
+assert_contains "$(sed -n '2,/^set -euo pipefail$/p' "$LAUNCHER")" "nick-agent --jira-url" "o comentário do topo do launcher cita o modo --jira-url"
 
 echo
 echo "== argumentos: qualquer outro uso sai com 1 e mostra o uso =="
@@ -685,11 +765,12 @@ without_session() {
     { print }' "$1" 2> /dev/null || true
 }
 # A matriz (plano do NS-35, 4.2): nome|jail|chaves. Tudo desligado (TDD_ENABLED="false"), tudo
-# ligado (com STACK_DESCRIPTION preenchido e a jail ligada, que cobre cada papel com a jail
-# ligada; os outros com a jail desligada) e cada flag ligada sozinha.
+# ligado (com STACK_DESCRIPTION e JIRA_URL preenchidos e a jail ligada, que cobre cada papel com
+# a jail ligada; os outros com a jail desligada) e cada flag ligada sozinha. A JIRA_URL (NS-53)
+# não entra em template nenhum: o prompt não pode mudar por causa dela.
 diff_matrix=(
   'tudo_desligado|false|TDD_ENABLED="false"'
-  'tudo_ligado|true|JIRA_ENABLED="true";SENTRY_ENABLED="true";PRODUCTION_ENABLED="true";TDD_ENABLED="true";PERMISSION_ENABLED="true";STACK_DESCRIPTION="Bash e Rust"'
+  'tudo_ligado|true|JIRA_ENABLED="true";SENTRY_ENABLED="true";PRODUCTION_ENABLED="true";TDD_ENABLED="true";PERMISSION_ENABLED="true";STACK_DESCRIPTION="Bash e Rust";JIRA_URL="https://j/browse/"'
   'so_jira|false|JIRA_ENABLED="true";TDD_ENABLED="false"'
   'so_sentry|false|SENTRY_ENABLED="true";TDD_ENABLED="false"'
   'so_production|false|PRODUCTION_ENABLED="true";TDD_ENABLED="false"'

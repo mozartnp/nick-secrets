@@ -8,10 +8,18 @@
 # the cwd at the project: --check and --render outside the PTY, then the launch in it.
 #   nick-agent --check
 #       only validates (the config and the jail), launching nothing and writing nothing. On
-#       success prints exactly three lines on stdout, jail=, jira= and sentry=, each true or
+#       success prints exactly four lines on stdout, jail=, jira= and sentry=, each true or
 #       false (true only with "true" exactly in the config: the rule of jail_exec and of
-#       choose_type), and exits with 0; the warnings of config_load go to stderr and don't change
-#       the result. On failure, the message of the lib on stderr and exit 1.
+#       choose_type), and jira_url=<the JIRA_URL of the config, literally, maybe empty> (NS-53),
+#       and exits with 0; the warnings of config_load go to stderr and don't change the result.
+#       On failure, the message of the lib on stderr and exit 1.
+#   nick-agent --jira-url
+#       (NS-53) only the config, without the jail and the claude rules: the old .nick.conf, the
+#       cwd config and config_load (load_config), then exactly one line, jira_url=<the JIRA_URL,
+#       literally, maybe empty>, and exit 0. The nick shell runs it to show the Jira links of a
+#       project (the shell never reads the config itself), so a broken jail must not hide them:
+#       the jail error shows up when an agent is opened. Writes nothing. On failure (no config,
+#       or only the old one), the message of the lib on stderr and exit 1.
 #   nick-agent --render <type> [--title <v>] [--description <v>] [--jira-id <v>]
 #              [--jira-link <v>] [--sentry-link <v>] [--plan-path <v>]
 #       the same checks, then the answers of <type> (one of the 8 types of choose_type, available
@@ -79,9 +87,10 @@ config_register_nick_keys
 
 # The keys this script reads, written by config_load (empty when the file lacks them; an
 # inherited environment variable of the same name never counts). The prompt blocks read
-# STACK_DESCRIPTION and the *_ENABLED flags.
+# STACK_DESCRIPTION and the *_ENABLED flags; --check and --jira-url print JIRA_URL (NS-53).
 STACK_DESCRIPTION=""
 JIRA_ENABLED=""
+JIRA_URL=""
 SENTRY_ENABLED=""
 PERMISSION_ENABLED=""
 PRODUCTION_ENABLED=""
@@ -105,15 +114,14 @@ AGENT_STAGES=(po tech_leader development review)
 # usage_error <message>: the error and the usage on stderr, exit 1 (the pattern of bin/nick-init).
 usage_error() {
   echo "Erro: $1" >&2
-  echo "Uso: nick-agent --check | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>" >&2
+  echo "Uso: nick-agent --check | --jira-url | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>" >&2
   exit 1
 }
 
-# load_and_check: the checks of every mode, in order — the old .nick.conf, the cwd config (the
-# message of auto_scrum's resolve_stack when it is missing), config_load, jail_check (the config
-# of the cwd is always the team's shared one) and claude_settings_load. Any failure exits with
-# 1, with the message of the lib on stderr.
-load_and_check() {
+# load_config: the start of load_and_check, alone in --jira-url (NS-53) — the old .nick.conf, the
+# cwd config (the message of auto_scrum's resolve_stack when it is missing) and config_load. Any
+# failure exits with 1, with the message of the lib on stderr. Never the jail nor the claude rules.
+load_config() {
   local cwd_config
   config_cwd_legacy_check || exit 1
   cwd_config="$(config_cwd_file)"
@@ -122,6 +130,15 @@ load_and_check() {
     exit 1
   fi
   config_load "$cwd_config"
+}
+
+# load_and_check: the checks of every mode, in order — load_config (the old .nick.conf, the cwd
+# config and config_load), jail_check (the config of the cwd is always the team's shared one)
+# and claude_settings_load. Any failure exits with 1, with the message of the lib on stderr.
+load_and_check() {
+  local cwd_config
+  load_config
+  cwd_config="$(config_cwd_file)"
   AGENT_JAIL_HOSTS="$(jail_mcp_hosts "$JIRA_ENABLED" "$SENTRY_ENABLED") $JAIL_ALLOW_HOSTS"
   jail_check "$JAIL_ENABLED" "$JAIL_CLIPBOARD" "$AGENT_JAIL_HOSTS" "$JAIL_FORWARD_PORTS" "$cwd_config" "true" || exit 1
   claude_settings_load NICK_CLAUDE_SETTINGS || exit 1
@@ -407,6 +424,14 @@ main() {
       if [ "$JAIL_ENABLED" = "true" ]; then echo "jail=true"; else echo "jail=false"; fi
       if [ "$JIRA_ENABLED" = "true" ]; then echo "jira=true"; else echo "jira=false"; fi
       if [ "$SENTRY_ENABLED" = "true" ]; then echo "sentry=true"; else echo "sentry=false"; fi
+      # The value as it is (printf, not echo: nothing in it is interpreted).
+      printf 'jira_url=%s\n' "$JIRA_URL"
+      exit 0
+      ;;
+    --jira-url)
+      [ "$#" -eq 1 ] || usage_error "o --jira-url não aceita outros argumentos."
+      load_config
+      printf 'jira_url=%s\n' "$JIRA_URL"
       exit 0
       ;;
     --render)

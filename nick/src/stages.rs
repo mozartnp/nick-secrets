@@ -222,13 +222,16 @@ impl StageType {
         }
     }
 
-    /// The answers a new form starts with: the Jira ID filled with the ID of the ticket
-    /// (editable), every other one empty.
-    pub fn initial_values(self, ticket_key: &str) -> Vec<String> {
+    /// The answers a new form starts with: the Jira ID filled with the key of the ticket or of
+    /// the epic (editable, even a provisional one: NS-35), the Jira link (po_jira,
+    /// tech_leader_jira) with `jira_link` when there is one (NS-53: `tickets::jira_link`,
+    /// editable too), every other one empty.
+    pub fn initial_values(self, holder_key: &str, jira_link: Option<&str>) -> Vec<String> {
         self.fields()
             .iter()
             .map(|field| match field.rule {
-                Rule::JiraId => ticket_key.to_string(),
+                Rule::JiraId => holder_key.to_string(),
+                _ if *field == JIRA_LINK => jira_link.unwrap_or_default().to_string(),
                 _ => String::new(),
             })
             .collect()
@@ -456,11 +459,41 @@ mod tests {
     #[test]
     fn the_id_starts_with_the_ticket_and_the_rest_empty() {
         assert_eq!(
-            StageType::TechLeader.initial_values("NS-9"),
+            StageType::TechLeader.initial_values("NS-9", None),
             ["NS-9", "", ""]
         );
-        assert_eq!(StageType::Review.initial_values("NS-9"), ["NS-9", ""]);
-        assert_eq!(StageType::Po.initial_values("NS-9"), ["", ""]);
+        assert_eq!(StageType::Review.initial_values("NS-9", None), ["NS-9", ""]);
+        assert_eq!(StageType::Po.initial_values("NS-9", None), ["", ""]);
+    }
+
+    /// NS-53: the field of the Jira link (po_jira, tech_leader_jira) starts with the link, and
+    /// only it; without a link it starts empty, as before.
+    #[test]
+    fn the_jira_link_starts_with_the_link() {
+        let link = Some("https://j/browse/NS-9");
+        for kind in [StageType::PoJira, StageType::TechLeaderJira] {
+            assert_eq!(
+                kind.initial_values("NS-9", link),
+                ["https://j/browse/NS-9", ""],
+                "{kind:?}"
+            );
+            assert_eq!(kind.initial_values("NS-9", None), ["", ""], "{kind:?}");
+        }
+        // The other types have no link field: the link changes nothing.
+        for kind in StageType::ALL {
+            if matches!(kind, StageType::PoJira | StageType::TechLeaderJira) {
+                continue;
+            }
+            assert_eq!(
+                kind.initial_values("NS-9", link),
+                kind.initial_values("NS-9", None),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            StageType::TechLeader.initial_values("NS-9", link),
+            ["NS-9", "", ""]
+        );
     }
 
     #[test]
@@ -671,8 +704,12 @@ mod tests {
     #[test]
     fn the_form_of_an_epic_starts_with_its_key() {
         assert_eq!(
-            StageType::TechLeader.initial_values("EPIC-1"),
+            StageType::TechLeader.initial_values("EPIC-1", None),
             ["EPIC-1", "", ""]
+        );
+        assert_eq!(
+            StageType::TechLeaderJira.initial_values("EPIC-1", Some("https://j/browse/EPIC-1")),
+            ["https://j/browse/EPIC-1", ""]
         );
     }
 }

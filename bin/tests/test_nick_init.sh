@@ -179,6 +179,37 @@ assert_eq "$(nick_gitignore_expected)" "$(cat "$ow_dir/cwd/.nick/.gitignore" 2>/
 assert_eq "$(init_expected_output "$ow_pwd")" "$(cat "$ow_dir/yes.out" 2>/dev/null || true)" "resposta s: stdout exato"
 
 echo
+echo "== NS-53: a pergunta da JIRA_URL, depois da sobrescrita, grava a resposta no nick.conf =="
+# jira_url_expected <valor>: o esqueleto esperado com JIRA_URL="<valor>".
+jira_url_expected() {
+  sed "s#^JIRA_URL=\"\"\$#JIRA_URL=\"$1\"#" "$skeleton_expected"
+}
+assert_eq "1" "$(grep -cx 'JIRA_URL=""' "$skeleton_expected" || true)" "amostra: o esqueleto esperado tem JIRA_URL=\"\""
+ju_dir="$TEST_TMP/jira_url"
+mkdir -p "$ju_dir/fresh"
+assert_eq "0" "$(run_init "$ju_dir/fresh" "https://j/browse/" "$ju_dir/fresh_run")" "cwd vazio, URL no stdin: termina com código 0"
+jira_url_expected "https://j/browse/" > "$ju_dir/fresh.expected"
+assert_eq "igual" "$(cmp -s "$ju_dir/fresh.expected" "$ju_dir/fresh/.nick/nick.conf" && echo igual || echo diferente)" "cwd vazio, URL no stdin: grava JIRA_URL=\"https://j/browse/\" e o resto é o esqueleto"
+assert_eq "$(init_expected_output "$(cd "$ju_dir/fresh" && pwd)")" "$(cat "$ju_dir/fresh_run.out" 2>/dev/null || true)" "cwd vazio, URL no stdin: stdout de sempre"
+assert_eq "" "$(cat "$ju_dir/fresh_run.err" 2>/dev/null || echo 'sem stderr gravado')" "cwd vazio, URL no stdin: nada no stderr"
+ju_load_rc=0
+ju_load_out="$(timeout 2 bash -c "set -euo pipefail; source '$CONFIG_SH'; source '$KEYS_SH'; config_register_nick_keys; config_load '$ju_dir/fresh/.nick/nick.conf'; printf '%s' \"\$JIRA_URL\"" 2> "$ju_dir/load.err")" || ju_load_rc=$?
+assert_eq "0|https://j/browse/" "$ju_load_rc|$ju_load_out" "o nick.conf com a URL carrega com o valor"
+assert_eq "" "$(cat "$ju_dir/load.err" 2>/dev/null || echo 'sem stderr gravado')" "o nick.conf com a URL carrega sem aviso"
+mkdir -p "$ju_dir/over/.nick"
+printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$ju_dir/over/.nick/nick.conf"
+assert_eq "0" "$(run_init "$ju_dir/over" $'s\nhttps://j/browse/' "$ju_dir/over_run")" "nick.conf existente, s e depois a URL: termina com código 0"
+assert_eq "igual" "$(cmp -s "$ju_dir/fresh.expected" "$ju_dir/over/.nick/nick.conf" && echo igual || echo diferente)" "nick.conf existente, s e depois a URL: sobrescreve com a URL"
+printf '%s\n' 'STACK_DESCRIPTION="antigo"' > "$ju_dir/over/.nick/nick.conf"
+assert_eq "0" "$(run_init "$ju_dir/over" $'N\nhttps://j/browse/' "$ju_dir/over_no")" "nick.conf existente, N: termina com código 0"
+assert_eq 'STACK_DESCRIPTION="antigo"' "$(cat "$ju_dir/over/.nick/nick.conf")" "nick.conf existente, N: nada muda (a pergunta da URL não vem)"
+mkdir -p "$ju_dir/quote"
+assert_eq "0" "$(run_init "$ju_dir/quote" $'https://j/"x\nhttps://ok/' "$ju_dir/quote_run")" "resposta com aspas, depois uma válida: termina com código 0"
+assert_eq 'JIRA_URL="https://ok/"' "$(grep '^JIRA_URL=' "$ju_dir/quote/.nick/nick.conf" 2>/dev/null || true)" "resposta com aspas: recusada, e a seguinte é gravada"
+assert_eq 'Erro: a resposta não pode ter aspas duplas (") nem caracteres de controle. Tente de novo.' "$(cat "$ju_dir/quote_run.err" 2>/dev/null || true)" "resposta com aspas: a recusa no stderr, sem ecoar o valor"
+assert_eq "" "$(grep -nw 'JIRA_URL' <<< "$init_code" || true)" "bin/nick-init não tem código específico da JIRA_URL (a pergunta vem do registro)"
+
+echo
 echo "== .nick/ existente: .gitignore editado e conteúdo de troca/ e docs/ ficam intactos =="
 ed_dir="$TEST_TMP/edited"
 mkdir -p "$ed_dir/cwd/.nick/troca" "$ed_dir/cwd/.nick/docs/SC-1"

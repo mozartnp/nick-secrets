@@ -31,7 +31,7 @@ use nick::deps::Deps;
 use nick::editor::TerminalEditorRunner;
 use nick::init::{self, TerminalInitRunner};
 use nick::keys::TermModes;
-use nick::launch::TerminalAgentLauncher;
+use nick::launch::{self, TerminalAgentLauncher};
 use nick::mascot::Mascot;
 use nick::paths::{self, DB_FILE_NAME};
 use nick::resources;
@@ -110,6 +110,9 @@ fn main() -> ExitCode {
         ),
     )
     .with_agents(resources.launcher(), agents_dir)
+    // The JIRA_URL of each project (NS-53), by `bin/nick-agent --jira-url`: the shell never
+    // reads the config itself.
+    .with_jira_url_reader(Box::new(launch::run_jira_url))
     .with_prompt_logs(state_dir.clone())
     .with_deps(deps);
     // The reserved shortcut of the database (NS-34): an invalid one, or an error, falls back

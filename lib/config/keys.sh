@@ -14,7 +14,7 @@
 # global is created. The registry never initializes the key globals: each tool owns the ones
 # it reads (auto_scrum.sh initializes them; bin/nick-init doesn't read the config at all).
 #
-# config_register_key <name> <default> <note> <skeleton comment>
+# config_register_key <name> <default> <note> <skeleton comment> [<init question>]
 # A toggle key ("true"/"false") must end in _ENABLED (config_is_toggle_key) and default to
 # "false" ("true" only for TDD_ENABLED, on by default); a text key defaults to "". The note is
 # the key-specific text both config warnings show, and only two keys have one, each because
@@ -26,6 +26,8 @@
 #     look for that question to tell whether it reached the prompt;
 #   - TDD_ENABLED is the only flag that is on by default: an absent or invalid value keeps
 #     TDD on, so the note says that instead of "a opção está desligada.".
+# The init question (5th argument, NS-53) is asked by config_init (bin/nick-init) and its answer
+# goes into the skeleton. Only text keys can have one, and today only JIRA_URL has.
 # A bad registration is a programming error: the first failing call makes the function
 # return 1 right there (without exit, and without registering the keys after it), so a
 # caller under set -e stops on load.
@@ -51,6 +53,14 @@ opt-in: vazio ou "false" tira essa pergunta do prompt do PO.' || return 1
 'JIRA_ENABLED: "true" se esse projeto tem o MCP do Jira configurado (.mcp.json do
 projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
 principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.' || return 1
+  # JIRA_URL is a text key, independent of JIRA_ENABLED: the nick shell builds each Jira link as
+  # base + ID (tickets::jira_link) and gets the value only from bin/nick-agent (--jira-url and
+  # the 4th line of --check). Never validated.
+  config_register_key JIRA_URL "" "" \
+'JIRA_URL: base dos links do Jira (ex: https://empresa.atlassian.net/jira/browse/). O nick
+monta o link de cada ticket e épico com ID do Jira como base + ID e o mostra no painel e
+nos formulários das etapas. Guardada exatamente como digitada. Vazio: sem link.' \
+'URL base dos links do Jira (opcional, Enter para pular; ex: https://empresa.atlassian.net/jira/browse/): ' || return 1
   config_register_key PRODUCTION_ENABLED "false" \
 'a pergunta de impacto em produção está desligada no prompt do PO. Use "true" para ligá-la ou "false" para mantê-la desligada.' \
 'PRODUCTION_ENABLED: "true" se esse projeto já está em produção — o PO passa a avaliar,

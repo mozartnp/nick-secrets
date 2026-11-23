@@ -1310,6 +1310,14 @@ launcher do protótipo do painel; ver "Rust no projeto: protótipo do painel (NS
 
 ## Registro de chaves da configuração
 
+> **Mudou no NS-53** (seção "Rust no projeto: link do Jira montado pelo ID (NS-53)"): o
+> `config_register_key` aceita um **5º argumento opcional**, a pergunta do init, guardada no array
+> interno `CONFIG_KEY_PROMPTS` (pergunta vazia é o mesmo que nenhuma; chave `_ENABLED` com pergunta
+> é recusada, retorno 1). A mensagem de contagem passou a "espera 4 ou 5 argumentos". O
+> `config_init` pergunta cada chave com pergunta, **depois** da confirmação de sobrescrita e
+> **antes** de criar qualquer coisa, e o `config_print_skeleton` ganhou pares opcionais
+> `CHAVE=valor`. Hoje só a `JIRA_URL` tem pergunta.
+
 As chaves da configuração do nick ficam num bloco único em `lib/config/keys.sh`, dentro da
 função `config_register_nick_keys`, uma chamada por chave, na ordem do esqueleto (até o NS-30
 o bloco ficava no topo do `auto_scrum.sh`):
@@ -3129,6 +3137,12 @@ Code, não roda dentro da jail do nick. O roteiro fica em `.nick/docs/NS-34/veri
 para o analista executar fora dela.
 
 ## Rust no projeto: etapas do auto_scrum na casca `nick` (NS-35)
+
+> **Mudou no NS-53** (seção "Rust no projeto: link do Jira montado pelo ID (NS-53)"): o `--check`
+> imprime **quatro** linhas, com `jira_url=<valor>` por último, e o `parse_check` recusa as três
+> de antes com `UNEXPECTED_CHECK_MESSAGE`. Entrou o modo leve `--jira-url`, só com a configuração
+> (sem jail e sem as regras do claude). O item "Como o painel recebe as flags" vale também para a
+> `JIRA_URL`: ela chega só pelo `bin/nick-agent`, e o Rust continua sem ler o `.nick/nick.conf`.
 
 > **Mudou no NS-52** (seção "Rust no projeto: instalador local (NS-52)"): os logs do `--render`
 > do nick saem do `auto_scrum/logs/` e vão para `$XDG_STATE_HOME/nick/logs/<nome>-<id>/`. O nick
@@ -5445,3 +5459,147 @@ agente no nick instalado, apaga o `prompt.sh` do prefixo para o controle positiv
 do NS-52: estavam copiados). Com cache, leva uns 5 s; o primeiro build release, uns 20 s
 nesta máquina. Os testes de `bin/tests/test_nick_agent.sh` e `auto_scrum/tests/test_auto_scrum.sh`
 não mudaram.
+
+## Rust no projeto: link do Jira montado pelo ID (NS-53)
+
+A chave nova `JIRA_URL` guarda a base dos links do Jira do projeto (ex:
+`https://empresa.atlassian.net/jira/browse/`). O painel do ticket e o do épico mostram
+`Jira: <base><ID>`, e os formulários de `po_jira` e `tech_leader_jira` já abrem com o link
+preenchido.
+
+**A chave.** `JIRA_URL` é de texto (padrão `""`, sem nota), registrada em `lib/config/keys.sh`
+logo depois de `JIRA_ENABLED`. Ela não depende da flag: o link no painel é só uma referência, e os
+campos de link só existem nos tipos com Jira, que já dependem de `JIRA_ENABLED`. O valor fica
+exatamente como foi digitado: o nick não acrescenta a `/` final, não confere o esquema nem valida
+o formato. Fora do escopo: o link pode estar quebrado. Ela não entra no `export` nem na lista do
+`envsubst` do `prompt.sh`, porque nenhum template a usa. As globais ganharam `JIRA_URL=""` no
+`bin/nick-agent` e no `auto_scrum.sh`. O `auto_scrum.sh` nunca lê a chave, mas o bloco dele lista todas as chaves. Por
+isso a linha leva um `# shellcheck disable=SC2034` com o motivo (P1 do review do NS-53: o aviso
+passou porque nenhuma suíte rodava o shellcheck no `auto_scrum.sh`). Desde então, o
+`auto_scrum/tests/test_auto_scrum.sh` tem um bloco `shellcheck -x` do `auto_scrum.sh` e dela
+mesma, no molde das outras suítes.
+
+**A regra "base + ID", com fonte única** (`tickets::jira_link(base, key, provisional)`). Ela
+devolve `None` sem base, com base vazia ou com ID provisório, e `base + ID` nos outros casos. O
+painel do ticket, o do épico e os formulários usam essa função, e nenhum outro lugar concatena
+base e ID.
+
+**Como a casca recebe o valor (D1): o Rust continua sem ler o `nick.conf`.** A regra do NS-31 e do
+NS-35 e o estrutural `no_rust_source_builds_the_prompt_nor_reads_the_config` continuam valendo sem
+isenção nova. O valor chega por dois caminhos:
+- **`bin/nick-agent --jira-url`**, um modo leve novo: roda só o `load_config`, que é o começo do
+  `load_and_check` (o `.nick.conf` antigo, a existência do arquivo e o `config_load`). O
+  `load_and_check` passou a chamar o `load_config`, sem mudar a ordem nem as mensagens. Não roda o
+  `jail_check` nem o `claude_settings_load`. Imprime uma linha só, `jira_url=<valor>` (com
+  `printf`, então o valor sai literal), e sai com 0. Uma jail ligada e quebrada não esconde o link:
+  o erro da jail aparece no `g`. Sem configuração (ou só com o arquivo antigo), sai com 1 e a
+  mensagem de sempre. Argumento extra dá `usage_error`, e o modo não grava nada;
+- **a 4ª linha do `--check`**, `jira_url=<valor>`. O formulário usa o valor do momento do `g`, e o
+  `jira_url` da `Row` do projeto passa a ser esse valor.
+
+**O protocolo do Rust (D7).** O `parse_check` exige **exatamente quatro linhas**, nesta ordem:
+`jail=`, `jira=`, `sentry=` e `jira_url=`. O valor é o resto da linha, pode ser vazio e precisa ser
+UTF-8. As três linhas de antes viram `UNEXPECTED_CHECK_MESSAGE`, porque binário e bash de versões
+diferentes não podem ser aceitos em silêncio (o racional do NS-52). Também é recusada uma 4ª linha
+que não seja `jira_url=<valor>` UTF-8: o projeto fica sem abrir agente até o valor ser corrigido,
+o lado seguro de "nada é presumido" (decisão desta execução). O `Precheck` ganhou
+`jira_url: Option<String>`, que fica `None` quando o valor é vazio. O `launch::run_jira_url`
+segue o molde do `run_check`: `Command::new("bash")`, cwd no projeto e stdin em `/dev/null`. O
+`parse_jira_url` aceita a linha `jira_url=<valor>` exata, com ou sem `\n`. Uma falha (código ≠ 0,
+saída inesperada, não UTF-8, launcher ausente) vira `None` sem mensagem na barra: o painel só
+deixa de mostrar o link, e o erro de verdade aparece no `g`. O stderr do sucesso, com os avisos da
+configuração, é ignorado: esses avisos aparecem na prévia do `g`.
+
+**Onde o valor mora, e quando é lido (D8, D9, com uma mudança decidida pelo usuário).** A `Row`
+ganhou `jira_url`. O leitor é injetável (`App::with_jira_url_reader`, um
+`Box<dyn FnMut(&Path, &Path) -> Option<String>>`, no molde do `with_agents`). O padrão do
+`App::new` devolve `None` sem rodar nada, então os testes de unidade não rodam bash. O `main.rs`
+liga o `launch::run_jira_url`. O leitor só roda com o projeto `Available` e o launcher sendo
+arquivo.
+
+**Mudança no plano, decidida pelo usuário na execução:** o D8 mandava ler a cada `App::refresh`.
+Só que o `refresh_tree` roda depois de **toda tecla** na árvore, e cada `--jira-url` custa uns
+28 ms nesta máquina: isso dava uns 85 ms de atraso por seta com 3 projetos. Por isso a leitura
+roda só quando o projeto entra na lista ou acaba de ficar disponível. Nos outros refreshes, o
+valor vem da `Row` anterior, se o projeto já estava disponível com o mesmo caminho. O
+`with_jira_url_reader` e o `with_agents` releem todos os projetos disponíveis, então a ordem das
+duas chamadas no `main.rs` não importa. Impacto: uma edição à mão da `JIRA_URL` com o nick aberto
+só aparece no painel depois de um `g` naquele projeto, de o projeto ficar indisponível e voltar,
+ou de reabrir o nick.
+
+O `TicketDetail` e o `EpicDetail` ganharam `jira_link`, calculado no `read_ticket_detail` e no
+`read_epic_detail` a partir da `Row` do projeto, da chave e do `is_provisional`. Como os detalhes
+são relidos depois de cada ação, o link acompanha o "Editar ID" (NS-36 e NS-40) sem código a mais.
+Um provisório que ganha um ID passa a ter link.
+
+**O formulário (D10).** O `Holder` ganhou `provisional`, preenchido nos dois `From`. O plano
+falava em 8 literais de `Holder`, mas os únicos que existem são os dois `From`.
+`StageType::initial_values(holder_key, jira_link)` faz o campo `Link do ticket no Jira` nascer
+com o link. O `ID do Jira` continua nascendo com a chave, mesmo provisória, como no NS-35. O link
+vem de `jira_link(precheck.jira_url, holder.key, holder.provisional)` no `key_choose_type`, e
+nunca da `Row`. O campo continua editável e obrigatório.
+
+**O init (D2, D5, D6).** O `config_init` pergunta as chaves com pergunta, na ordem do registro,
+depois da sobrescrita e antes do `config_dir_prepare`. A resposta é aparada nas pontas como faz o
+`read -r` (o `IFS` padrão vai explícito no `read`). Enter e EOF gravam `""` e o init segue: aqui o
+EOF **não cancela**, diferente da sobrescrita. Assim, todo `nick-init < /dev/null` continua
+gerando o esqueleto. Um EOF depois de texto sem `\n` também grava `""`. Uma resposta com `"` ou
+com caractere de controle (`[[:cntrl:]]`; sob `LC_ALL=C` um acento passa) é recusada com
+`Erro: a resposta não pode ter aspas duplas (") nem caracteres de controle. Tente de novo.`. A
+mensagem não ecoa o valor, e a pergunta se repete. O `read -p` só mostra a pergunta num terminal,
+então os testes provam a repetição pela contagem de recusas. Para provar que nada é criado antes
+das perguntas, um teste usa um FIFO. O
+`config_print_skeleton <tool> [CHAVE=valor...]` sem pares dá a saída de antes, byte a byte. Cada
+par troca o padrão da linha `CHAVE="..."` pelo valor literal. Um par de chave não registrada (ou
+sem `=`) é recusado antes de imprimir qualquer coisa: mensagem no stderr e retorno 1. O
+`bin/nick-init` não mudou.
+
+**No painel (D11).** No ticket, a linha `Jira: <link>` entra logo depois da linha do épico (ou do
+cabeçalho, sem épico), antes de `Etapa atual`. No épico, entra logo depois de `Pasta:`. As duas
+passam por `printable()`. Sem link, nenhuma linha aparece, e a tela fica idêntica à de antes. Com
+agente vivo, o painel tem 40 colunas e o fim do link pode ser cortado (impacto aceito, como no
+NS-36).
+
+**Impactos aceitos:** todo `.nick/nick.conf` existente (inclusive o deste repositório) passa a
+receber o aviso de chave ausente da `JIRA_URL` até ela ser acrescentada. O link montado pode não
+existir no Jira. O valor do painel vem da última leitura (acima). E roda um `bash` a mais por
+projeto quando ele entra na lista ou volta a ficar disponível.
+
+**Testes adaptados, com o motivo:**
+- `lib/tests/test_keys.sh`: os retratos fixados à mão (`CONFIG_KEYS`, padrões, notas, o corpo do
+  esqueleto, a contagem 11 e o "falha no meio") ganharam a `JIRA_URL`, porque a lista de chaves
+  mudou de propósito. A carga limpa confere os cinco arrays;
+- `auto_scrum/tests/test_auto_scrum.sh`: os quatro avisos de chave ausente fixados à mão ganharam
+  `JIRA_URL=""`, pelo mesmo motivo ("onze chaves");
+- `bin/tests/test_nick_agent.sh`: o `--check` espera quatro linhas, o `USAGE` cita `--jira-url`, e
+  a matriz do diferencial ganhou `JIRA_URL` no "tudo ligado";
+- `nick/src/launch.rs`: `jail_true_and_jail_false_are_read`,
+  `the_flags_of_jira_and_sentry_are_read`, `any_other_stdout_with_exit_0_is_an_error`,
+  `the_stderr_of_a_success_is_a_warning` e `a_failure_is_the_stderr_or_the_code` usam quatro
+  linhas. Os formatos recusados continuam recusados, e entraram as três linhas antigas, a 4ª linha
+  fora do formato ou em outra posição e o valor não UTF-8;
+- `nick/src/stages.rs`: `the_id_starts_with_the_ticket_and_the_rest_empty` e
+  `the_form_of_an_epic_starts_with_its_key` usam a assinatura nova, com as mesmas asserções e
+  `None`;
+- `nick/tests/stages.rs`: o diferencial do épico usa `initial_values(.., None)`. Os literais de
+  `Precheck` (`app.rs`, `ui.rs`) e de `Row` (`tree.rs`, `ui.rs`) ganharam o campo novo, só
+  sintaxe. Os testes atuais de painel (`draw_ticket_detail`, `epic_lines`) passaram sem mudança.
+
+**Testes novos:** `lib/tests/test_config.sh` (registro com 4 ou 5 argumentos, pergunta em `_ENABLED`,
+pergunta vazia, pares do esqueleto, as perguntas do init, inclusive recusa, EOF, sobrescrita e
+FIFO); `lib/tests/test_keys.sh` (a `JIRA_URL` depois de `JIRA_ENABLED`, a única com pergunta, com o
+texto fixado); `bin/tests/test_nick_init.sh` (URL no stdin; `s` e a URL; N; aspas recusadas; nenhum
+código da chave no script); `bin/tests/test_nick_agent.sh` (a 4ª linha literal com `$(id)`, a chave
+ausente, a do ambiente que não conta, e o `--jira-url` com jail quebrada de quatro jeitos, com
+controle positivo pelo `--check`, sem configuração, legado, argumentos e o cabeçalho);
+`launch.rs` (`parse_check` com a URL, `parse_jira_url`, `run_check` e `run_jira_url` com o launcher
+real, inclusive com a jail quebrada); `tickets.rs` (`jira_link`); `stages.rs` (o campo do link);
+`app.rs` (leitor do `new`, leitura só quando o projeto fica disponível e sem launcher, os detalhes
+nos três casos para ticket e épico, o "Editar ID" dos dois, o formulário pelo `Precheck` e não pela
+`Row`, provisório e sem URL, o `ID do Jira` igual ao do NS-35, o campo editável e obrigatório até
+o `render`, a `Row` atualizada pelo `g`); `ui.rs` (a linha no painel do ticket, do ticket num épico
+e do épico, a posição, o `?` no lugar do controle); `nick/tests/stages.rs` (o diferencial de
+`po_jira` e `tech_leader_jira` com o link do `initial_values` × o script com o link digitado); e,
+no PTY, `nick/tests/agent.rs` (painel → `g` → formulário preenchido → prévia com
+`Link do ticket no Jira: <base><ID>`; épico com jail quebrada; sem `JIRA_URL`, sem linha). As telas
+ficam em `.nick/docs/NS-53/`.

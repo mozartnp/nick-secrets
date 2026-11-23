@@ -15,7 +15,7 @@
 # Rules (see ABOUT.md, "Código compartilhado entre ferramentas (lib/)"):
 #   - loading it only assigns CONFIG_NICK_DIR_NAME, CONFIG_EXCHANGE_DIR_NAME,
 #     CONFIG_DOCS_DIR_NAME, CONFIG_CWD_FILE_NAME and CONFIG_CWD_LEGACY_FILE_NAME, creates the
-#     four empty registry arrays and defines functions: it prints nothing and runs no
+#     five empty registry arrays and defines functions: it prints nothing and runs no
 #     command;
 #   - no shebang and no executable bit; no set -euo pipefail of its own, but it works with
 #     or without it in the caller;
@@ -45,17 +45,21 @@ CONFIG_CWD_LEGACY_FILE_NAME=".nick.conf"
 # The key registry, filled by config_register_key in registration order (which is the order
 # of the skeleton and of the missing-key warning). Parallel indexed arrays rather than an
 # associative one: declare -A would need -g if this library were loaded inside a function.
-# CONFIG_KEYS is the public, read-only list; the other three are internal.
+# CONFIG_KEYS is the public, read-only list; the other four are internal. CONFIG_KEY_PROMPTS
+# holds the init question of each key ("" when the key has none, NS-53).
 CONFIG_KEYS=()
 CONFIG_KEY_DEFAULTS=()
 CONFIG_KEY_NOTES=()
 CONFIG_KEY_COMMENTS=()
+CONFIG_KEY_PROMPTS=()
 
-# config_register_key <name> <default> <note> <comment>: registers one key of the caller's
-# config, in skeleton order. <default> is the value the skeleton writes and the missing-key
-# warning suggests; <note> is the key-specific text both warnings show (may be empty);
-# <comment> is the skeleton comment above the key, without the "# " of each line
-# (config_print_skeleton adds it). Everything is checked before registering; on any broken
+# config_register_key <name> <default> <note> <comment> [<prompt>]: registers one key of the
+# caller's config, in skeleton order. <default> is the value the skeleton writes and the
+# missing-key warning suggests; <note> is the key-specific text both warnings show (may be
+# empty); <comment> is the skeleton comment above the key, without the "# " of each line
+# (config_print_skeleton adds it); <prompt>, optional (NS-53), is the question config_init asks
+# for this key, whose answer goes into the skeleton — an empty <prompt> is the same as none.
+# Everything is checked before registering; on any broken
 # rule it prints a message on stderr and returns 1 without registering anything (and
 # without exit — a caller under set -e stops right there, on purpose: a bad registration is
 # a programming error):
@@ -74,19 +78,21 @@ CONFIG_KEY_COMMENTS=()
 #     text key;
 #   - <comment> isn't empty and no line of it ends in a space, a tab or a \r, so the
 #     skeleton stays clean for the target team's text hooks (trailing-whitespace,
-#     mixed-line-ending).
+#     mixed-line-ending);
+#   - a toggle key has no <prompt>: its value is "true"/"false", never a typed answer.
 config_register_key() {
   local upper="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
   local word="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
-  local name default note comment line attributes
-  if [ "$#" -ne 4 ]; then
-    echo "Erro: config_register_key espera 4 argumentos (nome, padrão, nota e comentário), recebeu $#." >&2
+  local name default note comment prompt line attributes
+  if [ "$#" -ne 4 ] && [ "$#" -ne 5 ]; then
+    echo "Erro: config_register_key espera 4 ou 5 argumentos (nome, padrão, nota, comentário e, opcional, a pergunta do init), recebeu $#." >&2
     return 1
   fi
   name="$1"
   default="$2"
   note="$3"
   comment="$4"
+  prompt="${5:-}"
   case "$name" in
     "" | [!"$upper"]* | *[!"$word"]*)
       echo "Erro: config_register_key: nome de chave inválido '$name' (use só A-Z, 0-9 e _, começando por letra maiúscula)." >&2
@@ -124,6 +130,10 @@ config_register_key() {
         return 1
         ;;
     esac
+    if [ -n "$prompt" ]; then
+      echo "Erro: config_register_key: a chave liga/desliga '$name' não pode ter pergunta do init." >&2
+      return 1
+    fi
   elif [ -n "$default" ]; then
     echo "Erro: config_register_key: a chave de texto '$name' precisa de padrão \"\" (recebeu \"$default\")." >&2
     return 1
@@ -144,6 +154,7 @@ config_register_key() {
   CONFIG_KEY_DEFAULTS+=("$default")
   CONFIG_KEY_NOTES+=("$note")
   CONFIG_KEY_COMMENTS+=("$comment")
+  CONFIG_KEY_PROMPTS+=("$prompt")
 }
 
 # config_key_index <key>: prints the registry index of <key>, or nothing and returns 1 when
@@ -349,15 +360,28 @@ config_cwd_legacy_check() {
   return 1
 }
 
-# config_print_skeleton <tool_name>: prints (stdout) the config skeleton of the registered
-# keys: three header lines naming <tool_name>, then, for each key in registration order, its
-# comment with "# " before each line (a blank comment line becomes "#", with no trailing
-# space) and KEY="<default>". The file must stay friendly to the target team's generic text
-# hooks (pre-commit trailing-whitespace/end-of-file-fixer/mixed-line-ending): no shebang, no
-# trailing spaces, LF, ending with a newline — config_register_key refuses comments that
-# would break that. printf '%s\n', not echo, so nothing in the text is interpreted.
+# config_print_skeleton <tool_name> [<KEY>=<value>...]: prints (stdout) the config skeleton of
+# the registered keys: three header lines naming <tool_name>, then, for each key in
+# registration order, its comment with "# " before each line (a blank comment line becomes
+# "#", with no trailing space) and KEY="<default>". Each optional <KEY>=<value> pair (NS-53:
+# the init answers) writes KEY="<value>" instead of the default, literally; without pairs the
+# output is the same as before. A pair whose KEY isn't registered (or without "=") is refused
+# before anything is printed: a message on stderr and return 1. Checking the value is the
+# caller's job (config_init refuses quotes and control characters). The file must stay
+# friendly to the target team's generic text hooks (pre-commit
+# trailing-whitespace/end-of-file-fixer/mixed-line-ending): no shebang, no trailing spaces,
+# LF, ending with a newline — config_register_key refuses comments that would break that.
+# printf '%s\n', not echo, so nothing in the text is interpreted.
 config_print_skeleton() {
-  local tool_name="$1" index line
+  local tool_name="$1" index line pair value
+  shift
+  for pair in "$@"; do
+    case "$pair" in
+      *=*) config_key_index "${pair%%=*}" > /dev/null && continue ;;
+    esac
+    echo "Erro: config_print_skeleton: par inválido '$pair' (use CHAVE=valor com uma chave registrada)." >&2
+    return 1
+  done
   printf '%s\n' \
     "# Config do projeto pro $tool_name. Preencha as variáveis abaixo e salve." \
     "# Não é executado: o $tool_name lê só linhas CHAVE=\"valor\" (aspas duplas, sem aspas dentro do valor nem comentário no fim da linha) das chaves abaixo." \
@@ -370,7 +394,13 @@ config_print_skeleton() {
         printf '%s\n' "#"
       fi
     done <<< "${CONFIG_KEY_COMMENTS[$index]}"
-    printf '%s\n' "${CONFIG_KEYS[$index]}=\"${CONFIG_KEY_DEFAULTS[$index]}\""
+    value="${CONFIG_KEY_DEFAULTS[$index]}"
+    for pair in "$@"; do
+      if [ "${pair%%=*}" = "${CONFIG_KEYS[$index]}" ]; then
+        value="${pair#*=}"
+      fi
+    done
+    printf '%s\n' "${CONFIG_KEYS[$index]}=\"$value\""
   done
 }
 
@@ -402,6 +432,13 @@ config_dir_prepare() {
 #     answer prints "Cancelado. Nada foi alterado." on stdout and returns 0; a closed stdin
 #     (Ctrl+D) prints the same on stderr and returns 1. Either way nothing is created or
 #     changed.
+#   - Then, still before creating anything, each key registered with a question (the 5th
+#     argument of config_register_key) is asked, in registration order, and the answer goes
+#     into the skeleton (config_print_skeleton <tool_name> KEY=answer...). The answer is
+#     trimmed at both ends like read -r with the default IFS. Enter and EOF (Ctrl+D) write
+#     "" and go on — EOF doesn't cancel here, so an init with stdin closed still writes the
+#     skeleton. An answer with a double quote or a control character (the reader takes no
+#     quote inside a value) is refused without echoing it, and the question is asked again.
 #   - Then config_dir_prepare creates the whole .nick/ tree (the team sees and versions it
 #     from the first commit), the skeleton is written and the output shows the tree.
 #   - An old $PWD/$CONFIG_CWD_LEGACY_FILE_NAME doesn't stop it (the old file is the source
@@ -413,7 +450,7 @@ config_dir_prepare() {
 # bash's raw error), when <tool_name> is missing or empty, or when the tree or the file can't
 # be written.
 config_init() {
-  local tool_name file confirm
+  local tool_name file confirm index answer answers=()
   # Checked before touching "$1", so a caller under set -u gets this message, not bash's.
   if [ "$#" -ne 1 ] || [ -z "$1" ]; then
     echo "Erro: config_init espera 1 argumento (o nome da ferramenta), recebeu $#." >&2
@@ -435,10 +472,28 @@ config_init() {
         ;;
     esac
   fi
+  for index in "${!CONFIG_KEYS[@]}"; do
+    [ -n "${CONFIG_KEY_PROMPTS[$index]}" ] || continue
+    while :; do
+      # The default IFS spelled out, so the trim doesn't depend on the caller's IFS. EOF
+      # writes "", whatever was typed before it.
+      if ! IFS=$' \t\n' read -r -p "${CONFIG_KEY_PROMPTS[$index]}" answer; then
+        answer=""
+        break
+      fi
+      case "$answer" in
+        *\"* | *[[:cntrl:]]*)
+          echo "Erro: a resposta não pode ter aspas duplas (\") nem caracteres de controle. Tente de novo." >&2
+          ;;
+        *) break ;;
+      esac
+    done
+    answers+=("${CONFIG_KEYS[$index]}=$answer")
+  done
   # Before the skeleton, since nick.conf lives inside .nick/.
   config_dir_prepare || return 1
   # Grouped so the 2>/dev/null also covers the failing > "$file" (same as config_dir_prepare).
-  if ! { config_print_skeleton "$tool_name" > "$file"; } 2>/dev/null; then
+  if ! { config_print_skeleton "$tool_name" "${answers[@]}" > "$file"; } 2>/dev/null; then
     echo "Erro: não foi possível gravar $file." >&2
     return 1
   fi

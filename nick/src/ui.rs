@@ -22,7 +22,7 @@ use crate::launch::{Precheck, Rendered};
 use crate::mascot::{
     self, BUBBLE_COLS, BUBBLE_ROWS, MASCOT_COLS, MASCOT_ROWS, MEOW_TEXT, TREE_MIN_ROWS,
 };
-use crate::paths::printable;
+use crate::paths::{count_of, printable};
 use crate::projects;
 use crate::stages::{self, Input, Rule};
 use crate::tickets::{self, Ticket, TicketStage};
@@ -428,9 +428,9 @@ pub(crate) enum Place {
     Settings,
 }
 
-/// The place of the help, with the filters of the tree (the hidden tickets, only the active
-/// agents).
-type HelpState = (Place, bool, bool);
+/// The place of the help, with the filters of the tree (the hidden tickets, the done ones since
+/// the NS-54, only the active agents), in the order of the help: `f`, `d`, `v`.
+type HelpState = (Place, bool, bool, bool);
 
 /// The state of the help of `app` now.
 fn help_state(app: &App) -> HelpState {
@@ -456,7 +456,7 @@ fn help_state(app: &App) -> HelpState {
         }
     };
     let (show_hidden, only_active) = app.filters();
-    (place, show_hidden, only_active)
+    (place, show_hidden, app.hide_done(), only_active)
 }
 
 /// The keys of the selected node, in the help line. With the focus on the terminal, only the
@@ -514,7 +514,7 @@ fn dialog_keys(dialog: &Dialog) -> &'static str {
 /// without agents too), then `q sair`.
 fn help_text_for(
     app: &App,
-    (place, show_hidden, only_active): HelpState,
+    (place, show_hidden, hide_done, only_active): HelpState,
     on_terminal: bool,
     dialog: Option<&Dialog>,
     count: Option<String>,
@@ -537,7 +537,8 @@ fn help_text_for(
                            n novo épico · r remover"
             .into(),
         Place::Epic => "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · \
-                        e editar título · o ocultar/restaurar · g abrir agente · i editar ID"
+                        e editar título · o ocultar/restaurar · c concluir/reabrir · \
+                        g abrir agente · i editar ID"
             .into(),
         // Shorter since the NS-40 (`m etapa · i ID`), to make room for `p` with the same rows.
         Place::Ticket => "↑/↓ mover · →/Enter abrir · ← fechar/subir · e editar título · \
@@ -555,52 +556,53 @@ fn help_text_for(
     } else {
         "f mostrar ocultos"
     };
+    // NS-54: the filter of the done tickets and epics, off by default.
+    let done = if hide_done {
+        "d mostrar concluídos"
+    } else {
+        "d esconder concluídos"
+    };
     let active = if only_active {
         "v mostrar tudo"
     } else {
         "v agentes ativos"
     };
     let count = count.map_or(String::new(), |count| format!(" ({count})"));
-    format!("{keys} · {hidden} · {active}{count} · q sair")
+    format!("{keys} · {hidden} · {done} · {active}{count} · q sair")
 }
 
-/// Every state of the help without a dialog: each kind of node with both filters, and the
-/// settings. `help_rows` reserves rows for the longest of them.
-const HELP_STATES: [HelpState; 33] = [
-    (Place::Module, false, false),
-    (Place::Module, true, false),
-    (Place::Module, false, true),
-    (Place::Module, true, true),
-    (Place::Project, false, false),
-    (Place::Project, true, false),
-    (Place::Project, false, true),
-    (Place::Project, true, true),
-    (Place::Epic, false, false),
-    (Place::Epic, true, false),
-    (Place::Epic, false, true),
-    (Place::Epic, true, true),
-    (Place::Ticket, false, false),
-    (Place::Ticket, true, false),
-    (Place::Ticket, false, true),
-    (Place::Ticket, true, true),
-    (Place::LiveAgent, false, false),
-    (Place::LiveAgent, true, false),
-    (Place::LiveAgent, false, true),
-    (Place::LiveAgent, true, true),
-    (Place::StoppedAgent, false, false),
-    (Place::StoppedAgent, true, false),
-    (Place::StoppedAgent, false, true),
-    (Place::StoppedAgent, true, true),
-    (Place::ArchivedAgent, false, false),
-    (Place::ArchivedAgent, true, false),
-    (Place::ArchivedAgent, false, true),
-    (Place::ArchivedAgent, true, true),
-    (Place::ElsewhereAgent, false, false),
-    (Place::ElsewhereAgent, true, false),
-    (Place::ElsewhereAgent, false, true),
-    (Place::ElsewhereAgent, true, true),
-    (Place::Settings, false, false),
+/// The places of the tree, each with every combination of the three filters in `HELP_STATES`.
+const TREE_PLACES: [Place; 8] = [
+    Place::Module,
+    Place::Project,
+    Place::Epic,
+    Place::Ticket,
+    Place::LiveAgent,
+    Place::StoppedAgent,
+    Place::ArchivedAgent,
+    Place::ElsewhereAgent,
 ];
+
+/// Every state of the help without a dialog: each kind of node with the 8 combinations of the
+/// three filters (NS-54: 8 × 8), and the settings. `help_rows` reserves rows for the longest of
+/// them.
+const HELP_STATES: [HelpState; 65] = help_states();
+
+const fn help_states() -> [HelpState; 65] {
+    let mut states = [(Place::Settings, false, false, false); 65];
+    let mut at = 0;
+    while at < 64 {
+        let filters = at % 8;
+        states[at] = (
+            TREE_PLACES[at / 8],
+            filters & 1 != 0,
+            filters & 2 != 0,
+            filters & 4 != 0,
+        );
+        at += 1;
+    }
+    states
+}
 
 /// The rows reserved for the help with `running` agents (review NS-34, P1): never fewer than
 /// the longest help of the tree (`HELP_STATES`), with the longest count (`N, N com saída
@@ -806,18 +808,27 @@ fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
     (spans, style)
 }
 
-/// The label of an epic (NS-40): `<ID>  [épico]  <título>  [provisório]  [oculto]`, the
-/// `[épico]` in bold right after the ID, so the 34 columns of depth 2 keep it; the ID and the
-/// title in `EPIC_COLOR` (NS-45), the marks with no color; dimmed when hidden, as a ticket.
+/// The label of an epic (NS-40): `<ID>  [épico]  [aberto|concluído]  <título>  [provisório]
+/// [oculto]`, the `[épico]` in bold right after the ID, so the 34 columns of depth 2 keep it; the
+/// state (NS-54) right after it, whole in the 30 columns the label has at depth 2 with an ID of up
+/// to 8 characters (decisions of the user in the validation: after the title the cut took it
+/// away, and an open epic says `[aberto]`); the ID and the title in
+/// `EPIC_COLOR` (NS-45), the marks with no color; dimmed when hidden, as a ticket.
 fn epic_spans(epic: &Epic) -> (Vec<Span<'static>>, Style) {
     let purple = Style::new().fg(EPIC_COLOR);
     let mut spans = vec![
         Span::styled(printable(&epic.key), purple),
         Span::raw("  "),
         Span::styled("[épico]", Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled(printable(&epic.title), purple),
     ];
+    // NS-54: the state, open or done, with no new color.
+    spans.push(Span::raw(if epic.done_at.is_some() {
+        "  [concluído]"
+    } else {
+        "  [aberto]"
+    }));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(printable(&epic.title), purple));
     if epic.is_provisional {
         spans.push(Span::raw("  [provisório]"));
     }
@@ -1096,9 +1107,17 @@ fn epic_lines(detail: &EpicDetail) -> Vec<Line<'static>> {
     if epic.is_provisional {
         head.push(Span::raw("  [provisório]"));
     }
+    if epic.done_at.is_some() {
+        head.push(Span::raw("  [concluído]"));
+    }
     if epic.hidden_at.is_some() {
         head.push(Span::raw("  [oculto]"));
     }
+    // NS-54: open or done, with when.
+    let state = match &epic.done_at {
+        Some(at) => format!("Estado: concluído em {}", short_date(at)),
+        None => "Estado: aberto".to_string(),
+    };
     let exists = if detail.artifacts.plan {
         "(existe)"
     } else {
@@ -1126,6 +1145,7 @@ fn epic_lines(detail: &EpicDetail) -> Vec<Line<'static>> {
             printable(&docs::plan_path(&epic.key))
         )),
         Line::from(tickets),
+        Line::from(state),
         Line::from(""),
         Line::from("Agentes do épico: só PO e Tech Leader."),
     ]);
@@ -1355,15 +1375,6 @@ fn holder_line(holder: &Holder) -> String {
         printable(&holder.key),
         printable(&holder.title)
     )
-}
-
-/// `1 <one>` or `<n> <many>` (review of the NS-40, P3.2: `1 ticket`, `0 tickets`).
-fn count_of(n: usize, one: &str, many: &str) -> String {
-    if n == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{n} {many}")
-    }
 }
 
 /// The lines of the dialog of the title of a ticket or of an epic (review of the NS-40, P2.1: one
@@ -2091,8 +2102,14 @@ mod tests {
         );
     }
 
+    /// The last row with text (NS-54: the help may keep more than one empty row below it).
     fn last_line(buffer: &Buffer) -> String {
-        text(buffer).lines().last().unwrap_or("").to_string()
+        text(buffer)
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap_or("")
+            .to_string()
     }
 
     #[test]
@@ -2934,32 +2951,33 @@ mod tests {
         let (f, _) = with_running(&["proj"]);
         let area = Rect::new(0, 0, 100, 30);
         let areas = layout(&f.app, area);
-        // The help keeps the two rows the list of the tickets needs (review NS-34, P1).
-        assert_eq!(areas.list, Rect::new(0, 0, 40, 27));
+        // The help keeps the rows the longest help needs (review NS-34, P1): three since the
+        // NS-54 (the `c` of the epic and the `d` of the filters; two before).
+        assert_eq!(areas.list, Rect::new(0, 0, 40, 26));
         // The panel keeps its border (NS-37): the header and the terminal are inside it.
-        assert_eq!(areas.panel, Rect::new(40, 0, 60, 27));
+        assert_eq!(areas.panel, Rect::new(40, 0, 60, 26));
         assert_eq!(areas.header, Rect::new(41, 1, 58, 1));
-        assert_eq!(areas.terminal, Rect::new(41, 2, 58, 24));
-        assert_eq!(areas.status, Rect::new(0, 27, 100, 1));
-        assert_eq!(areas.help, Rect::new(0, 28, 100, 2));
+        assert_eq!(areas.terminal, Rect::new(41, 2, 58, 23));
+        assert_eq!(areas.status, Rect::new(0, 26, 100, 1));
+        assert_eq!(areas.help, Rect::new(0, 27, 100, 3));
         let agent = f.app.shown_agent().unwrap();
         assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
-        let mut parser = vt100::Parser::new(24, 58, 0);
-        parser.process(b"primeira\x1b[24;1Hultima");
+        let mut parser = vt100::Parser::new(23, 58, 0);
+        parser.process(b"primeira\x1b[23;1Hultima");
         let buffer = render_at(&f.app, 100, 30, Some(parser.screen()));
         assert_eq!(find(&buffer, "proj · Dev · NS-1 · na jail"), Some((1, 41)));
         assert_eq!(find(&buffer, "primeira"), Some((2, 41)));
         assert_eq!(
             find(&buffer, "ultima"),
-            Some((25, 41)),
+            Some((24, 41)),
             "the last row of the program"
         );
         let (y, _) = find(&buffer, " Navegação ").unwrap();
         assert_eq!(y, 0);
-        assert!(text(&buffer).lines().nth(26).unwrap().starts_with('└'));
+        assert!(text(&buffer).lines().nth(25).unwrap().starts_with('└'));
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
         assert_eq!(
-            lines[28].trim(),
+            lines[27].trim(),
             "Ctrl+\\ voltar à lista · Alt+Enter nova linha",
             "in the first row"
         );
@@ -2994,10 +3012,11 @@ mod tests {
             Rect::new(41, 1, 58, 2),
             "decision of the user"
         );
-        assert_eq!(areas.terminal, Rect::new(41, 3, 58, 23));
+        // One row less since the NS-54 (the help keeps three rows at 100 columns).
+        assert_eq!(areas.terminal, Rect::new(41, 3, 58, 22));
         // Each agent has the size of its own header: the one in the jail, one row.
         let in_jail = &f.app.agents()[0];
-        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(41, 2, 58, 24));
+        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(41, 2, 58, 23));
         let buffer = render_at(&f.app, 100, 30, None);
         let header: Vec<String> = text(&buffer)
             .lines()
@@ -3228,10 +3247,12 @@ mod tests {
             );
         }
         // Without agents, the help takes only the rows it needs, as before the NS-34 (the help
-        // of the module takes two at 100 columns, one at 140).
+        // of the module takes two at 100 columns, and two at 140 since the `d` of the NS-54; one
+        // at 160).
         let f = fixture();
         assert_eq!(layout(&f.app, Rect::new(0, 0, 100, 30)).help.height, 2);
-        assert_eq!(layout(&f.app, Rect::new(0, 0, 140, 30)).help.height, 1);
+        assert_eq!(layout(&f.app, Rect::new(0, 0, 140, 30)).help.height, 2);
+        assert_eq!(layout(&f.app, Rect::new(0, 0, 160, 30)).help.height, 1);
     }
 
     /// Review NS-34, P2: the PTY of a new agent is born with the size `layout` gives it once
@@ -3458,7 +3479,8 @@ mod tests {
         assert_border(&buffer, (40, 0), true, "┏");
         assert_border(&buffer, (99, 0), true, "┓");
         assert_border(&buffer, (99, 10), true, "┃");
-        assert_border(&buffer, (40, 26), true, "┗");
+        // The bottom one row up since the NS-54 (the help keeps three rows).
+        assert_border(&buffer, (40, 25), true, "┗");
         assert_border(&buffer, (0, 0), false, "┌");
         assert_border(&buffer, (39, 10), false, "│");
         // The focus on the list: the other way around.
@@ -3466,7 +3488,7 @@ mod tests {
         let buffer = render_at(&f.app, 100, 30, None);
         assert_border(&buffer, (0, 0), true, "┏");
         assert_border(&buffer, (39, 10), true, "┃");
-        assert_border(&buffer, (0, 26), true, "┗");
+        assert_border(&buffer, (0, 25), true, "┗");
         assert_border(&buffer, (40, 0), false, "┌");
         assert_border(&buffer, (99, 10), false, "│");
         // The title of the tree stays on the border.
@@ -3859,7 +3881,7 @@ mod tests {
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · →/Enter abrir · ← fechar · a adicionar projeto · c configurações · \
-             f mostrar ocultos · v agentes ativos · q sair"
+             f mostrar ocultos · d esconder concluídos · v agentes ativos · q sair"
         );
         // Without a project: the text of before.
         let f = fixture();
@@ -4002,7 +4024,8 @@ mod tests {
         );
         assert_eq!(
             help_text(&f.app),
-            "↑/↓ mover · r retomar · o arquivar · ← subir · f mostrar ocultos · v agentes \
+            "↑/↓ mover · r retomar · o arquivar · ← subir · f mostrar ocultos · \
+             d esconder concluídos · v agentes \
              ativos · q sair"
         );
         f.app.select(NodeId::Agent(agents[1].id));
@@ -4014,7 +4037,8 @@ mod tests {
         );
         assert_eq!(
             help_text(&f.app),
-            "↑/↓ mover · ← subir · f mostrar ocultos · v agentes ativos · q sair"
+            "↑/↓ mover · ← subir · f mostrar ocultos · d esconder concluídos · \
+             v agentes ativos · q sair"
         );
     }
 
@@ -4041,7 +4065,7 @@ mod tests {
             help_text(&f.app),
             "↑/↓ mover · →/Enter abrir · ← fechar/subir · e editar título · \
              o ocultar/restaurar · g abrir agente · m etapa · i ID · p épico · \
-             f mostrar ocultos · v agentes ativos · q sair"
+             f mostrar ocultos · d esconder concluídos · v agentes ativos · q sair"
         );
         // A history, oldest first, with the date as AAAA-MM-DD HH:MM UTC (raw when odd).
         let detail = f.app.ticket_detail.as_mut().unwrap();
@@ -4164,17 +4188,21 @@ mod tests {
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · Ctrl+\\ alternar · \
-             f mostrar ocultos · v agentes ativos (1) · q sair"
+             f mostrar ocultos · d esconder concluídos · v agentes ativos (1) · q sair"
         );
         f.app.tree.show_hidden = true;
         f.app.tree.only_active = true;
-        assert!(help_text(&f.app).ends_with("f esconder ocultos · v mostrar tudo (1) · q sair"));
+        assert!(
+            help_text(&f.app).ends_with(
+                "f esconder ocultos · d esconder concluídos · v mostrar tudo (1) · q sair"
+            )
+        );
         let project = NodeId::Project(f.app.agents[0].project_id);
         f.app.select(project);
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · n novo épico · \
-             r remover · f esconder ocultos · v mostrar tudo (1) · q sair"
+             r remover · f esconder ocultos · d esconder concluídos · v mostrar tudo (1) · q sair"
         );
         f.app.screen = Screen::Settings;
         assert_eq!(
@@ -4260,7 +4288,7 @@ mod tests {
             };
             for &(hidden, active) in filters {
                 assert!(
-                    HELP_STATES.contains(&(place, hidden, active)),
+                    HELP_STATES.contains(&(place, hidden, false, active)),
                     "{place:?} {hidden} {active}"
                 );
             }
@@ -4300,15 +4328,22 @@ mod tests {
             let mut sizes: Vec<Vec<Rect>> = Vec::new();
             for screen in [Screen::Tree, Screen::Settings] {
                 for node in nodes {
-                    for (hidden, active) in
-                        [(false, false), (true, false), (false, true), (true, true)]
-                    {
+                    for (hidden, active, done) in [
+                        (false, false, false),
+                        (true, false, false),
+                        (false, true, false),
+                        (true, true, false),
+                        // NS-54: the filter of the done ones.
+                        (false, false, true),
+                        (true, true, true),
+                    ] {
                         for focus in [Focus::List, Focus::Terminal] {
                             for unseen in [false, true] {
                                 f.app.screen = screen;
                                 f.app.select(node);
                                 f.app.tree.show_hidden = hidden;
                                 f.app.tree.only_active = active;
+                                f.app.tree.hide_done = done;
                                 f.app.focus = focus;
                                 f.app.agents[1].unseen = unseen;
                                 f.app.relayout();
@@ -4422,7 +4457,8 @@ mod tests {
         assert!(!text(&buffer).contains("r retomar"), "{}", text(&buffer));
         assert_eq!(
             help_text(&f.app),
-            "↑/↓ mover · o desarquivar · ← subir · f esconder ocultos · v agentes ativos · q sair"
+            "↑/↓ mover · o desarquivar · ← subir · f esconder ocultos · \
+             d esconder concluídos · v agentes ativos · q sair"
         );
     }
 
@@ -4588,7 +4624,8 @@ mod tests {
         assert!(!text(&buffer).contains("r retomar"), "{}", text(&buffer));
         assert_eq!(
             help_text(&f.app),
-            "↑/↓ mover · ← subir · f mostrar ocultos · v agentes ativos · q sair"
+            "↑/↓ mover · ← subir · f mostrar ocultos · d esconder concluídos · \
+             v agentes ativos · q sair"
         );
     }
 
@@ -4635,30 +4672,32 @@ mod tests {
             title: "Plano".into(),
             created_at: String::new(),
             hidden_at: None,
+            done_at: None,
         };
         let (spans, style) = epic_spans(&epic);
-        assert_eq!(spans_text(&spans), "EPIC-1  [épico]  Plano");
+        // NS-54: the state right after `[épico]` (`[aberto]`, decision of the user).
+        assert_eq!(spans_text(&spans), "EPIC-1  [épico]  [aberto]  Plano");
         assert_eq!(spans[2].content, "[épico]");
         assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(spans[2].style.fg, None, "the mark only bold");
         // NS-45: the ID and the title in purple.
         assert_eq!(spans[0].style.fg, Some(EPIC_COLOR));
-        assert_eq!(spans[4].style.fg, Some(EPIC_COLOR));
+        assert_eq!(spans[5].style.fg, Some(EPIC_COLOR));
         assert!(!style.add_modifier.contains(Modifier::DIM));
         epic.is_provisional = true;
         epic.hidden_at = Some("x".into());
         let (spans, style) = epic_spans(&epic);
         assert_eq!(
             spans_text(&spans),
-            "EPIC-1  [épico]  Plano  [provisório]  [oculto]"
+            "EPIC-1  [épico]  [aberto]  Plano  [provisório]  [oculto]"
         );
         assert!(style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(spans[5].style.fg, None, "[provisório] with no color");
-        assert_eq!(spans[6].style.fg, None, "[oculto] with no color");
+        assert_eq!(spans[6].style.fg, None, "[provisório] with no color");
+        assert_eq!(spans[7].style.fg, None, "[oculto] with no color");
         epic.title = "\x1b[2J".into();
         assert_eq!(
             spans_text(&epic_spans(&epic).0),
-            "EPIC-1  [épico]  ?[2J  [provisório]  [oculto]"
+            "EPIC-1  [épico]  [aberto]  ?[2J  [provisório]  [oculto]"
         );
     }
 
@@ -4773,8 +4812,8 @@ mod tests {
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · e editar título · \
-             o ocultar/restaurar · g abrir agente · i editar ID · f mostrar ocultos · \
-             v agentes ativos · q sair"
+             o ocultar/restaurar · c concluir/reabrir · g abrir agente · i editar ID · \
+             f mostrar ocultos · d esconder concluídos · v agentes ativos · q sair"
         );
         // The plan from the disk, and the hidden tickets counted.
         std::fs::create_dir_all(dir.join(".nick/docs/EPIC-1")).unwrap();
@@ -4832,15 +4871,15 @@ mod tests {
         assert_eq!(
             help_text(&f.app),
             "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · n novo épico · \
-             r remover · f mostrar ocultos · v agentes ativos · q sair"
+             r remover · f mostrar ocultos · d esconder concluídos · v agentes ativos · q sair"
         );
-        assert_eq!(HELP_STATES.len(), 33);
+        assert_eq!(HELP_STATES.len(), 65);
         assert_eq!(
             HELP_STATES
                 .iter()
-                .filter(|(place, _, _)| *place == Place::Epic)
+                .filter(|(place, ..)| *place == Place::Epic)
                 .count(),
-            4
+            8
         );
     }
 
@@ -5338,9 +5377,14 @@ mod tests {
     fn the_id_and_the_title_of_the_epic_are_purple_on_the_tree() {
         let (mut f, db, _) = with_epic_tree();
         let buffer = render(&f.app);
-        let (y, x) = find(&buffer, "EPIC-1  [épico]  Plano").unwrap();
+        let (y, x) = find(&buffer, "EPIC-1  [épico]  [aberto]  Pla").unwrap();
         assert_eq!(buffer[(x, y)].fg, EPIC_COLOR, "the ID");
-        assert_eq!(buffer[(x + 17, y)].fg, EPIC_COLOR, "the title");
+        assert_eq!(buffer[(x + 27, y)].fg, EPIC_COLOR, "the title");
+        assert_eq!(
+            buffer[(x + 17, y)].fg,
+            Color::Reset,
+            "[aberto] with no color"
+        );
         assert_eq!(buffer[(x + 8, y)].fg, Color::Reset, "[épico] with no color");
         assert!(buffer[(x + 8, y)].modifier.contains(Modifier::BOLD));
         // Hidden: still purple, dimmed.
@@ -5397,5 +5441,127 @@ mod tests {
         let buffer = render(&f.app);
         assert_has(&buffer, "> Aberto (atual)");
         assert_has(&buffer, "  Concluído");
+    }
+
+    // ---- the done epic and the filter of the done ones (NS-54, D7) ----
+
+    #[test]
+    /// The mark right after `[épico]` (decision of the user in the validation of the NS-54): at
+    /// the end of the row, after the title, the cut at 40 columns took it away.
+    fn the_label_of_a_done_epic_has_its_mark_right_after_the_mark_of_the_epic() {
+        let mut epic = Epic {
+            id: 1,
+            project_id: 1,
+            key: "EPIC-1".into(),
+            is_provisional: false,
+            title: "Plano".into(),
+            created_at: String::new(),
+            hidden_at: None,
+            done_at: Some("2026-11-22T10:00:00Z".into()),
+        };
+        let (spans, style) = epic_spans(&epic);
+        assert_eq!(spans_text(&spans), "EPIC-1  [épico]  [concluído]  Plano");
+        assert_eq!(spans[3].content, "  [concluído]");
+        assert_eq!(spans[3].style.fg, None, "no new color");
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(spans[0].style.fg, Some(EPIC_COLOR), "the purple stays");
+        assert_eq!(spans[5].style.fg, Some(EPIC_COLOR), "on the title too");
+        epic.is_provisional = true;
+        epic.hidden_at = Some("x".into());
+        assert_eq!(
+            spans_text(&epic_spans(&epic).0),
+            "EPIC-1  [épico]  [concluído]  Plano  [provisório]  [oculto]"
+        );
+        // At depth 2 the label has 30 columns (40, less the border, `> `, the indent and the
+        // arrow): with an ID of 8 characters (a provisional one) the mark still fits whole.
+        epic.key = "0a1b2c3d".into();
+        epic.title = "Painel do nick em Rust".into();
+        let text = spans_text(&epic_spans(&epic).0);
+        assert_eq!(
+            text.chars().take(30).collect::<String>(),
+            "0a1b2c3d  [épico]  [concluído]",
+            "{text}"
+        );
+        // An open epic: `[aberto]` in the same place, whole in the 30 columns too.
+        epic.done_at = None;
+        epic.is_provisional = false;
+        epic.hidden_at = None;
+        assert_eq!(
+            spans_text(&epic_spans(&epic).0),
+            "0a1b2c3d  [épico]  [aberto]  Painel do nick em Rust"
+        );
+    }
+
+    #[test]
+    fn the_panel_of_an_epic_says_its_state() {
+        let (mut f, _, _) = with_epic_tree();
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Estado: aberto");
+        assert!(find(&buffer, "[concluído]").is_none());
+        let detail = f.app.epic_detail.as_mut().unwrap();
+        detail.epic.done_at = Some("2026-11-22T10:05:00Z".into());
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Épico EPIC-1 — Plano longo  [concluído]");
+        assert_has(&buffer, "Estado: concluído em 2026-11-22 10:05 UTC");
+        let (tickets, _) = find(&buffer, "Tickets: 1").unwrap();
+        let (state, _) = find(&buffer, "Estado: concluído").unwrap();
+        assert_eq!(tickets + 1, state, "right after the tickets");
+        // A date out of the format is shown as it is, printable (the mold of `short_date`).
+        f.app.epic_detail.as_mut().unwrap().epic.done_at = Some("ontem\x07".into());
+        assert_has(&render(&f.app), "Estado: concluído em ontem?");
+    }
+
+    #[test]
+    fn the_help_of_the_epic_has_c_and_the_filters_have_d() {
+        let (mut f, _, _) = with_epic_tree();
+        assert_eq!(
+            help_text(&f.app),
+            "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · e editar título · \
+             o ocultar/restaurar · c concluir/reabrir · g abrir agente · i editar ID · \
+             f mostrar ocultos · d esconder concluídos · v agentes ativos · q sair"
+        );
+        f.app.tree.hide_done = true;
+        assert!(
+            help_text(&f.app)
+                .ends_with("f mostrar ocultos · d mostrar concluídos · v agentes ativos · q sair"),
+            "{}",
+            help_text(&f.app)
+        );
+        f.app.tree.show_hidden = true;
+        f.app.tree.only_active = true;
+        assert!(
+            help_text(&f.app)
+                .ends_with("f esconder ocultos · d mostrar concluídos · v mostrar tudo · q sair")
+        );
+    }
+
+    /// The 8 places of the tree with the 8 combinations of the three filters, and the settings.
+    #[test]
+    fn help_states_has_every_combination_of_the_three_filters() {
+        assert_eq!(HELP_STATES.len(), 65);
+        let tree = [
+            Place::Module,
+            Place::Project,
+            Place::Epic,
+            Place::Ticket,
+            Place::LiveAgent,
+            Place::StoppedAgent,
+            Place::ArchivedAgent,
+            Place::ElsewhereAgent,
+        ];
+        for place in tree {
+            for hidden in [false, true] {
+                for done in [false, true] {
+                    for active in [false, true] {
+                        assert!(
+                            HELP_STATES.contains(&(place, hidden, done, active)),
+                            "{place:?} {hidden} {done} {active}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(HELP_STATES.contains(&(Place::Settings, false, false, false)));
+        // 65 states, the 65 combinations above among them: no state twice.
     }
 }

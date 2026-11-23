@@ -26,7 +26,10 @@ use ratatui::layout::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::agents::{self, Agent, AgentState, Holder, OpenAgent, Owner};
-use crate::db::{Db, Epic, SETTING_RESERVED_SHORTCUT, SessionSwap, StageChangeRow};
+use crate::db::{
+    Db, Epic, SETTING_RESERVED_SHORTCUT, SETTING_TREE_HIDE_DONE, SETTING_TREE_SHOW_HIDDEN,
+    SessionSwap, StageChangeRow,
+};
 use crate::deps::{self, Deps};
 use crate::docs::{self, Artifacts};
 use crate::editor::{EditorOutcome, EditorRunner};
@@ -708,6 +711,50 @@ impl App {
         }
     }
 
+    /// Reads the filters of the tree remembered in the database (NS-54, D6; when the nick opens):
+    /// the hidden ones (`f`) and the done ones (`d`); the `v` is not remembered. `"1"` turns one
+    /// on; no row is the default (off); any other value falls back to the default, and the
+    /// message for the status bar says so (both joined, in the order of the help), or is the
+    /// error of the database.
+    pub fn load_filters(&mut self) -> Option<String> {
+        let mut messages = Vec::new();
+        for key in [SETTING_TREE_SHOW_HIDDEN, SETTING_TREE_HIDE_DONE] {
+            let on = match self.db.get_setting(key) {
+                Err(err) => return Some(projects::db_error_message(&err)),
+                Ok(None) => false,
+                Ok(Some(value)) if value == "1" => true,
+                Ok(Some(value)) => {
+                    messages.push(format!(
+                        "A configuração {key} gravada no banco ({}) não é válida. Usando o \
+                         padrão.",
+                        printable(&value)
+                    ));
+                    false
+                }
+            };
+            if key == SETTING_TREE_SHOW_HIDDEN {
+                self.tree.show_hidden = on;
+            } else {
+                self.tree.hide_done = on;
+            }
+        }
+        (!messages.is_empty()).then(|| messages.join(" "))
+    }
+
+    /// Stores a filter of the tree (NS-54, D6): `"1"` when on, out of the default; back to the
+    /// default deletes the row (the rule of the migration 4). An error of the database goes to
+    /// the bar; the filter changed on the screen anyway.
+    fn store_filter(&mut self, key: &str, on: bool) {
+        let stored = if on {
+            self.db.set_setting(key, "1")
+        } else {
+            self.db.delete_setting(key)
+        };
+        if let Err(err) = stored {
+            self.status = Some(projects::db_error_message(&err));
+        }
+    }
+
     /// Sets what the agent's program asked of its terminal (the loop reads it from the screen).
     pub fn set_agent_term(&mut self, term: AgentTerm) {
         self.agent_term = term;
@@ -1043,6 +1090,11 @@ impl App {
         (self.tree.show_hidden, self.tree.only_active)
     }
 
+    /// The filter of the done tickets and epics (`d`, NS-54).
+    pub fn hide_done(&self) -> bool {
+        self.tree.hide_done
+    }
+
     /// The project of the selected node (a project, or the project of a ticket or an agent).
     pub fn selected_project(&self) -> Option<&Project> {
         let project = match self.selected {
@@ -1283,7 +1335,15 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right => self.tree_enter(),
             KeyCode::Esc | KeyCode::Left => self.tree_back(),
-            KeyCode::Char('f') => self.tree.show_hidden = !self.tree.show_hidden,
+            KeyCode::Char('f') => {
+                self.tree.show_hidden = !self.tree.show_hidden;
+                self.store_filter(SETTING_TREE_SHOW_HIDDEN, self.tree.show_hidden);
+            }
+            // The done tickets and epics (NS-54, D5); remembered, as the `f` (D6).
+            KeyCode::Char('d') => {
+                self.tree.hide_done = !self.tree.hide_done;
+                self.store_filter(SETTING_TREE_HIDE_DONE, self.tree.hide_done);
+            }
             KeyCode::Char('v') => {
                 self.tree.only_active = !self.tree.only_active;
                 self.status = None;
@@ -1623,6 +1683,17 @@ impl App {
                 }
             }
             KeyCode::Char('g') => return self.choose_stage(Some((&epic).into())),
+            // Complete or reopen (NS-54, D4), with no confirmation: the same key undoes it.
+            KeyCode::Char('c') => {
+                let done = if epic.done_at.is_none() {
+                    epics::complete(&self.db, &epic, self.tree.hides_done())
+                } else {
+                    epics::reopen(&self.db, &epic)
+                };
+                self.status = Some(match done {
+                    Ok(message) | Err(message) => message,
+                });
+            }
             KeyCode::Char('i') => {
                 self.status = self.edit_id_refusal(epic.project_id);
                 if self.status.is_none() {
@@ -1961,12 +2032,16 @@ impl App {
                 // the end of an agent may have moved it). One gone from the database fails in
                 // `create`, which says why, with the dialog open.
                 let created = match item {
-                    NewItem::Ticket { epic_id } => tickets::create_in(
+                    NewItem::Ticket { epic_id } => tickets::create_in_reopening(
                         &self.db, project_id, epic_id, &title, &jira_id,
                     )
-                    .map(|ticket| {
+                    .map(|(ticket, reopened)| {
                         (
-                            tickets::created_message(&ticket),
+                            epics::with_reopened(
+                                tickets::created_message(&ticket),
+                                reopened.as_deref(),
+                                &ticket.key,
+                            ),
                             NodeId::Ticket(ticket.id),
                             epic_id,
                         )
@@ -10150,5 +10225,343 @@ pub(crate) mod tests {
         f.g(&mut launcher);
         f.pick(StageType::TechLeaderJira);
         assert_eq!(f.form().1, ["https://j/browse/EPIC-1", ""]);
+    }
+
+    // ---- completing and reopening an epic, and the filter of the done ones (NS-54) ----
+
+    impl Fixture {
+        /// Puts the ticket `key` in `to` by the database (the stage flow has its own tests).
+        fn put_stage(&mut self, key: &str, to: TicketStage) {
+            let ticket = self
+                .app
+                .db
+                .get_ticket(self.ticket_of(key).id)
+                .unwrap()
+                .unwrap();
+            tickets::change_stage(&self.app.db, &ticket, to).unwrap();
+            self.app.refresh_tree();
+        }
+
+        /// The epic `key` as stored.
+        fn stored_epic(&self, key: &str) -> Epic {
+            let id = self
+                .app
+                .epics
+                .values()
+                .flatten()
+                .find(|e| e.key == key)
+                .unwrap_or_else(|| panic!("no epic {key}"))
+                .id;
+            self.app.db.get_epic(id).unwrap().unwrap()
+        }
+
+        /// `a` on the selected epic: a ticket in it.
+        fn ticket_in_epic(&mut self, title: &str, jira: &str) -> Action {
+            self.ch('a');
+            self.type_text(title);
+            self.key(KeyCode::Tab);
+            self.type_text(jira);
+            self.key(KeyCode::Enter)
+        }
+
+        fn setting(&self, key: &str) -> Option<String> {
+            self.app.db.get_setting(key).unwrap()
+        }
+    }
+
+    /// `with_epic` with the tickets NS-5 and NS-6 in EPIC-1, both done, and the epic selected.
+    fn with_done_tickets_in_epic() -> (Fixture, PathBuf) {
+        let (mut f, p) = with_epic();
+        let epic = f.epic_node("EPIC-1");
+        for key in ["NS-5", "NS-6"] {
+            f.select(epic);
+            assert_eq!(f.ticket_in_epic("t", key), Action::None);
+            f.put_stage(key, TicketStage::Done);
+        }
+        f.select(epic);
+        (f, p)
+    }
+
+    #[test]
+    fn c_on_an_epic_refuses_an_empty_one_and_counts_the_tickets_not_done() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_node("EPIC-1");
+        assert_eq!(f.ch('c'), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("O épico EPIC-1 não tem tickets e não pode ser concluído.")
+        );
+        assert_eq!(f.app.dialog, None, "no confirmation");
+        f.ticket_in_epic("t", "NS-5");
+        f.select(epic);
+        f.ch('c');
+        assert_eq!(
+            f.status(),
+            Some("O épico EPIC-1 ainda tem 1 ticket não concluído.")
+        );
+        f.ticket_in_epic("t", "NS-6");
+        let hidden = f.ticket_of("NS-6");
+        tickets::hide(&f.app.db, &hidden).unwrap();
+        f.select(epic);
+        f.ch('c');
+        assert_eq!(
+            f.status(),
+            Some(
+                "O épico EPIC-1 ainda tem 2 tickets não concluídos (1 oculto; f mostra os ocultos)."
+            ),
+            "the hidden one counts, and the bar says it is hidden"
+        );
+        assert_eq!(f.stored_epic("EPIC-1").done_at, None);
+    }
+
+    #[test]
+    fn c_completes_an_epic_with_every_ticket_done_and_c_again_reopens_it() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        let epic = f.epic_node("EPIC-1");
+        assert_eq!(f.ch('c'), Action::None);
+        assert_eq!(f.status(), Some("Épico concluído: EPIC-1."));
+        assert_eq!(f.app.dialog, None, "no confirmation");
+        assert!(f.stored_epic("EPIC-1").done_at.is_some());
+        assert_eq!(f.app.selected, epic, "it stays on the tree");
+        assert!(
+            f.app.epic(epic_id(epic)).unwrap().done_at.is_some(),
+            "read again"
+        );
+        // The capital letter too (NS-43), and back.
+        assert_eq!(f.ch('C'), Action::None);
+        assert_eq!(f.status(), Some("Épico reaberto: EPIC-1."));
+        assert_eq!(f.stored_epic("EPIC-1").done_at, None);
+        f.ch('c');
+        assert!(f.stored_epic("EPIC-1").done_at.is_some());
+    }
+
+    fn epic_id(node: NodeId) -> i64 {
+        match node {
+            NodeId::Epic(id) => id,
+            other => panic!("not an epic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_with_the_filter_of_the_done_ones_says_the_epic_leaves_the_tree() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        let epic = f.epic_node("EPIC-1");
+        f.ch('d');
+        // The done tickets went; the epic, still open, stays.
+        f.select(epic);
+        f.ch('c');
+        assert_eq!(
+            f.status(),
+            Some("Épico concluído: EPIC-1. Ele sai da árvore (d mostra os concluídos).")
+        );
+        assert!(!f.rows().contains(&epic));
+        assert_ne!(f.app.selected, epic, "the selection left it");
+        f.ch('d');
+        assert!(f.rows().contains(&epic), "d shows it again");
+    }
+
+    /// Review of the NS-54, P1: with the `v` on, the filter of the done ones does not apply (an
+    /// epic with a live agent stays on the tree), so the message does not say it leaves.
+    #[test]
+    fn c_with_the_filters_d_and_v_does_not_say_the_epic_leaves_the_tree() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        let epic = f.epic_node("EPIC-1");
+        let mut launcher = FakeLauncher::new(false);
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
+        f.shortcut();
+        f.ch('d');
+        f.ch('v');
+        assert!(f.app.tree.hide_done && f.app.tree.only_active);
+        f.select(epic);
+        f.ch('c');
+        assert_eq!(f.status(), Some("Épico concluído: EPIC-1."));
+        assert!(f.stored_epic("EPIC-1").done_at.is_some());
+        assert!(
+            f.rows().contains(&epic),
+            "the v shows the branch of its live agent"
+        );
+        assert_eq!(f.app.selected, epic);
+    }
+
+    #[test]
+    fn d_toggles_the_filter_and_stores_it_and_f_is_stored_too_and_v_is_not() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        assert!(!f.app.tree.hide_done, "everything shows by default");
+        assert!(f.rows().contains(&f.tnode("NS-5")));
+        f.ch('d');
+        assert!(f.app.tree.hide_done);
+        assert!(!f.rows().contains(&f.tnode("NS-5")));
+        assert_eq!(f.setting(SETTING_TREE_HIDE_DONE).as_deref(), Some("1"));
+        f.ch('D');
+        assert!(!f.app.tree.hide_done);
+        assert_eq!(
+            f.setting(SETTING_TREE_HIDE_DONE),
+            None,
+            "the default: no row"
+        );
+        f.ch('f');
+        assert_eq!(f.setting(SETTING_TREE_SHOW_HIDDEN).as_deref(), Some("1"));
+        f.ch('f');
+        assert_eq!(f.setting(SETTING_TREE_SHOW_HIDDEN), None);
+        f.ch('v');
+        assert!(f.app.tree.only_active);
+        let rows: i64 = f
+            .app
+            .db
+            .connection()
+            .query_row("SELECT count(*) FROM settings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the v is not stored");
+    }
+
+    #[test]
+    fn a_failing_store_of_a_filter_changes_it_anyway_and_says_why() {
+        let (mut f, _) = with_tickets("proj");
+        f.app
+            .db
+            .connection()
+            .execute_batch("DROP TABLE settings;")
+            .unwrap();
+        f.ch('d');
+        assert!(f.app.tree.hide_done);
+        let message = f.status().unwrap().to_string();
+        assert!(message.contains("no such table: settings"), "{message}");
+        f.app.status = None;
+        f.ch('f');
+        assert!(f.app.tree.show_hidden);
+        assert!(f.status().unwrap().contains("no such table: settings"));
+    }
+
+    #[test]
+    fn load_filters_reads_the_stored_ones_and_falls_back_on_an_invalid_value() {
+        let mut f = fixture();
+        assert_eq!(f.app.load_filters(), None, "no row: the default");
+        assert!(!f.app.tree.show_hidden && !f.app.tree.hide_done);
+        f.app.db.set_setting(SETTING_TREE_SHOW_HIDDEN, "1").unwrap();
+        f.app.db.set_setting(SETTING_TREE_HIDE_DONE, "1").unwrap();
+        assert_eq!(f.app.load_filters(), None);
+        assert!(f.app.tree.show_hidden && f.app.tree.hide_done);
+        let mut f = fixture();
+        f.app
+            .db
+            .set_setting(SETTING_TREE_HIDE_DONE, "sim\x1b[2J")
+            .unwrap();
+        assert_eq!(
+            f.app.load_filters(),
+            Some(
+                "A configuração tree_hide_done gravada no banco (sim?[2J) não é válida. Usando \
+                 o padrão."
+                    .into()
+            )
+        );
+        assert!(!f.app.tree.hide_done);
+        f.app.db.set_setting(SETTING_TREE_SHOW_HIDDEN, "0").unwrap();
+        assert_eq!(
+            f.app.load_filters(),
+            Some(
+                "A configuração tree_show_hidden gravada no banco (0) não é válida. Usando o \
+                 padrão. A configuração tree_hide_done gravada no banco (sim?[2J) não é válida. \
+                 Usando o padrão."
+                    .into()
+            ),
+            "both, in the order of the help"
+        );
+        assert!(!f.app.tree.show_hidden);
+        f.app
+            .db
+            .connection()
+            .execute_batch("DROP TABLE settings;")
+            .unwrap();
+        let message = f.app.load_filters().unwrap();
+        assert!(message.contains("no such table: settings"), "{message}");
+    }
+
+    #[test]
+    fn the_filters_come_back_in_a_new_app_on_the_same_database() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        f.ch('d');
+        f.ch('f');
+        let db = Db::open(&f.root.join("nick.db")).unwrap();
+        let mut again = App::new(db, None, None, f.root.join("bin/nick-init"));
+        assert_eq!(again.load_filters(), None);
+        assert!(again.tree.hide_done && again.tree.show_hidden);
+        assert!(!again.tree.only_active, "the v is not remembered");
+    }
+
+    #[test]
+    fn with_v_the_live_agent_of_a_done_ticket_stays_reachable() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.select(f.tnode("NS-1"));
+        f.open_agent(0, &mut launcher);
+        let agent = Fixture::anode(launcher.ids[0]);
+        f.shortcut();
+        f.put_stage("NS-1", TicketStage::Done);
+        f.select(agent);
+        f.ch('d');
+        assert!(
+            !f.rows().contains(&agent),
+            "the live agent does not hold it"
+        );
+        assert!(!f.rows().contains(&f.tnode("NS-1")));
+        assert_ne!(f.app.selected, agent);
+        f.ch('v');
+        assert!(f.rows().contains(&f.tnode("NS-1")) && f.rows().contains(&agent));
+        assert!(f.app.tree.hide_done, "still on, it does not apply with v");
+    }
+
+    #[test]
+    fn a_new_ticket_in_a_done_epic_reopens_it_with_the_notice_on_the_bar() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        f.ch('c');
+        assert_eq!(f.ticket_in_epic("Login", "NS-9"), Action::None);
+        assert_eq!(
+            f.status(),
+            Some(
+                "Ticket criado: NS-9 — Login. O épico EPIC-1 foi reaberto: o ticket NS-9 não está \
+                 concluído."
+            )
+        );
+        assert_eq!(f.stored_epic("EPIC-1").done_at, None);
+        assert_eq!(f.app.selected, f.tnode("NS-9"));
+    }
+
+    #[test]
+    fn p_into_a_done_epic_reopens_it_with_the_notice_on_the_bar() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        f.ch('c');
+        f.select(f.tnode("NS-1"));
+        f.ch('p');
+        f.key(KeyCode::Down);
+        f.key(KeyCode::Enter);
+        assert_eq!(
+            f.status(),
+            Some(
+                "Ticket NS-1 movido para o épico EPIC-1. O épico EPIC-1 foi reaberto: o ticket \
+                 NS-1 não está concluído."
+            )
+        );
+        assert_eq!(f.stored_epic("EPIC-1").done_at, None);
+    }
+
+    #[test]
+    fn m_out_of_done_in_a_done_epic_reopens_it_with_the_notice_on_the_bar() {
+        let (mut f, _) = with_done_tickets_in_epic();
+        f.ch('c');
+        f.select(f.tnode("NS-5"));
+        f.choose_ticket_stage(TicketStage::Review);
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(
+            f.status(),
+            Some(
+                "Etapa do ticket NS-5: Concluído → Review. O épico EPIC-1 foi reaberto: o ticket \
+                 NS-5 não está concluído."
+            )
+        );
+        assert_eq!(f.stored_epic("EPIC-1").done_at, None);
+        // Without a done epic, the message of before.
+        f.choose_ticket_stage(TicketStage::Development);
+        f.ch('s');
+        assert_eq!(f.status(), Some("Etapa do ticket NS-5: Review → Dev."));
     }
 }

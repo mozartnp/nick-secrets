@@ -1251,3 +1251,126 @@ fn the_fast_cat_does_not_break_the_typing_in_a_text_field() {
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
+
+// ---- completing an epic and the filter of the done ones, remembered (NS-54) ----
+
+/// `proj` with the ticket NS-1, done, in the epic EPIC-1 (title `P`), and NS-2 out of any epic; the
+/// epic done too when `complete`.
+fn with_a_done_ticket_in_an_epic(complete: bool) -> (World, std::path::PathBuf) {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    world.ticket(&proj, "NS-1", "Pronto");
+    world.ticket(&proj, "NS-2", "Fora");
+    world.epic(&proj, "EPIC-1", "P", &["NS-1"]);
+    let db = nick::db::Db::open(&world.db_path()).unwrap();
+    let ticket = db
+        .connection()
+        .query_row("SELECT id FROM tickets WHERE key = 'NS-1'", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    let ticket = db.get_ticket(ticket).unwrap().unwrap();
+    nick::tickets::change_stage(&db, &ticket, nick::tickets::TicketStage::Done).unwrap();
+    if complete {
+        let epic = db.list_epics(ticket.project_id, true).unwrap().remove(0);
+        nick::epics::complete(&db, &epic, false).unwrap();
+    }
+    (world, proj)
+}
+
+fn epic_done_at(world: &World) -> Option<String> {
+    let db = nick::db::Db::open(&world.db_path()).unwrap();
+    db.connection()
+        .query_row(
+            "SELECT done_at FROM epics WHERE key = 'EPIC-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_done_epic_and_the_filter_d_are_remembered_when_the_nick_opens_again() {
+    let (world, _) = with_a_done_ticket_in_an_epic(false);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.select("EPIC-1  [épico]");
+    nick.wait_for_flat("c concluir/reabrir");
+    nick.wait_for("Estado: aberto");
+    nick.send("c");
+    nick.wait_for("Épico concluído: EPIC-1.");
+    nick.wait_for_tree("EPIC-1  [épico]  [concluído]");
+    nick.wait_for("Estado: concluído em ");
+    assert!(epic_done_at(&world).is_some());
+    nick.keep_screen("épico concluído na árvore e no painel");
+    // d: the done epic leaves the tree with its branch; NS-2 (open) stays.
+    nick.send("d");
+    nick.wait_for_flat("d mostrar concluídos");
+    nick.wait_until("the done epic to leave the tree", || {
+        !nick
+            .tree_rows()
+            .iter()
+            .any(|row| row.contains("EPIC-1  [épico]"))
+    });
+    assert!(nick.tree_rows().iter().any(|row| row.contains("NS-2")));
+    nick.keep_screen("filtro d ligado: o épico concluído sai da árvore");
+    assert_eq!(world.setting("tree_hide_done").as_deref(), Some("1"));
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+
+    // The nick again: the filter is still on, and the epic still out.
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.wait_for_flat("d mostrar concluídos");
+    nick.wait_for_tree("NS-2");
+    assert!(
+        !nick
+            .tree_rows()
+            .iter()
+            .any(|row| row.contains("EPIC-1  [épico]")),
+        "{:?}",
+        nick.tree_rows()
+    );
+    nick.keep_screen("nick aberto de novo com o filtro d lembrado");
+    // d again: everything shows, and the row goes (the default).
+    nick.send("d");
+    nick.wait_for_flat("d esconder concluídos");
+    nick.wait_for_tree("EPIC-1  [épico]  [concluído]");
+    assert_eq!(world.setting("tree_hide_done"), None);
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn a_ticket_leaving_done_in_a_done_epic_reopens_it_with_the_notice_on_the_bar() {
+    let (world, _) = with_a_done_ticket_in_an_epic(true);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    nick.open_node("EPIC-1  [épico]");
+    nick.wait_for_tree("EPIC-1  [épico]  [concluído]");
+    nick.select("NS-1  [✓ Concluído]");
+    nick.wait_for_flat("p épico");
+    // `m`, ↑ from Concluído (the last stage) to Review, Enter and `s`.
+    nick.send("m");
+    nick.wait_for("Para qual etapa?");
+    while !nick.screen().contains("> Review") {
+        let before = nick.screen();
+        nick.send(common::UP);
+        nick.wait_until("the selection to move", || nick.screen() != before);
+    }
+    nick.send(ENTER);
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    nick.wait_for_flat(
+        "Etapa do ticket NS-1: Concluído → Review. O épico EPIC-1 foi reaberto: o ticket NS-1 \
+         não está concluído.",
+    );
+    nick.keep_screen("aviso de reabertura do épico na barra de status");
+    assert_eq!(stage_of(&world, "NS-1"), "review");
+    assert_eq!(epic_done_at(&world), None);
+    // Open again: `[aberto]` in the place of `[concluído]`.
+    nick.wait_for_tree("EPIC-1  [épico]  [aberto]");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}

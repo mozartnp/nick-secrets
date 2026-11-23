@@ -275,6 +275,19 @@ CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON ti
     BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
 ";
 
+/// Migration 10 (NS-54): the state of an epic, open or done. `done_at` is when it was done, in the
+/// format of `hidden_at` (RFC 3339, in UTC); NULL while it is open. The rule, always: a done epic
+/// has every ticket done. It lives in the code, not here: `Db::complete_epic` only completes an
+/// epic with tickets and all of them done (one conditioned UPDATE), and the only three writers of
+/// a ticket that could break it (`Db::insert_ticket_reopening`, `set_ticket_epic` and
+/// `change_ticket_stage`) open the epic again in the same transaction, so the status bar can say
+/// so (a trigger would do it silently). No CHECK: it is a timestamp, as `hidden_at`, and two
+/// states need no enum in the database; so the table is not rebuilt. Every epic of before stays
+/// open, even one whose tickets are all done: the operator completes it when they want.
+pub const MIGRATION_10: &str = "\
+ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open (NS-54)
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
 pub const MIGRATIONS: &[&str] = &[
     MIGRATION_1,
@@ -286,4 +299,5 @@ pub const MIGRATIONS: &[&str] = &[
     MIGRATION_7,
     MIGRATION_8,
     MIGRATION_9,
+    MIGRATION_10,
 ];

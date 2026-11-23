@@ -368,6 +368,7 @@ mod tests {
             } else {
                 Availability::DirMissing
             },
+            jira_url: None,
         }
     }
 

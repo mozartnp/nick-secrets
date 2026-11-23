@@ -44,6 +44,16 @@ pub fn jira_id_valid(id: &str) -> bool {
         || id.chars().any(|c| c.is_whitespace() || c.is_control()))
 }
 
+/// The Jira link of a ticket or of an epic (NS-53): the base (the JIRA_URL of the project, from
+/// `bin/nick-agent`) followed by the key, literally (no `/` added, no scheme checked: the base is
+/// kept as typed). `None` without a base, with an empty one or with a provisional key (a UUID,
+/// which is no ID of the Jira). The only place that joins a base and a key: the panels and the
+/// forms of the stages all go through it.
+pub fn jira_link(base: Option<&str>, key: &str, provisional: bool) -> Option<String> {
+    let base = base.filter(|base| !base.is_empty())?;
+    (!provisional).then(|| format!("{base}{key}"))
+}
+
 /// The title, trimmed; empty or only spaces is refused.
 pub fn check_title(input: &str) -> Result<&str, String> {
     check_title_of(input, "ticket")
@@ -604,6 +614,27 @@ mod tests {
     const REFUSED: &[&str] = &[
         ".", "..", "a/b", "../x", "a..b", "a b", "a\tb", "a\x01b", "a\x7fb", "/abs", "",
     ];
+
+    #[test]
+    fn jira_link_is_the_base_and_the_key_of_a_real_id() {
+        assert_eq!(
+            jira_link(Some("https://j/browse/"), "NS-1", false),
+            Some("https://j/browse/NS-1".into())
+        );
+        assert_eq!(jira_link(Some(""), "NS-1", false), None, "empty base");
+        assert_eq!(jira_link(None, "NS-1", false), None, "no base");
+        assert_eq!(
+            jira_link(Some("https://j/browse/"), "8c2b6e0a-provisional", true),
+            None,
+            "provisional key"
+        );
+        assert_eq!(jira_link(None, "x", true), None);
+        // The base as typed: no "/" added.
+        assert_eq!(
+            jira_link(Some("https://x"), "NS-1", false),
+            Some("https://xNS-1".into())
+        );
+    }
 
     #[test]
     fn jira_id_valid_has_the_cases_of_the_bash_suite() {

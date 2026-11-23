@@ -167,11 +167,13 @@ já existem passam a receber o aviso de chaves ausentes, com a linha a adicionar
   <caminho do nick_secrets>/bin/nick-init
   ```
 
-  Ele cria a pasta `.nick/` inteira (abaixo) e o `.nick/nick.conf` com as chaves aceitas no
-  valor padrão e comentários explicando cada uma, e mostra a estrutura na saída. Abra e
-  preencha depois. Se o `.nick/nick.conf` já existir, pergunta antes de sobrescrever
-  (responder N, ou fechar a entrada com Ctrl+D, cancela sem alterar nada). O destino é sempre o
-  diretório atual, e o comando não aceita argumento.
+  Ele cria a pasta `.nick/` inteira (abaixo) e o `.nick/nick.conf` com as chaves aceitas e
+  comentários explicando cada uma, e mostra a estrutura na saída. Antes de criar, pode perguntar
+  o valor de algumas chaves opcionais: a resposta vai pro arquivo, e Enter (ou Ctrl+D) deixa a
+  chave vazia. As outras ficam no valor padrão: abra e preencha depois. Se o `.nick/nick.conf`
+  já existir, pergunta antes de sobrescrever (responder N, ou fechar a entrada com Ctrl+D,
+  cancela sem alterar nada, e aí nenhuma chave é perguntada). O destino é sempre o diretório
+  atual, e o comando não aceita argumento.
 - `./auto_scrum/auto_scrum.sh --requisitos-jail` mostra o que a jail precisa nesta máquina
   (ver [Sandbox (ai-jail)](#sandbox-ai-jail)) e sai, sem carregar configuração.
 - Só `--requisitos-jail` é reconhecido — qualquer outra flag dá erro claro em vez de ser

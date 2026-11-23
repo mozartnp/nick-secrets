@@ -461,14 +461,14 @@ miss_result="$(run_loader "$miss_dir/several.conf" "$miss_dir/several")"
 miss_err="$(cat "$miss_dir/several.err" 2>/dev/null || true)"
 assert_eq "stack-secreta-19|||true|" "$miss_result" "várias ausentes: as chaves presentes carregam"
 assert_eq "1" "$(count_warnings "$miss_dir/several.err")" "várias ausentes: exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/several.conf" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_URL=""' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$miss_err" "várias ausentes: um bloco só, com as linhas na ordem de CONFIG_KEYS"
 assert_not_contains "$miss_err" "stack-secreta-19" "várias ausentes: o aviso não mostra o valor de STACK_DESCRIPTION"
 
 : > "$miss_dir/empty_file.conf"
 miss_result="$(run_loader "$miss_dir/empty_file.conf" "$miss_dir/empty_file")"
 assert_eq "||||" "$miss_result" "arquivo vazio (0 byte): todas as chaves ficam vazias"
 assert_eq "1" "$(count_warnings "$miss_dir/empty_file.err")" "arquivo vazio (0 byte): exatamente um aviso no stderr"
-assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as dez chaves na ordem de CONFIG_KEYS"
+assert_eq "$(missing_warning "$miss_dir/empty_file.conf" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' 'JIRA_URL=""' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$(cat "$miss_dir/empty_file.err" 2>/dev/null || true)" "arquivo vazio (0 byte): o aviso lista as onze chaves na ordem de CONFIG_KEYS"
 
 # Contam como ausentes: o leitor não vê a chave em nenhum destes. A linha vem depois das
 # outras chaves, então o bloco só pode listar a chave do caso.
@@ -618,7 +618,7 @@ val_file="$val_dir/invalid_and_missing.conf"
 printf '%s\n' 'JIRA_ENABLED="sim"' > "$val_file"
 run_loader "$val_file" "$val_dir/invalid_and_missing" >/dev/null
 assert_eq "2" "$(count_warnings "$val_dir/invalid_and_missing.err")" "valor inválido e chaves ausentes: dois avisos no stderr"
-assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
+assert_eq "$(value_warning "$val_file:1" JIRA_ENABLED sim "$default_off_note")"$'\n'"$(missing_warning "$val_file" 'STACK_DESCRIPTION=""' 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_URL=""' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""')" "$(cat "$val_dir/invalid_and_missing.err" 2>/dev/null || true)" "valor inválido e chaves ausentes: primeiro o de valor (:1:), depois o de chave ausente, que não lista JIRA_ENABLED"
 
 val_file="$val_dir/control_char.conf"
 val_raw="a"$'\e'"[31mb"
@@ -821,7 +821,7 @@ printf '%s\n' "$(config_keys_blank PRODUCTION_ENABLED)" 'STACK_DESCRIPTION="stac
 # rs_miss_expected <file>: o aviso exato pra um arquivo que só tem STACK_DESCRIPTION.
 rs_miss_expected() {
   local file="$1"
-  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""'
+  missing_warning "$file" 'SENTRY_ENABLED="false"' 'PERMISSION_ENABLED="false"' 'JIRA_ENABLED="false"' 'JIRA_URL=""' "$production_note_line" 'PRODUCTION_ENABLED="false"' "$tdd_note_line" 'TDD_ENABLED="true"' 'JAIL_ENABLED="false"' 'JAIL_CLIPBOARD=""' 'JAIL_FORWARD_PORTS=""' 'JAIL_ALLOW_HOSTS=""'
 }
 
 rs_miss_result="$(run_resolve_stack "$rs_miss_cwd_incomplete" "$rs_miss_dir/cwd_incomplete")"
@@ -2632,6 +2632,18 @@ assert_eq "não ignorado" "$(git_isolated -C "$REPO_ROOT" check-ignore -q --no-i
 # auto_scrum/projects/ saiu do repositório (NS-30): nada mais o lê, e o .gitignore não o cita.
 assert_eq "" "$(grep -n 'auto_scrum/projects' "$REPO_ROOT/.gitignore" || true)" "o .gitignore da raiz não tem nenhuma linha com auto_scrum/projects"
 assert_eq "" "$(git_isolated -C "$REPO_ROOT" ls-files -- auto_scrum/projects 2>/dev/null || echo 'git falhou')" "auto_scrum/projects/ (inclusive o .gitkeep) não é versionado"
+
+echo
+echo "== shellcheck -x no auto_scrum.sh e nesta suíte (o prompt.sh tem o bloco dele, acima) =="
+if command -v shellcheck > /dev/null 2>&1; then
+  for checked in "$AUTO_SCRUM_SH" "$SCRIPT_DIR/test_auto_scrum.sh"; do
+    sc_rc=0
+    sc_out="$(shellcheck -x "$checked" 2>&1)" || sc_rc=$?
+    assert_eq "0" "$sc_rc" "shellcheck -x limpo: $(basename "$checked")${sc_out:+ — $sc_out}"
+  done
+else
+  echo "  PULADO: shellcheck não instalado"
+fi
 
 echo
 if [ "$failures" -gt 0 ]; then

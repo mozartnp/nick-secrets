@@ -41,6 +41,9 @@ STACK_DESCRIPTION=""
 SENTRY_ENABLED=""
 PERMISSION_ENABLED=""
 JIRA_ENABLED=""
+# shellcheck disable=SC2034
+# config_load writes it; only bin/nick-agent prints it (NS-53), but this block lists every key.
+JIRA_URL=""
 PRODUCTION_ENABLED=""
 TDD_ENABLED=""
 JAIL_ENABLED=""

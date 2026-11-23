@@ -104,14 +104,14 @@ mkdir -p "$clean_dir"
 clean_rc=0
 # config.sh primeiro (keys.sh depende dela), e o retrato só em volta do source de keys.sh. Só
 # redirecionamentos entre os retratos, pra o próprio teste não criar variável nenhuma.
-timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; compgen -v | sort > '$clean_dir/vars_before'; declare -F | sort > '$clean_dir/funcs_before'; source '$KEYS_SH' > '$clean_dir/out' 2>&1; compgen -v | sort > '$clean_dir/vars_after'; declare -F | sort > '$clean_dir/funcs_after'; printf '%s %s %s %s' \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\" > '$clean_dir/registry'" < /dev/null || clean_rc=$?
+timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; compgen -v | sort > '$clean_dir/vars_before'; declare -F | sort > '$clean_dir/funcs_before'; source '$KEYS_SH' > '$clean_dir/out' 2>&1; compgen -v | sort > '$clean_dir/vars_after'; declare -F | sort > '$clean_dir/funcs_after'; printf '%s %s %s %s %s' \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\" \"\${#CONFIG_KEY_PROMPTS[@]}\" > '$clean_dir/registry'" < /dev/null || clean_rc=$?
 assert_eq "0" "$clean_rc" "source lib/config/keys.sh (depois de config.sh) num bash limpo termina com código 0"
 assert_eq "" "$(cat "$clean_dir/out" 2>/dev/null || echo 'sem saída gravada')" "source lib/config/keys.sh não imprime nada (stdout nem stderr)"
 clean_new_vars="$(comm -13 "$clean_dir/vars_before" "$clean_dir/vars_after" 2>/dev/null | grep -vxE "$clean_bash_vars" || true)"
 clean_new_funcs="$(comm -13 "$clean_dir/funcs_before" "$clean_dir/funcs_after" 2>/dev/null | sed 's/^declare -f //' || true)"
 assert_eq "" "$clean_new_vars" "source lib/config/keys.sh não cria nenhuma variável"
 assert_eq "config_register_nick_keys" "$clean_new_funcs" "source lib/config/keys.sh só cria a função config_register_nick_keys"
-assert_eq "0 0 0 0" "$(cat "$clean_dir/registry" 2>/dev/null || echo 'sem registro gravado')" "a carga de keys.sh não registra nada: os quatro arrays do registro continuam vazios"
+assert_eq "0 0 0 0 0" "$(cat "$clean_dir/registry" 2>/dev/null || echo 'sem registro gravado')" "a carga de keys.sh não registra nada: os cinco arrays do registro continuam vazios"
 # Num terminal com tamanho, o bash atualiza COLUMNS e LINES (checkwinsize) depois de cada comando
 # externo: o mesmo retrato, num pseudo-terminal 80x24 (script, do util-linux), não pode mostrar
 # nenhuma variável nova da biblioteca.
@@ -137,15 +137,15 @@ assert_eq "" "$(grep -nE '(^|[;&|])[[:space:]]*\.[[:space:]]+[^[:space:]]' <<< "
 
 echo
 echo "== registro: config_register_nick_keys registra as chaves do nick, com os padrões e as notas de antes =="
-nick_keys="STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED JAIL_ENABLED JAIL_CLIPBOARD JAIL_FORWARD_PORTS JAIL_ALLOW_HOSTS"
+nick_keys="STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED JIRA_URL PRODUCTION_ENABLED TDD_ENABLED JAIL_ENABLED JAIL_CLIPBOARD JAIL_FORWARD_PORTS JAIL_ALLOW_HOSTS"
 assert_eq "$nick_keys" "$(run_keys "printf '%s' \"\${CONFIG_KEYS[*]}\"")" "CONFIG_KEYS é exatamente a lista de antes, na mesma ordem"
-assert_eq "[][false][false][false][false][true][false][][][]" "$(run_keys "printf '[%s]' \"\${CONFIG_KEY_DEFAULTS[@]}\"")" "os padrões de cada chave são os de antes (só TDD_ENABLED com \"true\")"
-assert_eq "[][][][][$production_note][$tdd_note][][][][]" "$(run_keys "printf '[%s]' \"\${CONFIG_KEY_NOTES[@]}\"")" "as notas são as de antes: só PRODUCTION_ENABLED e TDD_ENABLED têm nota"
+assert_eq "[][false][false][false][][false][true][false][][][]" "$(run_keys "printf '[%s]' \"\${CONFIG_KEY_DEFAULTS[@]}\"")" "os padrões de cada chave são os de antes, com JIRA_URL \"\" depois de JIRA_ENABLED (só TDD_ENABLED com \"true\")"
+assert_eq "[][][][][][$production_note][$tdd_note][][][][]" "$(run_keys "printf '[%s]' \"\${CONFIG_KEY_NOTES[@]}\"")" "as notas são as de antes: só PRODUCTION_ENABLED e TDD_ENABLED têm nota (JIRA_URL sem nota)"
 assert_eq "0" "$(run_keys "t_rc=0; config_register_nick_keys 2>/dev/null || t_rc=\$?; [ \"\$t_rc\" -ne 0 ] && printf 0 || printf 1")" "chamar config_register_nick_keys duas vezes retorna ≠ 0 (as chaves já foram registradas)"
-assert_eq "1|10|depois" "$(timeout 2 bash -c "source '$LOADER_SH'; config_register_nick_keys 2>/dev/null; t_rc=\$?; printf '%s|%s|depois' \"\$t_rc\" \"\${#CONFIG_KEYS[@]}\"" 2>/dev/null || true)" "duas vezes, sem set -e: retorna 1, sem exit (o shell segue) e sem registrar de novo"
+assert_eq "1|11|depois" "$(timeout 2 bash -c "source '$LOADER_SH'; config_register_nick_keys 2>/dev/null; t_rc=\$?; printf '%s|%s|depois' \"\$t_rc\" \"\${#CONFIG_KEYS[@]}\"" 2>/dev/null || true)" "duas vezes, sem set -e: retorna 1, sem exit (o shell segue) e sem registrar de novo"
 # Uma chamada que falha no meio para o registro ali (|| return 1): as chaves depois dela não
 # entram. A JAIL_ENABLED readonly faz a sétima chamada falhar.
-assert_eq "1|STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED PRODUCTION_ENABLED TDD_ENABLED|depois" "$(timeout 2 bash -c "source '$CONFIG_SH'; source '$KEYS_SH'; readonly JAIL_ENABLED=x; config_register_nick_keys 2>/dev/null; t_rc=\$?; printf '%s|%s|depois' \"\$t_rc\" \"\${CONFIG_KEYS[*]}\"" 2>/dev/null || true)" "registro que falha no meio: retorna 1 sem exit e não registra as chaves seguintes"
+assert_eq "1|STACK_DESCRIPTION SENTRY_ENABLED PERMISSION_ENABLED JIRA_ENABLED JIRA_URL PRODUCTION_ENABLED TDD_ENABLED|depois" "$(timeout 2 bash -c "source '$CONFIG_SH'; source '$KEYS_SH'; readonly JAIL_ENABLED=x; config_register_nick_keys 2>/dev/null; t_rc=\$?; printf '%s|%s|depois' \"\$t_rc\" \"\${CONFIG_KEYS[*]}\"" 2>/dev/null || true)" "registro que falha no meio: retorna 1 sem exit e não registra as chaves seguintes"
 assert_eq "parou" "$(timeout 2 bash -c "set -e; source '$CONFIG_SH'; source '$KEYS_SH'; readonly JAIL_ENABLED=x; trap 'printf parou' EXIT; config_register_nick_keys 2>/dev/null; trap - EXIT; printf seguiu" 2>/dev/null || true)" "registro que falha no meio, sob set -e: o chamador para na chamada (como o bloco de antes)"
 
 echo
@@ -173,6 +173,10 @@ PERMISSION_ENABLED="false"
 # projeto alvo) — só então a opção "PO - Criar ticket a partir do Jira" aparece no menu
 # principal. Padrão é opt-in: vazio ou "false" esconde a opção do menu.
 JIRA_ENABLED="false"
+# JIRA_URL: base dos links do Jira (ex: https://empresa.atlassian.net/jira/browse/). O nick
+# monta o link de cada ticket e épico com ID do Jira como base + ID e o mostra no painel e
+# nos formulários das etapas. Guardada exatamente como digitada. Vazio: sem link.
+JIRA_URL=""
 # PRODUCTION_ENABLED: "true" se esse projeto já está em produção — o PO passa a avaliar,
 # pra cada pedido, se existe impacto em produção. Padrão é opt-in: vazio ou "false" tira
 # essa pergunta do prompt do PO. Ligue ("true") quando o projeto entrar em produção.
@@ -224,7 +228,7 @@ JAIL_FORWARD_PORTS=""
 JAIL_ALLOW_HOSTS=""
 EOF
 tail -n +4 "$skel_dir/skeleton.conf" > "$skel_dir/body.conf" 2>/dev/null || true
-assert_eq "igual" "$(cmp -s "$skel_dir/body_expected.conf" "$skel_dir/body.conf" && echo igual || echo diferente)" "o corpo do esqueleto (sem as 3 linhas de cabeçalho) é idêntico byte a byte ao de antes"
+assert_eq "igual" "$(cmp -s "$skel_dir/body_expected.conf" "$skel_dir/body.conf" && echo igual || echo diferente)" "o corpo do esqueleto (sem as 3 linhas de cabeçalho) é idêntico byte a byte ao de antes, com a JIRA_URL do NS-53"
 assert_eq "3" "$(grep -c '^# .*nick' <(head -n3 "$skel_dir/skeleton.conf" 2>/dev/null) || true)" "as 3 linhas de cabeçalho citam o nome passado a config_print_skeleton (nick)"
 
 echo
@@ -447,8 +451,24 @@ run_loader "$jail_reg_dir/hosts_missing.conf" "$jail_reg_dir/hosts_missing" >/de
 assert_eq "$(missing_warning "$jail_reg_dir/hosts_missing.conf" 'JAIL_ALLOW_HOSTS=""')" "$(cat "$jail_reg_dir/hosts_missing.err" 2>/dev/null || true)" "sem a linha JAIL_ALLOW_HOSTS: aviso de chave ausente sugerindo JAIL_ALLOW_HOSTS=\"\""
 
 echo
+echo "== JIRA_URL (NS-53): chave de texto logo depois de JIRA_ENABLED, a única com pergunta do init =="
+jira_url_prompt='URL base dos links do Jira (opcional, Enter para pular; ex: https://empresa.atlassian.net/jira/browse/): '
+assert_eq "JIRA_ENABLED JIRA_URL" "$(grep -oE '^(JIRA_ENABLED|JIRA_URL)$' <<< "$registered_keys" | paste -sd ' ' -)" "JIRA_URL vem logo depois de JIRA_ENABLED em CONFIG_KEYS"
+assert_eq "$(($(grep -nx JIRA_ENABLED <<< "$registered_keys" | cut -d: -f1) + 1))" "$(grep -nx JIRA_URL <<< "$registered_keys" | cut -d: -f1)" "JIRA_URL está na posição seguinte à de JIRA_ENABLED"
+assert_eq "JIRA_URL|$jira_url_prompt" "$(run_keys "for i in \"\${!CONFIG_KEYS[@]}\"; do [ -z \"\${CONFIG_KEY_PROMPTS[\$i]}\" ] || printf '%s|%s\n' \"\${CONFIG_KEYS[\$i]}\" \"\${CONFIG_KEY_PROMPTS[\$i]}\"; done")" "JIRA_URL é a única chave com pergunta do init, com o texto fixado"
+assert_eq "" "$(run_keys "config_key_note JIRA_URL")" "JIRA_URL não tem nota"
+assert_contains "$jail_skeleton" 'JIRA_URL=""' "o esqueleto tem JIRA_URL=\"\""
+printf '%s\n' "$(config_keys_blank JIRA_URL)" 'JIRA_URL="qualquer coisa, sem validar"' > "$jail_reg_dir/jira_url_any.conf"
+run_loader "$jail_reg_dir/jira_url_any.conf" "$jail_reg_dir/jira_url_any" >/dev/null
+assert_eq "" "$(cat "$jail_reg_dir/jira_url_any.err" 2>/dev/null || true)" "JIRA_URL com qualquer texto: a carga não avisa (o formato não é validado)"
+assert_eq "qualquer coisa, sem validar" "$(loaded_value "$jail_reg_dir/jira_url_any.conf" JIRA_URL)" "JIRA_URL é lida literalmente"
+config_keys_blank JIRA_URL > "$jail_reg_dir/jira_url_missing.conf"
+run_loader "$jail_reg_dir/jira_url_missing.conf" "$jail_reg_dir/jira_url_missing" >/dev/null
+assert_eq "$(missing_warning "$jail_reg_dir/jira_url_missing.conf" 'JIRA_URL=""')" "$(cat "$jail_reg_dir/jira_url_missing.err" 2>/dev/null || true)" "sem a linha JIRA_URL: aviso de chave ausente sugerindo JIRA_URL=\"\""
+
+echo
 echo "== nenhuma chave de configuração nova: CONFIG_KEYS igual à de antes do ticket 21 =="
-assert_eq "$nick_keys" "$(run_keys "printf '%s' \"\${CONFIG_KEYS[*]}\"")" "CONFIG_KEYS não ganhou chave (as regras do claude não têm flag para desligar)"
+assert_eq "$nick_keys" "$(run_keys "printf '%s' \"\${CONFIG_KEYS[*]}\"")" "CONFIG_KEYS não ganhou chave além da JIRA_URL do NS-53 (as regras do claude não têm flag para desligar)"
 
 echo
 echo "== shellcheck -x em lib/config/keys.sh e nesta suíte =="

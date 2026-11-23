@@ -710,6 +710,147 @@ for init_nose in "fresh|" "overwrite|N" "overwrite|" "overwrite|s" "blocked|"; d
 done
 
 echo
+echo "== NS-53: registro com pergunta do init (5º argumento de config_register_key) =="
+# A pergunta do init é o 5º argumento, opcional. Sem ele (4 argumentos) a chave não tem pergunta.
+prompt_reg_dir="$TEST_TMP/prompt_register"
+mkdir -p "$prompt_reg_dir"
+assert_eq "0" "$(timeout 2 bash --norc --noprofile -c "source '$CONFIG_SH'; printf '%s' \"\${#CONFIG_KEY_PROMPTS[@]}\"" 2>/dev/null || echo 'sem CONFIG_KEY_PROMPTS')" "source lib/config/config.sh cria CONFIG_KEY_PROMPTS vazio"
+assert_eq "4|[][][][]" "$(run_fake "printf '%s|' \"\${#CONFIG_KEY_PROMPTS[@]}\"; printf '[%s]' \"\${CONFIG_KEY_PROMPTS[@]}\"")" "registro com 4 argumentos: a chave entra em CONFIG_KEY_PROMPTS sem pergunta"
+prompt_fake_question='URL de mentira (Enter para pular): '
+assert_eq "0|$fake_keys_all FAKE_URL|5 5 5 5 5|[][][][][$prompt_fake_question]" "$(run_fake "t_rc=0; config_register_key FAKE_URL '' '' 'FAKE_URL: url de mentira.' '$prompt_fake_question' || t_rc=\$?; printf '%s|%s|%s %s %s %s %s|' \"\$t_rc\" \"\${CONFIG_KEYS[*]}\" \"\${#CONFIG_KEYS[@]}\" \"\${#CONFIG_KEY_DEFAULTS[@]}\" \"\${#CONFIG_KEY_NOTES[@]}\" \"\${#CONFIG_KEY_COMMENTS[@]}\" \"\${#CONFIG_KEY_PROMPTS[@]}\"; printf '[%s]' \"\${CONFIG_KEY_PROMPTS[@]}\"")" "registro com 5 argumentos: retorna 0 e guarda a pergunta, com os cinco arrays do mesmo tamanho"
+assert_eq "0|5|[][][][][]" "$(run_fake "t_rc=0; config_register_key FAKE_URL '' '' 'FAKE_URL: url de mentira.' '' || t_rc=\$?; printf '%s|%s|' \"\$t_rc\" \"\${#CONFIG_KEY_PROMPTS[@]}\"; printf '[%s]' \"\${CONFIG_KEY_PROMPTS[@]}\"")" "pergunta vazia equivale a sem pergunta"
+prompt_count_message() {
+  printf '%s' "Erro: config_register_key espera 4 ou 5 argumentos (nome, padrão, nota, comentário e, opcional, a pergunta do init), recebeu $1."
+}
+reg_refuse "3 argumentos" FAKE_X "" ""
+assert_eq "$(prompt_count_message 3)" "$(cat "$reg_dir/refuse_$reg_case.err" 2>/dev/null || true)" "3 argumentos: a mensagem diz que espera 4 ou 5"
+reg_refuse "6 argumentos" FAKE_X "" "" "c" "p" "extra"
+assert_eq "$(prompt_count_message 6)" "$(cat "$reg_dir/refuse_$reg_case.err" 2>/dev/null || true)" "6 argumentos: a mensagem diz que espera 4 ou 5"
+reg_refuse "pergunta numa chave _ENABLED" FAKE_X_ENABLED "false" "" "c" "Ligar? "
+assert_eq "Erro: config_register_key: a chave liga/desliga 'FAKE_X_ENABLED' não pode ter pergunta do init." "$(cat "$reg_dir/refuse_$reg_case.err" 2>/dev/null || true)" "pergunta numa chave _ENABLED: mensagem exata"
+assert_eq "1|$fake_keys_all|4|depois" "$(run_fake "t_rc=0; config_register_key FAKE_Y_ENABLED 'false' '' 'c' 'Ligar? ' 2>/dev/null || t_rc=\$?; printf '%s|%s|%s|depois' \"\$t_rc\" \"\${CONFIG_KEYS[*]}\" \"\${#CONFIG_KEY_PROMPTS[@]}\"")" "pergunta numa chave _ENABLED: nada entra em CONFIG_KEY_PROMPTS"
+
+echo
+echo "== NS-53: config_print_skeleton <tool_name> [CHAVE=valor...] =="
+pskel_dir="$TEST_TMP/skeleton_pairs"
+mkdir -p "$pskel_dir"
+run_fake "config_print_skeleton ferramenta-x > '$pskel_dir/no_pairs.conf'" >/dev/null
+assert_eq "igual" "$(cmp -s "$skel_dir/expected.conf" "$pskel_dir/no_pairs.conf" && echo igual || echo diferente)" "sem pares: a saída é o retrato fixado de antes, byte a byte"
+run_fake "config_print_skeleton ferramenta-x 'FAKE_TEXT=https://x/browse/' > '$pskel_dir/one_pair.conf'" >/dev/null
+sed 's#^FAKE_TEXT=""$#FAKE_TEXT="https://x/browse/"#' "$skel_dir/expected.conf" > "$pskel_dir/one_pair.expected"
+assert_eq "igual" "$(cmp -s "$pskel_dir/one_pair.expected" "$pskel_dir/one_pair.conf" && echo igual || echo diferente)" "com FAKE_TEXT=valor: só a linha FAKE_TEXT muda"
+assert_eq "1" "$(diff "$skel_dir/expected.conf" "$pskel_dir/one_pair.conf" | grep -c '^>' || true)" "com FAKE_TEXT=valor: exatamente uma linha diferente do esqueleto sem pares"
+# shellcheck disable=SC2016 # o $(id) é literal de propósito: o valor nunca é expandido.
+pskel_literal='a $(id) `id` \n %s b=c'
+run_fake "config_print_skeleton ferramenta-x 'FAKE_ON_ENABLED=false' $(printf '%q' "FAKE_TEXT=$pskel_literal") > '$pskel_dir/two_pairs.conf'" >/dev/null
+assert_eq "FAKE_TEXT=\"$pskel_literal\"|FAKE_ON_ENABLED=\"false\"" "$(grep -E '^(FAKE_TEXT|FAKE_ON_ENABLED)=' "$pskel_dir/two_pairs.conf" 2>/dev/null | paste -sd '|' -)" "dois pares, em qualquer ordem: cada um troca a linha da sua chave, com o valor literal (sem expansão nem escape, e o = dentro do valor fica)"
+for pskel_bad in "FAKE_UNKNOWN=x" "FAKE_TEXT" "=x"; do
+  pskel_out="$(run_fake "t_rc=0; config_print_skeleton ferramenta-x 'FAKE_TEXT=ok' '$pskel_bad' > '$pskel_dir/bad.out' 2> '$pskel_dir/bad.err' || t_rc=\$?; printf '%s|depois' \"\$t_rc\"")"
+  assert_eq "1|depois" "$pskel_out" "par '$pskel_bad': retorna 1, sem exit"
+  assert_eq "" "$(cat "$pskel_dir/bad.out" 2>/dev/null || echo 'sem stdout gravado')" "par '$pskel_bad': nada impresso no stdout"
+  assert_eq "Erro: config_print_skeleton: par inválido '$pskel_bad' (use CHAVE=valor com uma chave registrada)." "$(cat "$pskel_dir/bad.err" 2>/dev/null || true)" "par '$pskel_bad': mensagem exata no stderr"
+done
+
+echo
+echo "== NS-53: config_init pergunta as chaves com pergunta, depois da sobrescrita e antes de criar =="
+pinit_dir="$TEST_TMP/init_prompt"
+mkdir -p "$pinit_dir"
+# A chave com pergunta só existe nestes casos: FAKE_URL, de texto, registrada depois das quatro.
+pinit_register="config_register_key FAKE_URL '' '' 'FAKE_URL: url de mentira.' '$prompt_fake_question'"
+run_fake "$pinit_register; config_print_skeleton ferramenta-x > '$pinit_dir/skeleton.conf'" >/dev/null
+assert_eq "true" "$(grep -qx 'FAKE_URL=""' "$pinit_dir/skeleton.conf" && echo true || echo false)" "o esqueleto com FAKE_URL registrada tem FAKE_URL=\"\" (amostra)"
+# pinit_expected <valor>: o esqueleto com FAKE_URL="<valor>".
+pinit_expected() {
+  local value="$1"
+  awk -v value="$value" '$0 == "FAKE_URL=\"\"" { print "FAKE_URL=\"" value "\""; next } { print }' "$pinit_dir/skeleton.conf" 2>/dev/null || true
+}
+# run_pinit <dir> <stdin> <out_prefix>: config_init ferramenta-x com FAKE_URL registrada.
+run_pinit() {
+  local dir="$1" input="$2" out_prefix="$3"
+  run_in_dir "$dir" "$input" "$out_prefix" "$pinit_register; t_rc=0; config_init ferramenta-x || t_rc=\$?; printf '%s|depois' \"\$t_rc\" > '$out_prefix.after'; exit \"\$t_rc\""
+}
+pinit_refusal='Erro: a resposta não pode ter aspas duplas (") nem caracteres de controle. Tente de novo.'
+pinit_case=0
+# pinit_ok <descrição> <stdin> <valor gravado> <refusals>
+pinit_ok() {
+  local description="$1" input="$2" value="$3" refusals="$4" dir expected_err=""
+  pinit_case=$((pinit_case + 1))
+  dir="$pinit_dir/case_$pinit_case"
+  mkdir -p "$dir/cwd"
+  assert_eq "0" "$(run_pinit "$dir/cwd" "$input" "$dir/run")" "$description: config_init retorna 0"
+  pinit_expected "$value" > "$dir/expected.conf"
+  assert_eq "igual" "$(cmp -s "$dir/expected.conf" "$dir/cwd/.nick/nick.conf" && echo igual || echo diferente)" "$description: grava FAKE_URL=\"$value\" e o resto é o esqueleto"
+  assert_eq "$(init_tree_expected)" "$(nick_tree "$dir/cwd")" "$description: a árvore de .nick/ é a de sempre"
+  assert_eq "$(init_expected_output "$(cd "$dir/cwd" && pwd)")" "$(cat "$dir/run.out" 2>/dev/null || true)" "$description: stdout de sempre"
+  for _ in $(seq 1 "$refusals"); do
+    expected_err+="${expected_err:+$'\n'}$pinit_refusal"
+  done
+  assert_eq "$expected_err" "$(cat "$dir/run.err" 2>/dev/null || true)" "$description: stderr com $refusals recusa(s) e nada mais"
+}
+pinit_ok "resposta https://x/browse/" "https://x/browse/" "https://x/browse/" 0
+pinit_ok "Enter (resposta vazia)" $'\n' "" 0
+pinit_ok "EOF (Ctrl+D) na pergunta" "" "" 0
+pinit_ok "espaços e tab nas pontas" $' \t https://x/browse/ \t' "https://x/browse/" 0
+pinit_ok "espaço no meio fica" "a b" "a b" 0
+# shellcheck disable=SC2016 # o $(touch ...) é literal de propósito.
+pinit_ok "\$(...) e crase ficam literais" "\$(touch $pinit_dir/marker) \`touch $pinit_dir/marker\`" "\$(touch $pinit_dir/marker) \`touch $pinit_dir/marker\`" 0
+assert_not_exists "$pinit_dir/marker" "\$(...) e crase na resposta: nada é executado"
+pinit_ok "aspas duplas recusadas, depois uma resposta válida" $'a"b\nhttps://ok/' "https://ok/" 1
+assert_not_contains "$(cat "$pinit_dir/case_$pinit_case/run.err" 2>/dev/null)" 'a"b' "aspas duplas: a mensagem não ecoa o valor"
+pinit_ok "caractere de controle (ESC) recusado, depois uma resposta válida" $'a\e[31mb\nhttps://ok/' "https://ok/" 1
+assert_eq "0" "$(grep -c $'\e' "$pinit_dir/case_$pinit_case/run.err" 2>/dev/null || true)" "caractere de controle: nenhum ESC no stderr (o valor não é ecoado)"
+pinit_ok "tab no meio é caractere de controle" $'a\tb\nok' "ok" 1
+pinit_ok "duas recusas seguidas: a pergunta se repete até uma resposta válida" $'"\n\x01\nfim' "fim" 2
+pinit_ok "recusa seguida de EOF grava vazio" $'"' "" 1
+pinit_case=$((pinit_case + 1))
+pinit_c_dir="$pinit_dir/case_$pinit_case"
+mkdir -p "$pinit_c_dir/cwd"
+run_in_dir "$pinit_c_dir/cwd" "não" "$pinit_c_dir/run" "LC_ALL=C; $pinit_register; config_init ferramenta-x" >/dev/null
+assert_eq 'FAKE_URL="não"' "$(grep '^FAKE_URL=' "$pinit_c_dir/cwd/.nick/nick.conf" 2>/dev/null || true)" "sob LC_ALL=C, acento não é caractere de controle: aceito"
+assert_eq "" "$(cat "$pinit_c_dir/run.err" 2>/dev/null || true)" "sob LC_ALL=C, acento: nenhuma recusa"
+
+# Arquivo existente: a pergunta vem só depois do "s". Com N (ou EOF), uma resposta inválida a
+# seguir no stdin provaria que a pergunta foi feita (a recusa iria para o stderr).
+mkdir -p "$pinit_dir/exists/.nick"
+printf '%s\n' 'FAKE_TEXT="antigo"' > "$pinit_dir/exists/.nick/nick.conf"
+assert_eq "0" "$(run_pinit "$pinit_dir/exists" $'N\na"b' "$pinit_dir/exists_no")" "arquivo existente, N: retorna 0"
+assert_eq "Cancelado. Nada foi alterado." "$(cat "$pinit_dir/exists_no.out" 2>/dev/null || true)" "arquivo existente, N: stdout é só o cancelamento"
+assert_eq "" "$(cat "$pinit_dir/exists_no.err" 2>/dev/null || true)" "arquivo existente, N: a pergunta não é feita (nenhuma recusa no stderr)"
+assert_eq "$(printf '%s\n' .nick .nick/nick.conf)|FAKE_TEXT=\"antigo\"" "$(nick_tree "$pinit_dir/exists")|$(cat "$pinit_dir/exists/.nick/nick.conf")" "arquivo existente, N: nada muda"
+assert_eq "1" "$(run_pinit "$pinit_dir/exists" "" "$pinit_dir/exists_eof")" "arquivo existente, EOF na sobrescrita: retorna 1"
+assert_eq "Cancelado. Nada foi alterado." "$(cat "$pinit_dir/exists_eof.err" 2>/dev/null || true)" "arquivo existente, EOF na sobrescrita: só o cancelamento no stderr"
+assert_eq "$(printf '%s\n' .nick .nick/nick.conf)|FAKE_TEXT=\"antigo\"" "$(nick_tree "$pinit_dir/exists")|$(cat "$pinit_dir/exists/.nick/nick.conf")" "arquivo existente, EOF na sobrescrita: nada muda"
+assert_eq "0" "$(run_pinit "$pinit_dir/exists" $'s\nhttps://novo/' "$pinit_dir/exists_yes")" "arquivo existente, s e depois a URL: retorna 0"
+pinit_expected "https://novo/" > "$pinit_dir/exists_yes.expected"
+assert_eq "igual" "$(cmp -s "$pinit_dir/exists_yes.expected" "$pinit_dir/exists/.nick/nick.conf" && echo igual || echo diferente)" "arquivo existente, s e depois a URL: sobrescreve com a URL"
+
+# Nada é criado antes das perguntas: com o stdin num FIFO, depois de uma resposta inválida a
+# pergunta está esperando de novo, e a árvore .nick/ ainda não existe. O EOF depois disso grava "".
+pfifo_dir="$pinit_dir/fifo"
+mkdir -p "$pfifo_dir/cwd"
+mkfifo "$pfifo_dir/in"
+(cd "$pfifo_dir/cwd" && timeout 5 bash -c "set -euo pipefail; source '$FAKE_KEYS_SH'; $pinit_register; config_init ferramenta-x" < "$pfifo_dir/in" > "$pfifo_dir/run.out" 2> "$pfifo_dir/run.err") &
+pfifo_pid=$!
+exec {pfifo_fd}> "$pfifo_dir/in"
+printf '%s\n' 'a"b' >&"$pfifo_fd"
+for _ in $(seq 1 50); do
+  grep -qF "$pinit_refusal" "$pfifo_dir/run.err" 2>/dev/null && break
+  sleep 0.1
+done
+assert_eq "$pinit_refusal" "$(cat "$pfifo_dir/run.err" 2>/dev/null || true)" "FIFO: a resposta inválida foi recusada (a pergunta espera de novo)"
+assert_not_exists "$pfifo_dir/cwd/.nick" "FIFO: com a pergunta ainda esperando, nada de .nick/ foi criado"
+exec {pfifo_fd}>&-
+pfifo_rc=0
+wait "$pfifo_pid" || pfifo_rc=$?
+assert_eq "0" "$pfifo_rc" "FIFO: o EOF depois da recusa não cancela (retorna 0)"
+assert_eq 'FAKE_URL=""' "$(grep '^FAKE_URL=' "$pfifo_dir/cwd/.nick/nick.conf" 2>/dev/null || true)" "FIFO: o EOF grava FAKE_URL=\"\""
+assert_eq "$(init_tree_expected)" "$(nick_tree "$pfifo_dir/cwd")" "FIFO: a árvore aparece depois das perguntas"
+
+# O arquivo gerado carrega sem aviso, com o valor respondido.
+assert_eq "https://x/browse/" "$(timeout 2 bash -c "source '$FAKE_KEYS_SH'; $pinit_register; config_load '$pinit_dir/case_1/cwd/.nick/nick.conf' 2> '$pinit_dir/load.err'; printf '%s' \"\$FAKE_URL\"" 2>/dev/null || true)" "o arquivo gerado carrega com config_load, com o valor respondido"
+assert_eq "" "$(cat "$pinit_dir/load.err" 2>/dev/null || echo 'sem stderr')" "o arquivo gerado carrega sem nenhum aviso"
+
+echo
 echo "== genérico: lib/config/config.sh não conhece nenhuma ferramenta =="
 assert_eq "" "$(grep -n 'auto_scrum' <<< "$(code_lines "$CONFIG_SH")" || true)" "lib/config/config.sh não cita auto_scrum fora de comentário"
 

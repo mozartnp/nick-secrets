@@ -1111,9 +1111,16 @@ fn epic_lines(detail: &EpicDetail) -> Vec<Line<'static>> {
             count_of(detail.hidden_tickets, "oculto", "ocultos")
         ));
     }
-    vec![
+    let mut lines = vec![
         Line::from(head),
         Line::from(format!("Pasta: {}", printable(&docs::dir_text(&epic.key)))),
+    ];
+    // NS-53: its Jira link, when it has one (printable: the base comes from a file another team
+    // may edit).
+    if let Some(link) = &detail.jira_link {
+        lines.push(Line::from(format!("Jira: {}", printable(link))));
+    }
+    lines.extend([
         Line::from(format!(
             "Plano {exists}:  {}",
             printable(&docs::plan_path(&epic.key))
@@ -1121,14 +1128,16 @@ fn epic_lines(detail: &EpicDetail) -> Vec<Line<'static>> {
         Line::from(tickets),
         Line::from(""),
         Line::from("Agentes do épico: só PO e Tech Leader."),
-    ]
+    ]);
+    lines
 }
 
 /// The panel of a ticket (the ticket screen of the NS-36, without its agents, which are on the
 /// tree since the NS-38): the ticket, its stage and its artifacts on top; then the history of
 /// the stage with the rest of the height (the newest when it does not fit, with how many older
 /// ones are left out).
-/// Since the NS-40 it says the epic of the ticket, when it has one.
+/// Since the NS-40 it says the epic of the ticket, when it has one, and since the NS-53 its Jira
+/// link, when it has one.
 fn draw_ticket_detail(
     frame: &mut Frame,
     detail: &TicketDetail,
@@ -1160,6 +1169,11 @@ fn draw_ticket_detail(
             printable(&epic.key),
             printable(&epic.title)
         )));
+    }
+    // NS-53: its Jira link, when it has one (printable: the base comes from a file another team
+    // may edit).
+    if let Some(link) = &detail.jira_link {
+        top.push(Line::from(format!("Jira: {}", printable(link))));
     }
     top.extend([
         Line::from(vec![Span::raw("Etapa atual: "), stage]),
@@ -2447,6 +2461,7 @@ mod tests {
         f.app.rows = vec![Row {
             project: project(1, "a\x1b[2Jb", "/w/a\x1b[2Jb"),
             availability: Availability::DirMissing,
+            jira_url: None,
         }];
         f.app.tree.open(MODULE);
         f.app.relayout();
@@ -2557,6 +2572,7 @@ mod tests {
             jail,
             jira: false,
             sentry: false,
+            jira_url: None,
             warning: None,
         }
     }
@@ -4516,6 +4532,7 @@ mod tests {
                 jail: true,
                 jira: false,
                 sentry: false,
+                jira_url: None,
                 warning: None,
             },
         });
@@ -4672,6 +4689,68 @@ mod tests {
             "{:?}",
             list_row(&buffer, y)
         );
+    }
+
+    /// NS-53: the line `Jira: <link>` of the panel of a ticket, right after its head (or after the
+    /// line of its epic) and before the stage; none without a link.
+    #[test]
+    fn the_panel_of_a_ticket_shows_its_jira_link() {
+        let (mut f, _) = with_tree();
+        f.app.select(tnode(&f.app, "NS-1"));
+        f.app.refresh_tree();
+        let without = text(&render_at(&f.app, 140, 30, None));
+        assert!(!without.contains("Jira:"), "no link: no line\n{without}");
+        f.app.ticket_detail.as_mut().unwrap().jira_link = Some("https://j/browse/NS-1".into());
+        let buffer = render_at(&f.app, 140, 30, None);
+        let (head, _) = find(&buffer, "NS-1  Um").unwrap();
+        let (jira, _) = find(&buffer, "Jira: https://j/browse/NS-1").unwrap();
+        let (stage, _) = find(&buffer, "Etapa atual:").unwrap();
+        assert_eq!((head + 1, jira + 1), (jira, stage), "{}", text(&buffer));
+        // Without the line, the rest of the panel is the one of before, a row up.
+        let with = text(&buffer);
+        let with: Vec<&str> = with.lines().filter(|l| !l.contains("Jira:")).collect();
+        let before: Vec<&str> = without.lines().collect();
+        assert_eq!(with[..stage as usize - 1], before[..stage as usize - 1]);
+        // A control character of the base shows as "?".
+        f.app.ticket_detail.as_mut().unwrap().jira_link = Some("https://j\x1b[2J/NS-1".into());
+        let buffer = render_at(&f.app, 140, 30, None);
+        assert_has(&buffer, "Jira: https://j?[2J/NS-1");
+    }
+
+    #[test]
+    fn the_jira_link_of_a_ticket_in_an_epic_comes_after_the_epic() {
+        let (mut f, db, _) = with_epic_tree();
+        let t = db
+            .list_tickets(f.app.project_rows()[0].project.id, true)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.key == "NS-1")
+            .unwrap();
+        f.app.select(NodeId::Ticket(t.id));
+        f.app.refresh_tree();
+        f.app.ticket_detail.as_mut().unwrap().jira_link = Some("https://j/browse/NS-1".into());
+        let buffer = render(&f.app);
+        let (epic, _) = find(&buffer, "Épico: EPIC-1 — Plano longo").unwrap();
+        let (jira, _) = find(&buffer, "Jira: https://j/browse/NS-1").unwrap();
+        let (stage, _) = find(&buffer, "Etapa atual:").unwrap();
+        assert_eq!((epic + 1, jira + 1), (jira, stage), "{}", text(&buffer));
+    }
+
+    /// NS-53: the line `Jira: <link>` of the panel of an epic, right after `Pasta:`.
+    #[test]
+    fn the_panel_of_an_epic_shows_its_jira_link() {
+        let (mut f, _, _) = with_epic_tree();
+        let without = text(&render(&f.app));
+        assert!(!without.contains("Jira:"), "no link: no line\n{without}");
+        f.app.epic_detail.as_mut().unwrap().jira_link = Some("https://j/browse/EPIC-1".into());
+        let buffer = render(&f.app);
+        let (folder, _) = find(&buffer, "Pasta: .nick/docs/EPIC-1/").unwrap();
+        let (jira, _) = find(&buffer, "Jira: https://j/browse/EPIC-1").unwrap();
+        let (plan, _) = find(&buffer, "Plano (não existe)").unwrap();
+        assert_eq!((folder + 1, jira + 1), (jira, plan), "{}", text(&buffer));
+        f.app.epic_detail.as_mut().unwrap().jira_link = Some("https://j\x07/EPIC-1".into());
+        let buffer = render(&f.app);
+        assert_has(&buffer, "Jira: https://j?/EPIC-1");
     }
 
     #[test]

@@ -3567,3 +3567,86 @@ fn without_the_jail_a_project_with_the_jail_on_keeps_the_error() {
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
+
+/// The base of the Jira links of the NS-53 tests.
+const JIRA_BASE: &str = "https://empresa.atlassian.net/jira/browse/";
+
+/// NS-53, end to end: with a JIRA_URL in the config, the panel of the ticket shows its link (read
+/// by `bin/nick-agent --jira-url`), and the form of "Tech Leader - Criar plano a partir do Jira"
+/// starts with it (from the `--check` of the `g`), so the preview has it without typing.
+#[test]
+fn the_jira_url_of_the_project_gives_the_link_of_the_panel_and_of_the_form() {
+    let url_line = format!("JIRA_URL=\"{JIRA_BASE}\"");
+    let (world, _) = world_with(&[
+        "JAIL_ENABLED=\"false\"",
+        "JIRA_ENABLED=\"true\"",
+        url_line.as_str(),
+    ]);
+    let link = format!("{JIRA_BASE}NS-1");
+    let mut nick = spawn(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    nick.wait_for(&format!("Jira: {link}"));
+    nick.keep_screen("NS-53: painel do ticket com o link do Jira");
+    assert!(open_menu(&mut nick));
+    choose_type(&mut nick, "Tech Leader - Criar plano a partir do Jira");
+    nick.wait_for(&link);
+    nick.keep_screen("NS-53: formulário do Tech Leader com o link preenchido");
+    nick.send(ENTER);
+    nick.wait_for("Confirma o envio para o claude? (s/N)");
+    // The line of the link is below the first page: one row down at a time until it shows.
+    let line = format!("Link do ticket no Jira: {link}");
+    nick.wait_for("linhas 1–");
+    for row in 2..=60 {
+        if nick.flat_screen().contains(&line) {
+            break;
+        }
+        nick.send(DOWN);
+        nick.wait_for(&format!("linhas {row}–"));
+    }
+    nick.wait_for_flat(&line);
+    nick.keep_screen("NS-53: prévia com o link do Jira");
+    let prompt = read(&only_log(&world));
+    assert!(
+        prompt.contains(&format!("Link do ticket no Jira: {link}\n")),
+        "{prompt}"
+    );
+    nick.send("n");
+    nick.wait_for("g abrir agente");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// NS-53: the panel of an epic shows its link too, and without a JIRA_URL no panel has a line
+/// `Jira:`, while the jail of the project is broken (the `--jira-url` runs no jail check).
+#[test]
+fn the_panel_of_an_epic_has_the_link_and_without_a_url_there_is_none() {
+    let url_line = format!("JIRA_URL=\"{JIRA_BASE}\"");
+    // The jail on, with an invalid clipboard level: the --check would fail, the link still shows.
+    let world = World::new();
+    let proj = world.project(
+        "proj",
+        &[
+            "JAIL_ENABLED=\"true\"",
+            "JAIL_CLIPBOARD=\"xyz\"",
+            url_line.as_str(),
+        ],
+    );
+    world.register(&proj);
+    world.epic(&proj, "EPIC-1", "Épico", &[]);
+    let mut nick = spawn(&world, "", &[]);
+    nick.open_project("proj");
+    nick.send(DOWN);
+    nick.wait_for(&format!("Jira: {JIRA_BASE}EPIC-1"));
+    nick.keep_screen("NS-53: painel do épico com o link do Jira (jail quebrada)");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+    // Without a JIRA_URL: no line.
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "", &[]);
+    open_tickets(&mut nick, "proj");
+    nick.wait_for("Etapa atual:");
+    assert!(!nick.screen().contains("Jira:"), "{}", nick.screen());
+    nick.keep_screen("NS-53: painel do ticket sem JIRA_URL (sem linha Jira:)");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}

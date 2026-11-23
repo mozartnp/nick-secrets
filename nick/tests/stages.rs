@@ -6,7 +6,8 @@
 //! argument that the bash differential (bin/tests/test_nick_agent.sh) does not see. The fake
 //! claude of bin/tests/fixtures/bin records the argv; nothing real is launched, and no log goes
 //! to auto_scrum/logs/ (NICK_PROMPT_LOGS_DIR). Since the NS-40 it covers the epic too: the 6
-//! types of PO and Tech Leader with the ID of an epic, as the App fills it.
+//! types of PO and Tech Leader with the ID of an epic, as the App fills it; since the NS-53, the
+//! two types with the Jira link filled by the App.
 
 use std::fs;
 use std::io::Write;
@@ -265,7 +266,7 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
     let epic_root = root.join("epic");
     fs::create_dir_all(&epic_root).unwrap();
     for kind in StageType::epic_menu(true, true) {
-        let initial = kind.initial_values("EPIC-1");
+        let initial = kind.initial_values("EPIC-1", None);
         let values: Vec<String> = raw_values(kind)
             .into_iter()
             .zip(kind.fields())
@@ -300,6 +301,65 @@ fn the_app_and_the_script_build_the_same_prompt_and_argv_for_every_type() {
                 rendered.prompt
             );
         }
+    }
+    // The Jira link (NS-53): with a JIRA_URL in the config (which no template uses), for the two
+    // types with the link, the answers the App builds from `initial_values` with the link of
+    // `tickets::jira_link`, not edited, give the log of `main()` of the script with the same link
+    // typed, byte for byte.
+    let base = "https://empresa.atlassian.net/jira/browse/";
+    let conf = fs::read_to_string(project.join(".nick/nick.conf")).unwrap();
+    fs::write(
+        project.join(".nick/nick.conf"),
+        format!("{conf}JIRA_URL=\"{base}\"\n"),
+    )
+    .unwrap();
+    let link_root = root.join("link");
+    fs::create_dir_all(&link_root).unwrap();
+    for kind in [StageType::PoJira, StageType::TechLeaderJira] {
+        let link = nick::tickets::jira_link(Some(base), "NS-1", false);
+        assert_eq!(
+            link.as_deref(),
+            Some("https://empresa.atlassian.net/jira/browse/NS-1")
+        );
+        let initial = kind.initial_values("NS-1", link.as_deref());
+        let values: Vec<String> = raw_values(kind)
+            .into_iter()
+            .zip(kind.fields())
+            .zip(initial)
+            .map(|((raw, field), initial)| {
+                if field.flag == "--jira-link" {
+                    initial
+                } else {
+                    raw
+                }
+            })
+            .collect();
+        assert_eq!(values[0], "https://empresa.atlassian.net/jira/browse/NS-1");
+        let answers = stages::render_args(kind, &values).expect("the answers pass");
+        let rendered = launch::run_render(
+            &nick::resources::Resources::checkout().launcher(),
+            &project,
+            &RenderRequest {
+                kind,
+                answers,
+                logs_dir: None,
+            },
+        )
+        .unwrap_or_else(|err| panic!("{} with the link: {err}", kind.key()));
+        let (script_log, _) = run_script(&project, kind, &values, &link_root);
+        assert_eq!(
+            fs::read(&rendered.log).unwrap(),
+            fs::read(&script_log).unwrap(),
+            "{} with the link: the log of the shell is the log of the script, byte for byte",
+            kind.key()
+        );
+        assert!(
+            rendered
+                .prompt
+                .contains("https://empresa.atlassian.net/jira/browse/NS-1"),
+            "the link reached the prompt: {}",
+            rendered.prompt
+        );
     }
 }
 

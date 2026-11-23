@@ -117,12 +117,15 @@ fn main() -> ExitCode {
     .with_deps(deps);
     // The reserved shortcut of the database (NS-34): an invalid one, or an error, falls back
     // to the default with a message. The status has a single line: every message is joined
-    // (the cleanup, the shortcut and the programs missing from the PATH, NS-52).
+    // (the cleanup, the shortcut, the filters of the tree remembered (NS-54) and the programs
+    // missing from the PATH, NS-52).
     let shortcut = app.load_shortcut();
+    let filters = app.load_filters();
     let messages: Vec<String> = cleanup
         .err()
         .into_iter()
         .chain(shortcut)
+        .chain(filters)
         .chain(deps.warning())
         .collect();
     if !messages.is_empty() {

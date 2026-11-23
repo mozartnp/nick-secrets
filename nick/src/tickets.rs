@@ -16,6 +16,7 @@ use crate::db::{
     is_unique_violation,
 };
 use crate::docs::{self, Renamed};
+use crate::epics;
 use crate::projects::db_error_message;
 
 /// How many provisional IDs are tried before giving up (plan D2).
@@ -82,6 +83,18 @@ pub fn create_in(
     title: &str,
     jira_input: &str,
 ) -> Result<Ticket, String> {
+    create_in_reopening(db, project_id, epic_id, title, jira_input).map(|(ticket, _)| ticket)
+}
+
+/// `create_in`, with the key of the done epic it opened again (NS-54, D3; for the notice of
+/// `epics::with_reopened`).
+pub fn create_in_reopening(
+    db: &Db,
+    project_id: i64,
+    epic_id: Option<i64>,
+    title: &str,
+    jira_input: &str,
+) -> Result<(Ticket, Option<String>), String> {
     create_in_with(db, project_id, epic_id, title, jira_input, &mut || {
         db.random_short_id()
     })
@@ -96,11 +109,11 @@ pub fn create_with(
     jira_input: &str,
     generate: &mut dyn FnMut() -> rusqlite::Result<String>,
 ) -> Result<Ticket, String> {
-    create_in_with(db, project_id, None, title, jira_input, generate)
+    create_in_with(db, project_id, None, title, jira_input, generate).map(|(ticket, _)| ticket)
 }
 
 /// `create_in` with the generator received by parameter: the one body of the creation of a ticket
-/// (review of the NS-40, P3.1).
+/// (review of the NS-40, P3.1), with the key of the done epic it opened again (NS-54).
 fn create_in_with(
     db: &Db,
     project_id: i64,
@@ -108,7 +121,7 @@ fn create_in_with(
     title: &str,
     jira_input: &str,
     generate: &mut dyn FnMut() -> rusqlite::Result<String>,
-) -> Result<Ticket, String> {
+) -> Result<(Ticket, Option<String>), String> {
     let title = check_title(title)?;
     create_key_with(
         db,
@@ -116,7 +129,9 @@ fn create_in_with(
         jira_input,
         NO_UNIQUE_ID_MESSAGE,
         generate,
-        &mut |key, provisional| db.insert_ticket(project_id, key, provisional, title, epic_id),
+        &mut |key, provisional| {
+            db.insert_ticket_reopening(project_id, key, provisional, title, epic_id)
+        },
     )
 }
 
@@ -403,14 +418,18 @@ pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String,
         to.key(),
         StageSource::Operator.key(),
     ) {
-        Ok(StageChange::Changed) => Ok(format!(
-            "Etapa do ticket {}: {} → {}.",
-            ticket.key,
-            stage_label(&ticket.stage),
-            to.label()
+        Ok((StageChange::Changed, reopened)) => Ok(epics::with_reopened(
+            format!(
+                "Etapa do ticket {}: {} → {}.",
+                ticket.key,
+                stage_label(&ticket.stage),
+                to.label()
+            ),
+            reopened.as_deref(),
+            &ticket.key,
         )),
-        Ok(StageChange::Gone) => Err(gone_message(ticket)),
-        Ok(StageChange::Moved) => Err(format!(
+        Ok((StageChange::Gone, _)) => Err(gone_message(ticket)),
+        Ok((StageChange::Moved, _)) => Err(format!(
             "A etapa do ticket {} mudou em outro nick. Nada foi gravado.",
             ticket.key
         )),
@@ -456,18 +475,22 @@ fn advance_on_agent_opening_with(
         to.key(),
         StageSource::AgentOpening.key(),
     ) {
-        Ok(StageChange::Changed) => Ok(Some(format!(
-            "Etapa do ticket {}: {} → {} ({}).",
-            ticket.key,
-            current.label(),
-            to.label(),
-            StageSource::AgentOpening.label()
+        Ok((StageChange::Changed, reopened)) => Ok(Some(epics::with_reopened(
+            format!(
+                "Etapa do ticket {}: {} → {} ({}).",
+                ticket.key,
+                current.label(),
+                to.label(),
+                StageSource::AgentOpening.label()
+            ),
+            reopened.as_deref(),
+            &ticket.key,
         ))),
-        Ok(StageChange::Moved) => Err(format!(
+        Ok((StageChange::Moved, _)) => Err(format!(
             "A etapa do ticket {} mudou em outro nick. A etapa não avançou.",
             ticket.key
         )),
-        Ok(StageChange::Gone) => Ok(None),
+        Ok((StageChange::Gone, _)) => Ok(None),
         Err(err) => Err(db_error_message(&err)),
     }
 }
@@ -1105,7 +1128,8 @@ mod tests {
         // Another nick moved it to Review; this one still shows it in Aberto.
         assert_eq!(
             f.db.change_ticket_stage(t.id, "open", "review", "operator")
-                .unwrap(),
+                .unwrap()
+                .0,
             StageChange::Changed
         );
         assert_eq!(
@@ -1527,5 +1551,60 @@ mod tests {
         assert_eq!(f.stored(t.id), t);
         // Another case of the same ID is another ID (BINARY), and passes.
         assert_eq!(check_new_id(&f.db, &t, " ns-1 "), Ok("ns-1".to_string()));
+    }
+
+    // ---- the automatic reopening of a done epic (NS-54, D3) ----
+
+    /// A done epic `E-1` with the ticket `NS-3` in it, done; returns the ticket.
+    fn in_done_epic(f: &Fixture) -> Ticket {
+        let e = f.db.insert_epic(f.project, "E-1", false, "e").unwrap();
+        let t = create_in(&f.db, f.project, Some(e.id), "t", "NS-3").unwrap();
+        change_stage(&f.db, &t, TicketStage::Done).unwrap();
+        assert_eq!(
+            f.db.complete_epic(e.id).unwrap(),
+            crate::db::EpicCompletion::Done
+        );
+        f.stored(t.id)
+    }
+
+    #[test]
+    fn leaving_done_in_a_done_epic_says_it_reopened() {
+        let f = fixture();
+        let t = in_done_epic(&f);
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Development),
+            Ok(
+                "Etapa do ticket NS-3: Concluído → Dev. O épico E-1 foi reaberto: o ticket NS-3 \
+                não está concluído."
+                    .into()
+            )
+        );
+        let t = f.stored(t.id);
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Review),
+            Ok("Etapa do ticket NS-3: Dev → Review.".into()),
+            "already open: the message of before"
+        );
+    }
+
+    /// The advance never leaves `Done` (NS-45), so it reopens only an epic done against the rule
+    /// (by hand, here); it says so as the operator's change does.
+    #[test]
+    fn the_advance_says_it_reopened_too() {
+        let f = fixture();
+        let e = f.db.insert_epic(f.project, "E-1", false, "e").unwrap();
+        let t = create_in(&f.db, f.project, Some(e.id), "t", "NS-3").unwrap();
+        f.db.connection()
+            .execute("UPDATE epics SET done_at = 'x' WHERE id = ?1", [e.id])
+            .unwrap();
+        assert_eq!(
+            advance_on_agent_opening(&f.db, t.id, Stage::Po),
+            Ok(Some(
+                "Etapa do ticket NS-3: Aberto → PO (abertura de agente). O épico E-1 foi \
+                 reaberto: o ticket NS-3 não está concluído."
+                    .into()
+            ))
+        );
+        assert_eq!(f.db.get_epic(e.id).unwrap().unwrap().done_at, None);
     }
 }

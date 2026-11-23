@@ -93,10 +93,35 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
+/// `1 <one>` or `<n> <many>` (review of the NS-40, P3.2: `1 ticket`, `0 tickets`), the one plural
+/// of the counts of the screen and of the messages (moved from ui.rs in the review of the NS-54,
+/// P2). Here, beside `printable`: the text shared by the modules of the screen.
+pub fn count_of<N>(n: N, one: &str, many: &str) -> String
+where
+    N: PartialEq + From<u8> + std::fmt::Display,
+{
+    if n == N::from(1) {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn count_of_says_one_or_many() {
+        assert_eq!(count_of(1usize, "ticket", "tickets"), "1 ticket");
+        assert_eq!(count_of(0usize, "ticket", "tickets"), "0 tickets");
+        assert_eq!(
+            count_of(3i64, "agente ativo", "agentes ativos"),
+            "3 agentes ativos"
+        );
+        assert_eq!(count_of(1i64, "oculto", "ocultos"), "1 oculto");
+    }
 
     fn os(text: &str) -> Option<&OsStr> {
         Some(OsStr::new(text))

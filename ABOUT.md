@@ -4182,6 +4182,14 @@ em outro nick, o ID trocado e os dois estruturais. As sabotagens ficam em
 
 ## Rust no projeto: épicos opcionais (NS-40)
 
+> **Mudou no NS-54** (seção "Rust no projeto: concluir épicos e filtro de concluídos (NS-54)"): o
+> épico ganhou os estados aberto e concluído (migração 10, `epics.done_at`), o `c` no nó do épico
+> (concluir/reabrir) e a marca `[concluído]` no nó e no painel, com a linha `Estado:`. A árvore ganhou
+> o filtro `d` (`Tree::hide_done`), e o `f` e o `d` são lembrados entre aberturas. O `set_ticket_epic`
+> e o `change_ticket_stage` devolvem também a chave do épico reaberto, e o INSERT de ticket passou
+> para o `insert_ticket_reopening` (o `insert_ticket` continua, com a mesma assinatura). O
+> `HELP_STATES` tem 65 estados, e o rodapé mais longo cresceu uma linha.
+
 > **Mudou no NS-45** (seção "Rust no projeto: etapa Aberto, cores e avanço ao abrir agente
 > (NS-45)"): o ID e o título do épico ficam em roxo (`ui::EPIC_COLOR`, `Color::Magenta`) na
 > árvore. O "sem cor nova" desta seção deixou de valer para eles; o `[épico]` continua só em
@@ -5603,3 +5611,239 @@ e do épico, a posição, o `?` no lugar do controle); `nick/tests/stages.rs` (o
 no PTY, `nick/tests/agent.rs` (painel → `g` → formulário preenchido → prévia com
 `Link do ticket no Jira: <base><ID>`; épico com jail quebrada; sem `JIRA_URL`, sem linha). As telas
 ficam em `.nick/docs/NS-53/`.
+
+## Rust no projeto: concluir épicos e filtro de concluídos (NS-54)
+
+História filha do épico NS-28. O épico (NS-40) ganhou fim: dois estados, **aberto** e **concluído**,
+com reabertura automática, e a árvore ganhou um filtro que esconde os concluídos. Os filtros `f` e `d`
+são lembrados entre aberturas. Fora do escopo: outros estados de épico, concluir em lote, lembrar o
+`v`, cor nova para o épico e sincronizar com o Jira.
+
+**A regra, que vale sempre: um épico concluído tem todos os tickets concluídos.** "Todos" inclui os
+ocultos: um ticket oculto e não concluído impede a conclusão.
+
+**Banco: migração 10** (`ALTER TABLE epics ADD COLUMN done_at TEXT`). `done_at` é um timestamp RFC 3339
+UTC, no formato do `hidden_at`, e `NULL` quer dizer aberto. Não tem `CHECK` (dois estados não precisam
+de enum no banco), então a tabela não é reconstruída. Todo épico que já existia fica **aberto**, mesmo
+com todos os tickets concluídos: nada é inferido, e o operador conclui quando quiser. O `Epic`, o
+`EPIC_COLUMNS` e o `epic_from_row` ganharam `done_at`. O teste v9 → v10 usa o banco populado do NS-45
+(projetos, épicos visíveis, ocultos e provisórios, tickets em várias etapas dentro e fora de épico,
+agentes de ticket e de épico, histórico, settings) mais um épico com todos os tickets concluídos. Ele
+confere todos os `id` e campos, `done_at` nulo em todos, `foreign_key_check` e `integrity_check`
+vazios e os seis gatilhos da migração 9.
+
+**Concluir e reabrir à mão (`c` no nó do épico, D2 e D4).** Com `done_at` nulo, `c` conclui
+(`epics::complete`); com `done_at`, reabre (`epics::reopen`). Não há `(s/N)` em nenhum dos dois
+sentidos: a mesma tecla desfaz, como o restaurar (NS-40). O `c` do nó do módulo (configurações) não
+mudou, porque as teclas são por nó, e o `C` vale pela regra do NS-43. O `Db::complete_epic` é **um
+`UPDATE` condicionado** (aberto, com tickets, nenhum ticket com etapa diferente de
+`TicketStage::Done.key()`, que vai por parâmetro e não como literal). Ele roda numa transação, e com 0
+linhas o motivo é relido nela, que já tem a trava de escrita: `EpicCompletion::{Done, Gone,
+AlreadyDone, Empty, Pending(n)}`. Concluir um épico oculto, ou com agente ativo, é permitido: concluir
+não esconde nada; quem esconde é o filtro. Mensagens:
+- `Épico concluído: <ID>.` e, quando o filtro de concluídos se aplica (`d` ligado e `v` desligado:
+  `Tree::hides_done`, o mesmo critério da árvore), ` Ele sai da árvore (d mostra os concluídos).` (o
+  `epics::complete` recebe esse estado num `bool`, sem depender do `Tree`);
+- `O épico <ID> ainda tem 1 ticket não concluído.` / `... tem <N> tickets não concluídos.`
+  (`epics::pending_message`, com o plural de `paths::count_of`). Quando algum dos pendentes está
+  oculto, a recusa diz quantos e a tecla que os mostra, no molde da recusa de ID duplicado: `(oculto;
+  f mostra os ocultos)`, `(ocultos; ...)` quando todos estão ocultos, ou `(<M> oculto(s); ...)`. O
+  `EpicCompletion::Pending` traz `{ pending, hidden }`. Sem isso, um épico com o único ticket pendente
+  oculto parecia pronto na árvore, e o `c` parecia não fazer nada (achado na validação com o banco
+  do operador: o NS-42 tinha um ticket provisório oculto em PO);
+- `O épico <ID> não tem tickets e não pode ser concluído.` e `O épico <ID> já está concluído.` (outro
+  nick concluiu antes);
+- `Épico reaberto: <ID>.` e `O épico <ID> já está aberto.`; sumido, o `gone_message` de sempre.
+
+**Reabertura automática: no código, na mesma transação do escritor do ticket (D3).** Só três métodos
+do `Db` escrevem num ticket o que pode quebrar a regra, e cada um reabre o épico na mesma transação da
+escrita, por um `UPDATE epics SET done_at = NULL ... AND EXISTS (ticket do épico não concluído)
+RETURNING key` (`reopen_if_pending`, privado do `db/mod.rs`). A leitura do épico afetado vem **depois**
+da escrita do ticket, já com a trava. Os três:
+- `insert_ticket_reopening` (o épico do ticket novo, que nasce em `open`, então sempre reabre um épico
+  concluído). **Diferença do plano, prevista nos riscos dele:** o `insert_ticket` continua com a mesma
+  assinatura, agora em cima do irmão (a mesma transação), porque cerca de 70 testes o chamam. O INSERT
+  mora só no irmão, e é este nome que o estrutural cobra;
+- `set_ticket_epic` (o épico de destino), que passa a devolver `(bool, Option<String>)`. Ele reabre só
+  se o ticket movido não estiver concluído;
+- `change_ticket_stage` (o épico lido no SQL, `SELECT epic_id FROM tickets WHERE id = ?1`, e não no
+  `Ticket` em memória, que pode estar velho), que passa a devolver `(StageChange, Option<String>)`.
+
+**Por que no código e não em gatilho:** a barra de status precisa saber que *esta* ação reabriu o
+épico. Um gatilho reabriria em silêncio, e descobrir depois exigiria ler antes e depois numa transação
+`DEFERRED`, sujeita à corrida com outro nick. O `UPDATE ... RETURNING` dentro da transação do escritor
+já tem a trava de escrita, então a resposta é exata. A corrida entre dois nicks fica fechada porque o
+SQLite serializa as escritas: se o "concluir" de um nick vem antes, a escrita do ticket do outro
+reabre; se vem depois, a condição do `complete_epic` falha. Como a regra vive no código e não em
+gatilho, uma reconstrução futura de `tickets` ou `epics` não precisa recriar nada por causa dela.
+
+**Garantia de que não há outro escritor:** o estrutural
+`only_the_three_writers_of_the_db_write_a_ticket_and_they_reopen_the_epic` (`nick/tests/agent.rs`)
+cobra que fora de `src/db/` não há `INSERT INTO tickets`, `UPDATE tickets SET stage` nem `UPDATE
+tickets SET epic_id`, e que no `db/mod.rs` cada um aparece uma vez, no seu método
+(`insert_ticket_reopening`, `set_ticket_epic`, `change_ticket_stage`), cujo corpo tem a transação, o
+`reopen_if_pending(&tx, ...)` e o commit. As migrações ficam de fora (o `INSERT INTO tickets_new` é
+outra tabela). O código é lido com os espaços colapsados e sem os `\` de continuação das strings, e as
+escritas valem em qualquer grafia: um ticket novo por qualquer `... INTO tickets` (`INSERT`, `REPLACE`,
+`INSERT OR ...`) e a etapa ou o épico em qualquer ponto da lista do `SET` (`SET title = ?, stage = ?`).
+O controle positivo cobre uma escrita em outra função, essas grafias, o `UPDATE tickets SET title`
+(que não é escrita da regra) e o histórico (`ticket_stage_changes`, outra tabela). Os estruturais de antes (`only_move_ticket_moves_a_ticket_between_epics`
+e o da etapa do NS-45) passaram sem mudança.
+
+**Casos que não reabrem (decisão do plano):** tirar o último ticket de um épico concluído (ele fica
+concluído e vazio: a regra continua verdadeira, e "vazio não pode ser concluído" é uma regra da ação
+de concluir); mover um ticket já concluído para um épico concluído; ocultar ou restaurar um ticket; e
+editar título ou ID. Uma reabertura feita por **outro nick** só aparece no próximo refresh da árvore,
+sem aviso aqui.
+
+**O aviso.** `epics::reopened_notice(épico, ticket)` dá `O épico <EID> foi reaberto: o ticket <ID> não
+está concluído.`, e `epics::with_reopened(mensagem, reaberto, ticket)` o acrescenta **só** quando houve
+reabertura (senão a mensagem de antes, byte a byte). Ele entra em `epics::move_ticket`,
+`tickets::change_stage`, `tickets::advance_on_agent_opening` e na criação do App, que passou a chamar
+`tickets::create_in_reopening` (irmão novo de `create_in`, que não mudou de assinatura; o corpo único
+continua no `create_in_with`). O avanço ao abrir agente nunca sai de `Done` (NS-45), então ele só
+reabre um épico concluído contra a regra (feito à mão no teste). Exemplos:
+`Ticket criado: NS-9 — Login. O épico E-1 foi reaberto: o ticket NS-9 não está concluído.` e
+`Etapa do ticket NS-3: Concluído → Dev. O épico E-1 foi reaberto: o ticket NS-3 não está concluído.`
+
+**O filtro de concluídos: tecla `d`, `Tree::hide_done` (D5).** Por padrão ele fica desligado e tudo
+aparece. Ligado, some todo ticket com etapa `done` (em qualquer profundidade) e todo épico com
+`done_at`, **com o ramo inteiro** (os agentes do épico e os tickets dele). Com ele desligado, a árvore
+gera exatamente as linhas de antes. O `d` fica em `App::key_tree`, ao lado do `f` e do `v`, sem relayout
+(o `reselect` precisa das linhas de antes).
+- **Diferente do `f`, um agente vivo não segura o nó.** O ticket aceitou que um ticket ativo pode sumir
+  da vista. O agente continua acessível pelo `v`: com `only_active`, o `hide_done` não se aplica, e o `v`
+  mostra todo ramo com agente vivo, como já fazia com os ocultos.
+- Um agente vivo cujo ramo o filtro tirou **não conta acima dele**: a marca `● saída nova` não sobe aos
+  ancestrais fechados, não segura um épico oculto e não abre um projeto indisponível. O `visible` filtra
+  os vivos uma vez, no começo, e só com o filtro aplicado: os ids dos épicos e tickets concluídos são
+  lidos uma vez num `DoneIds` (dois `HashSet`), e sem o filtro os dados são usados como estão, sem
+  cópia. O rodapé `v agentes ativos (N, M com saída nova)` continua contando o agente.
+- O `f` e o `d` são independentes: um ticket oculto e concluído só aparece com o `f` ligado **e** o `d`
+  desligado.
+
+**Filtros lembrados (`settings`, D6).** Há duas chaves em `db/mod.rs`: `SETTING_TREE_SHOW_HIDDEN =
+"tree_show_hidden"` e `SETTING_TREE_HIDE_DONE = "tree_hide_done"`. O valor `"1"` quer dizer ligado, fora
+do padrão, e voltar ao padrão **apaga a linha** (regra da migração 4). Cada `f` ou `d` grava na hora
+(`App::store_filter`). Se o banco der erro, o filtro muda na tela mesmo assim, e a barra mostra o
+`db_error_message`. O `App::load_filters` (no molde do `load_shortcut`) roda no `main.rs` logo depois
+do atalho, e as mensagens se juntam na mesma linha, com o atalho primeiro. Sem linha, vale o padrão.
+Qualquer outro valor também cai no padrão, com `A configuração <chave> gravada no banco (<valor>) não é
+válida. Usando o padrão.` (o valor passa por `printable`), e as duas mensagens vêm na ordem do rodapé.
+O `v` **não** é lembrado. O `App::filters()` continua devolvendo `(f, v)`, porque um teste de antes
+compara esse par, e o `d` sai por `App::hide_done()`.
+
+**Desenho (D7).** O nó do épico ficou `<ID>  [épico]  [aberto|concluído]  <título>  [provisório]
+[oculto]`,
+sem cor nova (o roxo do NS-45 continua no ID e no título). **Diferença do plano, decidida pelo
+usuário na validação:** o plano punha a marca depois de `[provisório]`, mas na profundidade 2 o
+rótulo tem 30 colunas (40, menos a borda, o `> `, o recuo e a seta), e com qualquer título de
+tamanho normal a marca era cortada inteira: o épico concluído ficava igual ao aberto na árvore. Logo
+depois de `[épico]`, ela cabe inteira com um ID de até 8 caracteres (o provisório), e o corte leva o
+título. **Também por decisão do usuário, o épico aberto mostra `[aberto]` no mesmo lugar** (o plano
+deixava o rótulo de antes): o estado fica sempre visível na árvore, e não só pela falta da marca. É
+`[aberto]` minúsculo, sem cor, diferente da etapa `[Aberto]` do ticket (branca, NS-45). O
+painel do épico tem a mesma marca no cabeçalho e a linha `Estado: aberto` / `Estado: concluído em
+<data>` (`short_date`, como o `Aberto em:` do agente), logo depois de `Tickets:`. Ela não fica entre
+`Pasta:`, `Jira:` e `Plano`, porque um teste do NS-53 cobra que essas três linhas sejam seguidas. O
+`Tickets: N (M ocultos, K concluídos)` opcional ficou de fora: ele mudaria a construção do
+`EpicDetail` nos testes. Rodapés:
+- épico: `... · o ocultar/restaurar · c concluir/reabrir · g abrir agente · i editar ID`;
+- filtros, depois do `f`: `d esconder concluídos` (padrão) / `d mostrar concluídos` (ligado).
+
+O `HelpState` ficou `(Place, f, d, v)`, e o `HELP_STATES` tem os 65 estados (8 lugares da árvore × 8
+combinações dos três filtros, mais Configurações), gerados por uma `const fn`. Um teste confere as 65
+combinações.
+
+**A altura reservada do rodapé cresceu uma linha** (P1 do review do NS-34; o limite de +1 é a decisão
+do analista no plano). Foi medido com o `help_rows` real, o texto novo contra o mesmo texto sem `· d …`
+e `· c concluir/reabrir`, com 1, 2, 3, 9 e 10 agentes. Com agente vivo, o rodapé ficou com +1 linha em
+50, 58, 78, 80, 100 e 120 colunas e +0 em 140; com 10 agentes a 100 colunas, +0. Sem agente vivo, o
+rodapé do módulo a 140 colunas passou de 1 para 2 linhas (aí não há PTY para redimensionar). O terminal
+do agente perdeu uma linha. Números que mudaram:
+- `a_resize_reaches_claude_below_the_header` (`nick/tests/agent.rs`): `SIZE 23 58` → `SIZE 22 58` e
+  `SIZE 34 78` → `SIZE 33 78` (o rodapé reserva 3 linhas, e não 2, a 100 e a 120 colunas);
+- `moving_on_the_tree_sends_no_sigwinch_to_claude` e `the_fast_cat_sends_no_sigwinch_to_claude`
+  (`nick/tests/agent.rs`): `SIZE 23 58` → `22 58` e `34 78` → `33 78`, pelo mesmo motivo. O primeiro
+  também passou a alternar o `d` (nenhum SIGWINCH);
+- `with_an_agent_the_list_is_on_the_left_and_the_agent_on_the_right` (`ui.rs`): a 100×30, a lista e o
+  painel passaram de 27 para 26 linhas, o terminal de 24 para 23, a barra de status da linha 27 para
+  a 26 e o rodapé de 2 linhas (na 28) para 3 (na 27). O resto segue: o `ultima` fica na linha 24, o `└`
+  na 25 e o rodapé do terminal na 27;
+- `the_warning_out_of_the_jail_wraps_in_the_header_and_the_terminal_shrinks` (`ui.rs`): o terminal
+  fora da jail passou de 23 para 22 linhas, e o da jail de 24 para 23;
+- `the_focused_panel_has_the_thick_cyan_border` (`ui.rs`): a borda de baixo subiu da linha 26 para a 25;
+- `the_terminal_keeps_its_size_whatever_the_focus_the_marks_and_the_dialog` (`ui.rs`): sem agente, o
+  rodapé do módulo a 140 colunas tem 2 linhas, e não 1. Ganhou o caso de 160 colunas, onde é 1.
+
+**Testes adaptados, com o motivo:**
+- `db/mod.rs`: `a_new_database_gets_version_9_…` → `…_version_10_…`, `opening_twice_duplicates_nothing`
+  (10), os dois de "banco mais novo" (11 e `(10)`) e `migration_1_is_pinned` (10 migrações e o texto da
+  10), pela migração nova; `a_version_8_database_populated_migrates_to_9_…` passou a abrir só até a
+  migração 9, porque o `SELECT *` de `epics` ganharia a coluna da 10 (o teste da 10 é próprio); os
+  testes de `set_ticket_epic` e de `change_ticket_stage` ganharam `.0`, só na construção do retorno
+  novo, com as mesmas asserções;
+- `tickets.rs`: `a_ticket_gone_or_moved_by_another_nick_stores_nothing` ganhou `.0`, só na construção;
+- `tree.rs` e `ui.rs`: os literais de `Epic` ganharam `done_at: None`;
+- `ui.rs`: os 10 rodapés completos fixados nos testes ganharam o `· d esconder concluídos` (e o do épico,
+  o `c concluir/reabrir`), porque o rodapé mudou de propósito; `every_help_state_is_in_help_states` e
+  `the_project_help_has_n_and_the_epic_place_is_in_the_help_states` usam o `HelpState` de quatro campos
+  (65 estados, 8 do épico); `moving_on_the_tree_and_the_filters_resize_no_terminal` ganhou combinações
+  com o `d`; o helper `last_line` passou a pegar a última linha **com texto**. Com 3 linhas
+  reservadas, o rodapé de um diálogo deixa duas vazias embaixo, e o `str::lines()` só ignora uma (o
+  `the_confirmations_of_ending_one_and_quitting` não mudou de asserção). Os números de tamanho estão
+  acima;
+- `nick/tests/agent.rs`: `a_real_version_6_database_opens_migrated_with_the_tree_of_before` (versão 10)
+  e os três de `SIZE` (acima).
+
+Os testes de `hide_epic`/`restore_epic`, de etapa (NS-45), de `settings` (NS-34), de mover (NS-40), de
+criação e mensagens de ticket e os de `tree.rs` passaram sem mudar asserção. Nenhum teste foi apagado.
+
+**Testes novos:** `db` (v9 → v10 populado, `done_at` lido, cada `EpicCompletion`, inclusive o ticket
+oculto contando, épico oculto e com agente ativo, `reopen_epic` nos três casos, a reabertura nos três
+escritores e os casos que não reabrem, a atomicidade com um gatilho de teste que impede a reabertura);
+`epics` (mensagens de concluir, recusas, reabrir, aviso, mover com e sem reabertura, criar no épico
+concluído); `tickets` (a etapa saindo de Concluído e o avanço); `tree` (padrão sem mudança, ticket nas
+profundidades 2 e 3, épico com o ramo, o vivo não segura, o `v`, `f` × `d`, a marca e o `reselect`);
+`app` (`c` com as recusas, concluir e reabrir, com o `d` ligado, `d`/`f` gravando e apagando, o `v` não
+gravado, erro do banco ao gravar, `load_filters` sem linha, com `"1"`, inválido e com erro, filtros num
+`App` novo sobre o mesmo banco, o vivo de um ticket concluído pelo `v`, e o aviso pelo `a` no épico, pelo
+`p` e pelo `m`); `ui` (a marca, o `Estado:`, os rodapés, os 65 estados); o estrutural de D3; e, no PTY
+(`nick/tests/tui.rs`), `a_done_epic_and_the_filter_d_are_remembered_when_the_nick_opens_again` (concluir,
+`d`, sair, abrir de novo com o filtro ligado e o épico fora, `d` apagando a linha) e
+`a_ticket_leaving_done_in_a_done_epic_reopens_it_with_the_notice_on_the_bar`. As sabotagens estão em
+`.nick/docs/NS-54/sabotagens.md`, e as telas em `.nick/docs/NS-54/telas.txt` e `telas_ansi/`.
+
+**Ajustes do review do NS-54** (`.nick/docs/NS-54/review.md`). Os quatro pontos procediam. Os de
+comportamento ganharam teste que falhou antes da correção, provado também na cópia (S13 e S14 em
+`.nick/docs/NS-54/sabotagens.md`):
+- **P1:** com o `d` e o `v` ligados, concluir um épico com agente vivo dizia `Ele sai da árvore`, mas o
+  épico continuava nela (o `v` mostra todo ramo com agente vivo). O `c` passa o `Tree::hides_done()`
+  (agora `pub(crate)`) e não o `hide_done` cru. Teste:
+  `c_with_the_filters_d_and_v_does_not_say_the_epic_leaves_the_tree`;
+- **P2:** o `count_of` saiu do `ui.rs` e foi para o `paths.rs`, ao lado do `printable`, o texto já
+  compartilhado entre os módulos. Ele ficou genérico (`usize` e `i64`), e o `epics::pending_message` e o
+  `epics::active_message` passaram a usá-lo. As mensagens não mudaram, e os testes de antes passaram sem
+  mudança; entrou o `count_of_says_one_or_many`;
+- **P3:** o `Tree::visible` não copia os vivos sem o filtro e, com ele, consulta os `HashSet` do
+  `DoneIds` em vez de varrer todos os épicos e tickets para cada agente vivo. Os testes de `tree.rs`
+  passaram sem mudança;
+- **P4:** os quatro rodapés esperados acima de 100 colunas no `ui.rs` foram quebrados com `\`, dois
+  comentários de documentação foram refluídos, e o estrutural de D3 passou a reconhecer as outras
+  grafias (acima), com controle positivo que falhou antes.
+
+**Validação com o banco do operador** (fora da jail, sempre numa cópia do `nick.db`; o original foi
+conferido byte a byte depois). O NS-42 "não mudava" porque o `c` era recusado por um ticket oculto que
+a árvore não mostrava, e porque a marca `[concluído]` era cortada. Por decisão do usuário, a recusa
+passou a apontar os ocultos e a marca foi para logo depois de `[épico]` (ambos acima). Os testes que
+mudaram por isso: `the_label_of_a_done_epic_has_its_mark_right_after_the_mark_of_the_epic` (era
+`..._between_provisional_and_hidden`), as recusas com oculto de `complete_epic_is_refused_with_...`,
+`complete_is_refused_with_...` e `c_on_an_epic_refuses_...`, e as esperas do PTY por
+`EPIC-1  [épico]  [concluído]`. Com o `[aberto]`, mudaram de propósito os testes do NS-40/NS-45 que
+fixavam o rótulo do épico aberto: `the_label_of_an_epic_has_the_mark_bold_and_dims_when_hidden` (o
+texto e os índices dos spans, um a mais), `the_id_and_the_title_of_the_epic_are_purple_on_the_tree`
+(o título 10 colunas adiante, e o `[aberto]` sem cor), e, no PTY (`nick/tests/agent.rs`),
+`an_epic_from_its_creation_to_the_resume_of_its_agent`,
+`opening_new_agents_advances_the_stage_and_each_stage_has_its_color` e
+`hiding_an_epic_is_refused_with_a_live_agent_and_then_takes_and_brings_back_the_branch`, que passaram a esperar `EPIC-1  [épico]  [aberto]  Pla` (o que cabe nas 30 colunas). As telas estão em `.nick/docs/NS-54/telas_validacao_banco_real.txt`.
+

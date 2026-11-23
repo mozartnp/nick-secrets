@@ -2,10 +2,10 @@
 //! since the NS-40), as a pure model, with no database, no screen and no disk. The App fills a
 //! `TreeData` from the database and its running agents; here are the nodes by identity (`NodeId`,
 //! the selection survives a refresh), the open/closed state of the branches, the flattening into
-//! the visible rows with their depth, the two filters (the hidden tickets and epics,
-//! `show_hidden`; only the live agents, `only_active`), the "saída nova" mark that goes up to the
-//! closed ancestors, and where the selection goes when its node is gone (`reselect`). ui.rs draws
-//! the rows; app.rs moves on them.
+//! the visible rows with their depth, the three filters (the hidden tickets and epics,
+//! `show_hidden`; the done tickets and epics, `hide_done`, NS-54; only the live agents,
+//! `only_active`), the "saída nova" mark that goes up to the closed ancestors, and where the
+//! selection goes when its node is gone (`reselect`). ui.rs draws the rows; app.rs moves on them.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +14,7 @@ use crate::app::Row;
 use crate::db::Epic;
 use crate::modules::ModuleKind;
 use crate::projects::Availability;
-use crate::tickets::Ticket;
+use crate::tickets::{Ticket, TicketStage};
 
 /// A node of the tree, by identity: the selection survives a refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,6 +65,46 @@ pub struct TreeData<'a> {
     pub live: &'a [LiveAgent],
 }
 
+/// The ids of the done epics and tickets of a `TreeData`, read once per `Tree::visible` with the
+/// filter of the done ones on (review of the NS-54, P3: not a scan of every epic and ticket for
+/// each live agent).
+struct DoneIds {
+    epics: HashSet<i64>,
+    tickets: HashSet<i64>,
+}
+
+impl DoneIds {
+    fn of(data: &TreeData) -> DoneIds {
+        DoneIds {
+            epics: data
+                .epics
+                .values()
+                .flatten()
+                .filter(|epic| epic.done_at.is_some())
+                .map(|epic| epic.id)
+                .collect(),
+            tickets: data
+                .tickets
+                .values()
+                .flatten()
+                .filter(|ticket| ticket.stage == TicketStage::Done.key())
+                .map(|ticket| ticket.id)
+                .collect(),
+        }
+    }
+
+    /// Whether the filter takes the branch of the live `agent`: its ticket or the epic of its
+    /// branch is done.
+    fn takes(&self, agent: &LiveAgent) -> bool {
+        let epic_done = agent.epic_id.is_some_and(|id| self.epics.contains(&id));
+        let ticket_done = match agent.owner {
+            Owner::Ticket(id) => self.tickets.contains(&id),
+            Owner::Epic(_) => false,
+        };
+        epic_done || ticket_done
+    }
+}
+
 /// The open branches and the filters. Every branch starts closed.
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
@@ -73,6 +113,9 @@ pub struct Tree {
     pub show_hidden: bool,
     /// Only the branches with a live agent of this nick, all open (`v`).
     pub only_active: bool,
+    /// The done tickets and the done epics, with their whole branch, are out (`d`; NS-54). Off
+    /// by default: everything shows.
+    pub hide_done: bool,
 }
 
 /// A visible row: the node, its depth (0..=4), whether it can open, whether it is open, and
@@ -95,8 +138,33 @@ impl Tree {
     /// open ticket or epic, in the order they were opened, without the archived ones unless
     /// `show_hidden` (NS-39; a node with only archived agents is then a leaf). With `only_active`,
     /// only the branches with a live agent and only the live agents, every branch open, whatever
-    /// the state kept.
+    /// the state kept. With `hide_done` (NS-54, D5), a done ticket (at any depth) and a done epic
+    /// with its whole branch are out, and, unlike `show_hidden`, a live agent does not hold them:
+    /// it stays reachable by `only_active`, where `hide_done` does not apply. A live agent the
+    /// filter took is not counted anywhere above it (its mark, a hidden epic it would hold, an
+    /// unavailable project it would open). `show_hidden` and `hide_done` are independent: a
+    /// hidden and done ticket shows only with the first on and the second off.
     pub fn visible(&self, data: &TreeData) -> Vec<Visible> {
+        // Only with the filter on: the data as it is otherwise, with no copy (review of the
+        // NS-54, P3).
+        let live: Vec<LiveAgent>;
+        let narrowed: TreeData;
+        let data = if self.hides_done() {
+            let done = DoneIds::of(data);
+            live = data
+                .live
+                .iter()
+                .filter(|agent| !done.takes(agent))
+                .copied()
+                .collect();
+            narrowed = TreeData {
+                live: &live,
+                ..*data
+            };
+            &narrowed
+        } else {
+            data
+        };
         let live_in = |test: &dyn Fn(&LiveAgent) -> bool| data.live.iter().any(test);
         let unseen_in = |test: &dyn Fn(&LiveAgent) -> bool| {
             data.live.iter().any(|agent| agent.unseen && test(agent))
@@ -162,6 +230,12 @@ impl Tree {
         rows
     }
 
+    /// Whether the filter of the done ones is on and applies (not with `only_active`, NS-54). The
+    /// App asks it too, to say whether a completed epic leaves the tree (review of the NS-54, P1).
+    pub(crate) fn hides_done(&self) -> bool {
+        self.hide_done && !self.only_active
+    }
+
     /// The agents of `owner` that show (the filters `v` and `f`).
     fn agents_of<'a>(&self, data: &'a TreeData, owner: Owner) -> Vec<&'a Agent> {
         data.agents
@@ -198,6 +272,9 @@ impl Tree {
 
     /// A ticket at `depth` (2 under the project, 3 under an epic) and, open, its agents.
     fn push_ticket(&self, rows: &mut Vec<Visible>, data: &TreeData, ticket: &Ticket, depth: u16) {
+        if self.hides_done() && ticket.stage == TicketStage::Done.key() {
+            return;
+        }
         let owner = Owner::Ticket(ticket.id);
         let has_live = data.live.iter().any(|a| a.owner == owner);
         if !self.shows(ticket.hidden_at.is_some(), has_live) {
@@ -220,6 +297,9 @@ impl Tree {
 
     /// An epic (depth 2) and, open, its agents (depth 3) and then its tickets (depth 3).
     fn push_epic(&self, rows: &mut Vec<Visible>, data: &TreeData, epic: &Epic, tickets: &[Ticket]) {
+        if self.hides_done() && epic.done_at.is_some() {
+            return;
+        }
         let in_branch = |a: &LiveAgent| a.epic_id == Some(epic.id);
         let has_live = data.live.iter().any(in_branch);
         if !self.shows(epic.hidden_at.is_some(), has_live) {
@@ -776,6 +856,7 @@ mod tests {
             title: String::new(),
             created_at: String::new(),
             hidden_at: hidden.then(|| "2026-11-20T00:00:00Z".to_string()),
+            done_at: None,
         }
     }
 
@@ -1015,5 +1096,184 @@ mod tests {
         hidden.epics.get_mut(&1).unwrap()[0].hidden_at = Some("x".into());
         let after = tree.visible(&hidden.data());
         assert_eq!(Tree::reselect(&before, &after, NodeId::Agent(140)), P1);
+    }
+
+    // ---- the filter of the done ones (NS-54, D5) ----
+
+    const T: fn(i64) -> NodeId = NodeId::Ticket;
+
+    /// `with_epics` with the ticket 12 (no epic) and 13 (of the epic 5) done.
+    fn with_done_tickets() -> Data {
+        let mut data = with_epics();
+        for t in data.tickets.get_mut(&1).unwrap() {
+            if [12, 13].contains(&t.id) {
+                t.stage = "done".into();
+            }
+        }
+        data
+    }
+
+    fn done_epic(mut data: Data, id: i64) -> Data {
+        for e in data.epics.get_mut(&1).unwrap() {
+            if e.id == id {
+                e.done_at = Some("2026-11-22T00:00:00Z".into());
+            }
+        }
+        data
+    }
+
+    fn ids(tree: &Tree, data: &Data) -> Vec<NodeId> {
+        rows(tree, data).into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn opened() -> Tree {
+        let mut tree = Tree::default();
+        for id in [M, P1, E5, T(14)] {
+            tree.open(id);
+        }
+        tree
+    }
+
+    #[test]
+    fn by_default_the_done_ones_show_with_the_rows_of_before() {
+        let tree = opened();
+        assert!(!tree.hide_done, "the default shows everything");
+        let done = done_epic(with_done_tickets(), 5);
+        assert_eq!(
+            rows(&tree, &done),
+            rows(&tree, &with_epics()),
+            "a done stage or epic changes no row"
+        );
+    }
+
+    #[test]
+    fn hide_done_takes_the_done_tickets_at_depth_2_and_3() {
+        let mut tree = opened();
+        tree.hide_done = true;
+        let data = with_done_tickets();
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (P1, 1),
+                (E5, 2),
+                (NodeId::Agent(500), 3),
+                (NodeId::Agent(501), 3),
+                (T(14), 3),
+                (NodeId::Agent(140), 4),
+                (T(10), 2),
+                (NodeId::Project(2), 1),
+            ],
+            "13 (in the epic) and 12 (no epic) out; the open epic stays"
+        );
+    }
+
+    #[test]
+    fn hide_done_takes_a_done_epic_with_its_whole_branch() {
+        let mut tree = opened();
+        tree.hide_done = true;
+        let data = done_epic(with_epics(), 5);
+        let shown = ids(&tree, &data);
+        for gone in [E5, NodeId::Agent(500), NodeId::Agent(501), T(13), T(14)] {
+            assert!(!shown.contains(&gone), "{gone:?}: {shown:?}");
+        }
+        assert!(shown.contains(&T(10)) && shown.contains(&T(12)));
+    }
+
+    #[test]
+    fn a_live_agent_does_not_hold_a_done_ticket_nor_a_done_epic() {
+        let mut tree = opened();
+        tree.hide_done = true;
+        let data = live_of_epic(with_done_tickets(), 130, Owner::Ticket(13), 5, false);
+        assert!(!ids(&tree, &data).contains(&T(13)), "unlike the f");
+        let data = live_of_epic(done_epic(with_epics(), 5), 500, Owner::Epic(5), 5, false);
+        assert!(!ids(&tree, &data).contains(&E5));
+        // Not even a hidden and done epic with a live agent (the f would keep it).
+        let mut data = live_of_epic(done_epic(with_epics(), 6), 150, Owner::Ticket(15), 6, false);
+        assert!(!ids(&tree, &data).contains(&E6));
+        tree.hide_done = false;
+        assert!(
+            ids(&tree, &data).contains(&E6),
+            "the decision 9 of the NS-40"
+        );
+        data.live.clear();
+        assert!(!ids(&tree, &data).contains(&E6));
+    }
+
+    #[test]
+    fn with_only_active_the_filter_of_the_done_ones_does_not_apply() {
+        let tree = Tree {
+            only_active: true,
+            hide_done: true,
+            ..Tree::default()
+        };
+        // The live agent of a done ticket of a done epic stays reachable by the v.
+        let mut data = done_epic(with_done_tickets(), 5);
+        data.agents.insert(Owner::Ticket(13), vec![agent(130, 13)]);
+        let data = live_of_epic(data, 130, Owner::Ticket(13), 5, false);
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (P1, 1),
+                (E5, 2),
+                (T(13), 3),
+                (NodeId::Agent(130), 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_filters_of_the_hidden_and_of_the_done_ones_are_independent() {
+        let mut data = Data::new();
+        // The ticket 11 is hidden; done too now.
+        data.tickets.get_mut(&1).unwrap()[1].stage = "done".into();
+        let mut tree = Tree::default();
+        tree.open(M);
+        tree.open(P1);
+        let shows_11 = |tree: &Tree| ids(tree, &data).contains(&T(11));
+        for (show_hidden, hide_done, shown) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            tree.show_hidden = show_hidden;
+            tree.hide_done = hide_done;
+            assert_eq!(shows_11(&tree), shown, "f {show_hidden}, d {hide_done}");
+        }
+    }
+
+    #[test]
+    fn the_mark_does_not_go_up_from_a_branch_the_filter_took() {
+        let mut data = with_done_tickets();
+        data.agents.insert(Owner::Ticket(13), vec![agent(130, 13)]);
+        let data = live_of_epic(data, 130, Owner::Ticket(13), 5, true);
+        let mut tree = Tree {
+            hide_done: true,
+            ..Tree::default()
+        };
+        assert!(!find(&tree, &data, M).unseen_below, "the closed module");
+        tree.open(M);
+        assert!(!find(&tree, &data, P1).unseen_below, "the closed project");
+        tree.open(P1);
+        assert!(!find(&tree, &data, E5).unseen_below, "the closed epic");
+        tree.hide_done = false;
+        assert!(find(&tree, &data, E5).unseen_below, "without the filter");
+    }
+
+    #[test]
+    fn reselect_leaves_a_node_the_filter_of_the_done_ones_took() {
+        let data = done_epic(with_done_tickets(), 5);
+        let mut tree = opened();
+        let before = tree.visible(&data.data());
+        tree.hide_done = true;
+        let after = tree.visible(&data.data());
+        // The ticket 12 (done): the previous sibling, the ticket 10 (no next one).
+        assert_eq!(Tree::reselect(&before, &after, T(12)), T(10));
+        // The agent of the done epic: the closest ancestor left, the project.
+        assert_eq!(Tree::reselect(&before, &after, NodeId::Agent(140)), P1);
+        // The done epic: the next sibling, the ticket 10.
+        assert_eq!(Tree::reselect(&before, &after, E5), T(10));
     }
 }

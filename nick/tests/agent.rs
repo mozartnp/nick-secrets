@@ -722,12 +722,12 @@ fn a_resize_reaches_claude_below_the_header() {
     open_agent(&mut nick, 0);
     // The panel beside the list (NS-34): 100 - 40 columns less the 2 of its border (NS-37),
     // and 30 rows less the 2 of the border, the header (two rows: the warning out of the jail
-    // wraps at 58 columns), the status and the help (two rows: the ones the help of the
-    // tickets needs, whatever the focus; review NS-34, P1): 30 - 2 - 2 - 1 - 2.
-    nick.wait_for("SIZE 23 58");
-    // At 120 columns the list takes 40 and the header fits in one row: 40 - 2 - 1 - 1 - 2.
+    // wraps at 58 columns), the status and the help (three rows since the NS-54, two before: the
+    // ones the longest help needs, whatever the focus; review NS-34, P1): 30 - 2 - 2 - 1 - 3.
+    nick.wait_for("SIZE 22 58");
+    // At 120 columns the list takes 40 and the header fits in one row: 40 - 2 - 1 - 1 - 3.
     nick.resize(40, 120);
-    nick.wait_for("SIZE 34 78");
+    nick.wait_for("SIZE 33 78");
     // Ctrl+C goes to the program (cooked in this mode: it ends it).
     nick.send("\x03");
     nick.wait_for("O agente proj · PO · NS-1 terminou");
@@ -2203,7 +2203,7 @@ fn moving_on_the_tree_sends_no_sigwinch_to_claude() {
     let mut nick = spawn(&world, "winsize", &[]);
     open_tickets(&mut nick, "proj");
     open_agent(&mut nick, 0);
-    nick.wait_for_panel("SIZE 23 58");
+    nick.wait_for_panel("SIZE 22 58");
     nick.send(SHORTCUT);
     wait_flat(&nick, "Enter ir ao terminal");
     // The ticket, the project, the module, down again to the other ticket, the filters.
@@ -2226,13 +2226,16 @@ fn moving_on_the_tree_sends_no_sigwinch_to_claude() {
         ("v", "v mostrar tudo"),
         ("v", "v agentes ativos"),
         ("f", "f mostrar ocultos"),
+        // The filter of the done ones (NS-54) resizes nothing either.
+        ("d", "d mostrar concluídos"),
+        ("d", "d esconder concluídos"),
         (DOWN, "Enter ir ao terminal"),
     ] {
         nick.send(key);
         wait_flat(&nick, help);
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
-    nick.wait_for_panel("SIZE 23 58");
+    nick.wait_for_panel("SIZE 22 58");
     let panel = nick.panel();
     assert_eq!(panel.matches("SIZE").count(), 1, "never resized: {panel}");
     nick.send("q");
@@ -2801,7 +2804,7 @@ fn an_epic_from_its_creation_to_the_resume_of_its_agent() {
     nick.open_project("proj");
     new_epic(&mut nick, "Plano longo", "EPIC-1");
     let (_, row) = nick.selected_row().expect("the epic selected");
-    assert!(row.contains("EPIC-1  [épico]  Plano longo"), "{row}");
+    assert!(row.contains("EPIC-1  [épico]  [aberto]  Pla"), "{row}");
     nick.wait_for_flat("Agentes do épico: só PO e Tech Leader.");
     nick.keep_screen("painel do épico");
     // `g`: only the types of PO and Tech Leader.
@@ -2940,7 +2943,7 @@ fn hiding_an_epic_is_refused_with_a_live_agent_and_then_takes_and_brings_back_th
     nick.send("f");
     // The `[oculto]` is past the 38 columns at depth 2 (the end of a row is cut, NS-34).
     nick.wait_for(" Navegação (com ocultos) ");
-    nick.wait_for_tree("EPIC-1  [épico]  Plano longo");
+    nick.wait_for_tree("EPIC-1  [épico]  [aberto]  Pla");
     nick.keep_screen("épico oculto com f");
     nick.select("EPIC-1");
     nick.send("o");
@@ -3004,7 +3007,7 @@ fn a_real_version_6_database_opens_migrated_with_the_tree_of_before() {
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(world.agents()[0].3, "stopped");
 }
 
@@ -3023,10 +3026,10 @@ fn opening_new_agents_advances_the_stage_and_each_stage_has_its_color() {
     let mut nick = spawn(&world, "sleep", &[]);
     nick.open_project("proj");
     // The epic: the ID and the title in purple, `[épico]` with no color.
-    nick.wait_for_tree("EPIC-1  [épico]  Plano longo");
+    nick.wait_for_tree("EPIC-1  [épico]  [aberto]  Pla");
     assert_eq!(nick.color_at("EPIC-1  [épico]", 0), PURPLE, "the ID");
     assert_eq!(
-        nick.color_at("EPIC-1  [épico]  Plano", 17),
+        nick.color_at("EPIC-1  [épico]  [aberto]  Pla", 27),
         PURPLE,
         "the title"
     );
@@ -3148,6 +3151,191 @@ fn only_move_ticket_moves_a_ticket_between_epics() {
     assert_eq!(
         epic_moves("db.set_ticket_epic(1, None); \"UPDATE tickets SET epic_id = 1\""),
         (1, 1)
+    );
+}
+
+/// The writes of a ticket that could break the rule of a done epic (NS-54, D3): a new ticket, its
+/// stage and its epic.
+const TICKET_WRITES: [&str; 3] = [
+    "INSERT INTO tickets",
+    "UPDATE tickets SET epic_id",
+    "UPDATE tickets SET stage",
+];
+
+/// Each write of `TICKET_WRITES` in `code`, with the name of the function it is in (the last
+/// `fn <name>` before it). The code is read with its whitespace collapsed and the `\` of the
+/// string continuations taken out, and the writes in any spelling (review of the NS-54, P4): a
+/// new ticket by any `... INTO tickets` (`INSERT`, `REPLACE`, `INSERT OR ...`), and the stage or
+/// the epic anywhere in the `SET` list of an `UPDATE tickets` (`SET title = ?, stage = ?`).
+/// `tickets_new` (a migration) and `ticket_stage_changes` are other tables.
+fn ticket_writes(code: &str) -> Vec<(&'static str, String)> {
+    let code = code
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fn_of = |at: usize| -> String {
+        code[..at]
+            .rfind("fn ")
+            .map(|fn_at| {
+                code[fn_at + 3..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let table_at = |at: usize| {
+        !code[at..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    };
+    let mut found = Vec::new();
+    for (at, needle) in code.match_indices("INTO tickets") {
+        if table_at(at + needle.len()) {
+            found.push((TICKET_WRITES[0], fn_of(at)));
+        }
+    }
+    for (at, needle) in code.match_indices("UPDATE tickets SET ") {
+        let set = &code[at + needle.len()..];
+        let set = &set[..[" WHERE ", "\"", " RETURNING "]
+            .into_iter()
+            .filter_map(|end| set.find(end))
+            .min()
+            .unwrap_or(set.len())];
+        let names: Vec<&str> = set
+            .split(',')
+            .filter_map(|assignment| assignment.split('=').next())
+            .map(str::trim)
+            .collect();
+        if names.contains(&"epic_id") {
+            found.push((TICKET_WRITES[1], fn_of(at)));
+        }
+        if names.contains(&"stage") {
+            found.push((TICKET_WRITES[2], fn_of(at)));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The body of `fn <name>` in `code`, up to the next `fn` of the same indentation.
+fn body_of<'a>(code: &'a str, name: &str) -> &'a str {
+    let start = code
+        .find(&format!("pub fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name}"));
+    let rest = &code[start + 1..];
+    let end = ["\n    pub fn ", "\n    fn ", "\n}\n"]
+        .into_iter()
+        .filter_map(|next| rest.find(next))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The only writers of a ticket that could break the rule of a done epic are the three of the
+/// Db that open the epic again in the same transaction (NS-54, D3): no other nick, function nor
+/// source writes a new ticket, its stage or its epic.
+#[test]
+fn only_the_three_writers_of_the_db_write_a_ticket_and_they_reopen_the_epic() {
+    let mut db = None;
+    for (name, code) in production_sources() {
+        if name.ends_with("src/db/migrations.rs") {
+            continue;
+        }
+        let writes = ticket_writes(&code);
+        if name.ends_with("src/db/mod.rs") {
+            db = Some(code);
+            continue;
+        }
+        assert_eq!(writes, [], "{name}: no write of a ticket out of src/db/");
+    }
+    let db = db.expect("src/db/mod.rs");
+    assert_eq!(
+        ticket_writes(&db),
+        [
+            ("INSERT INTO tickets", "insert_ticket_reopening".to_string()),
+            ("UPDATE tickets SET epic_id", "set_ticket_epic".to_string()),
+            (
+                "UPDATE tickets SET stage",
+                "change_ticket_stage".to_string()
+            ),
+        ],
+        "once each, in the three writers"
+    );
+    for writer in [
+        "insert_ticket_reopening",
+        "set_ticket_epic",
+        "change_ticket_stage",
+    ] {
+        let body = body_of(&db, writer);
+        assert!(body.contains("unchecked_transaction()"), "{writer}");
+        assert!(body.contains("reopen_if_pending(&tx,"), "{writer}");
+        assert!(body.contains("tx.commit()"), "{writer}");
+    }
+    // Positive control: a write in another function or source is found, with its function, and
+    // the table of a migration is not.
+    assert_eq!(
+        ticket_writes("fn other() { \"INSERT INTO tickets (x) VALUES (1)\" }"),
+        [("INSERT INTO tickets", "other".to_string())]
+    );
+    assert_eq!(
+        ticket_writes(
+            "pub fn hide(db: &Db) { conn.execute(\"UPDATE tickets SET stage = 'done'\") }\n\
+             fn mv() { \"UPDATE tickets SET epic_id = NULL\" }"
+        ),
+        [
+            ("UPDATE tickets SET epic_id", "mv".to_string()),
+            ("UPDATE tickets SET stage", "hide".to_string()),
+        ]
+    );
+    // Review of the NS-54, P4: other spellings of the same writes are found too.
+    for (bad, kind) in [
+        (
+            "fn a() { \"UPDATE tickets SET title = ?2, stage = ?3 WHERE id = ?1\" }",
+            "UPDATE tickets SET stage",
+        ),
+        (
+            "fn a() { \"UPDATE tickets \\\n             SET epic_id = NULL\" }",
+            "UPDATE tickets SET epic_id",
+        ),
+        (
+            "fn a() { \"UPDATE  tickets\n SET\tstage = 'done'\" }",
+            "UPDATE tickets SET stage",
+        ),
+        (
+            "fn a() { \"REPLACE INTO tickets (id) VALUES (1)\" }",
+            "INSERT INTO tickets",
+        ),
+        (
+            "fn a() { \"INSERT OR IGNORE INTO tickets (id) VALUES (1)\" }",
+            "INSERT INTO tickets",
+        ),
+        (
+            "fn a() { \"INSERT INTO\n    tickets (id) VALUES (1)\" }",
+            "INSERT INTO tickets",
+        ),
+    ] {
+        assert_eq!(ticket_writes(bad), [(kind, "a".to_string())], "{bad}");
+    }
+    assert_eq!(ticket_writes("INSERT INTO tickets_new (id) SELECT id"), []);
+    assert_eq!(
+        ticket_writes("INSERT INTO ticket_stage_changes (ticket_id) VALUES (1)"),
+        [],
+        "the history is another table"
+    );
+    assert_eq!(
+        ticket_writes("UPDATE tickets SET title = ?2"),
+        [],
+        "the title is no write of the rule"
+    );
+    assert_eq!(
+        body_of(
+            "    pub fn a() {\n        x();\n    }\n    pub fn b() {}\n",
+            "a"
+        ),
+        "ub fn a() {\n        x();\n    }"
     );
 }
 
@@ -3395,7 +3583,7 @@ fn the_fast_cat_sends_no_sigwinch_to_claude() {
     let mut nick = spawn(&world, "winsize", &[("NICK_TEST_MASCOT", "fast")]);
     open_tickets(&mut nick, "proj");
     open_agent(&mut nick, 0);
-    nick.wait_for("SIZE 23 58");
+    nick.wait_for("SIZE 22 58");
     // A few seconds of animation (a blink every 60 ms, a meow every 180 ms).
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert_eq!(
@@ -3406,7 +3594,7 @@ fn the_fast_cat_sends_no_sigwinch_to_claude() {
     );
     // Control: a real resize does reach it.
     nick.resize(40, 120);
-    nick.wait_for("SIZE 34 78");
+    nick.wait_for("SIZE 33 78");
     nick.send("\x03");
     nick.wait_for("O agente proj · PO · NS-1 terminou");
     nick.send("q");

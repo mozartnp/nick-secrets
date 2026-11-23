@@ -10,7 +10,8 @@ use std::path::Path;
 
 pub use crate::db::Epic;
 
-use crate::db::{Db, EpicHide, Owner};
+use crate::db::{Db, EpicCompletion, EpicHide, Owner};
+use crate::paths::count_of;
 use crate::projects::db_error_message;
 use crate::tickets::{self, Ticket};
 
@@ -67,11 +68,7 @@ pub fn rename(db: &Db, epic: &Epic, title: &str) -> Result<String, String> {
 
 /// The refusal of hiding an epic whose branch has `active` agents (of any nick).
 pub fn active_message(epic: &Epic, active: i64) -> String {
-    let agents = if active == 1 {
-        "1 agente ativo".to_string()
-    } else {
-        format!("{active} agentes ativos")
-    };
+    let agents = count_of(active, "agente ativo", "agentes ativos");
     format!(
         "O épico {} tem {agents} (no épico ou nos tickets dele). Encerre-os antes de ocultar.",
         epic.key
@@ -102,6 +99,76 @@ pub fn hide(db: &Db, epic: &Epic) -> Result<String, String> {
 pub fn restore(db: &Db, epic: &Epic) -> Result<String, String> {
     still_there(epic, db.restore_epic(epic.id))?;
     Ok(format!("Épico restaurado: {}.", epic.key))
+}
+
+/// Completes the epic (NS-54, D2): only with tickets and every one of them done, the hidden ones
+/// included, by one conditioned UPDATE (`Db::complete_epic`). No confirmation: `c` opens it again.
+/// With `hide_done` (the filter `d` of the tree is on), the message says it leaves the tree.
+pub fn complete(db: &Db, epic: &Epic, hide_done: bool) -> Result<String, String> {
+    match db.complete_epic(epic.id) {
+        Ok(EpicCompletion::Done) => {
+            let mut message = format!("Épico concluído: {}.", epic.key);
+            if hide_done {
+                message.push_str(" Ele sai da árvore (d mostra os concluídos).");
+            }
+            Ok(message)
+        }
+        Ok(EpicCompletion::Gone) => Err(gone_message(epic)),
+        Ok(EpicCompletion::AlreadyDone) => Err(format!("O épico {} já está concluído.", epic.key)),
+        Ok(EpicCompletion::Empty) => Err(format!(
+            "O épico {} não tem tickets e não pode ser concluído.",
+            epic.key
+        )),
+        Ok(EpicCompletion::Pending { pending, hidden }) => {
+            Err(pending_message(epic, pending, hidden))
+        }
+        Err(err) => Err(db_error_message(&err)),
+    }
+}
+
+/// The refusal of completing an epic with tickets not done (the plural of `count_of`). The hidden
+/// ones among them are told apart, with the key that shows them (the mold of the refusal of a
+/// duplicate key): without the `f` the tree does not list them, and the epic looks done (found in
+/// the validation of the NS-54 with the operator's database).
+pub fn pending_message(epic: &Epic, pending: i64, hidden: i64) -> String {
+    let tickets = count_of(pending, "ticket não concluído", "tickets não concluídos");
+    let hidden = match hidden {
+        0 => String::new(),
+        _ if hidden == pending && pending == 1 => " (oculto; f mostra os ocultos)".to_string(),
+        _ if hidden == pending => " (ocultos; f mostra os ocultos)".to_string(),
+        _ => format!(
+            " ({}; f mostra os ocultos)",
+            count_of(hidden, "oculto", "ocultos")
+        ),
+    };
+    format!("O épico {} ainda tem {tickets}{hidden}.", epic.key)
+}
+
+/// Opens a done epic again by hand (NS-54, D2), with no confirmation (the mold of `restore`).
+pub fn reopen(db: &Db, epic: &Epic) -> Result<String, String> {
+    match db.reopen_epic(epic.id) {
+        Ok(true) => Ok(format!("Épico reaberto: {}.", epic.key)),
+        Ok(false) => match db.get_epic(epic.id) {
+            Ok(Some(_)) => Err(format!("O épico {} já está aberto.", epic.key)),
+            Ok(None) => Err(gone_message(epic)),
+            Err(err) => Err(db_error_message(&err)),
+        },
+        Err(err) => Err(db_error_message(&err)),
+    }
+}
+
+/// The notice of a done epic opened again by a write of the ticket `ticket_key` (NS-54, D3).
+pub fn reopened_notice(epic_key: &str, ticket_key: &str) -> String {
+    format!("O épico {epic_key} foi reaberto: o ticket {ticket_key} não está concluído.")
+}
+
+/// `message`, with the notice of the reopening after it only when the write opened an epic again
+/// (`reopened`: its key); otherwise the message of before, byte by byte.
+pub fn with_reopened(message: String, reopened: Option<&str>, ticket_key: &str) -> String {
+    match reopened {
+        Some(epic_key) => format!("{message} {}", reopened_notice(epic_key, ticket_key)),
+        None => message,
+    }
 }
 
 fn still_there(epic: &Epic, updated: rusqlite::Result<bool>) -> Result<(), String> {
@@ -170,7 +237,8 @@ pub fn edit_id_with(
 
 /// Moves `ticket` into the epic `to`, or out of its epic (None) (decision 11 of NS-40): only the
 /// database changes (`Db::set_ticket_epic`, its only caller), no file is touched and no agent is
-/// told, even an active one. The same place is refused, and so is an epic of another project.
+/// told, even an active one. The same place is refused, and so is an epic of another project. A
+/// ticket not done into a done epic opens it again, with the notice (NS-54, D3).
 pub fn move_ticket(db: &Db, ticket: &Ticket, to: Option<&Epic>) -> Result<String, String> {
     if ticket.epic_id == to.map(|epic| epic.id) {
         return Err(format!("O ticket {} já está aí.", ticket.key));
@@ -189,14 +257,19 @@ pub fn move_ticket(db: &Db, ticket: &Ticket, to: Option<&Epic>) -> Result<String
         None => None,
     };
     match db.set_ticket_epic(ticket.id, to.map(|epic| epic.id)) {
-        Ok(true) => Ok(match (to, from) {
-            (Some(epic), _) => format!("Ticket {} movido para o épico {}.", ticket.key, epic.key),
-            (None, Some(epic)) => {
-                format!("Ticket {} tirado do épico {}.", ticket.key, epic.key)
-            }
-            (None, None) => format!("Ticket {} tirado do épico.", ticket.key),
-        }),
-        Ok(false) => match db.get_ticket(ticket.id) {
+        Ok((true, reopened)) => {
+            let message = match (to, from) {
+                (Some(epic), _) => {
+                    format!("Ticket {} movido para o épico {}.", ticket.key, epic.key)
+                }
+                (None, Some(epic)) => {
+                    format!("Ticket {} tirado do épico {}.", ticket.key, epic.key)
+                }
+                (None, None) => format!("Ticket {} tirado do épico.", ticket.key),
+            };
+            Ok(with_reopened(message, reopened.as_deref(), &ticket.key))
+        }
+        Ok((false, _)) => match db.get_ticket(ticket.id) {
             Ok(None) => Err(tickets::gone_message(ticket)),
             Ok(Some(_)) => {
                 let Some(to) = to else {
@@ -859,5 +932,170 @@ mod tests {
             Ok("Ticket T-2 tirado do épico E-1.".into())
         );
         agents::end(&f.db, agent).unwrap();
+    }
+
+    // ---- completing and reopening (NS-54, D2) and the automatic reopening (D3) ----
+
+    /// The epic `key` with one ticket `T-<key>` in it, done.
+    fn done_ticket_in(f: &Fixture, key: &str) -> (Epic, Ticket) {
+        let e = f.create("e", key).unwrap();
+        let t = f.ticket(&format!("T-{key}"), Some(&e));
+        tickets::change_stage(&f.db, &t, tickets::TicketStage::Done).unwrap();
+        (f.stored(e.id), f.db.get_ticket(t.id).unwrap().unwrap())
+    }
+
+    #[test]
+    fn complete_says_it_and_with_the_filter_on_that_it_leaves_the_tree() {
+        let f = fixture();
+        let (e, _) = done_ticket_in(&f, "E-1");
+        assert_eq!(
+            complete(&f.db, &e, false),
+            Ok("Épico concluído: E-1.".into())
+        );
+        assert!(f.stored(e.id).done_at.is_some());
+        let (e, _) = done_ticket_in(&f, "E-2");
+        assert_eq!(
+            complete(&f.db, &e, true),
+            Ok("Épico concluído: E-2. Ele sai da árvore (d mostra os concluídos).".into())
+        );
+    }
+
+    #[test]
+    fn complete_is_refused_with_the_count_empty_already_done_and_gone() {
+        let f = fixture();
+        let e = f.create("e", "E-1").unwrap();
+        assert_eq!(
+            complete(&f.db, &e, false),
+            Err("O épico E-1 não tem tickets e não pode ser concluído.".into())
+        );
+        f.ticket("T-1", Some(&e));
+        assert_eq!(
+            complete(&f.db, &e, false),
+            Err("O épico E-1 ainda tem 1 ticket não concluído.".into())
+        );
+        let hidden = f.ticket("T-2", Some(&e));
+        tickets::hide(&f.db, &hidden).unwrap();
+        assert_eq!(
+            complete(&f.db, &e, false),
+            Err(
+                "O épico E-1 ainda tem 2 tickets não concluídos (1 oculto; f mostra os ocultos)."
+                    .into()
+            ),
+            "the hidden one counts, and is told apart"
+        );
+        // Every one pending hidden: the operator sees none of them on the tree without the f.
+        let t1 =
+            f.db.list_tickets(f.project, true)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.key == "T-1")
+                .unwrap();
+        tickets::hide(&f.db, &t1).unwrap();
+        assert_eq!(
+            complete(&f.db, &e, false),
+            Err(
+                "O épico E-1 ainda tem 2 tickets não concluídos (ocultos; f mostra os ocultos)."
+                    .into()
+            )
+        );
+        let t2 = f.db.get_ticket(hidden.id).unwrap().unwrap();
+        tickets::change_stage(&f.db, &t2, tickets::TicketStage::Done).unwrap();
+        assert_eq!(
+            complete(&f.db, &e, false),
+            Err(
+                "O épico E-1 ainda tem 1 ticket não concluído (oculto; f mostra os ocultos)."
+                    .into()
+            )
+        );
+        assert_eq!(f.stored(e.id).done_at, None);
+        let (done, _) = done_ticket_in(&f, "E-2");
+        complete(&f.db, &done, false).unwrap();
+        assert_eq!(
+            complete(&f.db, &done, false),
+            Err("O épico E-2 já está concluído.".into())
+        );
+        f.db.delete_project(f.project).unwrap();
+        assert_eq!(complete(&f.db, &e, false), Err(gone_message(&e)));
+    }
+
+    #[test]
+    fn reopen_says_it_already_open_and_gone() {
+        let f = fixture();
+        let (e, _) = done_ticket_in(&f, "E-1");
+        assert_eq!(reopen(&f.db, &e), Err("O épico E-1 já está aberto.".into()));
+        complete(&f.db, &e, false).unwrap();
+        assert_eq!(reopen(&f.db, &e), Ok("Épico reaberto: E-1.".into()));
+        assert_eq!(f.stored(e.id).done_at, None);
+        f.db.delete_project(f.project).unwrap();
+        assert_eq!(reopen(&f.db, &e), Err(gone_message(&e)));
+    }
+
+    #[test]
+    fn the_notice_of_the_reopening_is_added_to_the_message_only_when_it_reopened() {
+        assert_eq!(
+            reopened_notice("E-1", "NS-9"),
+            "O épico E-1 foi reaberto: o ticket NS-9 não está concluído."
+        );
+        assert_eq!(
+            with_reopened("Ticket criado: NS-9 — Login.".into(), Some("E-1"), "NS-9"),
+            "Ticket criado: NS-9 — Login. O épico E-1 foi reaberto: o ticket NS-9 não está \
+             concluído."
+        );
+        assert_eq!(with_reopened("x.".into(), None, "NS-9"), "x.");
+    }
+
+    #[test]
+    fn moving_a_ticket_not_done_into_a_done_epic_says_it_reopened() {
+        let f = fixture();
+        let (e, _) = done_ticket_in(&f, "E-1");
+        complete(&f.db, &e, false).unwrap();
+        let t = f.ticket("NS-3", None);
+        assert_eq!(
+            move_ticket(&f.db, &t, Some(&e)),
+            Ok(
+                "Ticket NS-3 movido para o épico E-1. O épico E-1 foi reaberto: o ticket NS-3 \
+                não está concluído."
+                    .into()
+            )
+        );
+        assert_eq!(f.stored(e.id).done_at, None);
+    }
+
+    #[test]
+    fn moving_a_done_ticket_in_or_the_last_one_out_keeps_the_message_of_before() {
+        let f = fixture();
+        let (e, last) = done_ticket_in(&f, "E-1");
+        complete(&f.db, &e, false).unwrap();
+        let (_, done) = done_ticket_in(&f, "E-2");
+        assert_eq!(
+            move_ticket(&f.db, &done, Some(&e)),
+            Ok("Ticket T-E-2 movido para o épico E-1.".into())
+        );
+        assert!(f.stored(e.id).done_at.is_some());
+        let done = f.db.get_ticket(done.id).unwrap().unwrap();
+        move_ticket(&f.db, &done, None).unwrap();
+        assert_eq!(
+            move_ticket(&f.db, &last, None),
+            Ok("Ticket T-E-1 tirado do épico E-1.".into())
+        );
+        assert!(f.stored(e.id).done_at.is_some(), "done and empty");
+    }
+
+    #[test]
+    fn creating_a_ticket_in_a_done_epic_reopens_it_and_gives_its_key() {
+        let f = fixture();
+        let (e, _) = done_ticket_in(&f, "E-1");
+        complete(&f.db, &e, false).unwrap();
+        let (t, reopened) =
+            tickets::create_in_reopening(&f.db, f.project, Some(e.id), "Login", "NS-9").unwrap();
+        assert_eq!(reopened.as_deref(), Some("E-1"));
+        assert_eq!(
+            with_reopened(tickets::created_message(&t), reopened.as_deref(), &t.key),
+            "Ticket criado: NS-9 — Login. O épico E-1 foi reaberto: o ticket NS-9 não está \
+             concluído."
+        );
+        let (_, reopened) =
+            tickets::create_in_reopening(&f.db, f.project, Some(e.id), "x", "NS-10").unwrap();
+        assert_eq!(reopened, None, "open now");
     }
 }

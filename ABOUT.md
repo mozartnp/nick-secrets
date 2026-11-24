@@ -3736,6 +3736,12 @@ do helper ele cai, conforme a sabotagem registrada em `.nick/docs/NS-37/review_s
 
 ## Rust no projeto: navegação em árvore (NS-38)
 
+> **Mudou no NS-55** (seção "Rust no projeto: letreiro do nó selecionado na árvore (NS-55)"): uma
+> linha longa deixou de ser só cortada pela borda. A não selecionada termina em `…` na última coluna
+> antes da borda, e a selecionada rola como um letreiro. As linhas que cabem ficaram iguais. A
+> montagem de uma linha saiu do `draw_tree` para o `ui::tree_row`, e o símbolo de seleção virou a
+> constante `ui::HIGHLIGHT_SYMBOL`.
+
 > **Mudou no NS-40** (seção "Rust no projeto: épicos opcionais (NS-40)"): a árvore ganhou o nível
 > opcional do épico (Módulo > Projeto > [Épico >] Ticket > Agente), com o `NodeId::Epic`, as
 > profundidades 2 a 4, o `Place::Epic` e o `HELP_STATES` com 33 estados (a altura do rodapé não
@@ -4895,6 +4901,11 @@ realista); e a validação do UUID faz um `grep` por salto (custo desprezível c
 
 ## Rust no projeto: a gata Nick no painel (NS-51)
 
+> **Mudou no NS-55** (seção "Rust no projeto: letreiro do nó selecionado na árvore (NS-55)"): o
+> laço acorda também pelo letreiro do nó selecionado. O `idle_wait` recebe o `App::next_wake` (o
+> mais próximo entre a gata e o letreiro) no lugar do `App::mascot_wake`, que continua existindo e
+> igual. O `Nick::spawn` dos testes de PTY põe também o `NICK_TEST_MARQUEE=still`.
+
 História filha do épico NS-28. A Nick, a gata do operador, aparece desenhada em pixel art na base
 da coluna da esquerda do `nick` (a árvore e as Configurações), dentro da borda e encostada à
 esquerda. Ela pisca de vez em quando e, raramente, mostra um balão "Miau!" ao lado.
@@ -5847,3 +5858,162 @@ texto e os índices dos spans, um a mais), `the_id_and_the_title_of_the_epic_are
 `opening_new_agents_advances_the_stage_and_each_stage_has_its_color` e
 `hiding_an_epic_is_refused_with_a_live_agent_and_then_takes_and_brings_back_the_branch`, que passaram a esperar `EPIC-1  [épico]  [aberto]  Pla` (o que cabe nas 30 colunas). As telas estão em `.nick/docs/NS-54/telas_validacao_banco_real.txt`.
 
+## Rust no projeto: letreiro do nó selecionado na árvore (NS-55)
+
+História filha do épico NS-28. Antes, um nome que não cabia na coluna da árvore era cortado na
+borda pelo `List` do ratatui, sem nenhuma indicação. Agora:
+
+- a linha **não selecionada** que não cabe termina em `…`, sem passar da borda;
+- a linha **selecionada** que não cabe rola como um letreiro: começa parada, avança uma coluna por
+  vez até mostrar o fim, pausa e volta de uma vez ao começo, em ciclo;
+- uma linha que cabe fica como antes: não rola e não ganha `…`;
+- trocar a seleção reinicia o letreiro do nó novo do início.
+
+Fora do escopo: quebrar o nome em várias linhas, mudar a largura da coluna (`ui::LIST_WIDTH`), a
+tela de Configurações, os títulos dos blocos e o painel da direita.
+
+**Decisões (os números são os do plano):**
+- **D1. O que rola:** tudo que vem **depois** da seta (`▾ `/`▸ `/`  `), ou seja, o rótulo do nó e,
+  num nó fechado, a marca `  ● saída nova`. O recuo e a seta ficam parados, para a hierarquia
+  continuar legível. Numa linha não selecionada, a marca de nó fechado pode ficar sob o `…`, como
+  antes ela já era cortada pela borda.
+- **D2. Largura disponível** de uma linha: a largura do conteúdo da coluna (`content_area` do
+  `left_column`, com ou sem a gata), menos o símbolo de seleção e menos o recuo e a seta
+  (`ui::tree_available`). O símbolo é a constante `ui::HIGHLIGHT_SYMBOL = "> "`, usada pelo `List` e
+  pela conta, e não um `2` solto. O `List` reserva esse espaço em todas as linhas quando há
+  seleção, e na árvore sempre há (`HighlightSpacing::WhenSelected`, o padrão, ficou). A **sobra** é
+  `largura do texto − disponível` (`saturating_sub`). Com sobra 0, a linha é desenhada como antes.
+- **D3. Linha não selecionada com sobra** (`marquee::ellipsize`): os graphemes que cabem em
+  `disponível − 1` colunas e, depois, `…` (`Span::raw`, sem estilo próprio: herda o da linha, como o
+  DIM de um ticket oculto ou de um agente parado). Cada span mantém o próprio estilo (a cor da
+  etapa, o vermelho do `[FORA DA JAIL]`). Um caractere largo que não cabe inteiro antes do `…` sai
+  inteiro, e a linha fica uma coluna mais curta.
+- **D4. Linha selecionada com sobra** (`marquee::window`): a janela de `disponível` colunas a
+  partir da coluna `offset` do texto, **sem** `…` (o movimento já diz que há mais texto). Um
+  caractere largo cortado por uma das pontas da janela vira espaço na metade que aparece, então a
+  janela tem sempre `disponível` colunas e o texto não "pula".
+- **D5. Tempo** (constantes em `marquee.rs`, `PRODUCTION`): 1500 ms parado no começo
+  (`hold_start`), 150 ms por coluna (`step`) e 1500 ms parado no fim (`hold_end`). Depois ele volta
+  de uma vez ao começo (sem rolar para trás). Com `t = (agora − início) % ciclo`, em que
+  `ciclo = hold_start + sobra·step + hold_end`: `t < hold_start` dá `offset 0`; até
+  `hold_start + sobra·step`, `offset = (t − hold_start) / step`; depois, `offset = sobra` (o fim à
+  mostra). Com sobra 0, o `offset` é sempre 0 e não há prazo para acordar.
+- **D6. Reinício:** o letreiro guarda o `NodeId` que está rolando e o instante em que começou. Quando
+  o nó selecionado muda (inclusive voltar a um nó anterior), ele recomeça do `offset 0` a partir do
+  `agora`. Um refresh que muda o texto do **mesmo** nó (título editado) ou um resize **não**
+  reinicia: a sobra é recalculada, e o `offset` desenhado é limitado à sobra nova
+  (`Marquee::offset_for`, `min(offset, sobra)`). O `App::select` não recebe `Instant`: o reinício
+  sai do `tick`, que compara o `NodeId` guardado com o selecionado, sem mexer nas dezenas de
+  chamadas de `select`.
+- **D7. Onde rola:** só na tela da árvore. Nas Configurações a sobra é 0. O letreiro continua
+  rolando com o foco no terminal do agente e com diálogo aberto, porque a árvore continua visível.
+  É só redesenho, sem `after_change` (a mesma regra da gata): não muda o tamanho de nenhum PTY, nem
+  o modo do terminal de fora, nem o texto guardado do agente escondido.
+- **D8. Custo aceito no ticket:** enquanto o nó selecionado tem sobra, há cerca de 1 redesenho a
+  cada 150 ms durante o movimento, mais 2 nas pausas de cada ciclo, sempre com o limite de `FRAME`
+  (16 ms) do laço. Sem sobra, o custo é zero (o `next_wake` do letreiro é `None`). O laço também
+  refaz a conta da sobra (`ui::marquee_overflow`, que chama o `layout`) no topo de cada volta,
+  como o desenho faz a cada quadro.
+- **D9. O gancho só de teste `NICK_TEST_MARQUEE`**, lido no `main.rs` logo depois do
+  `NICK_TEST_MASCOT` (`marquee_hook`):
+  - `still`: o letreiro nunca sai do `offset 0` e não acorda o laço. É o padrão do `Nick::spawn`
+    dos testes de PTY (`tests/common/mod.rs`; um valor do caso substitui), para uma leitura de
+    tela não pegar a linha selecionada no meio da rolagem;
+  - `fast`: tempos curtos fixos (`FAST`: 60 ms no começo e no fim, 20 ms por coluna);
+  - qualquer outro valor, ou vazio: o de produção. O gancho não desliga o `…` (D3), que não depende
+    do relógio.
+
+**Largura por grapheme, pelo ratatui, sem dependência nova.** O corte percorre os spans por
+`Span::styled_graphemes` (com o estilo vazio de base, então cada grapheme sai com o estilo do
+próprio span) e mede cada grapheme com `Span::raw(símbolo).width()`, o unicode-width que o próprio
+buffer do ratatui usa para desenhar. Nada de `len()` nem `chars().count()`: uma letra com acento
+combinante (`a\u{0303}`) é um grapheme de 1 coluna, e `🐈`/`漢` têm 2. Um grapheme de largura 0
+solto acompanha o anterior. **Não** entraram `unicode-width` nem `unicode-segmentation` no
+`Cargo.toml`. Sequências ZWJ e bandeiras seguem o que o ratatui fizer e não têm teste próprio.
+
+**Reaproveitamento:**
+- `nick/src/marquee.rs` é um módulo novo **no molde do `mascot.rs`**: puro (sem I/O, sem banco,
+  sem `Instant::now()`), com o relógio por parâmetro. Nenhum código é compartilhado com a gata: os
+  eventos dela são sorteados e liga/desliga, e o letreiro é uma função determinística da posição,
+  então uma abstração comum seria só semelhança superficial. Ele tem três partes separadas: o tempo
+  puro (`offset`, `next_change`, que devolve quando o **valor** muda, e não a fronteira de fase), o
+  estado (`Marquee`: `new`, `still`, `fast`, `tick`, `next_wake`, `offset_for`) e o corte puro
+  (`width`, `ellipsize`, `window`);
+- **o padrão do `prompt_window`**: o laço pede à `ui` uma conta da tela (`ui::marquee_overflow`) e
+  entrega ao `App` (`App::tick_marquee`). A conta usa as **mesmas** funções do desenho (`layout`, o
+  `list_block` e o `content_area` da coluna, `tree_row`, `tree_available`), e um teste confere que
+  ela bate com o que o `draw_tree` corta;
+- o laço (`main.rs`) e o `terminal::idle_wait` foram reaproveitados sem mudança na função: no topo
+  de cada volta, ao lado do `tick_mascot`, vêm a sobra e o `tick_marquee`; no ramo ocioso, o
+  `idle_wait` recebe o `App::next_wake` (o mínimo entre a gata e o letreiro). Toda tecla que muda a
+  seleção marca `dirty`, e o desenho sai sempre numa volta que começou pelo `tick_marquee`, então o
+  primeiro quadro depois da troca já tem o `offset 0`. Mesmo assim, o `offset_for` devolve 0 para
+  um nó diferente do guardado, como defesa;
+- os spans de cada nó (`node_spans`, `project_spans`, `ticket_spans`, `epic_spans`, `agent_spans`)
+  não mudaram: o letreiro corta o resultado deles.
+
+**A extração do `tree_row` foi provada antes do corte novo.** A montagem de uma linha (recuo e seta,
+rótulo, a marca de nó fechado e o estilo) saiu do `draw_tree` para o `ui::tree_row`, usada pelo
+desenho e pela conta da sobra. Logo depois da extração, sozinha, o `make test` inteiro passou sem
+editar nenhum teste (log em `.nick/docs/NS-55/baseline_extracao.log`).
+
+**O estado fica no `App`** (`marquee`), e a assinatura de `App::new` não mudou (ele cria o letreiro
+de produção). Novos: `set_marquee` (o gancho), `tick_marquee(now, sobra)`, `marquee_offset(nó,
+sobra)` e `next_wake`. O `tick_marquee` só mexe no letreiro: não mexe em foco, seleção, diálogo,
+texto digitado, barra de status nem agentes.
+
+**Testes adaptados** (a lista completa, com antes e depois, está em
+`.nick/docs/NS-55/testes_adaptados.md`): mudaram de propósito só os que conferiam o fim cortado pela
+borda de uma linha longa **não selecionada**, que agora termina em `…`.
+`the_rows_are_indented_with_the_arrows_and_the_label_of_each_node` (`ui.rs`),
+`each_kind_of_node_has_its_panel_and_its_help`,
+`hiding_an_epic_is_refused_with_a_live_agent_and_then_takes_and_brings_back_the_branch` e
+`opening_new_agents_advances_the_stage_and_each_stage_has_its_color` (`tests/agent.rs`),
+`a_project_whose_directory_is_gone_is_marked_unavailable` e
+`the_ticket_flow_works_and_touches_no_file_of_the_project` (`tests/tui.rs`, que passou a esperar o
+texto comum à linha selecionada e à não selecionada). Nenhum teste foi apagado. Também não entrou
+dependência nova nem migração nova, e o README não mudou (regra "README genérico").
+
+**Testes novos:** em `marquee` (os tempos de produção e do `fast`; `offset` e `next_change` em
+instantes exatos, sem sobra, com sobra 1 e depois de um milhão de ciclos; o `Marquee` com nó novo,
+o avanço só com mudança, a troca e a volta, a sobra que diminui sem reiniciar, o `next_wake`, o
+`still` e o `fast`; o corte com ASCII, acento pré-composto, combinante e solto, emoji e caractere
+largo nas duas pontas, estilos de vários spans e larguras 0 e 1); em `app`
+(`tick_marquee_follows_the_selection`, `ticking_the_marquee_changes_nothing_but_the_marquee` e
+`next_wake_is_the_nearest_of_the_cat_and_the_marquee`); em `ui` (a linha não selecionada com `…` em
+projeto, épico, ticket e agente, com a borda no lugar e os estilos; a selecionada rolando, com o
+prefixo parado e sem `…`; a linha curta igual a antes; acento e emoji sem deslocar a borda em
+nenhuma posição; o `marquee_overflow` igual ao corte do desenho em 50, 60, 78, 100 e 140 colunas,
+com e sem a gata; 0 nas Configurações; e o `layout`/`agent_area` sem mudança em nenhuma posição);
+no PTY, em `tests/tui.rs` (com o `fast`: o começo, o meio e o fim, o `…` do nó não selecionado e a
+volta ao começo ao sair e voltar ao nó; com o `still` padrão, a linha selecionada igual entre duas
+leituras) e em `tests/agent.rs` (com o `fast`, o nó de um agente fora da jail rolando: o texto
+digitado chega inteiro com o foco no terminal, e nenhum SIGWINCH em 3 s, com o controle positivo do
+resize). As sabotagens estão em `.nick/docs/NS-55/sabotagens.md`, e as telas em
+`.nick/docs/NS-55/prints/`.
+
+**Ajustes do review do NS-55** (`.nick/docs/NS-55/review.md`). Os três pontos procediam, e nenhum
+mexeu no código de produção além de um comentário:
+- **P1, leitura da árvore nos helpers de PTY:** o `tests/tui.rs` tinha cópias próprias de
+  `tree_rows` e `selected_row`, porque o `Nick::tree_rows` cortava a linha em 38 `char` do texto da
+  tela, e no vt100 um caractere largo (`🐈`, `漢`) é um `char` só mas ocupa duas células: numa linha
+  com ele, a borda entrava junto. A correção foi no helper comum. As funções livres
+  `common::tree_rows_of(screen)` e `common::selected_row_of(screen)` (no molde do `cat_rows`) leem
+  as colunas 1 a 38 **célula a célula**, pulando a segunda célula de um caractere largo e trocando
+  os meio-blocos da gata por espaço, e o `Nick::tree_rows`/`selected_row` passaram a chamá-las.
+  **Diferença da sugestão do review:** ele propunha cortar na borda direita (`take_while` até `│`/`┃`).
+  Isso cortaria errado a linha com um diálogo aberto, cuja borda fica sobre as colunas da árvore. Por
+  célula, uma linha sem caractere largo dá exatamente o texto de antes, e a suíte de PTY passou sem
+  mudar nenhum teste. As cópias do `tui.rs` saíram;
+- **P2, a volta ao nó sem janela curta:** o teste de PTY conferia a volta ao NS-1 num laço próprio,
+  que exigia ler a primeira tela dentro dos cerca de 80 ms em que o letreiro `fast` fica no começo.
+  Agora há o `Nick::wait_screen(what, cond)`, que devolve a mesma tela em que a condição valeu (o
+  `keep_when` usa ele e também devolve a tela). O teste sai do NS-2 depois de ele andar pelo menos
+  10 colunas, volta ao NS-1 e desce de novo, e confere que a primeira tela do NS-2 começa **antes**
+  de onde ele saiu. Sem o reinício, ele seguiria dali ou adiante; com ele, só um atraso de 260 ms
+  passaria das 10 colunas. Provado numa cópia (sabotagem do `tick` sem reiniciar: `at 11, left at
+  10`; e o laço com `mascot_wake`), e rodado 10 vezes seguidas sem falha;
+- **P3:** a linha do `//!` do `main.rs` que passava de 100 colunas foi quebrada.
+
+Das observações do review, ficou como está (D6): voltar das Configurações para a árvore com o mesmo
+nó não reinicia o letreiro, porque o nó não mudou.

@@ -37,6 +37,7 @@ use crate::epics;
 use crate::init::{InitOutcome, InitRunner};
 use crate::keys::{self, Shortcut, TermModes};
 use crate::launch::{AgentLauncher, HolderKey, Launch, Precheck, RenderRequest, Rendered};
+use crate::marquee::Marquee;
 use crate::mascot::{Mascot, Palette, SystemDice};
 use crate::modules::ModuleKind;
 use crate::paths::{self, printable};
@@ -485,6 +486,8 @@ pub struct App {
     truecolor: bool,
     /// The colors of the cat for `truecolor`, resolved once (review NS-51, problem 1).
     palette: Palette,
+    /// The marquee of the selected node on the tree (NS-55). Only `tick_marquee` moves it.
+    marquee: Marquee,
 }
 
 impl App {
@@ -525,6 +528,7 @@ impl App {
             mascot: Mascot::new(Instant::now(), SystemDice::new()),
             truecolor: false,
             palette: Palette::new(false),
+            marquee: Marquee::new(Instant::now()),
         };
         app.refresh_tree();
         app
@@ -546,9 +550,36 @@ impl App {
         self.mascot.tick(now)
     }
 
-    /// When the cat changes next (None: never): where the idle loop wakes.
+    /// When the cat changes next (None: never).
     pub fn mascot_wake(&self) -> Option<Instant> {
         self.mascot.next_wake()
+    }
+
+    /// Replaces the marquee (the loop, by the test hook NICK_TEST_MARQUEE).
+    pub fn set_marquee(&mut self, marquee: Marquee) {
+        self.marquee = marquee;
+    }
+
+    /// Moves the clock of the marquee to `now`, on the selected node with `overflow` columns
+    /// that do not fit (`ui::marquee_overflow`, NS-55). True when its offset changed (a redraw).
+    /// It touches nothing else: not the focus, the selection, the dialog, the status nor the
+    /// agents.
+    pub fn tick_marquee(&mut self, now: Instant, overflow: usize) -> bool {
+        self.marquee.tick(now, self.selected, overflow)
+    }
+
+    /// The offset of the marquee to draw on `node` with `overflow` (0 on any other node).
+    pub fn marquee_offset(&self, node: NodeId, overflow: usize) -> usize {
+        self.marquee.offset_for(node, overflow)
+    }
+
+    /// When the cat or the marquee changes next, the nearest (None: never): where the idle
+    /// loop wakes.
+    pub fn next_wake(&self) -> Option<Instant> {
+        [self.mascot.next_wake(), self.marquee.next_wake()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Whether the terminal has truecolor (COLORTERM, read by the loop).
@@ -5493,6 +5524,139 @@ pub(crate) mod tests {
                 input: "/um/cami".into()
             })
         );
+    }
+
+    /// NS-55: the marquee follows the selection. The node selected by `↓` starts still at 0, moves
+    /// with the clock, and the next one selected starts again from 0.
+    #[test]
+    fn tick_marquee_follows_the_selection() {
+        use crate::marquee::{FAST, Marquee};
+        use crate::tree::NodeId;
+        use std::time::Instant;
+        let (mut f, _) = with_tickets("proj");
+        let long = "Um título bem comprido que não cabe na coluna da árvore";
+        f.new_ticket(long, "NS-1");
+        f.new_ticket(long, "NS-2");
+        let t0 = Instant::now();
+        f.app.set_marquee(Marquee::fast(t0));
+        f.on_project();
+        f.key(KeyCode::Down);
+        let first = f.app.selected();
+        assert!(matches!(first, NodeId::Ticket(_)), "{first:?}");
+        f.app.tick_marquee(t0, 10);
+        assert_eq!(f.app.marquee_offset(first, 10), 0);
+        let moving = t0 + FAST.hold_start + FAST.step * 3;
+        assert!(f.app.tick_marquee(moving, 10));
+        assert_eq!(f.app.marquee_offset(first, 10), 3);
+        f.key(KeyCode::Down);
+        let second = f.app.selected();
+        assert_ne!(second, first);
+        f.app.tick_marquee(moving, 10);
+        assert_eq!(
+            f.app.marquee_offset(second, 10),
+            0,
+            "the new node from the start"
+        );
+        assert_eq!(f.app.marquee_offset(first, 10), 0);
+        f.app.tick_marquee(moving + FAST.hold_start + FAST.step, 10);
+        assert_eq!(f.app.marquee_offset(second, 10), 1);
+    }
+
+    /// NS-55 (D7): the marquee touches nothing but itself: not the focus, the selection, the
+    /// dialog (nor the text typed in it), the status nor the agents.
+    #[test]
+    fn ticking_the_marquee_changes_nothing_but_the_marquee() {
+        use crate::marquee::Marquee;
+        use std::time::{Duration, Instant};
+        fn tick_a_second(f: &mut Fixture) {
+            let t0 = Instant::now();
+            f.app.set_marquee(Marquee::fast(t0));
+            f.app.tick_marquee(t0, 7);
+            let mut changed = 0;
+            let mut now = t0;
+            while now < t0 + Duration::from_secs(1) {
+                now = f.app.next_wake().expect("the fast marquee wakes");
+                changed += usize::from(f.app.tick_marquee(now, 7));
+            }
+            assert!(changed > 10, "the marquee changed only {changed} times");
+        }
+        fn state(f: &Fixture) -> String {
+            format!(
+                "{:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                f.app.focus(),
+                f.app.selected(),
+                f.app.dialog,
+                f.app.status,
+                f.app.shown(),
+                f.app.agents.len(),
+                f.app.screen,
+            )
+        }
+
+        let (mut f, _) = running();
+        f.app
+            .set_mascot(crate::mascot::Mascot::still(Instant::now()));
+        f.app.set_status("uma mensagem".into());
+        let before = state(&f);
+        tick_a_second(&mut f);
+        assert_eq!(state(&f), before);
+        assert_eq!(f.app.focus(), Focus::Terminal);
+
+        let mut f = fixture();
+        f.app
+            .set_mascot(crate::mascot::Mascot::still(Instant::now()));
+        f.app
+            .select(crate::tree::NodeId::Module(ModuleKind::AutoScrum));
+        f.ch('a');
+        f.type_text("/um/cami");
+        let before = state(&f);
+        tick_a_second(&mut f);
+        assert_eq!(state(&f), before);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::AddPath {
+                input: "/um/cami".into()
+            })
+        );
+    }
+
+    /// NS-55: the loop wakes at the nearest of the cat and the marquee; with the marquee still
+    /// (no overflow, or the hook `still`) that is the cat's.
+    #[test]
+    fn next_wake_is_the_nearest_of_the_cat_and_the_marquee() {
+        use crate::marquee::{FAST, Marquee};
+        use crate::mascot::Mascot;
+        use std::time::{Duration, Instant};
+        let mut f = fixture();
+        let t0 = Instant::now();
+        let node = f.app.selected();
+        // A new App: the marquee of production, no overflow yet.
+        assert_eq!(f.app.next_wake(), f.app.mascot_wake());
+        f.app.tick_marquee(t0, 0);
+        assert_eq!(f.app.next_wake(), f.app.mascot_wake());
+
+        f.app.set_marquee(Marquee::fast(t0));
+        f.app.tick_marquee(t0, 5);
+        let marquee = t0 + FAST.hold_start + FAST.step;
+        // The cat of production wakes in seconds: the marquee is nearer.
+        assert!(f.app.mascot_wake().unwrap() > marquee);
+        assert_eq!(f.app.next_wake(), Some(marquee));
+        // The fast cat wakes at 40 ms, before the marquee.
+        f.app.set_mascot(Mascot::fast(t0));
+        assert_eq!(f.app.next_wake(), Some(t0 + Duration::from_millis(40)));
+        assert_eq!(f.app.next_wake(), f.app.mascot_wake());
+        // The cat still: only the marquee; without overflow: nothing.
+        f.app.set_mascot(Mascot::still(t0));
+        assert_eq!(f.app.next_wake(), Some(marquee));
+        f.app.tick_marquee(t0, 0);
+        assert_eq!(f.app.next_wake(), None);
+        assert_eq!(f.app.next_wake(), f.app.mascot_wake());
+        // The marquee still, with overflow: the cat's.
+        f.app.set_mascot(Mascot::fast(t0));
+        f.app.set_marquee(Marquee::still(t0));
+        f.app.tick_marquee(t0, 30);
+        assert_eq!(f.app.marquee_offset(node, 30), 0);
+        assert_eq!(f.app.next_wake(), f.app.mascot_wake());
     }
 
     /// With the focus on the terminal, every key but the reserved shortcut goes to the program

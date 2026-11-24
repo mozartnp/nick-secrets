@@ -17,6 +17,7 @@ pub mod epics;
 pub mod init;
 pub mod keys;
 pub mod launch;
+pub mod marquee;
 pub mod mascot;
 pub mod modules;
 pub mod paths;

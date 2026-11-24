@@ -19,6 +19,7 @@ use crate::app::{
 use crate::db::Epic;
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
+use crate::marquee;
 use crate::mascot::{
     self, BUBBLE_COLS, BUBBLE_ROWS, MASCOT_COLS, MASCOT_ROWS, MEOW_TEXT, TREE_MIN_ROWS,
 };
@@ -31,6 +32,10 @@ use crate::version;
 
 /// The widest the list gets beside an agent (NS-34); never more than half the window.
 pub const LIST_WIDTH: u16 = 40;
+
+/// The mark of the selected row of the tree. The `List` keeps its width on every row while a
+/// row is selected (always, on the tree), so it is out of the room of each row (NS-55, D2).
+pub const HIGHLIGHT_SYMBOL: &str = "> ";
 
 /// The color of the border of the focused panel beside an agent (NS-37).
 pub const FOCUS_COLOR: Color = Color::Cyan;
@@ -904,24 +909,25 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         title.push_str(" (só ativos)");
     }
     title.push(' ');
+    let content = left_column(frame, app, area, title);
     let items: Vec<ListItem> = app
         .visible()
         .iter()
         .map(|row| {
-            let (label, style) = node_spans(app, row);
-            let arrow = match (row.expandable, row.open) {
-                (true, true) => "▾ ",
-                (true, false) => "▸ ",
-                (false, _) => "  ",
-            };
-            let mut spans = vec![Span::raw(format!(
-                "{}{arrow}",
-                "  ".repeat(usize::from(row.depth))
-            ))];
-            spans.extend(label);
-            if row.unseen_below {
-                spans.push(Span::raw("  ● saída nova"));
+            let (prefix, mut text, style) = tree_row(app, row);
+            // NS-55: what does not fit scrolls on the selected row and ends in `…` on the
+            // others; the prefix stays (D1).
+            let room = tree_available(content, &prefix);
+            let overflow = marquee::width(&text).saturating_sub(room);
+            if overflow > 0 {
+                text = if row.id == app.selected() {
+                    marquee::window(&text, app.marquee_offset(row.id, overflow), room)
+                } else {
+                    marquee::ellipsize(&text, room)
+                };
             }
+            let mut spans = vec![Span::raw(prefix)];
+            spans.extend(text);
             ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
@@ -929,12 +935,57 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .visible()
         .iter()
         .position(|row| row.id == app.selected());
-    let content = left_column(frame, app, area, title);
     let list = List::new(items)
-        .highlight_symbol("> ")
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
         .highlight_style(selected_style());
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(list, content, &mut state);
+}
+
+/// The columns left for the text of a row of the tree with `prefix` in `content` (the area of
+/// the tree inside the column, `left_column`): its width without the highlight symbol and the
+/// prefix (NS-55, D2).
+fn tree_available(content: Rect, prefix: &str) -> usize {
+    usize::from(content.width)
+        .saturating_sub(Span::raw(HIGHLIGHT_SYMBOL).width())
+        .saturating_sub(Span::raw(prefix).width())
+}
+
+/// How many columns of the text of the selected row of the tree do not fit on a screen of
+/// `area` (NS-55): what its marquee scrolls, for the loop to give the App
+/// (`App::tick_marquee`) before each draw. The same count the drawing makes (`layout`, the
+/// block and the cat of the column, `tree_row`, `tree_available`); 0 on the settings and
+/// without the selected row on the tree.
+pub fn marquee_overflow(app: &App, area: Rect) -> usize {
+    if app.screen != Screen::Tree {
+        return 0;
+    }
+    let content = content_area(list_block(app).inner(layout(app, area).list));
+    app.visible()
+        .iter()
+        .find(|row| row.id == app.selected())
+        .map_or(0, |row| {
+            let (prefix, text, _) = tree_row(app, row);
+            marquee::width(&text).saturating_sub(tree_available(content, &prefix))
+        })
+}
+
+/// One row of the tree: its prefix (the indent of its depth and the arrow, `▾ `/`▸ `/`  `), its
+/// text (the label of the node and, on a closed node with a marked agent below it, the mark
+/// `  ● saída nova`) and the style of the whole row. The drawing and the count of what does not
+/// fit (NS-55) both take the row from here.
+fn tree_row(app: &App, row: &Visible) -> (String, Vec<Span<'static>>, Style) {
+    let (mut text, style) = node_spans(app, row);
+    let arrow = match (row.expandable, row.open) {
+        (true, true) => "▾ ",
+        (true, false) => "▸ ",
+        (false, _) => "  ",
+    };
+    let prefix = format!("{}{arrow}", "  ".repeat(usize::from(row.depth)));
+    if row.unseen_below {
+        text.push(Span::raw("  ● saída nova"));
+    }
+    (prefix, text, style)
 }
 
 /// The label of a visible row and its style.
@@ -3912,12 +3963,13 @@ mod tests {
                 "",
             ]
             .map(|row| {
-                // The end of a row is cut at the 38 columns inside the border (NS-34).
-                row.chars()
-                    .take(38)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
+                // The end of a row is cut at the 38 columns inside the border (NS-34), and a
+                // row not selected that does not fit ends in `…` since the NS-55.
+                if row.chars().count() > 38 {
+                    format!("{}…", row.chars().take(37).collect::<String>())
+                } else {
+                    row.to_string()
+                }
             }),
             "{}",
             text(&buffer)
@@ -5563,5 +5615,434 @@ mod tests {
         }
         assert!(HELP_STATES.contains(&(Place::Settings, false, false, false)));
         // 65 states, the 65 combinations above among them: no state twice.
+    }
+
+    // --- NS-55: the marquee of the selected node, and the `…` of the others. ---
+
+    /// A tree with long rows of every kind: a project with a long name (depth 1), an epic with
+    /// a long title (depth 2), the ticket NS-10 with accents (precomposed and combining), a cat
+    /// and a wide character, the ticket NS-11 in Tech Leader with an ASCII-ish title and an agent
+    /// not live (depth 3), and the short NS-12. Every branch open, the module selected.
+    fn with_long() -> Fixture {
+        let mut f = fixture();
+        let root = std::fs::canonicalize(f._tmp.path()).unwrap();
+        let dir = root.join("alfa");
+        std::fs::create_dir_all(dir.join(".nick")).unwrap();
+        std::fs::write(dir.join(".nick/nick.conf"), "").unwrap();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let p = db
+            .insert_project(
+                "auto_scrum",
+                "alfa-projeto-com-um-nome-comprido-demais",
+                dir.to_str().unwrap(),
+            )
+            .unwrap();
+        db.insert_epic(p.id, "E-1", false, "Épico de título muito comprido")
+            .unwrap();
+        db.insert_ticket(
+            p.id,
+            "NS-10",
+            false,
+            "Título com ação, a\u{0303} e 🐈 漢 que não cabe",
+            None,
+        )
+        .unwrap();
+        let t11 = db
+            .insert_ticket(
+                p.id,
+                "NS-11",
+                false,
+                "Outro titulo bem longo para ver as reticencias",
+                None,
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE tickets SET stage = 'tech_leader' WHERE id = ?1",
+                [t11.id],
+            )
+            .unwrap();
+        db.insert_ticket(p.id, "NS-12", false, "Curto", None)
+            .unwrap();
+        let agent = db
+            .insert_agent(
+                Owner::Ticket(t11.id),
+                "tech_leader",
+                "s-1",
+                "alfa · Tech Leader · NS-11",
+                "NS-11",
+            )
+            .unwrap();
+        db.stop_agent(agent.id).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE agents SET opened_at = '2026-11-20T00:00:00Z' WHERE id = ?1",
+                [agent.id],
+            )
+            .unwrap();
+        f.app.refresh_tree();
+        f.app.tree.open(MODULE);
+        f.app.tree.open(NodeId::Project(p.id));
+        f.app.tree.open(NodeId::Ticket(t11.id));
+        f.app.refresh_tree();
+        f.app.select(MODULE);
+        f.app
+            .set_marquee(crate::marquee::Marquee::fast(std::time::Instant::now()));
+        f
+    }
+
+    /// The node of the row whose text starts with `start`.
+    fn node_starting(app: &App, start: &str) -> NodeId {
+        app.visible()
+            .iter()
+            .find(|row| marquee_text(app, row).starts_with(start))
+            .unwrap_or_else(|| panic!("no row starts with {start:?}"))
+            .id
+    }
+
+    /// The text of a row, after its prefix (what scrolls, D1).
+    fn marquee_text(app: &App, row: &Visible) -> String {
+        tree_row(app, row)
+            .1
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    /// The screen row of `node` on the tree (the list starts right below the border).
+    fn screen_row(app: &App, node: NodeId) -> u16 {
+        let index = app.visible().iter().position(|row| row.id == node).unwrap();
+        1 + u16::try_from(index).unwrap()
+    }
+
+    /// The cells of the row `y` from the column 1 to `last`, as the buffer has them: a wide
+    /// grapheme then the blank cell it covers.
+    fn row_cells(buffer: &Buffer, y: u16, last: u16) -> String {
+        (1..=last)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// `spans` as the buffer draws them in `cells` columns: each grapheme of width > 0 and a
+    /// blank for each other column it takes, then blanks up to `cells`.
+    fn as_cells(spans: &[Span<'static>], cells: usize) -> String {
+        let mut out = String::new();
+        let mut used = 0;
+        for span in spans {
+            for g in span.styled_graphemes(Style::default()) {
+                let w = Span::raw(g.symbol).width();
+                if w == 0 {
+                    continue;
+                }
+                out.push_str(g.symbol);
+                out.push_str(&" ".repeat(w - 1));
+                used += w;
+            }
+        }
+        out.push_str(&" ".repeat(cells.saturating_sub(used)));
+        out
+    }
+
+    /// The row of `node` as `draw_tree` must draw it on a 40 column list (38 inside): the
+    /// highlight symbol (or its blanks), the prefix, and its text `cut` to the room left.
+    fn expected_row(
+        app: &App,
+        node: NodeId,
+        cut: impl Fn(&[Span<'static>], usize) -> Vec<Span<'static>>,
+    ) -> String {
+        let row = app.visible().iter().find(|row| row.id == node).unwrap();
+        let (prefix, text, _) = tree_row(app, row);
+        let symbol = if node == app.selected() {
+            HIGHLIGHT_SYMBOL.to_string()
+        } else {
+            " ".repeat(HIGHLIGHT_SYMBOL.len())
+        };
+        let room = 38 - HIGHLIGHT_SYMBOL.len() - prefix.chars().count();
+        format!("{symbol}{prefix}{}", as_cells(&cut(&text, room), room))
+    }
+
+    /// Moves the marquee of `f` to the column `k` of the selected node (fast timing, from `t0`
+    /// selected on the screen `area`) and draws it.
+    fn draw_at_column(f: &mut Fixture, t0: std::time::Instant, k: usize, area: Rect) -> Buffer {
+        use crate::marquee::FAST;
+        let overflow = marquee_overflow(&f.app, area);
+        let at = if k == 0 {
+            t0
+        } else {
+            t0 + FAST.hold_start + FAST.step * u32::try_from(k).unwrap()
+        };
+        f.app.tick_marquee(at, overflow);
+        render_at(&f.app, area.width, area.height, None)
+    }
+
+    #[test]
+    fn a_long_row_not_selected_ends_in_an_ellipsis_before_the_border() {
+        let f = with_long();
+        let buffer = render(&f.app);
+        let module = screen_row(&f.app, MODULE);
+        let border = buffer[(LIST_WIDTH - 1, module)].symbol().to_string();
+        for start in [
+            "alfa-projeto",
+            "E-1",
+            "NS-10",
+            "NS-11",
+            "Tech Leader  parado",
+        ] {
+            let node = node_starting(&f.app, start);
+            let y = screen_row(&f.app, node);
+            assert_eq!(
+                row_cells(&buffer, y, LIST_WIDTH - 2),
+                expected_row(&f.app, node, marquee::ellipsize),
+                "{start}:\n{}",
+                text(&buffer)
+            );
+            assert_eq!(
+                buffer[(LIST_WIDTH - 1, y)].symbol(),
+                border,
+                "{start}: the border in its place"
+            );
+        }
+        // Byte by byte: the last column inside the border is the `…`, after 29 columns.
+        let y = screen_row(&f.app, node_starting(&f.app, "NS-11"));
+        assert_eq!(
+            list_row(&buffer, y),
+            "      ▾ NS-11  [Tech Leader]  Outro t…"
+        );
+        assert_eq!(buffer[(LIST_WIDTH - 2, y)].symbol(), "…");
+        // Each part keeps its style: the color of the stage; the `…` has the style of the row.
+        let (_, x) = find(&buffer, "[Tech Leader]").unwrap();
+        assert_eq!(buffer[(x + 1, y)].fg, STAGE_BLUE);
+        assert_eq!(buffer[(LIST_WIDTH - 2, y)].fg, Color::Reset);
+        let agent = screen_row(&f.app, node_starting(&f.app, "Tech Leader  parado"));
+        assert_eq!(
+            list_row(&buffer, agent),
+            "          Tech Leader  parado  2026-1…"
+        );
+        let dim = |x: u16, y: u16| buffer[(x, y)].modifier.contains(Modifier::DIM);
+        assert!(
+            dim(LIST_WIDTH - 2, agent),
+            "the `…` of a row not live: dimmed"
+        );
+        assert!(dim(12, agent));
+        let project = screen_row(&f.app, node_starting(&f.app, "alfa-projeto"));
+        assert_eq!(
+            list_row(&buffer, project),
+            "    ▾ alfa-projeto-com-um-nome-compri…"
+        );
+    }
+
+    #[test]
+    fn the_selected_long_row_scrolls_without_an_ellipsis_and_its_prefix_stays() {
+        use crate::marquee::FAST;
+        let mut f = with_long();
+        let area = Rect::new(0, 0, 100, 30);
+        let node = node_starting(&f.app, "NS-11");
+        f.app.select(node);
+        let y = screen_row(&f.app, node);
+        let text = marquee_text(&f.app, &f.app.visible()[usize::from(y - 1)]);
+        assert_eq!(
+            text,
+            "NS-11  [Tech Leader]  Outro titulo bem longo para ver as reticencias"
+        );
+        // 68 columns, 30 of room after `> ` and `    ▾ `.
+        assert_eq!(marquee_overflow(&f.app, area), 38);
+        let t0 = std::time::Instant::now();
+        let window = |k: usize| -> String { text.chars().skip(k).take(30).collect() };
+        // At the start: still, with the start of the text and no `…`.
+        let buffer = draw_at_column(&mut f, t0, 0, area);
+        assert_eq!(
+            row_cells(&buffer, y, 38),
+            format!("> {}{}", "    ▾ ", window(0))
+        );
+        // Still while the hold lasts.
+        f.app.tick_marquee(
+            t0 + FAST.hold_start - std::time::Duration::from_millis(1),
+            38,
+        );
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_eq!(
+            row_cells(&buffer, y, 38),
+            format!("> {}{}", "    ▾ ", window(0))
+        );
+        for k in [1, 5, 20, 37, 38] {
+            let buffer = draw_at_column(&mut f, t0, k, area);
+            assert_eq!(
+                row_cells(&buffer, y, 38),
+                format!("> {}{}", "    ▾ ", window(k)),
+                "column {k}"
+            );
+            assert!(!row_cells(&buffer, y, 38).contains('…'));
+        }
+        // At the end: the end of the text against the border.
+        assert!(window(38).ends_with("reticencias"));
+        // Back to the start at once after the hold at the end.
+        let cycle = FAST.hold_start + FAST.step * 38 + FAST.hold_end;
+        f.app.tick_marquee(t0 + cycle, 38);
+        let buffer = render_at(&f.app, 100, 30, None);
+        assert_eq!(
+            row_cells(&buffer, y, 38),
+            format!("> {}{}", "    ▾ ", window(0))
+        );
+    }
+
+    #[test]
+    fn a_short_row_is_drawn_as_before() {
+        let mut f = with_long();
+        let node = node_starting(&f.app, "NS-12");
+        let y = screen_row(&f.app, node);
+        let buffer = render(&f.app);
+        assert_eq!(list_row(&buffer, y), "        NS-12  [Aberto]  Curto");
+        f.app.select(node);
+        let area = Rect::new(0, 0, 100, 30);
+        assert_eq!(marquee_overflow(&f.app, area), 0);
+        let t0 = std::time::Instant::now();
+        for k in [0, 3, 50] {
+            let buffer = draw_at_column(&mut f, t0, k, area);
+            assert_eq!(list_row(&buffer, y), ">       NS-12  [Aberto]  Curto");
+        }
+        assert_eq!(
+            f.app.next_wake(),
+            f.app.mascot_wake(),
+            "nothing to wake for"
+        );
+        // The module row, short too, as before.
+        assert_eq!(list_row(&render(&f.app), 1), "  ▾ auto_scrum");
+    }
+
+    #[test]
+    fn accents_and_wide_graphemes_never_move_the_border() {
+        let mut f = with_long();
+        let area = Rect::new(0, 0, 100, 30);
+        let node = node_starting(&f.app, "NS-10");
+        let y = screen_row(&f.app, node);
+        let reference = render(&f.app);
+        let edge = |b: &Buffer| -> Vec<String> {
+            (LIST_WIDTH - 1..=LIST_WIDTH)
+                .map(|x| b[(x, y)].symbol().to_string())
+                .collect()
+        };
+        // Not selected: the `…`, and the border where it was.
+        assert_eq!(
+            row_cells(&reference, y, 38),
+            expected_row(&f.app, node, marquee::ellipsize)
+        );
+        let border = edge(&reference);
+        f.app.select(node);
+        let overflow = marquee_overflow(&f.app, area);
+        assert!(overflow > 0);
+        let t0 = std::time::Instant::now();
+        for k in 0..=overflow {
+            let buffer = draw_at_column(&mut f, t0, k, area);
+            assert_eq!(edge(&buffer), border, "column {k}");
+            assert_eq!(
+                row_cells(&buffer, y, 38),
+                expected_row(&f.app, node, |text, room| marquee::window(text, k, room)),
+                "column {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn marquee_overflow_is_what_the_drawing_cuts_at_every_width_with_and_without_the_cat() {
+        use crate::marquee::FAST;
+        for (width, height) in [
+            (50, 30),
+            (60, 30),
+            (78, 30),
+            (100, 30),
+            (140, 30),
+            (100, 16),
+            (50, 16),
+        ] {
+            let mut f = with_long();
+            let node = node_starting(&f.app, "NS-11");
+            f.app.select(node);
+            let y = screen_row(&f.app, node);
+            let area = Rect::new(0, 0, width, height);
+            let list = layout(&f.app, area).list;
+            let inner = Block::bordered().inner(list);
+            assert_eq!(
+                mascot_area(inner).is_some(),
+                height == 30,
+                "{width}x{height}: the cat"
+            );
+            let overflow = marquee_overflow(&f.app, area);
+            assert!(overflow > 0, "{width}x{height}");
+            let last = inner.right() - 1;
+            let t0 = std::time::Instant::now();
+            let draw = |f: &mut Fixture, k: usize| {
+                let at = t0 + FAST.hold_start + FAST.step * u32::try_from(k).unwrap();
+                f.app.tick_marquee(at, overflow);
+                render_at(&f.app, width, height, None)
+            };
+            f.app.tick_marquee(t0, overflow);
+            // At the end (offset = overflow) the last letter is against the border; one
+            // column before, the one before it.
+            let buffer = draw(&mut f, overflow);
+            assert_eq!(buffer[(last, y)].symbol(), "s", "{width}x{height}");
+            let buffer = draw(&mut f, overflow - 1);
+            assert_eq!(buffer[(last, y)].symbol(), "a", "{width}x{height}");
+            // Not selected: the `…` in the last column inside.
+            f.app.select(MODULE);
+            let buffer = render_at(&f.app, width, height, None);
+            assert_eq!(buffer[(last, y)].symbol(), "…", "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn marquee_overflow_is_0_on_the_settings_and_without_a_selected_row() {
+        let mut f = with_long();
+        let area = Rect::new(0, 0, 100, 30);
+        f.app.select(node_starting(&f.app, "NS-11"));
+        assert_eq!(marquee_overflow(&f.app, area), 38);
+        f.app.screen = Screen::Settings;
+        assert_eq!(marquee_overflow(&f.app, area), 0);
+        f.app.screen = Screen::Tree;
+        f.app.select(MODULE);
+        assert_eq!(marquee_overflow(&f.app, area), 0, "a short row");
+    }
+
+    #[test]
+    fn the_marquee_resizes_no_terminal() {
+        let (mut f, root) = with_running(&["proj", "fora"]);
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE tickets SET title = 'Um título bem comprido que não cabe na árvore'",
+                [],
+            )
+            .unwrap();
+        f.app.refresh_tree();
+        let ticket = node_starting(&f.app, "NS-1");
+        f.app.select(ticket);
+        f.app.focus = Focus::List;
+        f.app
+            .set_marquee(crate::marquee::Marquee::fast(std::time::Instant::now()));
+        for (width, height) in [(100, 30), (50, 30), (140, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let before = (
+                layout(&f.app, area),
+                f.app
+                    .agents()
+                    .iter()
+                    .map(|a| agent_area(&f.app, area, a))
+                    .collect::<Vec<_>>(),
+            );
+            let overflow = marquee_overflow(&f.app, area);
+            assert!(overflow > 0, "{width}x{height}");
+            let t0 = std::time::Instant::now();
+            for k in 0..=overflow + 3 {
+                draw_at_column(&mut f, t0, k, area);
+                let now = (
+                    layout(&f.app, area),
+                    f.app
+                        .agents()
+                        .iter()
+                        .map(|a| agent_area(&f.app, area, a))
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(now, before, "{width}x{height}, column {k}");
+            }
+        }
     }
 }

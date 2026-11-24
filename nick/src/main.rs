@@ -2,7 +2,8 @@
 //! TUI: an error there is printed on the normal terminal), the cleanup of the agents left by a
 //! dead nick, the panic hook, and the loop of the TUI. Only this file reads the environment
 //! (HOME, XDG_STATE_HOME, NICK_INIT_BIN, EDITOR, COLORTERM, PATH and the test hooks
-//! NICK_TEST_PANIC and NICK_TEST_MASCOT) and asks where the binary is (`current_exe`, NS-52).
+//! NICK_TEST_PANIC, NICK_TEST_MASCOT and NICK_TEST_MARQUEE) and asks where the binary is
+//! (`current_exe`, NS-52).
 //!
 //! The loop is driven by a channel (finding of NS-29): an input thread reads the terminal
 //! (paused by its gate while bin/nick-init runs), a signal thread turns SIGTERM and SIGHUP into
@@ -32,6 +33,7 @@ use nick::editor::TerminalEditorRunner;
 use nick::init::{self, TerminalInitRunner};
 use nick::keys::TermModes;
 use nick::launch::{self, TerminalAgentLauncher};
+use nick::marquee::Marquee;
 use nick::mascot::Mascot;
 use nick::paths::{self, DB_FILE_NAME};
 use nick::resources;
@@ -136,6 +138,7 @@ fn main() -> ExitCode {
         std::env::var_os("COLORTERM").as_deref(),
     ));
     mascot_hook(&mut app);
+    marquee_hook(&mut app);
 
     // The editor of the long texts of the stage forms (NS-35): ${EDITOR:-nano}.
     let editor = std::env::var_os("EDITOR");
@@ -273,9 +276,14 @@ impl Shell {
         let mut dirty = true;
         let mut last_draw = Instant::now() - FRAME;
         loop {
-            // The cat Nick (NS-51) only redraws: no PTY changes size, no mode of the outer
-            // terminal changes, so no `after_change`.
+            // The cat Nick (NS-51) and the marquee of the selected node (NS-55) only redraw:
+            // no PTY changes size, no mode of the outer terminal changes, so no
+            // `after_change`. The marquee follows the selection here, before any draw: a key
+            // that selects another node marks `dirty`, so its first frame starts from 0.
             dirty |= self.app.tick_mascot(Instant::now());
+            let area = self.frame_area(guard)?;
+            let overflow = ui::marquee_overflow(&self.app, area);
+            dirty |= self.app.tick_marquee(Instant::now(), overflow);
             let event = if dirty && !terminal::panicking() {
                 let wait = (last_draw + FRAME).saturating_duration_since(Instant::now());
                 if wait.is_zero() {
@@ -290,7 +298,7 @@ impl Shell {
                     Err(RecvTimeoutError::Disconnected) => return Ok(None),
                 }
             } else {
-                match terminal::idle_wait(self.app.mascot_wake(), Instant::now()) {
+                match terminal::idle_wait(self.app.next_wake(), Instant::now()) {
                     Some(wait) => match rx.recv_timeout(wait) {
                         Ok(event) => event,
                         Err(RecvTimeoutError::Timeout) => continue,
@@ -699,6 +707,18 @@ fn mascot_hook(app: &mut App) {
     match std::env::var("NICK_TEST_MASCOT").as_deref() {
         Ok("still") => app.set_mascot(Mascot::still(Instant::now())),
         Ok("fast") => app.set_mascot(Mascot::fast(Instant::now())),
+        _ => {}
+    }
+}
+
+/// Test hook (ABOUT.md, tests/common/mod.rs), only for the tests: NICK_TEST_MARQUEE=still keeps
+/// the marquee of the selected node at its start (it never wakes the loop), =fast scrolls it on
+/// short fixed times (NS-55). Any other value, or none, is the marquee of production. The `…` of
+/// the rows not selected does not depend on it.
+fn marquee_hook(app: &mut App) {
+    match std::env::var("NICK_TEST_MARQUEE").as_deref() {
+        Ok("still") => app.set_marquee(Marquee::still(Instant::now())),
+        Ok("fast") => app.set_marquee(Marquee::fast(Instant::now())),
         _ => {}
     }
 }

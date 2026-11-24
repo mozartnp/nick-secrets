@@ -2300,8 +2300,9 @@ fn each_kind_of_node_has_its_panel_and_its_help() {
     // The filters: the hidden ticket shows; only the live branches.
     nick.send("f");
     nick.wait_for(" Navegação (com ocultos) ");
-    // The end cut at 40 columns (NS-34): `[Aberto]` is longer than the `[PO]` of before (NS-45).
-    nick.wait_for("NS-2  [Aberto]  Segundo  [ocul");
+    // The end cut at 40 columns (NS-34): `[Aberto]` is longer than the `[PO]` of before (NS-45),
+    // and a row not selected that does not fit ends in `…` (NS-55).
+    nick.wait_for("NS-2  [Aberto]  Segundo  [ocu…");
     nick.keep_screen("filtro de ocultos");
     nick.send("v");
     nick.wait_for(" Navegação (com ocultos) (só ativos) ");
@@ -2941,9 +2942,10 @@ fn hiding_an_epic_is_refused_with_a_live_agent_and_then_takes_and_brings_back_th
             .any(|r| r.contains("[épico]") || r.contains("NS-1  [PO]"))
     });
     nick.send("f");
-    // The `[oculto]` is past the 38 columns at depth 2 (the end of a row is cut, NS-34).
+    // The `[oculto]` is past the 38 columns at depth 2 (the end of a row is cut, NS-34, in `…`
+    // when not selected, NS-55).
     nick.wait_for(" Navegação (com ocultos) ");
-    nick.wait_for_tree("EPIC-1  [épico]  [aberto]  Pla");
+    nick.wait_for_tree("EPIC-1  [épico]  [aberto]  Pl…");
     nick.keep_screen("épico oculto com f");
     nick.select("EPIC-1");
     nick.send("o");
@@ -3025,11 +3027,12 @@ fn opening_new_agents_advances_the_stage_and_each_stage_has_its_color() {
     world.epic(&proj, "EPIC-1", "Plano longo", &[]);
     let mut nick = spawn(&world, "sleep", &[]);
     nick.open_project("proj");
-    // The epic: the ID and the title in purple, `[épico]` with no color.
-    nick.wait_for_tree("EPIC-1  [épico]  [aberto]  Pla");
+    // The epic: the ID and the title in purple, `[épico]` with no color. Not selected, its end
+    // is in `…` (NS-55).
+    nick.wait_for_tree("EPIC-1  [épico]  [aberto]  Pl…");
     assert_eq!(nick.color_at("EPIC-1  [épico]", 0), PURPLE, "the ID");
     assert_eq!(
-        nick.color_at("EPIC-1  [épico]  [aberto]  Pla", 27),
+        nick.color_at("EPIC-1  [épico]  [aberto]  Pl…", 27),
         PURPLE,
         "the title"
     );
@@ -3585,6 +3588,85 @@ fn the_fast_cat_sends_no_sigwinch_to_claude() {
     open_agent(&mut nick, 0);
     nick.wait_for("SIZE 22 58");
     // A few seconds of animation (a blink every 60 ms, a meow every 180 ms).
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(
+        nick.panel().matches("SIZE").count(),
+        1,
+        "only the SIZE of the start: {}",
+        nick.panel()
+    );
+    // Control: a real resize does reach it.
+    nick.resize(40, 120);
+    nick.wait_for("SIZE 33 78");
+    nick.send("\x03");
+    nick.wait_for("O agente proj · PO · NS-1 terminou");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- the marquee of the selected node does not get in the way (NS-55) ----
+
+/// The text of the selected row of the tree, after the `> ` and the prefix of an agent (depth
+/// 3: 8 columns).
+fn selected_agent_text(nick: &Nick) -> Option<String> {
+    nick.selected_row()
+        .map(|(_, row)| row.chars().skip(10).collect())
+}
+
+/// Waits until the marquee of the selected agent (`PO  ● vivo  [FORA DA JAIL]  <data>`: it
+/// does not fit in the 28 columns of depth 3) has left its start, and keeps that screen.
+fn wait_for_the_agent_scrolling(nick: &Nick) {
+    nick.wait_until("the row of the agent scrolling", || {
+        selected_agent_text(nick).is_some_and(|text| !text.starts_with("PO  "))
+    });
+}
+
+/// Criterion 7: with the marquee of the selected agent scrolling fast, a text typed on its
+/// terminal reaches claude whole, and the focus stays on the terminal.
+#[test]
+fn the_fast_marquee_neither_takes_the_focus_nor_breaks_the_typing_on_the_terminal() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let typed = "letreiro rola";
+    let bytes = typed.len().to_string();
+    let mut nick = spawn(
+        &world,
+        "echo",
+        &[
+            ("FAKE_CLAUDE_READ_BYTES", bytes.as_str()),
+            ("NICK_TEST_MARQUEE", "fast"),
+        ],
+    );
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    wait_for_focus_border(&nick, true);
+    wait_for_the_agent_scrolling(&nick);
+    let (half, rest) = typed.split_at(typed.len() / 2);
+    for chunk in half.as_bytes().chunks(2) {
+        nick.send(std::str::from_utf8(chunk).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(border_at(&nick, 0, PANEL_COL), ("┏".into(), true));
+    nick.send(rest);
+    let hex: String = typed.bytes().map(|b| format!(" {b:02x}")).collect();
+    nick.wait_for(&format!("GOT{hex}"));
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Criterion 7: the marquee never resizes the PTY of the agent: no SIGWINCH reaches claude
+/// while the row of its node scrolls (several cycles), with the positive control of a resize.
+#[test]
+fn the_fast_marquee_sends_no_sigwinch_to_claude() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "winsize", &[("NICK_TEST_MARQUEE", "fast")]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("SIZE 22 58");
+    wait_for_the_agent_scrolling(&nick);
+    // A cycle of the fast marquee of this row is about half a second: a few of them.
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert_eq!(
         nick.panel().matches("SIZE").count(),

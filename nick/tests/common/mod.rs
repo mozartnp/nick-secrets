@@ -364,9 +364,10 @@ pub struct Nick {
 
 impl Nick {
     /// Starts the binary at `cwd` with only PATH, TERM, `NICK_TEST_MASCOT=still` (the cat Nick
-    /// drawn still, NS-51: no blink nor "Miau!" in the middle of a reading of the screen) and
-    /// `env` in the environment (a `NICK_TEST_MASCOT` of `env` replaces it), on a terminal
-    /// without the kitty keyboard protocol.
+    /// drawn still, NS-51: no blink nor "Miau!" in the middle of a reading of the screen),
+    /// `NICK_TEST_MARQUEE=still` (NS-55: the selected row never caught in the middle of its
+    /// scroll) and `env` in the environment (a `NICK_TEST_MASCOT` or `NICK_TEST_MARQUEE` of `env`
+    /// replaces it), on a terminal without the kitty keyboard protocol.
     pub fn spawn(cwd: &Path, env: &[(String, String)]) -> Nick {
         Nick::spawn_as(cwd, env, Keyboard::Legacy)
     }
@@ -392,6 +393,7 @@ impl Nick {
         command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
         command.env("TERM", "xterm-256color");
         command.env("NICK_TEST_MASCOT", "still");
+        command.env("NICK_TEST_MARQUEE", "still");
         for (key, value) in env {
             command.env(key, value);
         }
@@ -470,13 +472,26 @@ impl Nick {
 
     /// Waits until `cond` holds on the screen (`what` in the panic), and keeps that same screen
     /// (`keep`, so a screen that changes fast, as the cat Nick blinking, is kept as it was seen).
-    pub fn keep_when(&self, label: &str, what: &str, cond: impl Fn(&vt100::Screen) -> bool) {
+    /// Returns that screen too.
+    pub fn keep_when(
+        &self,
+        label: &str,
+        what: &str,
+        cond: impl Fn(&vt100::Screen) -> bool,
+    ) -> vt100::Screen {
+        let screen = self.wait_screen(what, cond);
+        keep(label, &screen);
+        screen
+    }
+
+    /// Waits until `cond` holds on the screen (`what` in the panic) and returns that same screen,
+    /// so what is checked on it is what `cond` saw (NS-55: a row that scrolls fast).
+    pub fn wait_screen(&self, what: &str, cond: impl Fn(&vt100::Screen) -> bool) -> vt100::Screen {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
             let parser = self.parser();
             if cond(parser.screen()) {
-                keep(label, parser.screen());
-                return;
+                return parser.screen().clone();
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -677,19 +692,7 @@ impl Nick {
     /// from the first row under the top of the border; the half blocks of the cat Nick (NS-51)
     /// taken out, so her rows are empty ones (the end of the tree for `select`).
     pub fn tree_rows(&self) -> Vec<String> {
-        self.screen()
-            .lines()
-            .skip(1)
-            .map(|line| {
-                line.chars()
-                    .skip(1)
-                    .take(TREE_COLS)
-                    .map(|c| if MASCOT_BLOCKS.contains(&c) { ' ' } else { c })
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        tree_rows_of(self.parser().screen())
     }
 
     /// Waits until `needle` is in the column on the left read as one line (`tree_rows`, the
@@ -708,10 +711,7 @@ impl Nick {
 
     /// The row of the tree with the selection (`> ` on it), and its index in `tree_rows`.
     pub fn selected_row(&self) -> Option<(usize, String)> {
-        self.tree_rows()
-            .into_iter()
-            .enumerate()
-            .find(|(_, row)| row.starts_with("> "))
+        selected_row_of(self.parser().screen())
     }
 
     /// Moves the selection of the tree with ↓ (then ↑) until its row contains `label`. Each key
@@ -771,6 +771,39 @@ impl Nick {
         }
         panic!("{what} never happened. Screen:\n{}", self.screen());
     }
+}
+
+/// The rows of the tree on `screen` (`Nick::tree_rows`): the cells of the columns inside the
+/// border of the column on the left (1 to `TREE_COLS`), from the first row under the top of the
+/// border, cell by cell (NS-55: a wide character takes two cells and is one `char` of the text of
+/// the screen, so its second cell is skipped and the row never takes the border), the half blocks
+/// of the cat Nick (NS-51) as blanks, and without the blanks of the end.
+pub fn tree_rows_of(screen: &vt100::Screen) -> Vec<String> {
+    let (rows, _) = screen.size();
+    (1..rows)
+        .map(|row| {
+            (1..=TREE_COLS as u16)
+                .filter_map(|col| screen.cell(row, col))
+                .filter(|cell| !cell.is_wide_continuation())
+                .map(|cell| match cell.contents() {
+                    "" => " ".to_string(),
+                    text if text.chars().all(|c| MASCOT_BLOCKS.contains(&c)) => " ".to_string(),
+                    text => text.to_string(),
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The row of the tree on `screen` with the selection (`> ` on it), and its index in
+/// `tree_rows_of`.
+pub fn selected_row_of(screen: &vt100::Screen) -> Option<(usize, String)> {
+    tree_rows_of(screen)
+        .into_iter()
+        .enumerate()
+        .find(|(_, row)| row.starts_with("> "))
 }
 
 /// The rows of `screen` with a half block of the cat Nick in her columns (NS-51).

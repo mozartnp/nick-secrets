@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::{
-    DOWN, ENTER, ESC, KITTY_OFF, KITTY_ON, KITTY_QUERY, LEFT, TAB, World, assert_in_order,
+    DOWN, ENTER, ESC, KITTY_OFF, KITTY_ON, KITTY_QUERY, LEFT, TAB, UP, World, assert_in_order,
 };
 use nick::mascot::MASCOT_ROWS;
 
@@ -577,9 +577,10 @@ fn a_project_whose_directory_is_gone_is_marked_unavailable() {
     fs::remove_file(noconf.join(".nick/nick.conf")).unwrap();
     let mut nick = world.spawn(&world.root, &[]);
     open_projects(&mut nick);
-    // On the tree, the end of the row is cut at 40 columns (NS-34); the panel says it whole.
-    nick.wait_for("gone  [indisponível: pasta não");
-    nick.wait_for("noconf  [indisponível: sem .nick");
+    // On the tree, the end of the row is cut at 40 columns (NS-34), in `…` when not selected
+    // (NS-55); the panel says it whole.
+    nick.wait_for("gone  [indisponível: pasta não …");
+    nick.wait_for("noconf  [indisponível: sem .nic…");
     nick.select("gone");
     nick.wait_for("Situação: [indisponível: pasta não encontrada]");
     nick.select("noconf");
@@ -684,20 +685,22 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     nick.send("senha");
     nick.send(ENTER);
     nick.wait_for("Título atualizado: NS-7.");
-    nick.wait_for("NS-7  [Aberto]  Corrigir o sen");
+    // What shows of the title both selected (`...o sen`, the start of its marquee) and not
+    // (`...o se…`, NS-55): the end of the row is cut at 40 columns (NS-34).
+    nick.wait_for("NS-7  [Aberto]  Corrigir o se");
 
     // Hide it: `n` cancels, `s` confirms and it leaves the list.
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("n");
     nick.wait_for_flat("f mostrar ocultos");
-    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o sen"));
+    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o se"));
     nick.send("o");
     nick.wait_for("(s/N)");
     nick.send("s");
     nick.wait_for("Ticket ocultado: NS-7.");
     assert!(
-        !nick.screen().contains("Corrigir o sen"),
+        !nick.screen().contains("Corrigir o se"),
         "{}",
         nick.screen()
     );
@@ -705,20 +708,20 @@ fn the_ticket_flow_works_and_touches_no_file_of_the_project() {
     // The filter shows it as [oculto], and `o` restores it.
     nick.send("f");
     nick.wait_for("(com ocultos)");
-    nick.wait_for("NS-7  [Aberto]  Corrigir o sen");
+    nick.wait_for("NS-7  [Aberto]  Corrigir o se");
     nick.wait_for_flat("f esconder ocultos");
     nick.send("\x1b[A");
     nick.send("o");
     nick.wait_for("Ticket restaurado: NS-7.");
     nick.send("f");
     nick.wait_for_flat("f mostrar ocultos");
-    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o sen"));
+    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o se"));
     assert!(!nick.screen().contains("[oculto]"));
 
     // Up to the project, with it still there.
     nick.send(ESC);
     nick.wait_for_flat("a novo ticket");
-    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o sen"));
+    assert!(nick.screen().contains("NS-7  [Aberto]  Corrigir o se"));
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 
@@ -1371,6 +1374,126 @@ fn a_ticket_leaving_done_in_a_done_epic_reopens_it_with_the_notice_on_the_bar() 
     assert_eq!(epic_done_at(&world), None);
     // Open again: `[aberto]` in the place of `[concluído]`.
     nick.wait_for_tree("EPIC-1  [épico]  [aberto]");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+// ---- the marquee of the selected node (NS-55) ----
+
+/// The long titles of the marquee: accents (precomposed and combining), a cat and wide
+/// characters in NS-1, plain text in NS-2.
+const LONG_1: &str = "Título com ação, a\u{0303}, 🐈 e 漢字 que não cabe na coluna";
+const LONG_2: &str = "Outro título comprido para ver as reticências no fim";
+
+/// `proj` with the tickets NS-1 and NS-2 of long titles.
+fn with_long_titles() -> World {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    world.ticket(&proj, "NS-1", LONG_1);
+    world.ticket(&proj, "NS-2", LONG_2);
+    world
+}
+
+/// The tree: the module (0), proj (1), NS-1 (2) and NS-2 (3), as `common::tree_rows_of` reads
+/// it. The text of a ticket row comes after the highlight symbol (or its blanks) and the 6
+/// columns of its prefix.
+const NS1: usize = 2;
+const NS2: usize = 3;
+fn ticket_text(screen: &vt100::Screen, index: usize) -> String {
+    common::tree_rows_of(screen)
+        .get(index)
+        .map(|row| row.chars().skip(8).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the row `index` is the selected one on `screen`.
+fn on(screen: &vt100::Screen, index: usize) -> bool {
+    common::selected_row_of(screen).is_some_and(|(at, _)| at == index)
+}
+
+/// The column of the text of NS-2 (plain text: one column a `char`) where the window shown on
+/// `screen` starts.
+fn ns2_offset(screen: &vt100::Screen) -> Option<usize> {
+    let full: Vec<char> = format!("NS-2  [Aberto]  {LONG_2}").chars().collect();
+    let shown: Vec<char> = ticket_text(screen, NS2).chars().collect();
+    (0..full.len()).find(|&i| full[i..].starts_with(&shown))
+}
+
+/// Criteria 1, 2 and 5, in the real binary with NICK_TEST_MARQUEE=fast: the selected row shows
+/// the start, then the text moved, then its end; the row not selected ends in `…`; going to
+/// another node and back starts the marquee again.
+#[test]
+fn the_selected_long_row_scrolls_and_the_others_end_in_an_ellipsis() {
+    let world = with_long_titles();
+    let mut nick = world.spawn(&world.root, &[("NICK_TEST_MARQUEE", "fast")]);
+    nick.open_project("proj");
+    nick.send(DOWN);
+    let start = "NS-1  [Aberto]  Título com aç";
+    let text = |screen: &vt100::Screen| ticket_text(screen, NS1);
+    nick.keep_when("NS-55 letreiro no começo", "the start of NS-1", |screen| {
+        on(screen, NS1) && text(screen).starts_with(start)
+    });
+    nick.keep_when("NS-55 letreiro no meio", "NS-1 moved", |screen| {
+        on(screen, NS1) && !text(screen).starts_with("NS-1") && !text(screen).ends_with("coluna")
+    });
+    let screen = nick.keep_when("NS-55 letreiro no fim", "the end of NS-1", |screen| {
+        on(screen, NS1) && text(screen).ends_with("não cabe na coluna")
+    });
+    // Never a `…` on the selected row; the one not selected ends in it, at the border.
+    assert!(!text(&screen).contains('…'), "{}", screen.contents());
+    let other = ticket_text(&screen, NS2);
+    assert!(other.starts_with("NS-2  [Aberto]  Outro"), "{other:?}");
+    assert!(other.ends_with('…'), "{other:?}");
+    assert_eq!(
+        other.chars().count(),
+        30,
+        "the 30 columns of the room: {other:?}"
+    );
+    nick.keep_screen("NS-55 nó não selecionado com reticências");
+    // The start again after leaving a node and coming back. NS-2 (38 columns too wide: 60 ms
+    // still, then 20 ms a column) is left once it has moved at least 10 columns, and back on it
+    // its first screen must start before where it was. Without the start again, it would go on
+    // from there (or later); with it, it would take 260 ms of delay to reach the 10 columns, so
+    // a slow test thread does not fail it (review NS-55, P2).
+    nick.send(DOWN);
+    let moved = nick.wait_screen("NS-2 moved 10 columns", |screen| {
+        on(screen, NS2) && ns2_offset(screen).is_some_and(|at| (10..30).contains(&at))
+    });
+    let before = ns2_offset(&moved).unwrap();
+    nick.send(UP);
+    nick.wait_screen("NS-1 selected", |screen| on(screen, NS1));
+    nick.send(DOWN);
+    let back = nick.wait_screen("NS-2 selected again", |screen| on(screen, NS2));
+    let after = ns2_offset(&back).expect("a window of NS-2");
+    assert!(
+        after < before,
+        "back on NS-2 it starts again: at {after}, left at {before}\n{}",
+        back.contents()
+    );
+    assert!(text(&back).ends_with('…'), "NS-1 not selected");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+/// Criterion 9: by default (`Nick::spawn`, NICK_TEST_MARQUEE=still) the selected row does not
+/// move between two readings, and still shows its start; the `…` of the others does not depend
+/// on the clock.
+#[test]
+fn with_the_still_marquee_the_selected_row_does_not_move() {
+    let world = with_long_titles();
+    let mut nick = world.spawn(&world.root, &[]);
+    nick.open_project("proj");
+    nick.select("NS-1");
+    let first = nick.tree_rows();
+    std::thread::sleep(Duration::from_millis(2500));
+    let second = nick.tree_rows();
+    assert_eq!(first[NS1], second[NS1]);
+    assert!(
+        second[NS1].starts_with(">       NS-1  [Aberto]  Título com aç"),
+        "{second:?}"
+    );
+    assert!(second[NS2].ends_with('…'), "{second:?}");
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }

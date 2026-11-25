@@ -918,6 +918,101 @@ fn the_operator_changes_the_stage_and_done_stays_on_the_list() {
     assert_eq!(nick.wait_exit(), Some(0));
 }
 
+/// NS-61: `m` → Rejeitado, the reason (an empty one refused with the field open), `s`; the gray
+/// mark on the tree and on the panel, the reason in the history, the refusal of `g`, the filter
+/// `d` taking it and bringing it back, and `m` out of Rejeitado to Dev.
+#[test]
+fn a_ticket_is_rejected_with_a_reason_and_leaves_rejected_by_m() {
+    let world = World::new();
+    let proj = world.dir("proj", true);
+    world.register(&proj);
+    let mut nick = world.spawn(&world.root, &[]);
+    open_tickets(&mut nick, "proj");
+    new_ticket(&mut nick, "Corrigir o login", "NS-7");
+    nick.wait_for("NS-7  [Aberto]  Corrigir o");
+    nick.send("m");
+    nick.wait_for("Para qual etapa?");
+    while !nick.screen().contains("> Rejeitado") {
+        let before = nick.screen();
+        nick.send(DOWN);
+        nick.wait_until("the selection to move", || nick.screen() != before);
+    }
+    nick.keep_screen("diálogo de mudar etapa com Rejeitado");
+    nick.send(ENTER);
+    nick.wait_for("Motivo da rejeição (até 120 caracteres):");
+    // An empty reason: refused, the field stays open.
+    nick.send(ENTER);
+    nick.wait_for("Informe o motivo da rejeição.");
+    assert!(nick.screen().contains("Motivo da rejeição"), "still open");
+    nick.keep_screen("motivo vazio recusado");
+    nick.send("fora do escopo");
+    nick.wait_for("fora do escopo");
+    nick.keep_screen("campo do motivo");
+    nick.send(ENTER);
+    nick.wait_for_flat("Rejeitar o ticket NS-7 (de Aberto)? Motivo: fora do escopo (s/N)");
+    nick.wait_for_flat("s rejeitar · qualquer outra tecla cancela");
+    nick.keep_screen("confirmação da rejeição");
+    nick.send("s");
+    nick.wait_for("Etapa do ticket NS-7: Aberto → Rejeitado.");
+    assert_eq!(stage_of(&world, "NS-7"), "rejected");
+    nick.wait_for("NS-7  [✗ Rejeitado]  Corrig");
+    for offset in [0, 6, 22] {
+        assert_eq!(
+            nick.color_at("NS-7  [✗ Rejeitado]  Corrig", offset),
+            vt100::Color::Idx(8),
+            "the whole label gray, column {offset}"
+        );
+    }
+    nick.wait_for("Etapa atual: [✗ Rejeitado]");
+    assert_eq!(
+        nick.color_at("Etapa atual: [✗ Rejeitado]", 13),
+        vt100::Color::Idx(8)
+    );
+    nick.wait_for("UTC  Aberto → Rejeitado  (operador)");
+    nick.wait_for("    Motivo: fora do escopo");
+    nick.keep_screen("ticket rejeitado: árvore cinza, painel e motivo no histórico");
+    // No agent of a rejected ticket.
+    nick.send("g");
+    nick.wait_for_flat("ticket rejeitado: mude a etapa com m antes de abrir um agente");
+    nick.keep_screen("g recusado no ticket rejeitado");
+    // The filter d takes it, and brings it back.
+    nick.send("d");
+    nick.wait_for_flat("d mostrar concluídos");
+    nick.wait_until("the rejected ticket to leave the tree", || {
+        !nick.tree_rows().iter().any(|row| row.contains("NS-7"))
+    });
+    nick.keep_screen("d esconde o rejeitado");
+    nick.send("d");
+    nick.wait_for_flat("d esconder concluídos");
+    nick.wait_for("NS-7  [✗ Rejeitado]");
+    nick.select("NS-7");
+    // Out of Rejeitado by m, to Dev, with no reason (the dialog starts on Rejeitado, the last).
+    nick.send("m");
+    nick.wait_for("> Rejeitado (atual)");
+    while !nick.screen().contains("> Dev") {
+        let before = nick.screen();
+        nick.send(UP);
+        nick.wait_until("the selection to move", || nick.screen() != before);
+    }
+    nick.send(ENTER);
+    nick.wait_for_flat("Mudar a etapa do ticket NS-7 de Rejeitado para Dev? (s/N)");
+    nick.send("s");
+    nick.wait_for("Etapa do ticket NS-7: Rejeitado → Dev.");
+    nick.wait_for("NS-7  [Dev]  Corrigir o");
+    assert_eq!(nick.color_at("NS-7  [Dev]", 6), vt100::Color::Idx(208));
+    assert_eq!(
+        nick.color_at("NS-7  [Dev]", 0),
+        vt100::Color::Default,
+        "the ID"
+    );
+    nick.wait_for("UTC  Aberto → Rejeitado  (operador)");
+    nick.wait_for("UTC  Rejeitado → Dev  (operador)");
+    nick.keep_screen("saiu do Rejeitado pelo m");
+    assert_eq!(stage_of(&world, "NS-7"), "development");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
 #[test]
 fn the_ticket_screen_reads_the_plan_from_the_disk() {
     let world = World::new();
@@ -1274,7 +1369,7 @@ fn with_a_done_ticket_in_an_epic(complete: bool) -> (World, std::path::PathBuf) 
         })
         .unwrap();
     let ticket = db.get_ticket(ticket).unwrap().unwrap();
-    nick::tickets::change_stage(&db, &ticket, nick::tickets::TicketStage::Done).unwrap();
+    nick::tickets::change_stage(&db, &ticket, nick::tickets::TicketStage::Done, None).unwrap();
     if complete {
         let epic = db.list_epics(ticket.project_id, true).unwrap().remove(0);
         nick::epics::complete(&db, &epic, false).unwrap();

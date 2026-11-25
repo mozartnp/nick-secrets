@@ -288,6 +288,96 @@ pub const MIGRATION_10: &str = "\
 ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open (NS-54)
 ";
 
+/// Migration 11 (NS-61): the stage "Rejeitado" (`rejected`), for a ticket that will not be done,
+/// and the reason of the rejection in the history. `rejected` goes into the CHECK of the stage of
+/// both tables (the DEFAULT stays `open`); the history gains `reason`, required in a change to
+/// `rejected` and absent in every other one (one CHECK ties them), trimmed by the code and not
+/// empty nor longer than 120 characters here (`length` counts the characters of a TEXT, as
+/// `chars().count()` in Rust). The rows of before get `reason = NULL`: none of them is a
+/// rejection. The stage of the agents (`agents.stage`) does not change: there is no agent of
+/// Rejeitado. Published migrations are never edited, so the migrations 5 and 9 keep their text
+/// and their comments.
+///
+/// The rebuild is the one of the migration 9, with its three traps repeated: the foreign keys off
+/// around the loop and a `foreign_key_check` before the commit (`Db::open_with`, unchanged), so
+/// the DROP of `tickets` deletes no child; the six triggers of the migration 7 dropped first and
+/// created again after the RENAME with the same text as in the migration 9; and the `id` of every
+/// row kept, with the columns of `tickets` in the same order (`TICKET_COLUMNS` did not change).
+/// The `sqlite_master` of a version 10 database has nothing else that reads these tables but
+/// the autoindex of `UNIQUE (project_id, key)`, which the new table makes again.
+pub const MIGRATION_11: &str = "\
+DROP TRIGGER epics_key_not_a_ticket_insert;
+DROP TRIGGER epics_key_not_a_ticket_update;
+DROP TRIGGER tickets_key_not_an_epic_insert;
+DROP TRIGGER tickets_key_not_an_epic_update;
+DROP TRIGGER tickets_epic_of_the_project_insert;
+DROP TRIGGER tickets_epic_of_the_project_update;
+CREATE TABLE tickets_new (
+    id             INTEGER PRIMARY KEY,
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,     -- the Jira ID, or the provisional short UUID
+    is_provisional INTEGER NOT NULL CHECK (is_provisional IN (0, 1)),
+    title          TEXT NOT NULL CHECK (trim(title) <> ''),
+    created_at     TEXT NOT NULL,     -- RFC 3339, in UTC
+    hidden_at      TEXT,              -- RFC 3339, in UTC; NULL while visible
+    stage          TEXT NOT NULL DEFAULT 'open'
+                   CHECK (stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done',
+                                    'rejected')),
+    epic_id        INTEGER REFERENCES epics(id),  -- NULL: no epic
+    UNIQUE (project_id, key)
+);
+INSERT INTO tickets_new (id, project_id, key, is_provisional, title, created_at, hidden_at,
+                         stage, epic_id)
+    SELECT id, project_id, key, is_provisional, title, created_at, hidden_at, stage, epic_id
+    FROM tickets;
+CREATE TABLE ticket_stage_changes_new (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    from_stage TEXT NOT NULL
+               CHECK (from_stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done',
+                                     'rejected')),
+    to_stage   TEXT NOT NULL
+               CHECK (to_stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done',
+                                   'rejected')),
+    source     TEXT NOT NULL CHECK (source IN ('operator', 'agent_opening')),
+    reason     TEXT,            -- why it was rejected; only in a change to 'rejected'
+    changed_at TEXT NOT NULL,   -- RFC 3339, in UTC
+    CHECK (from_stage <> to_stage),
+    CHECK ((to_stage = 'rejected') = (reason IS NOT NULL)),
+    CHECK (reason IS NULL OR (trim(reason) <> '' AND length(reason) <= 120))
+);
+INSERT INTO ticket_stage_changes_new (id, ticket_id, from_stage, to_stage, source, reason,
+                                      changed_at)
+    SELECT id, ticket_id, from_stage, to_stage, source, NULL, changed_at
+    FROM ticket_stage_changes;
+DROP TABLE ticket_stage_changes;
+DROP TABLE tickets;
+ALTER TABLE tickets_new RENAME TO tickets;
+ALTER TABLE ticket_stage_changes_new RENAME TO ticket_stage_changes;
+-- the key is unique across the tickets and the epics of a project (both use .nick/docs/<key>/)
+CREATE TRIGGER epics_key_not_a_ticket_insert BEFORE INSERT ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER epics_key_not_a_ticket_update BEFORE UPDATE OF key ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER tickets_key_not_an_epic_insert BEFORE INSERT ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+CREATE TRIGGER tickets_key_not_an_epic_update BEFORE UPDATE OF key ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+-- a ticket only goes to an epic of its own project
+CREATE TRIGGER tickets_epic_of_the_project_insert BEFORE INSERT ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+";
+
 /// Every migration, in order. The schema version of a fully migrated database is its length.
 pub const MIGRATIONS: &[&str] = &[
     MIGRATION_1,
@@ -300,4 +390,5 @@ pub const MIGRATIONS: &[&str] = &[
     MIGRATION_8,
     MIGRATION_9,
     MIGRATION_10,
+    MIGRATION_11,
 ];

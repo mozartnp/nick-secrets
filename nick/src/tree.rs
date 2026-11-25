@@ -3,9 +3,10 @@
 //! `TreeData` from the database and its running agents; here are the nodes by identity (`NodeId`,
 //! the selection survives a refresh), the open/closed state of the branches, the flattening into
 //! the visible rows with their depth, the three filters (the hidden tickets and epics,
-//! `show_hidden`; the done tickets and epics, `hide_done`, NS-54; only the live agents,
-//! `only_active`), the "saída nova" mark that goes up to the closed ancestors, and where the
-//! selection goes when its node is gone (`reselect`). ui.rs draws the rows; app.rs moves on them.
+//! `show_hidden`; the done tickets and epics, `hide_done`, NS-54, with the rejected tickets, NS-61;
+//! only the live agents, `only_active`), the "saída nova" mark that goes up to the closed
+//! ancestors, and where the selection goes when its node is gone (`reselect`). ui.rs draws the
+//! rows; app.rs moves on them.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +15,7 @@ use crate::app::Row;
 use crate::db::Epic;
 use crate::modules::ModuleKind;
 use crate::projects::Availability;
-use crate::tickets::{Ticket, TicketStage};
+use crate::tickets::{self, Ticket};
 
 /// A node of the tree, by identity: the selection survives a refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,8 +66,8 @@ pub struct TreeData<'a> {
     pub live: &'a [LiveAgent],
 }
 
-/// The ids of the done epics and tickets of a `TreeData`, read once per `Tree::visible` with the
-/// filter of the done ones on (review of the NS-54, P3: not a scan of every epic and ticket for
+/// The ids of the done epics and closed tickets of a `TreeData`, read once per `Tree::visible` with
+/// the filter of the done ones on (review of the NS-54, P3: not a scan of every epic and ticket for
 /// each live agent).
 struct DoneIds {
     epics: HashSet<i64>,
@@ -87,7 +88,7 @@ impl DoneIds {
                 .tickets
                 .values()
                 .flatten()
-                .filter(|ticket| ticket.stage == TicketStage::Done.key())
+                .filter(|ticket| tickets::is_closed(ticket))
                 .map(|ticket| ticket.id)
                 .collect(),
         }
@@ -113,8 +114,9 @@ pub struct Tree {
     pub show_hidden: bool,
     /// Only the branches with a live agent of this nick, all open (`v`).
     pub only_active: bool,
-    /// The done tickets and the done epics, with their whole branch, are out (`d`; NS-54). Off
-    /// by default: everything shows.
+    /// The done tickets and the done epics, with their whole branch, are out (`d`; NS-54); a
+    /// rejected ticket is closed too, and goes as a done one (NS-61, D8). Off by default:
+    /// everything shows.
     pub hide_done: bool,
 }
 
@@ -138,12 +140,12 @@ impl Tree {
     /// open ticket or epic, in the order they were opened, without the archived ones unless
     /// `show_hidden` (NS-39; a node with only archived agents is then a leaf). With `only_active`,
     /// only the branches with a live agent and only the live agents, every branch open, whatever
-    /// the state kept. With `hide_done` (NS-54, D5), a done ticket (at any depth) and a done epic
-    /// with its whole branch are out, and, unlike `show_hidden`, a live agent does not hold them:
-    /// it stays reachable by `only_active`, where `hide_done` does not apply. A live agent the
-    /// filter took is not counted anywhere above it (its mark, a hidden epic it would hold, an
-    /// unavailable project it would open). `show_hidden` and `hide_done` are independent: a
-    /// hidden and done ticket shows only with the first on and the second off.
+    /// the state kept. With `hide_done` (NS-54, D5), a closed ticket (done or rejected, NS-61; at
+    /// any depth) and a done epic with its whole branch are out, and, unlike `show_hidden`, a live
+    /// agent does not hold them: it stays reachable by `only_active`, where `hide_done` does not
+    /// apply. A live agent the filter took is not counted anywhere above it (its mark, a hidden
+    /// epic it would hold, an unavailable project it would open). `show_hidden` and `hide_done` are
+    /// independent: a hidden and done ticket shows only with the first on and the second off.
     pub fn visible(&self, data: &TreeData) -> Vec<Visible> {
         // Only with the filter on: the data as it is otherwise, with no copy (review of the
         // NS-54, P3).
@@ -272,7 +274,7 @@ impl Tree {
 
     /// A ticket at `depth` (2 under the project, 3 under an epic) and, open, its agents.
     fn push_ticket(&self, rows: &mut Vec<Visible>, data: &TreeData, ticket: &Ticket, depth: u16) {
-        if self.hides_done() && ticket.stage == TicketStage::Done.key() {
+        if self.hides_done() && tickets::is_closed(ticket) {
             return;
         }
         let owner = Owner::Ticket(ticket.id);
@@ -1275,5 +1277,65 @@ mod tests {
         assert_eq!(Tree::reselect(&before, &after, NodeId::Agent(140)), P1);
         // The done epic: the next sibling, the ticket 10.
         assert_eq!(Tree::reselect(&before, &after, E5), T(10));
+    }
+
+    // ---- a rejected ticket is closed for the filter `d` (NS-61, D8) ----
+
+    /// `with_epics` with the ticket 12 (no epic) and 13 (of the epic 5) rejected.
+    fn with_rejected_tickets() -> Data {
+        let mut data = with_epics();
+        for t in data.tickets.get_mut(&1).unwrap() {
+            if [12, 13].contains(&t.id) {
+                t.stage = "rejected".into();
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn hide_done_takes_the_rejected_tickets_at_depth_2_and_3_too() {
+        let mut tree = opened();
+        assert_eq!(
+            rows(&tree, &with_rejected_tickets()),
+            rows(&tree, &with_epics()),
+            "off, a rejected stage changes no row"
+        );
+        tree.hide_done = true;
+        assert_eq!(
+            rows(&tree, &with_rejected_tickets()),
+            rows(&tree, &with_done_tickets()),
+            "on, the rejected ones go as the done ones"
+        );
+        let shown = ids(&tree, &with_rejected_tickets());
+        assert!(
+            !shown.contains(&T(13)) && !shown.contains(&T(12)),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_agent_does_not_hold_a_rejected_ticket_and_the_v_shows_it() {
+        let mut tree = opened();
+        tree.hide_done = true;
+        let mut data = with_rejected_tickets();
+        data.agents.insert(Owner::Ticket(13), vec![agent(130, 13)]);
+        let data = live_of_epic(data, 130, Owner::Ticket(13), 5, true);
+        assert!(!ids(&tree, &data).contains(&T(13)), "unlike the f");
+        assert!(
+            !find(&tree, &data, E5).unseen_below,
+            "the mark does not go up"
+        );
+        tree.only_active = true;
+        assert_eq!(
+            rows(&tree, &data),
+            [
+                (M, 0),
+                (P1, 1),
+                (E5, 2),
+                (T(13), 3),
+                (NodeId::Agent(130), 4)
+            ],
+            "reachable by the v"
+        );
     }
 }

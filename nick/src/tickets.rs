@@ -273,9 +273,10 @@ pub fn gone_message(ticket: &Ticket) -> String {
 }
 
 /// The stage of a ticket (NS-36): "Aberto" (NS-45), the four stages of the agents, then
-/// "Concluído". The declaration order is the order of the flow, and `Ord` follows it. Changed by
-/// the operator (`change_stage`), to any stage, and by the opening of a new agent of a later stage
-/// (`advance_on_agent_opening`, NS-45): it opens, closes and hides no agent.
+/// "Concluído" and "Rejeitado" (NS-61, declared last: the six of before keep their order). The
+/// declaration order is the order of the flow, and `Ord` follows it. Changed by the operator
+/// (`change_stage`), to any stage, and by the opening of a new agent of a later stage
+/// (`advance_on_agent_opening`, NS-45), which never takes a ticket out of a closed stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TicketStage {
     Open,
@@ -284,6 +285,7 @@ pub enum TicketStage {
     Development,
     Review,
     Done,
+    Rejected,
 }
 
 impl From<Stage> for TicketStage {
@@ -299,24 +301,34 @@ impl From<Stage> for TicketStage {
 
 impl TicketStage {
     /// Every stage, in the order of the flow (the order of the dialog).
-    pub const ALL: [TicketStage; 6] = [
+    pub const ALL: [TicketStage; 7] = [
         TicketStage::Open,
         TicketStage::Po,
         TicketStage::TechLeader,
         TicketStage::Development,
         TicketStage::Review,
         TicketStage::Done,
+        TicketStage::Rejected,
     ];
 
-    /// The stage of the agents with the same key and label; None for `Open` and `Done`, the
-    /// stages only of the ticket.
+    /// The closed stages (NS-61, D2): the one source of "closed", for the filter `d`, the
+    /// completion and the reopening of an epic and the advance on the opening of an agent.
+    pub const CLOSED: [TicketStage; 2] = [TicketStage::Done, TicketStage::Rejected];
+
+    /// Whether the stage is closed (`CLOSED`): done or rejected.
+    pub fn is_closed(self) -> bool {
+        TicketStage::CLOSED.contains(&self)
+    }
+
+    /// The stage of the agents with the same key and label; None for `Open`, `Done` and
+    /// `Rejected`, the stages only of the ticket.
     pub fn agent_stage(self) -> Option<Stage> {
         match self {
             TicketStage::Po => Some(Stage::Po),
             TicketStage::TechLeader => Some(Stage::TechLeader),
             TicketStage::Development => Some(Stage::Development),
             TicketStage::Review => Some(Stage::Review),
-            TicketStage::Open | TicketStage::Done => None,
+            TicketStage::Open | TicketStage::Done | TicketStage::Rejected => None,
         }
     }
 
@@ -329,6 +341,7 @@ impl TicketStage {
             TicketStage::Development => Stage::Development.key(),
             TicketStage::Review => Stage::Review.key(),
             TicketStage::Done => "done",
+            TicketStage::Rejected => "rejected",
         }
     }
 
@@ -341,6 +354,7 @@ impl TicketStage {
             TicketStage::Development => Stage::Development.label(),
             TicketStage::Review => Stage::Review.label(),
             TicketStage::Done => "Concluído",
+            TicketStage::Rejected => "Rejeitado",
         }
     }
 
@@ -356,6 +370,17 @@ impl TicketStage {
 /// schema keeps it from happening; the screen never panics on it).
 pub fn stage_label(key: &str) -> String {
     TicketStage::from_key(key).map_or_else(|| key.to_string(), |stage| stage.label().into())
+}
+
+/// Whether `ticket` is in Rejeitado (NS-61). The one place that reads it from the stored key.
+pub fn is_rejected(ticket: &Ticket) -> bool {
+    TicketStage::from_key(&ticket.stage) == Some(TicketStage::Rejected)
+}
+
+/// Whether `ticket` is closed (`TicketStage::is_closed`: done or rejected, NS-61, D2). An unknown
+/// key is not closed.
+pub fn is_closed(ticket: &Ticket) -> bool {
+    TicketStage::from_key(&ticket.stage).is_some_and(TicketStage::is_closed)
 }
 
 /// Who changed the stage of a ticket (NS-45), stored in `ticket_stage_changes.source`: the
@@ -399,6 +424,37 @@ pub fn source_label(key: &str) -> String {
     StageSource::from_key(key).map_or_else(|| key.to_string(), |source| source.label().into())
 }
 
+/// The longest reason of a rejection, in characters (NS-61, D3; the CHECK of the migration 11).
+pub const REJECT_REASON_MAX: usize = 120;
+
+/// The refusal of an empty reason of a rejection (or only blanks).
+pub const EMPTY_REASON_MESSAGE: &str = "Informe o motivo da rejeição.";
+
+/// The refusal of a reason in a change that is not a rejection: a mistake of the caller, refused
+/// with no panic (NS-61, D5).
+pub const REASON_ONLY_FOR_REJECTION: &str = "Só a mudança para Rejeitado tem motivo.";
+
+/// The refusal of a new agent, or of a resume, of a rejected ticket (NS-61, D7).
+pub const REJECTED_AGENT_MESSAGE: &str =
+    "ticket rejeitado: mude a etapa com m antes de abrir um agente";
+
+/// The reason of a rejection (NS-61, D3): trimmed, not empty, and up to `REJECT_REASON_MAX`
+/// characters (`chars().count()`, as the `length` of SQLite for a TEXT). Used by the dialog of the
+/// reason and, again, by `change_stage`.
+pub fn check_reject_reason(input: &str) -> Result<String, String> {
+    let reason = input.trim();
+    if reason.is_empty() {
+        return Err(EMPTY_REASON_MESSAGE.into());
+    }
+    let count = reason.chars().count();
+    if count > REJECT_REASON_MAX {
+        return Err(format!(
+            "O motivo tem {count} caracteres; o limite é {REJECT_REASON_MAX}."
+        ));
+    }
+    Ok(reason.to_string())
+}
+
 /// The refusal of changing the ticket to the stage it is already at.
 pub fn same_stage_message(ticket: &Ticket, to: TicketStage) -> String {
     format!("O ticket {} já está em {}.", ticket.key, to.label())
@@ -407,16 +463,29 @@ pub fn same_stage_message(ticket: &Ticket, to: TicketStage) -> String {
 /// Changes the stage of the ticket to `to`, with its row in the history, by the operator (one
 /// transaction: `Db::change_ticket_stage`). Only the confirmation of the dialog of the node of a
 /// ticket calls it; the other writer is `advance_on_agent_opening` (NS-45). The same stage is
-/// refused; a ticket gone, or moved by another nick meanwhile, stores nothing.
-pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String, String> {
+/// refused; a ticket gone, or moved by another nick meanwhile, stores nothing. `reason` (NS-61,
+/// D5): required for `Rejected` (`check_reject_reason`, stored trimmed), and refused for any other
+/// stage, before the database is touched.
+pub fn change_stage(
+    db: &Db,
+    ticket: &Ticket,
+    to: TicketStage,
+    reason: Option<&str>,
+) -> Result<String, String> {
     if ticket.stage == to.key() {
         return Err(same_stage_message(ticket, to));
     }
+    let reason = match (to, reason) {
+        (TicketStage::Rejected, reason) => Some(check_reject_reason(reason.unwrap_or_default())?),
+        (_, None) => None,
+        (_, Some(_)) => return Err(REASON_ONLY_FOR_REJECTION.into()),
+    };
     match db.change_ticket_stage(
         ticket.id,
         &ticket.stage,
         to.key(),
         StageSource::Operator.key(),
+        reason.as_deref(),
     ) {
         Ok((StageChange::Changed, reopened)) => Ok(epics::with_reopened(
             format!(
@@ -437,11 +506,12 @@ pub fn change_stage(db: &Db, ticket: &Ticket, to: TicketStage) -> Result<String,
     }
 }
 
-/// The advance of the stage on the opening of a new agent (NS-45, plan D4): a new agent of a
-/// stage later than the one of the ticket moves the ticket to it, even skipping stages, with the
-/// source `agent_opening` in the history. The same or an earlier stage, `Done`, an unknown key and
-/// a ticket gone change nothing (`Ok(None)`). Called only by `App::open_agent`, after the agent
-/// was spawned, for an agent of a ticket. The message is for the status bar.
+/// The advance of the stage on the opening of a new agent (NS-45, plan D4): a new agent of a stage
+/// later than the one of the ticket moves the ticket to it, even skipping stages, with the source
+/// `agent_opening` in the history. The same or an earlier stage, a closed one (`Done` or
+/// `Rejected`, NS-61), an unknown key and a ticket gone change nothing (`Ok(None)`). Called only by
+/// `App::open_agent`, after the agent was spawned, for an agent of a ticket. The message is for the
+/// status bar.
 pub fn advance_on_agent_opening(
     db: &Db,
     ticket_id: i64,
@@ -466,7 +536,7 @@ fn advance_on_agent_opening_with(
         return Ok(None);
     };
     let to = TicketStage::from(stage);
-    if current == TicketStage::Done || to <= current {
+    if current.is_closed() || to <= current {
         return Ok(None);
     }
     match db.change_ticket_stage(
@@ -474,6 +544,7 @@ fn advance_on_agent_opening_with(
         current.key(),
         to.key(),
         StageSource::AgentOpening.key(),
+        None,
     ) {
         Ok((StageChange::Changed, reopened)) => Ok(Some(epics::with_reopened(
             format!(
@@ -987,24 +1058,50 @@ mod tests {
     use crate::db::StageChange;
 
     #[test]
-    fn ticket_stage_has_the_six_stages_in_the_order_of_the_flow() {
+    fn ticket_stage_has_the_seven_stages_in_the_order_of_the_flow() {
         use TicketStage::*;
         assert_eq!(
             TicketStage::ALL,
-            [Open, Po, TechLeader, Development, Review, Done]
+            [Open, Po, TechLeader, Development, Review, Done, Rejected]
         );
         assert_eq!(
             TicketStage::ALL.map(TicketStage::key),
-            ["open", "po", "tech_leader", "development", "review", "done"]
+            [
+                "open",
+                "po",
+                "tech_leader",
+                "development",
+                "review",
+                "done",
+                "rejected"
+            ]
         );
         assert_eq!(
             TicketStage::ALL.map(TicketStage::label),
-            ["Aberto", "PO", "Tech Leader", "Dev", "Review", "Concluído"]
+            [
+                "Aberto",
+                "PO",
+                "Tech Leader",
+                "Dev",
+                "Review",
+                "Concluído",
+                "Rejeitado"
+            ]
         );
         for stage in TicketStage::ALL {
             assert_eq!(TicketStage::from_key(stage.key()), Some(stage));
         }
-        for bad in ["", "PO", "dev", "Done", "concluido", "Open", "aberto"] {
+        for bad in [
+            "",
+            "PO",
+            "dev",
+            "Done",
+            "concluido",
+            "Open",
+            "aberto",
+            "Rejected",
+            "rejeitado",
+        ] {
             assert_eq!(TicketStage::from_key(bad), None, "{bad:?}");
         }
         // The four of the agents are the same as `Stage` (no repeated text).
@@ -1015,15 +1112,40 @@ mod tests {
         }
         assert_eq!(Open.agent_stage(), None);
         assert_eq!(Done.agent_stage(), None);
-        // `ALL` is the order of the flow, and `Ord` follows it (the rule of the advance, NS-45).
+        assert_eq!(
+            Rejected.agent_stage(),
+            None,
+            "no agent of Rejeitado (NS-61)"
+        );
+        // `ALL` is the order of the flow, and `Ord` follows it (the rule of the advance, NS-45);
+        // Rejeitado is the last one (NS-61, D1): the six of before keep their order.
         let mut sorted = TicketStage::ALL;
         sorted.sort();
         assert_eq!(sorted, TicketStage::ALL);
         assert!(TicketStage::ALL.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(TicketStage::ALL.last(), Some(&Rejected));
         // A key the CHECK should never let in shows raw, without a panic.
         assert_eq!(stage_label("po"), "PO");
         assert_eq!(stage_label("open"), "Aberto");
+        assert_eq!(stage_label("rejected"), "Rejeitado");
         assert_eq!(stage_label("archived"), "archived");
+    }
+
+    #[test]
+    fn only_done_and_rejected_are_closed() {
+        use TicketStage::*;
+        assert_eq!(TicketStage::CLOSED, [Done, Rejected]);
+        for stage in TicketStage::ALL {
+            assert_eq!(
+                stage.is_closed(),
+                TicketStage::CLOSED.contains(&stage),
+                "{stage:?}"
+            );
+        }
+        assert_eq!(
+            TicketStage::ALL.map(TicketStage::is_closed),
+            [false, false, false, false, false, true, true]
+        );
     }
 
     #[test]
@@ -1099,7 +1221,7 @@ mod tests {
             ),
         ] {
             let current = f.stored(t.id);
-            assert_eq!(change_stage(&f.db, &current, to), Ok(message.into()));
+            assert_eq!(change_stage(&f.db, &current, to, None), Ok(message.into()));
             assert_eq!(f.stored(t.id).stage, to.key());
             steps.push((current.stage, to.key().to_string(), "operator".to_string()));
         }
@@ -1115,7 +1237,7 @@ mod tests {
         let f = fixture();
         let t = f.create("t", "NS-1").unwrap();
         assert_eq!(
-            change_stage(&f.db, &t, TicketStage::Open),
+            change_stage(&f.db, &t, TicketStage::Open, None),
             Err("O ticket NS-1 já está em Aberto.".into())
         );
         assert_eq!(f.history(t.id), []);
@@ -1127,20 +1249,20 @@ mod tests {
         let t = f.create("t", "NS-1").unwrap();
         // Another nick moved it to Review; this one still shows it in Aberto.
         assert_eq!(
-            f.db.change_ticket_stage(t.id, "open", "review", "operator")
+            f.db.change_ticket_stage(t.id, "open", "review", "operator", None)
                 .unwrap()
                 .0,
             StageChange::Changed
         );
         assert_eq!(
-            change_stage(&f.db, &t, TicketStage::Done),
+            change_stage(&f.db, &t, TicketStage::Done, None),
             Err("A etapa do ticket NS-1 mudou em outro nick. Nada foi gravado.".into())
         );
         assert_eq!(f.stored(t.id).stage, "review");
         assert_eq!(f.history(t.id).len(), 1);
         f.db.delete_project(f.project).unwrap();
         assert_eq!(
-            change_stage(&f.db, &f.stored_or(t.clone()), TicketStage::Done),
+            change_stage(&f.db, &f.stored_or(t.clone()), TicketStage::Done, None),
             Err("O ticket NS-1 não existe mais no banco.".into())
         );
     }
@@ -1152,6 +1274,177 @@ mod tests {
         }
     }
 
+    // ---- the stage Rejeitado and the reason (NS-61) ----
+
+    impl Fixture {
+        /// The history with the source and the reason of each change (NS-61).
+        fn reasoned_history(&self, id: i64) -> Vec<(String, String, String, Option<String>)> {
+            self.db
+                .list_stage_changes(id)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.from_stage, c.to_stage, c.source, c.reason))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn check_reject_reason_trims_and_refuses_empty_and_long() {
+        assert_eq!(
+            check_reject_reason("  não vamos fazer \t"),
+            Ok("não vamos fazer".into())
+        );
+        for blank in ["", "   ", "\t \t"] {
+            assert_eq!(
+                check_reject_reason(blank),
+                Err("Informe o motivo da rejeição.".into()),
+                "{blank:?}"
+            );
+        }
+        assert_eq!(REJECT_REASON_MAX, 120);
+        // Up to 120 characters, counted as characters (accents count one), after the trim.
+        let longest = "é".repeat(120);
+        assert_eq!(check_reject_reason(&longest), Ok(longest.clone()));
+        assert_eq!(check_reject_reason(&format!("  {longest}  ")), Ok(longest));
+        assert_eq!(
+            check_reject_reason(&"é".repeat(121)),
+            Err("O motivo tem 121 caracteres; o limite é 120.".into())
+        );
+        assert_eq!(
+            check_reject_reason(&"a".repeat(300)),
+            Err("O motivo tem 300 caracteres; o limite é 120.".into())
+        );
+    }
+
+    #[test]
+    fn rejecting_from_each_stage_stores_the_trimmed_reason() {
+        let f = fixture();
+        for (n, from) in TicketStage::ALL
+            .into_iter()
+            .filter(|s| *s != TicketStage::Rejected)
+            .enumerate()
+        {
+            let t = f.in_stage(&format!("NS-{n}"), from);
+            let before = f.reasoned_history(t.id);
+            assert_eq!(
+                change_stage(&f.db, &t, TicketStage::Rejected, Some("  fora do escopo ")),
+                Ok(format!(
+                    "Etapa do ticket NS-{n}: {} → Rejeitado.",
+                    from.label()
+                ))
+            );
+            assert_eq!(f.stored(t.id).stage, "rejected");
+            let mut expected = before;
+            expected.push((
+                from.key().into(),
+                "rejected".into(),
+                "operator".into(),
+                Some("fora do escopo".into()),
+            ));
+            assert_eq!(f.reasoned_history(t.id), expected, "{from:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_reason_is_refused_and_nothing_is_stored() {
+        let f = fixture();
+        let t = f.create("t", "NS-1").unwrap();
+        // None is a mistake of the caller, refused as an empty one (no panic).
+        for reason in [Some(""), Some("  \t "), None] {
+            assert_eq!(
+                change_stage(&f.db, &t, TicketStage::Rejected, reason),
+                Err("Informe o motivo da rejeição.".into()),
+                "{reason:?}"
+            );
+        }
+        let long = "x".repeat(121);
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Rejected, Some(&long)),
+            Err("O motivo tem 121 caracteres; o limite é 120.".into())
+        );
+        // A reason out of a rejection is a mistake of the caller: refused, with no panic.
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Po, Some("motivo")),
+            Err(REASON_ONLY_FOR_REJECTION.into())
+        );
+        assert_eq!(f.stored(t.id).stage, "open");
+        assert_eq!(f.reasoned_history(t.id), []);
+    }
+
+    #[test]
+    fn leaving_rejected_to_each_stage_stores_no_reason() {
+        let f = fixture();
+        for (n, to) in TicketStage::ALL
+            .into_iter()
+            .filter(|s| *s != TicketStage::Rejected)
+            .enumerate()
+        {
+            let t = f.create("t", &format!("NS-{n}")).unwrap();
+            change_stage(&f.db, &t, TicketStage::Rejected, Some("não")).unwrap();
+            let rejected = f.stored(t.id);
+            assert_eq!(
+                change_stage(&f.db, &rejected, to, None),
+                Ok(format!(
+                    "Etapa do ticket NS-{n}: Rejeitado → {}.",
+                    to.label()
+                ))
+            );
+            assert_eq!(f.stored(t.id).stage, to.key());
+            assert_eq!(
+                f.reasoned_history(t.id)[1],
+                ("rejected".into(), to.key().into(), "operator".into(), None),
+                "{to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_again_is_the_same_stage_and_gone_or_moved_store_nothing() {
+        let f = fixture();
+        let t = f.create("t", "NS-1").unwrap();
+        change_stage(&f.db, &t, TicketStage::Rejected, Some("não")).unwrap();
+        let rejected = f.stored(t.id);
+        assert_eq!(
+            change_stage(&f.db, &rejected, TicketStage::Rejected, Some("de novo")),
+            Err("O ticket NS-1 já está em Rejeitado.".into())
+        );
+        assert_eq!(f.history(t.id).len(), 1);
+        // Moved by another nick: this one still shows it in Aberto.
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Rejected, Some("não")),
+            Err("A etapa do ticket NS-1 mudou em outro nick. Nada foi gravado.".into())
+        );
+        assert_eq!(f.history(t.id).len(), 1);
+        f.db.delete_project(f.project).unwrap();
+        assert_eq!(
+            change_stage(&f.db, &rejected, TicketStage::Po, None),
+            Err("O ticket NS-1 não existe mais no banco.".into())
+        );
+    }
+
+    #[test]
+    fn opening_an_agent_never_takes_a_ticket_out_of_rejected() {
+        let f = fixture();
+        let t = f.in_stage("NS-1", TicketStage::Open);
+        change_stage(&f.db, &t, TicketStage::Rejected, Some("não")).unwrap();
+        let before = f.reasoned_history(t.id);
+        for stage in Stage::ALL {
+            assert_eq!(
+                advance_on_agent_opening(&f.db, t.id, stage),
+                Ok(None),
+                "{stage:?}"
+            );
+            let mut read = |id: i64| f.db.get_ticket(id);
+            assert_eq!(
+                advance_on_agent_opening_with(&f.db, t.id, stage, &mut read),
+                Ok(None),
+                "{stage:?}, by the _with"
+            );
+        }
+        assert_eq!(f.stored(t.id).stage, "rejected");
+        assert_eq!(f.reasoned_history(t.id), before, "nothing stored");
+    }
+
     // ---- the advance on the opening of a new agent (NS-45) ----
 
     impl Fixture {
@@ -1159,7 +1452,7 @@ mod tests {
         fn in_stage(&self, key: &str, stage: TicketStage) -> Ticket {
             let t = self.create("t", key).unwrap();
             if stage != TicketStage::Open {
-                change_stage(&self.db, &t, stage).unwrap();
+                change_stage(&self.db, &t, stage, None).unwrap();
             }
             self.stored(t.id)
         }
@@ -1262,7 +1555,7 @@ mod tests {
         // Read in Aberto; another nick moves it to Review before the write.
         let mut read_then_moved = |id: i64| {
             let read = f.db.get_ticket(id);
-            f.db.change_ticket_stage(id, "open", "review", "operator")
+            f.db.change_ticket_stage(id, "open", "review", "operator", None)
                 .unwrap();
             read
         };
@@ -1559,7 +1852,7 @@ mod tests {
     fn in_done_epic(f: &Fixture) -> Ticket {
         let e = f.db.insert_epic(f.project, "E-1", false, "e").unwrap();
         let t = create_in(&f.db, f.project, Some(e.id), "t", "NS-3").unwrap();
-        change_stage(&f.db, &t, TicketStage::Done).unwrap();
+        change_stage(&f.db, &t, TicketStage::Done, None).unwrap();
         assert_eq!(
             f.db.complete_epic(e.id).unwrap(),
             crate::db::EpicCompletion::Done
@@ -1572,7 +1865,7 @@ mod tests {
         let f = fixture();
         let t = in_done_epic(&f);
         assert_eq!(
-            change_stage(&f.db, &t, TicketStage::Development),
+            change_stage(&f.db, &t, TicketStage::Development, None),
             Ok(
                 "Etapa do ticket NS-3: Concluído → Dev. O épico E-1 foi reaberto: o ticket NS-3 \
                 não está concluído."
@@ -1581,9 +1874,29 @@ mod tests {
         );
         let t = f.stored(t.id);
         assert_eq!(
-            change_stage(&f.db, &t, TicketStage::Review),
+            change_stage(&f.db, &t, TicketStage::Review, None),
             Ok("Etapa do ticket NS-3: Dev → Review.".into()),
             "already open: the message of before"
+        );
+    }
+
+    #[test]
+    fn rejecting_in_a_done_epic_keeps_it_done_and_leaving_rejected_reopens_it() {
+        let f = fixture();
+        let t = in_done_epic(&f);
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Rejected, Some("não")),
+            Ok("Etapa do ticket NS-3: Concluído → Rejeitado.".into()),
+            "Concluído → Rejeitado does not reopen"
+        );
+        let t = f.stored(t.id);
+        assert_eq!(
+            change_stage(&f.db, &t, TicketStage::Development, None),
+            Ok(
+                "Etapa do ticket NS-3: Rejeitado → Dev. O épico E-1 foi reaberto: o ticket NS-3 \
+                não está concluído."
+                    .into()
+            )
         );
     }
 

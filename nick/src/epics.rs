@@ -940,7 +940,7 @@ mod tests {
     fn done_ticket_in(f: &Fixture, key: &str) -> (Epic, Ticket) {
         let e = f.create("e", key).unwrap();
         let t = f.ticket(&format!("T-{key}"), Some(&e));
-        tickets::change_stage(&f.db, &t, tickets::TicketStage::Done).unwrap();
+        tickets::change_stage(&f.db, &t, tickets::TicketStage::Done, None).unwrap();
         (f.stored(e.id), f.db.get_ticket(t.id).unwrap().unwrap())
     }
 
@@ -999,7 +999,7 @@ mod tests {
             )
         );
         let t2 = f.db.get_ticket(hidden.id).unwrap().unwrap();
-        tickets::change_stage(&f.db, &t2, tickets::TicketStage::Done).unwrap();
+        tickets::change_stage(&f.db, &t2, tickets::TicketStage::Done, None).unwrap();
         assert_eq!(
             complete(&f.db, &e, false),
             Err(

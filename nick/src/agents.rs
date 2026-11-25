@@ -22,7 +22,7 @@ pub use crate::db::{Agent, Owner};
 use crate::db::{AgentChange, Db, Epic, SessionSwap, Ticket};
 use crate::projects::db_error_message;
 use crate::stages::EPIC_STAGES;
-use crate::tickets::jira_id_valid;
+use crate::tickets::{self, jira_id_valid};
 
 /// The directory of the locks, inside the state directory.
 pub const AGENTS_DIR_NAME: &str = "agents";
@@ -119,6 +119,9 @@ pub struct Holder {
     pub hidden: bool,
     /// Whether the key is a provisional UUID (NS-53: such a key has no Jira link).
     pub provisional: bool,
+    /// Whether it is a rejected ticket (NS-61, D7: no agent opens nor resumes for it); never for
+    /// an epic (the rejected tickets of an epic do not touch its agents).
+    pub rejected: bool,
 }
 
 impl From<&Ticket> for Holder {
@@ -130,6 +133,7 @@ impl From<&Ticket> for Holder {
             title: ticket.title.clone(),
             hidden: ticket.hidden_at.is_some(),
             provisional: ticket.is_provisional,
+            rejected: tickets::is_rejected(ticket),
         }
     }
 }
@@ -143,6 +147,7 @@ impl From<&Epic> for Holder {
             title: epic.title.clone(),
             hidden: epic.hidden_at.is_some(),
             provisional: epic.is_provisional,
+            rejected: false,
         }
     }
 }

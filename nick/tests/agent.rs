@@ -2448,6 +2448,91 @@ fn a_stopped_agent_is_resumed_in_its_conversation() {
     assert_eq!(nick.wait_exit(), Some(0));
 }
 
+/// NS-61, D6: rejecting a ticket with a live agent warns on the confirmation which one ends,
+/// writes the stage and then ends it (record and session), saying so on the bar; `r` on it is
+/// refused while the ticket is rejected, and works again after `m` takes it out.
+#[test]
+fn rejecting_a_ticket_with_a_live_agent_warns_and_ends_it() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for("READY");
+    let session = world.agents()[0].0.clone();
+    assert_eq!(world.agents()[0].3, "active");
+    let group = pids(&world);
+    assert!(!group.is_empty() && group.iter().all(|p| alive(*p)));
+    nick.send(SHORTCUT);
+    nick.wait_for_flat("Enter ir ao terminal");
+    nick.select("NS-1  [PO]");
+    nick.wait_for("Etapa atual: PO");
+    nick.send("m");
+    nick.wait_for("Para qual etapa?");
+    while !nick.screen().contains("> Rejeitado") {
+        let before = nick.screen();
+        nick.send(DOWN);
+        nick.wait_until("the selection to move", || nick.screen() != before);
+    }
+    nick.send(ENTER);
+    nick.wait_for("Motivo da rejeição (até 120 caracteres):");
+    nick.send("duplicado do NS-2");
+    nick.send(ENTER);
+    nick.wait_for_flat("Rejeitar o ticket NS-1 (de PO)? Motivo: duplicado do NS-2 (s/N)");
+    nick.wait_for_flat("Aviso: o agente proj · PO · NS-1 será encerrado.");
+    nick.keep_screen("confirmação da rejeição com agente vivo");
+    assert_eq!(world.agents()[0].3, "active", "nothing before the s");
+    assert!(
+        group.iter().all(|p| alive(*p)),
+        "no process ended before the s"
+    );
+    nick.send("s");
+    nick.wait_for_flat(
+        "Etapa do ticket NS-1: PO → Rejeitado. O agente proj · PO · NS-1 foi encerrado.",
+    );
+    // The session itself ended (the loop ran terminate_all), not only its record.
+    for pid in group {
+        wait_dead(&nick, pid);
+    }
+    nick.wait_until("the agent to stop", || world.agents()[0].3 == "stopped");
+    assert!(
+        !world.agents_dir().join(format!("{session}.lock")).exists(),
+        "its lock released"
+    );
+    nick.wait_for("NS-1  [✗ Rejeitado]");
+    nick.keep_screen("rejeitado: agente encerrado e barra");
+    // The resume is refused while it is rejected.
+    keep_conversation(&world, &proj, &session);
+    nick.select("PO  parado");
+    nick.send("r");
+    nick.wait_for_flat("ticket rejeitado: mude a etapa com m antes de abrir um agente");
+    assert_eq!(world.agents()[0].3, "stopped");
+    nick.keep_screen("r recusado no ticket rejeitado");
+    // m → PO, and r works again.
+    nick.select("NS-1  [✗ Rejeitado]");
+    nick.send("m");
+    nick.wait_for("> Rejeitado (atual)");
+    while !nick.screen().contains("> PO") {
+        let before = nick.screen();
+        nick.send(common::UP);
+        nick.wait_until("the selection to move", || nick.screen() != before);
+    }
+    nick.send(ENTER);
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    nick.wait_for_flat("Etapa do ticket NS-1: Rejeitado → PO.");
+    nick.select("PO  parado");
+    nick.send("r");
+    nick.wait_for("READY");
+    nick.wait_for_flat("O agente proj · PO · NS-1 foi retomado.");
+    assert_eq!(world.agents()[0].3, "active");
+    nick.keep_screen("retomado depois de sair do Rejeitado");
+    nick.send(SHORTCUT);
+    nick.send("q");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
 // ---- the resume follows the session the conversation went on in (NS-50) ----
 
 /// The record claude appends to the file of a session when it goes on with the conversation in
@@ -3009,7 +3094,7 @@ fn a_real_version_6_database_opens_migrated_with_the_tree_of_before() {
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(world.agents()[0].3, "stopped");
 }
 

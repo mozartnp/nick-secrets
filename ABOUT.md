@@ -3404,6 +3404,14 @@ A verificação com o `claude` e o ai-jail reais não roda dentro da jail do nic
 
 ## Rust no projeto: etapa do ticket, histórico e edição do ID (NS-36)
 
+> **Mudou no NS-61** (seção "Rust no projeto: etapa Rejeitado (NS-61)"): as etapas
+> passaram a ser **sete**, com **Rejeitado** (`rejected`) depois de Concluído. O `m` para Rejeitado
+> pede um motivo obrigatório (até 120 caracteres, `Dialog::RejectReason`) antes da confirmação, e o
+> motivo vai para a coluna nova `ticket_stage_changes.reason` (migração 11) e aparece no histórico,
+> na linha `Motivo:` abaixo da mudança. O `tickets::change_stage` e o `Db::change_ticket_stage`
+> ganharam o parâmetro `reason`, e o `ConfirmStageChange` ganhou `reason` e `live`. O corte do
+> histórico passou a contar linhas.
+
 > **Mudou no NS-45** (seção "Rust no projeto: etapa Aberto, cores e avanço ao abrir agente
 > (NS-45)"): as etapas passaram a ser **seis**, com **Aberto** (`open`) antes de PO, e os tickets
 > novos nascem em Aberto. A regra "o nick nunca muda a etapa sozinho" foi **substituída**: abrir um
@@ -3962,6 +3970,12 @@ atalho com um ticket selecionado indo ao último agente e voltando (com a borda 
 estão em `.nick/docs/NS-38/telas/`.
 
 ## Rust no projeto: retomar e arquivar agentes (NS-39)
+
+> **Mudou no NS-61** (seção "Rust no projeto: etapa Rejeitado (NS-61)"): o `r` de um
+> agente de ticket **rejeitado** é recusado antes do `--check` (`ticket rejeitado: mude a etapa com
+> m antes de abrir um agente`), com o ticket lido do banco. Isso difere do ticket oculto, cuja
+> retomada continua permitida. Rejeitar um ticket encerra os agentes vivos dele neste nick, depois
+> de gravar a etapa.
 
 > **Mudou no NS-50** (seção "Rust no projeto: retomada segue a troca de sessão do claude
 > (NS-50)"): o `--has-conversation` segue a cadeia de registros `continued-in` e, com o arquivo,
@@ -5059,6 +5073,13 @@ truecolor) ficam em `.nick/docs/NS-51/prints/`, em texto, ANSI e PNG.
 
 ## Rust no projeto: etapa Aberto, cores e avanço ao abrir agente (NS-45)
 
+> **Mudou no NS-61** (seção "Rust no projeto: etapa Rejeitado (NS-61)"): entrou a
+> sétima etapa, **Rejeitado**, em cinza (`ui::STAGE_GRAY`, `Color::DarkGray`), com o rótulo inteiro
+> do ticket cinza na árvore e a marca `[✗ Rejeitado]`. O avanço na abertura usa
+> `current.is_closed()` (Concluído ou Rejeitado) em vez de `current == Done`, então nunca tira um
+> ticket do Rejeitado, e o `g` num ticket rejeitado é recusado. A migração 11 repete as três
+> armadilhas da 9.
+
 História filha do épico NS-28. Três ajustes nas etapas do ticket do NS-36: a etapa **Aberto**
 antes de PO, as **cores** das etapas e do épico, e o **avanço da etapa** quando se abre um agente
 novo de uma etapa posterior. Fora do escopo: cores configuráveis, etapa nos épicos e cor da etapa
@@ -5625,6 +5646,12 @@ ficam em `.nick/docs/NS-53/`.
 
 ## Rust no projeto: concluir épicos e filtro de concluídos (NS-54)
 
+> **Mudou no NS-61** (seção "Rust no projeto: etapa Rejeitado (NS-61)"): "concluído"
+> passou a ser "fechado" (`TicketStage::CLOSED`: Concluído ou Rejeitado). O `d` esconde também os
+> rejeitados, e o `complete_epic` e o `reopen_if_pending` contam como pendente só o ticket não
+> fechado (`stage NOT IN (?2, ?3)`, com as chaves de `db::closed_keys()`). O rodapé do `d`, a
+> mensagem `Ele sai da árvore (d mostra os concluídos).` e as mensagens de pendência não mudaram.
+
 História filha do épico NS-28. O épico (NS-40) ganhou fim: dois estados, **aberto** e **concluído**,
 com reabertura automática, e a árvore ganhou um filtro que esconde os concluídos. Os filtros `f` e `d`
 são lembrados entre aberturas. Fora do escopo: outros estados de épico, concluir em lote, lembrar o
@@ -6017,3 +6044,270 @@ mexeu no código de produção além de um comentário:
 
 Das observações do review, ficou como está (D6): voltar das Configurações para a árvore com o mesmo
 nó não reinicia o letreiro, porque o nó não mudou.
+
+## Rust no projeto: etapa Rejeitado (NS-61)
+
+História filha do épico NS-28. Antes, um ticket que não ia ser feito só podia ir para Concluído.
+Agora existe a etapa **Rejeitado** (`rejected`): ela é escolhida no `m`, a partir de qualquer etapa,
+exige um motivo, que vai para o histórico, e bloqueia agentes enquanto o ticket estiver nela. O
+plano está em `.nick/docs/NS-61/plan.md`. Ficaram fora do escopo:
+- sincronizar com o Jira (rejeitar no nick não rejeita no Jira: impacto aceito no ticket);
+- rejeitar épicos;
+- editar o motivo depois;
+- mudar o rodapé `d esconder concluídos`;
+- cor por etapa no histórico e no diálogo "Mudar etapa".
+
+**A etapa e "fechado".** `TicketStage::Rejected` (chave `rejected`, rótulo `Rejeitado`) é declarada
+depois de `Done`, então o `ALL` tem sete etapas, segue ordenado pelo `Ord` e o diálogo mostra o
+Rejeitado por último. O `agent_stage()` dá `None`, como Aberto e Concluído; o `agents::Stage` e o
+`CHECK` de `agents.stage` não mudaram.
+
+O conceito de **fechado** tem uma fonte única: `TicketStage::CLOSED = [Done, Rejected]` e
+`is_closed()`. Quem usa:
+- o filtro `d` (`tickets::is_closed(&Ticket)`, em `DoneIds` e no `push_ticket`);
+- a conclusão e a reabertura do épico (`db::closed_keys()`, que vai por parâmetro no
+  `stage NOT IN (?2, ?3)` do `complete_epic` e do `reopen_if_pending`);
+- o avanço na abertura (`current.is_closed() || to <= current`).
+
+Não há literal `"done"`/`"rejected"` fora do `tickets.rs` e das migrações. Para um `Ticket` há um só
+ponto que lê a chave gravada: `tickets::is_rejected(&Ticket)` e `tickets::is_closed(&Ticket)`, usados
+no `Holder::from`, no `ticket_spans`, na árvore e no `rejected_now`.
+
+**Rejeitar (o `m`).** O fluxo é `ChooseTicketStage` → `Enter` no Rejeitado → `RejectReason` →
+`ConfirmStageChange` → `s`.
+- **Recusa com agente em outro nick:** se o ticket tem agente `active` em outro nick (um registro
+  ativo sem sessão neste nick), a rejeição é recusada com `O ticket <ID> tem agente ativo em outro
+  nick. Encerre os agentes dele lá antes de rejeitar o ticket.` (`App::rejection_refused`, no molde
+  do `removal_refusal`). Agentes parados não contam, porque a retomada deles já é recusada. A recusa
+  é checada ao escolher o Rejeitado, e o "Mudar etapa" fica aberto com ela na barra, e de novo no
+  `s`, porque outro nick pode abrir um agente nesse meio-tempo (molde do `key_confirm_remove`).
+- **O motivo (`Dialog::RejectReason { ticket, input }`):** campo de texto, título ` Rejeitar ticket `,
+  as linhas `Ticket <ID> — <título>` e `Motivo da rejeição (até 120 caracteres):`, e rodapé `Enter
+  confirmar · Esc cancelar`. Uma recusa fica na barra com o campo aberto (molde do `EditId`).
+- **A confirmação (`ConfirmStageChange { ticket, to, reason, live }`):** `Rejeitar o ticket <ID> (de
+  <etapa>)? Motivo: <motivo> (s/N)`, com rodapé `s rejeitar · qualquer outra tecla cancela`. Com
+  agentes vivos neste nick, ela avisa antes:
+  - com um: `Aviso: o agente <nome> será encerrado.`;
+  - com N: `Aviso: <N> agentes vivos deste ticket serão encerrados: <nomes>.`.
+
+  Os nomes entram no aviso de N para cumprir o "avisa quais" do plano. As outras etapas seguem o
+  fluxo de antes, com `reason: None` e `live` vazio.
+- **Cancelar:** `Esc` no motivo, ou qualquer tecla diferente de `s` na confirmação, cancela sem
+  gravar nada.
+- **Nenhum dos dois diálogos é irreversível** (`irreversible() == false`): o agente encerrado pode
+  ser retomado depois que o ticket sair do Rejeitado.
+
+**O motivo (D3).** Ele é aparado (`trim`), não pode ser vazio e vai até `REJECT_REASON_MAX = 120`
+caracteres, contados com `chars().count()`, que dá o mesmo que o `length()` do SQLite para TEXT.
+Ele é validado por `tickets::check_reject_reason`, no campo e de novo no `change_stage`. As
+mensagens:
+- `Informe o motivo da rejeição.`;
+- `O motivo tem <N> caracteres; o limite é 120.`.
+
+**Por que obrigatório:** para o histórico explicar a decisão. O passo a mais foi aceito. O motivo só
+existe na mudança **para** Rejeitado, e as outras mudanças gravam `NULL`. Um motivo passado para
+outra etapa é erro de programação e vira recusa (`Só a mudança para Rejeitado tem motivo.`), sem
+`panic!`. Na tela, o motivo passa pelo `printable`.
+
+**Um só ponto de gravação.** `tickets::change_stage(db, ticket, to, reason)` recusa a mesma etapa
+primeiro, valida o motivo e chama `Db::change_ticket_stage(id, from, to, source, reason)`, que grava
+a coluna `reason` no INSERT do histórico. A chamada no `app.rs` continua uma só, dentro da
+confirmação. Os estruturais `the_stage_is_only_written_by_the_operator_or_by_opening_a_new_agent` e
+`only_the_three_writers_of_the_db_write_a_ticket_and_they_reopen_the_epic` passaram sem mudança.
+
+**Agentes vivos: grava, depois encerra (D6).** O molde é a remoção de projeto com agentes vivos
+(NS-38), com a ordem invertida: a etapa é gravada **primeiro**, na confirmação. Só com sucesso, e se
+o ticket tem agentes vivos neste nick, a confirmação devolve `Action::EndRejectedAgents { agents,
+message }`. Então o laço do `main.rs` encerra as sessões (`agent_session::terminate_all`), e
+`App::end_agents_of_rejected` encerra os registros e solta as travas. A barra mostra a mensagem da
+etapa seguida de ` O agente <nome> foi encerrado.` ou ` Os <N> agentes vivos dele foram encerrados.`.
+
+Com essa ordem, uma gravação que falha (`Moved`, `Gone` ou erro) não encerra nenhum agente. O sufixo
+e o encerramento dos registros saíram de `remove_project_ending_agents` para o helper privado
+`App::end_records`, usado pelos dois. A remoção de projeto não mudou de comportamento, e os testes
+dela passaram sem mudança.
+
+**Sem agente num ticket rejeitado (D7).** A mensagem é `tickets::REJECTED_AGENT_MESSAGE` = `ticket
+rejeitado: mude a etapa com m antes de abrir um agente`. As crases do Jira eram só formatação, e o
+nick cita teclas sem crase. O `agents::Holder` ganhou `rejected: bool`, que é verdadeiro no ticket
+em Rejeitado e sempre `false` no épico (no molde do `hidden`). Onde ela recusa:
+1. `choose_stage` (o `g`), depois do `hidden_refusal`;
+2. o `n` do `key_conversation_lost`;
+3. `ask_resume` (o `r`), antes do `--check`. Ele usa `App::rejected_now(owner)`, que **lê o ticket
+   do banco** naquela hora. Isso **difere do oculto**, cuja retomada continua permitida (NS-39), por
+   decisão do usuário;
+4. `resume_agent` (o ticket do `holder_of_agent`, lido agora) e `open_agent` (o `rejected_now` logo
+   no começo, antes do `agents::open`). É a defesa final caso outro nick rejeite o ticket no meio do
+   fluxo `g` → tipo → formulário → prévia. Recusado, nada é gravado nem lançado, e nenhuma trava é
+   tomada.
+
+Um agente de **épico** abre normalmente com tickets rejeitados no épico. O avanço na abertura
+(NS-45) nunca tira um ticket do Rejeitado.
+
+**Sair do Rejeitado:** pelo `m`, para qualquer outra etapa, sem motivo. Não existe "reabrir" à parte.
+Fora do Rejeitado, o `g` e o `r` voltam a funcionar.
+
+**Migração 11** (no molde da 9, publicada, nunca editada). Ela reconstrói `tickets` e
+`ticket_stage_changes`:
+- `tickets`: `'rejected'` no `CHECK` da etapa; o `DEFAULT 'open'` continua;
+- `ticket_stage_changes`:
+  - `'rejected'` nos dois `CHECK`s;
+  - a coluna `reason TEXT`, entre `source` e `changed_at`;
+  - `CHECK ((to_stage = 'rejected') = (reason IS NOT NULL))`;
+  - `CHECK (reason IS NULL OR (trim(reason) <> '' AND length(reason) <= 120))`;
+  - as linhas antigas copiadas com `reason` `NULL`.
+
+As três armadilhas da 9 foram repetidas:
+- a FK fica desligada pelo laço do `open_with`, que não mudou;
+- os seis gatilhos são derrubados e recriados com o texto idêntico ao da 9;
+- os `id`s são preservados.
+
+Antes de escrever a migração, o `sqlite_master` de um banco v10 confirmou que só os seis gatilhos e o
+autoindex dependem de `tickets` (`.nick/docs/NS-61/sqlite_master_v10.txt`). A prova é o teste
+`a_version_10_database_populated_migrates_to_11_keeping_every_row_and_link`. O banco dele é o
+populado do v9 → v10 mais um épico concluído (`populated_v10`). O teste confere todas as linhas e
+ligações, `foreign_key_check` e `integrity_check` vazios e os seis gatilhos.
+
+**Limite conhecido do `CHECK` do motivo:** o `trim()` do SQLite tira só espaços, então ele não pega
+um motivo só de tabs. Quem pega é o código (`check_reject_reason`, com teste). O `CHECK` ficou com o
+texto do plano, como o do título.
+
+**Cor e marca (D9).** `ui::STAGE_GRAY = Color::DarkGray` (índice 8, `Idx(8)` no vt100), e o
+`stage_span` dá `[✗ Rejeitado]` sempre: na árvore e no `Etapa atual:` do painel. Na árvore,
+**o rótulo inteiro** do ticket rejeitado (ID, marca, título, `[provisório]`/`[oculto]`) é cinza
+(`ticket_spans`), e o DIM do oculto convive com o cinza. O cinza vale também no rótulo cortado com
+`…` e na linha que rola no letreiro do NS-55 (testado).
+
+**Histórico (D10).** Uma mudança para Rejeitado ganha a linha `    Motivo: <motivo>` logo abaixo da
+linha de sempre (`  <data>  <de> → Rejeitado  (<origem>)`). Com 40 colunas, o corte leva o fim do
+motivo, não a data nem as etapas. O corte `(+N mudanças mais antigas)` passou a contar **linhas** (1
+ou 2 por mudança) e mantém as mudanças mais novas inteiras, para não estourar a área.
+
+**Efeito no NS-54 (D8).** O `d` esconde também os rejeitados, em qualquer profundidade, e um agente
+vivo não segura um ticket rejeitado na árvore. Um ticket rejeitado conta como fechado:
+- um épico só com tickets concluídos e rejeitados pode ser concluído;
+- um rejeitado oculto não é pendente;
+- mover um ticket de Concluído para Rejeitado (ou o contrário) mantém o épico concluído;
+- sair do Rejeitado para uma etapa aberta reabre o épico;
+- mover um ticket rejeitado para um épico concluído não o reabre.
+
+Não mudaram, de propósito (mudar o rodapé reabriria a medição de altura do NS-54):
+- o rodapé `d esconder concluídos` / `d mostrar concluídos`;
+- a mensagem `Ele sai da árvore (d mostra os concluídos).`;
+- as pendências `... ticket não concluído`.
+
+No filtro, "concluídos" inclui os rejeitados.
+
+**Impactos conhecidos.**
+- O Jira não fica sabendo da rejeição.
+- Ao rejeitar, um agente vivo é encerrado sem pergunta além do aviso na confirmação, e a conversa
+  dele fica para retomar depois que o ticket sair do Rejeitado.
+- O diálogo "Mudar etapa" tem sete linhas e cabe na altura mínima já testada
+  (`the_dialog_of_the_stages_fits_its_seven_rows_in_a_short_terminal`).
+
+**Testes adaptados (nenhum apagado), com o motivo de cada um:**
+- **Pela sétima etapa:**
+  - `ticket_stage_has_the_seven_stages_in_the_order_of_the_flow` (era `six`);
+  - `m_lists_the_seven_stages_and_only_s_changes_the_stage` (era `six`; ganhou o índice 6);
+  - `the_colors_of_the_stages_and_of_the_epic` (+`STAGE_GRAY`).
+
+  Outros dois percorriam todas as etapas e, sem mudar as asserções, ficaram nas seis de antes,
+  porque o Rejeitado tem fluxo próprio:
+  - `the_operator_moves_the_ticket_to_open_from_any_stage` (o Rejeitado pede motivo);
+  - `each_stage_shows_in_its_color_on_the_tree_and_on_the_panel` (o cinza tem teste próprio).
+- **Pelo diálogo novo:**
+  - `only_the_eight_dialogs_with_a_text_field_take_text` (era `seven`; com o irreversível
+    `only_the_removal_of_a_project_is_irreversible`, as variantes passaram de 24 para 25);
+  - `one_of_each_dialog` (ganhou `RejectReason`);
+  - `capital_letters_are_typed_as_they_are_in_the_text_fields` (ganhou o motivo);
+  - o literal de `ConfirmStageChange` no `ui.rs` (`reason`/`live`).
+- **Pela migração 11:**
+  - `a_new_database_gets_version_11_…` (era `10`);
+  - `opening_twice`;
+  - os de banco mais novo (12 / `(11)`);
+  - `migration_1_is_pinned` (11 migrações e o `PINNED_MIGRATION_11`);
+  - o v9 → v10, que agora abre só até `MIGRATIONS[..10]`;
+  - `a_real_version_6_…` (`tests/agent.rs`, versão 11).
+- **Só sintaxe (o `None` novo do `reason`):** as chamadas de `change_stage` e `change_ticket_stage`
+  nos testes, no `epics.rs` e em `tests/tui.rs`. O helper `sourced` do `ui.rs` ganhou
+  `reason: None`.
+
+**Testes novos.**
+- **`tickets.rs`:**
+  - `only_done_and_rejected_are_closed`;
+  - `check_reject_reason_trims_and_refuses_empty_and_long`;
+  - `rejecting_from_each_stage_stores_the_trimmed_reason`;
+  - `an_invalid_reason_is_refused_and_nothing_is_stored`;
+  - `leaving_rejected_to_each_stage_stores_no_reason`;
+  - `rejected_again_is_the_same_stage_and_gone_or_moved_store_nothing`;
+  - `opening_an_agent_never_takes_a_ticket_out_of_rejected`;
+  - `rejecting_in_a_done_epic_keeps_it_done_and_leaving_rejected_reopens_it`.
+- **`db/mod.rs`:**
+  - o v10 → v11 populado;
+  - `the_rejected_stage_and_the_reason_are_checked`;
+  - `change_ticket_stage_stores_the_reason_of_a_rejection_and_none_otherwise`;
+  - `a_new_ticket_is_still_born_open_after_the_migration_11`;
+  - os quatro do épico (concluir com rejeitados, rejeitado oculto não pendente, entre Concluído e
+    Rejeitado, mover rejeitado para épico concluído).
+- **`tree.rs`:**
+  - `hide_done_takes_the_rejected_tickets_at_depth_2_and_3_too`;
+  - `a_live_agent_does_not_hold_a_rejected_ticket_and_the_v_shows_it`.
+- **`app.rs`:**
+  - o `Holder`;
+  - as recusas do `g`, do `r`, do `n` e da retomada e da abertura com o ticket rejeitado no meio do
+    fluxo;
+  - sair do Rejeitado e abrir de novo;
+  - agente de épico;
+  - o fluxo motivo → confirmação;
+  - a recusa com agente em outro nick (na escolha e no `s`);
+  - o encerramento de um e de dois vivos;
+  - a gravação que falha não encerra nenhum;
+  - outra etapa com vivo não encerra nada.
+- **`ui.rs`:**
+  - a marca e a cor;
+  - o rótulo cinza e o DIM;
+  - árvore e painel;
+  - o cinza no `…` e no letreiro;
+  - o histórico com o motivo e o corte por linhas;
+  - os diálogos da rejeição;
+  - a altura do "Mudar etapa".
+- **PTY:**
+  - `a_ticket_is_rejected_with_a_reason_and_leaves_rejected_by_m` (`tests/tui.rs`: o cinza `Idx(8)`
+    no rótulo, `Etapa atual: [✗ Rejeitado]`, `Motivo:`, a recusa do `g`, o `d` e a saída pelo `m`);
+  - `rejecting_a_ticket_with_a_live_agent_warns_and_ends_it` (`tests/agent.rs`).
+
+**Sabotagens** (numa cópia do repositório, `.nick/docs/NS-61/sabotagens.md`): foram 22, e 20 deram
+teste vermelho na primeira rodada. Os dois casos restantes:
+- **A S18** (o laço não termina as sessões) passou. O PTY da rejeição usava o claude falso em
+  `echo`, que não grava pids, e conferia só o registro, a trava e a barra, que o
+  `end_agents_of_rejected` faz sozinho. Ele passou para o modo `sleep` e agora espera cada pid do
+  grupo morrer (`wait_dead`), como o `removing_a_project_ends_its_live_agent`. Com isso, a S18
+  ficou vermelha.
+- **A S2** (o avanço sem o `is_closed()`) é um **mutante equivalente**. O Rejeitado é a última
+  etapa e não tem etapa de agente, então o `to <= current` já recusa o avanço a partir dele. O
+  `is_closed()` fica como a regra explícita do D2, que protege se a ordem das etapas mudar.
+
+As telas estão em `.nick/docs/NS-61/telas.txt` e `telas_ansi/`.
+
+**Ajustes do review do NS-61** (`.nick/docs/NS-61/review.md`). Os sete pontos procediam, e nenhum
+mudou comportamento; os testes passaram sem mudança, com uma exceção: o P6 renomeou uma variável
+dentro de um teste.
+- **P1, bloco repetido no laço:** os braços `RemoveProject` e `EndRejectedAgents` do `main.rs`
+  repetiam o mesmo bloco, que tira as sessões de `sessions`/`sizes` e chama o `terminate_all`. O
+  bloco virou o método `Shell::terminate_sessions(&[i64])`, usado pelos dois braços.
+- **P2, predicado repetido:** "ativo em outro nick" (registro `active` sem sessão neste nick) virou
+  `App::active_elsewhere(&[Agent])`, usado pelo `removal_refusal` e pelo `rejection_refused`. Cada um
+  continua montando a sua mensagem.
+- **P3, linhas do diálogo do motivo:** o `RejectReason` era montado direto no `draw_dialog`. Agora um
+  helper comum, `text_field_lines(header, label, typed)`, monta o cabeçalho, a linha vazia, o rótulo,
+  o texto digitado e o cursor em (3, n). O `title_lines`, o `id_lines` e o novo `reason_lines`
+  delegam a ele, e os textos ficaram iguais byte a byte.
+- **P4, "rejeitado?" escrito de três jeitos:** veja o ponto único acima. O `rejected_now` não monta
+  mais um `Holder` só para ler o campo, e o `is_closed` privado da árvore saiu.
+- **P5, comentários com mais de 100 colunas:** os parágrafos foram refluídos sem mudar o texto, com
+  uma exceção. A documentação do `Db::change_ticket_stage` dizia "um ticket que sai de `done`
+  reabre o épico", o que estava errado desde o NS-61 e foi corrigido para "sai de uma etapa
+  fechada para uma aberta".
+- **P6:** a variável `_launcher` do teste `a_failing_write_of_the_rejection_ends_no_agent` era usada
+  e virou `launcher`.
+- **P7:** `rejection_lines` recebe `Option<&str>` em vez de `&Option<String>`.

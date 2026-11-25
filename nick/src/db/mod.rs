@@ -213,6 +213,8 @@ pub struct StageChangeRow {
     pub to_stage: String,
     /// Who changed it: `operator` or `agent_opening` (`tickets::StageSource`, NS-45).
     pub source: String,
+    /// Why the ticket was rejected (migration 11, NS-61): only in a change to `rejected`.
+    pub reason: Option<String>,
     /// RFC 3339, in UTC.
     pub changed_at: String,
 }
@@ -349,20 +351,29 @@ pub fn is_trigger_abort(err: &rusqlite::Error, marker: &str) -> bool {
     )
 }
 
-/// Opens the done epic `epic_id` again when it has a ticket not done (NS-54, D3), and gives its
-/// key; None without an epic, with an open one, or with every ticket done (the rule holds). Called
-/// only by the writers of a ticket, after the write and in its transaction, which already holds the
-/// database for writing: no other nick completes the epic in between.
+/// The keys of the closed stages (`TicketStage::CLOSED`, NS-61, D2), for the `NOT IN (?, ?)` of the
+/// queries of the epic: a rejected ticket counts as a done one. Destructured, so a new closed
+/// stage breaks the build here, and not the rule in silence.
+fn closed_keys() -> [&'static str; 2] {
+    TicketStage::CLOSED.map(TicketStage::key)
+}
+
+/// Opens the done epic `epic_id` again when it has a ticket not closed (NS-54, D3; NS-61: not done
+/// nor rejected), and gives its key; None without an epic, with an open one, or with every ticket
+/// closed (the rule holds). Called only by the writers of a ticket, after the write and in its
+/// transaction, which already holds the database for writing: no other nick completes the epic in
+/// between.
 fn reopen_if_pending(conn: &Connection, epic_id: Option<i64>) -> rusqlite::Result<Option<String>> {
     let Some(epic_id) = epic_id else {
         return Ok(None);
     };
+    let [done, rejected] = closed_keys();
     conn.query_row(
         "UPDATE epics SET done_at = NULL \
          WHERE id = ?1 AND done_at IS NOT NULL \
-         AND EXISTS (SELECT 1 FROM tickets WHERE epic_id = epics.id AND stage <> ?2) \
+         AND EXISTS (SELECT 1 FROM tickets WHERE epic_id = epics.id AND stage NOT IN (?2, ?3)) \
          RETURNING key",
-        params![epic_id, TicketStage::Done.key()],
+        params![epic_id, done, rejected],
         |row| row.get(0),
     )
     .optional()
@@ -751,20 +762,22 @@ impl Db {
     }
 
     /// Completes the epic (NS-54, D2): one UPDATE conditioned on the epic being open, having
-    /// tickets and every one of them done, the hidden ones included (the rule: a done epic has
-    /// every ticket done). A hidden epic, or one with an active agent, may be completed. With 0
-    /// rows, the reason is read in the same transaction, which the UPDATE already holds for
-    /// writing (the mold of `hide_epic`, with no second try: nothing changes in between).
+    /// tickets and every one of them closed (done or rejected, NS-61), the hidden ones included
+    /// (the rule: a done epic has every ticket closed). A hidden epic, or one with an active agent,
+    /// may be completed. With 0 rows, the reason is read in the same transaction, which the UPDATE
+    /// already holds for writing (the mold of `hide_epic`, with no second try: nothing changes in
+    /// between).
     pub fn complete_epic(&self, id: i64) -> rusqlite::Result<EpicCompletion> {
-        let done = TicketStage::Done.key();
+        let [done, rejected] = closed_keys();
         // The Db has &self, so the transaction is unchecked; it rolls back when dropped.
         let tx = self.conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE epics SET done_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
              WHERE id = ?1 AND done_at IS NULL \
              AND EXISTS (SELECT 1 FROM tickets WHERE epic_id = ?1) \
-             AND NOT EXISTS (SELECT 1 FROM tickets WHERE epic_id = ?1 AND stage <> ?2)",
-            params![id, done],
+             AND NOT EXISTS (SELECT 1 FROM tickets WHERE epic_id = ?1 \
+             AND stage NOT IN (?2, ?3))",
+            params![id, done, rejected],
         )?;
         if changed > 0 {
             tx.commit()?;
@@ -774,11 +787,11 @@ impl Db {
             .query_row(
                 "SELECT done_at IS NOT NULL, \
                  (SELECT count(*) FROM tickets WHERE epic_id = ?1), \
-                 (SELECT count(*) FROM tickets WHERE epic_id = ?1 AND stage <> ?2), \
-                 (SELECT count(*) FROM tickets WHERE epic_id = ?1 AND stage <> ?2 \
+                 (SELECT count(*) FROM tickets WHERE epic_id = ?1 AND stage NOT IN (?2, ?3)), \
+                 (SELECT count(*) FROM tickets WHERE epic_id = ?1 AND stage NOT IN (?2, ?3) \
                   AND hidden_at IS NOT NULL) \
                  FROM epics WHERE id = ?1",
-                params![id, done],
+                params![id, done, rejected],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
@@ -1045,18 +1058,21 @@ impl Db {
     }
 
     /// Changes the stage of the ticket from `from` to `to` and writes the row of the history with
-    /// its `source`, in one transaction: both or neither. Only when the ticket is still at `from`;
-    /// otherwise nothing is written, and the result says whether the ticket is gone or was moved
-    /// (by another nick). The only writer of the stage, called only by `tickets::change_stage`
-    /// (the operator) and `tickets::advance_on_agent_opening` (NS-45). With the key of the epic it
-    /// opened again (NS-54, D3): a ticket leaving `done` opens its done epic, read in the SQL (the
-    /// `Ticket` in memory may be old), in the same transaction.
+    /// its `source` and `reason` (NS-61: the reason of a rejection, None for any other change; the
+    /// CHECK of the migration 11 ties them), in one transaction: both or neither. Only when the
+    /// ticket is still at `from`; otherwise nothing is written, and the result says whether the
+    /// ticket is gone or was moved (by another nick). The only writer of the stage, called only by
+    /// `tickets::change_stage` (the operator) and `tickets::advance_on_agent_opening` (NS-45). With
+    /// the key of the epic it opened again (NS-54, D3): a ticket that leaves a closed stage for an
+    /// open one (NS-61: not done nor rejected) opens its done epic, read in the SQL (the `Ticket`
+    /// in memory may be old), in the same transaction.
     pub fn change_ticket_stage(
         &self,
         id: i64,
         from: &str,
         to: &str,
         source: &str,
+        reason: Option<&str>,
     ) -> rusqlite::Result<(StageChange, Option<String>)> {
         // The Db has &self, so the transaction is unchecked; it rolls back when dropped.
         let tx = self.conn.unchecked_transaction()?;
@@ -1078,9 +1094,9 @@ impl Db {
             return Ok((change, None));
         }
         tx.execute(
-            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, source, \
-             changed_at) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-            params![id, from, to, source],
+            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, source, reason, \
+             changed_at) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![id, from, to, source, reason],
         )?;
         let epic: Option<i64> = tx.query_row(
             "SELECT epic_id FROM tickets WHERE id = ?1",
@@ -1095,7 +1111,7 @@ impl Db {
     /// The history of the stage of the ticket, oldest first.
     pub fn list_stage_changes(&self, ticket_id: i64) -> rusqlite::Result<Vec<StageChangeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT from_stage, to_stage, source, changed_at FROM ticket_stage_changes \
+            "SELECT from_stage, to_stage, source, reason, changed_at FROM ticket_stage_changes \
              WHERE ticket_id = ?1 ORDER BY id",
         )?;
         stmt.query_map(params![ticket_id], |row| {
@@ -1103,7 +1119,8 @@ impl Db {
                 from_stage: row.get(0)?,
                 to_stage: row.get(1)?,
                 source: row.get(2)?,
-                changed_at: row.get(3)?,
+                reason: row.get(3)?,
+                changed_at: row.get(4)?,
             })
         })?
         .collect()
@@ -1168,7 +1185,7 @@ impl Db {
 mod tests {
     use super::migrations::{
         MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7,
-        MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATIONS,
+        MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATIONS,
     };
     use super::*;
 
@@ -1201,12 +1218,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_gets_version_10_with_auto_scrum_and_no_project() {
+    fn a_new_database_gets_version_11_with_auto_scrum_and_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nick.db");
         let db = Db::open(&path).unwrap();
         assert!(path.is_file());
-        assert_eq!(user_version(db.connection()), 10);
+        assert_eq!(user_version(db.connection()), 11);
         assert_eq!(
             modules(db.connection()),
             [("auto_scrum".to_string(), "auto_scrum".to_string())]
@@ -1241,7 +1258,7 @@ mod tests {
             .insert_project("auto_scrum", "p", "/p")
             .unwrap();
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(db.connection()), 10);
+        assert_eq!(user_version(db.connection()), 11);
         assert_eq!(modules(db.connection()).len(), 1);
         assert_eq!(db.list_projects("auto_scrum").unwrap().len(), 1);
     }
@@ -1279,7 +1296,7 @@ mod tests {
         let path = tmp.path().join("nick.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 11;")
+            conn.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 12;")
                 .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
@@ -1288,7 +1305,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 11, mais nova que a deste nick (10). \
+                "Erro: o banco {} está na versão 12, mais nova que a deste nick (11). \
                  Atualize o nick.",
                 path.display()
             )
@@ -1477,7 +1494,7 @@ INSERT INTO tickets (project_id, key, is_provisional, title, created_at)
     fn migration_1_is_pinned() {
         assert_eq!(
             MIGRATIONS.len(),
-            10,
+            11,
             "a new migration also pins its own text here"
         );
         assert_eq!(
@@ -1709,6 +1726,8 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
 "
         );
         assert_eq!(MIGRATIONS[9], MIGRATION_10);
+        assert_eq!(MIGRATION_11, PINNED_MIGRATION_11);
+        assert_eq!(MIGRATIONS[10], MIGRATION_11);
     }
 
     #[test]
@@ -1717,13 +1736,13 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         let path = tmp.path().join("nick.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 11;")
+            .execute_batch("PRAGMA user_version = 12;")
             .unwrap();
         let err = Db::open(&path).err().expect("a newer database is refused");
         assert_eq!(
             err.to_string(),
             format!(
-                "Erro: o banco {} está na versão 11, mais nova que a deste nick (10). \
+                "Erro: o banco {} está na versão 12, mais nova que a deste nick (11). \
                  Atualize o nick.",
                 path.display()
             )
@@ -2651,13 +2670,13 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         let (db, project, ticket) = with_ticket(&tmp);
         let other = db.insert_ticket(project, "NS-2", false, "t", None).unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "open", "review", "operator")
+            db.change_ticket_stage(ticket, "open", "review", "operator", None)
                 .unwrap()
                 .0,
             StageChange::Changed
         );
         assert_eq!(
-            db.change_ticket_stage(ticket, "review", "development", "agent_opening")
+            db.change_ticket_stage(ticket, "review", "development", "agent_opening", None)
                 .unwrap()
                 .0,
             StageChange::Changed,
@@ -2693,10 +2712,10 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         let tmp = tempfile::tempdir().unwrap();
         let (db, project, ticket) = with_ticket(&tmp);
         // Another nick moved it to review: this one still believes it is in open.
-        db.change_ticket_stage(ticket, "open", "review", "operator")
+        db.change_ticket_stage(ticket, "open", "review", "operator", None)
             .unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "open", "done", "operator")
+            db.change_ticket_stage(ticket, "open", "done", "operator", None)
                 .unwrap()
                 .0,
             StageChange::Moved
@@ -2705,7 +2724,7 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         assert_eq!(db.list_stage_changes(ticket).unwrap().len(), 1);
         db.delete_project(project).unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "review", "done", "agent_opening")
+            db.change_ticket_stage(ticket, "review", "done", "agent_opening", None)
                 .unwrap()
                 .0,
             StageChange::Gone
@@ -2726,7 +2745,7 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
             )
             .unwrap();
         let err = db
-            .change_ticket_stage(ticket, "open", "review", "operator")
+            .change_ticket_stage(ticket, "open", "review", "operator", None)
             .unwrap_err();
         assert!(err.to_string().contains("no history"), "{err}");
         assert_eq!(stage_of(&db, ticket), "open");
@@ -2736,14 +2755,14 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
             .execute_batch("DROP TRIGGER no_history;")
             .unwrap();
         assert_eq!(
-            db.change_ticket_stage(ticket, "open", "review", "operator")
+            db.change_ticket_stage(ticket, "open", "review", "operator", None)
                 .unwrap()
                 .0,
             StageChange::Changed
         );
         // A source the CHECK refuses stores nothing either: the stage stays.
         let err = db
-            .change_ticket_stage(ticket, "review", "done", "cron")
+            .change_ticket_stage(ticket, "review", "done", "cron", None)
             .unwrap_err();
         assert!(err.to_string().contains("CHECK"), "{err}");
         assert_eq!(stage_of(&db, ticket), "review");
@@ -4284,7 +4303,9 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         assert_eq!(rows[6].len(), 5, "five changes of the stage");
         assert_eq!(before_triggers.len(), 6);
 
-        let db = Db::open(&path).unwrap();
+        // Only up to the migration 10: the history gains a column in the 11, which has its own
+        // test (NS-61).
+        let db = Db::open_with(&path, &MIGRATIONS[..10]).unwrap();
         let conn = db.connection();
         assert_eq!(user_version(conn), 10);
         assert_eq!(
@@ -4548,7 +4569,7 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         let tmp = tempfile::tempdir().unwrap();
         let f = with_done_epic(&tmp);
         assert_eq!(
-            f.db.change_ticket_stage(f.in_e1.id, "done", "development", "operator")
+            f.db.change_ticket_stage(f.in_e1.id, "done", "development", "operator", None)
                 .unwrap(),
             (StageChange::Changed, Some("EPIC-1".to_string()))
         );
@@ -4562,7 +4583,7 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         f.db.set_ticket_epic(f.loose.id, Some(f.e1.id)).unwrap();
         assert!(done_at_of(&f.db, f.e1.id).is_some());
         assert_eq!(
-            f.db.change_ticket_stage(f.loose.id, "done", "review", "agent_opening")
+            f.db.change_ticket_stage(f.loose.id, "done", "review", "agent_opening", None)
                 .unwrap(),
             (StageChange::Changed, Some("EPIC-1".to_string()))
         );
@@ -4573,17 +4594,17 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         let tmp = tempfile::tempdir().unwrap();
         let f = with_epics(&tmp);
         assert_eq!(
-            f.db.change_ticket_stage(f.loose.id, "open", "review", "operator")
+            f.db.change_ticket_stage(f.loose.id, "open", "review", "operator", None)
                 .unwrap(),
             (StageChange::Changed, None)
         );
         assert_eq!(
-            f.db.change_ticket_stage(f.in_e1.id, "open", "done", "operator")
+            f.db.change_ticket_stage(f.in_e1.id, "open", "done", "operator", None)
                 .unwrap(),
             (StageChange::Changed, None)
         );
         assert_eq!(
-            f.db.change_ticket_stage(f.in_e1.id, "done", "po", "operator")
+            f.db.change_ticket_stage(f.in_e1.id, "done", "po", "operator", None)
                 .unwrap(),
             (StageChange::Changed, None),
             "an open epic stays open"
@@ -4592,7 +4613,7 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         // Gone and moved reopen nothing.
         let f = with_done_epic(&tempfile::tempdir().unwrap());
         assert_eq!(
-            f.db.change_ticket_stage(f.in_e1.id, "po", "review", "operator")
+            f.db.change_ticket_stage(f.in_e1.id, "po", "review", "operator", None)
                 .unwrap(),
             (StageChange::Moved, None)
         );
@@ -4619,7 +4640,7 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
         let err = f.db.set_ticket_epic(f.loose.id, Some(f.e1.id)).unwrap_err();
         assert!(err.to_string().contains("no reopen"), "{err}");
         let err =
-            f.db.change_ticket_stage(f.in_e1.id, "done", "po", "operator")
+            f.db.change_ticket_stage(f.in_e1.id, "done", "po", "operator", None)
                 .unwrap_err();
         assert!(err.to_string().contains("no reopen"), "{err}");
         assert_eq!(
@@ -4637,5 +4658,514 @@ ALTER TABLE epics ADD COLUMN done_at TEXT;  -- RFC 3339, in UTC; NULL while open
             f.db.set_ticket_epic(f.loose.id, Some(f.e1.id)).unwrap(),
             (true, Some("EPIC-1".to_string()))
         );
+    }
+
+    // ---- migration 11: the stage "Rejeitado" and the reason of the rejection (NS-61) ----
+
+    /// The text of the migration 11, pinned (a published migration is never edited).
+    const PINNED_MIGRATION_11: &str = "\
+DROP TRIGGER epics_key_not_a_ticket_insert;
+DROP TRIGGER epics_key_not_a_ticket_update;
+DROP TRIGGER tickets_key_not_an_epic_insert;
+DROP TRIGGER tickets_key_not_an_epic_update;
+DROP TRIGGER tickets_epic_of_the_project_insert;
+DROP TRIGGER tickets_epic_of_the_project_update;
+CREATE TABLE tickets_new (
+    id             INTEGER PRIMARY KEY,
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL,     -- the Jira ID, or the provisional short UUID
+    is_provisional INTEGER NOT NULL CHECK (is_provisional IN (0, 1)),
+    title          TEXT NOT NULL CHECK (trim(title) <> ''),
+    created_at     TEXT NOT NULL,     -- RFC 3339, in UTC
+    hidden_at      TEXT,              -- RFC 3339, in UTC; NULL while visible
+    stage          TEXT NOT NULL DEFAULT 'open'
+                   CHECK (stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done',
+                                    'rejected')),
+    epic_id        INTEGER REFERENCES epics(id),  -- NULL: no epic
+    UNIQUE (project_id, key)
+);
+INSERT INTO tickets_new (id, project_id, key, is_provisional, title, created_at, hidden_at,
+                         stage, epic_id)
+    SELECT id, project_id, key, is_provisional, title, created_at, hidden_at, stage, epic_id
+    FROM tickets;
+CREATE TABLE ticket_stage_changes_new (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    from_stage TEXT NOT NULL
+               CHECK (from_stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done',
+                                     'rejected')),
+    to_stage   TEXT NOT NULL
+               CHECK (to_stage IN ('open', 'po', 'tech_leader', 'development', 'review', 'done',
+                                   'rejected')),
+    source     TEXT NOT NULL CHECK (source IN ('operator', 'agent_opening')),
+    reason     TEXT,            -- why it was rejected; only in a change to 'rejected'
+    changed_at TEXT NOT NULL,   -- RFC 3339, in UTC
+    CHECK (from_stage <> to_stage),
+    CHECK ((to_stage = 'rejected') = (reason IS NOT NULL)),
+    CHECK (reason IS NULL OR (trim(reason) <> '' AND length(reason) <= 120))
+);
+INSERT INTO ticket_stage_changes_new (id, ticket_id, from_stage, to_stage, source, reason,
+                                      changed_at)
+    SELECT id, ticket_id, from_stage, to_stage, source, NULL, changed_at
+    FROM ticket_stage_changes;
+DROP TABLE ticket_stage_changes;
+DROP TABLE tickets;
+ALTER TABLE tickets_new RENAME TO tickets;
+ALTER TABLE ticket_stage_changes_new RENAME TO ticket_stage_changes;
+-- the key is unique across the tickets and the epics of a project (both use .nick/docs/<key>/)
+CREATE TRIGGER epics_key_not_a_ticket_insert BEFORE INSERT ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER epics_key_not_a_ticket_update BEFORE UPDATE OF key ON epics
+    WHEN EXISTS (SELECT 1 FROM tickets WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of a ticket'); END;
+CREATE TRIGGER tickets_key_not_an_epic_insert BEFORE INSERT ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+CREATE TRIGGER tickets_key_not_an_epic_update BEFORE UPDATE OF key ON tickets
+    WHEN EXISTS (SELECT 1 FROM epics WHERE project_id = NEW.project_id AND key = NEW.key)
+    BEGIN SELECT RAISE(ABORT, 'nick: key of an epic'); END;
+-- a ticket only goes to an epic of its own project
+CREATE TRIGGER tickets_epic_of_the_project_insert BEFORE INSERT ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+CREATE TRIGGER tickets_epic_of_the_project_update BEFORE UPDATE OF epic_id ON tickets
+    WHEN NEW.epic_id IS NOT NULL AND NOT EXISTS
+         (SELECT 1 FROM epics WHERE id = NEW.epic_id AND project_id = NEW.project_id)
+    BEGIN SELECT RAISE(ABORT, 'nick: epic of another project'); END;
+";
+
+    /// The history with the columns of before the migration 11.
+    const HISTORY_OF_V10: &str = "SELECT id, ticket_id, from_stage, to_stage, source, changed_at \
+                                  FROM ticket_stage_changes ORDER BY id";
+
+    /// Every row of every table but the history, whose columns change (by `id`), at the version 10.
+    fn every_row_of_v10(conn: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        [
+            "modules", "projects", "epics", "tickets", "agents", "settings",
+        ]
+        .map(|table| dump(conn, &format!("SELECT * FROM {table} ORDER BY rowid")))
+        .into()
+    }
+
+    /// The names of the columns of `table`, in order.
+    fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// `populated_v8` taken to the version 10, with more: a done epic (its two tickets done, one
+    /// hidden), a ticket in `open` (the stage of the migration 9) in and out of an epic, and
+    /// changes by the opening of an agent. Every stage of before has a ticket now. Returns the ids
+    /// of the projects.
+    fn populated_v10(path: &Path) -> (i64, i64) {
+        let (a, b) = populated_v8(path);
+        let v10 = Db::open_with(path, &MIGRATIONS[..10]).unwrap();
+        assert_eq!(user_version(v10.connection()), 10);
+        let conn = v10.connection();
+        let done_epic = conn
+            .query_row(
+                "INSERT INTO epics (project_id, key, is_provisional, title, created_at, done_at) \
+                 VALUES (?1, 'EP-9', 0, 'pronto', '2026-01-11T00:00:00Z', \
+                 '2026-01-20T00:00:00Z') RETURNING id",
+                [a],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let ticket = |key: &str, hidden: bool, stage: &str, epic: Option<i64>| -> i64 {
+            conn.query_row(
+                "INSERT INTO tickets (project_id, key, is_provisional, title, created_at, \
+                 hidden_at, stage, epic_id) VALUES (?1, ?2, 0, 'título', '2026-01-12T00:00:00Z', \
+                 CASE WHEN ?3 THEN '2026-01-13T00:00:00Z' END, ?4, ?5) RETURNING id",
+                params![a, key, hidden, stage, epic],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let t9 = ticket("NS-9", false, "done", Some(done_epic));
+        ticket("NS-10", true, "done", Some(done_epic));
+        let epic_of_a: i64 = conn
+            .query_row(
+                "SELECT id FROM epics WHERE project_id = ?1 AND key = 'EP-1'",
+                [a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let t11 = ticket("NS-11", false, "open", Some(epic_of_a));
+        ticket("NS-12", false, "open", None);
+        for (ticket, from, to, source) in [
+            (t9, "open", "development", "agent_opening"),
+            (t9, "development", "done", "operator"),
+            (t11, "po", "open", "operator"),
+        ] {
+            raw_sourced_change(conn, ticket, from, to, Some(source)).unwrap();
+        }
+        v10.set_setting(SETTING_TREE_HIDE_DONE, "1").unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn a_version_10_database_populated_migrates_to_11_keeping_every_row_and_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        let (a, b) = populated_v10(&path);
+        let (rows, history, before_triggers, ticket_columns) = {
+            let conn = Connection::open(&path).unwrap();
+            (
+                every_row_of_v10(&conn),
+                dump(&conn, HISTORY_OF_V10),
+                triggers(&conn),
+                columns_of(&conn, "tickets"),
+            )
+        };
+        assert_eq!(rows[2].len(), 4, "four epics");
+        assert_eq!(rows[3].len(), 9, "nine tickets");
+        assert_eq!(rows[4].len(), 6, "six agents");
+        assert_eq!(rows[5].len(), 2, "two settings");
+        assert_eq!(history.len(), 8, "eight changes of the stage");
+        assert_eq!(before_triggers.len(), 6);
+        let stages: std::collections::BTreeSet<String> = rows[3]
+            .iter()
+            .map(|row| match &row[7] {
+                rusqlite::types::Value::Text(stage) => stage.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            stages.into_iter().collect::<Vec<_>>(),
+            ["development", "done", "open", "po", "review", "tech_leader"],
+            "every stage of before"
+        );
+
+        let db = Db::open(&path).unwrap();
+        let conn = db.connection();
+        assert_eq!(user_version(conn), 11);
+        assert_eq!(
+            every_row_of_v10(conn),
+            rows,
+            "every row, field by field, with its id"
+        );
+        assert_eq!(
+            dump(conn, HISTORY_OF_V10),
+            history,
+            "the history, with its id"
+        );
+        assert_eq!(
+            columns_of(conn, "tickets"),
+            ticket_columns,
+            "the same columns"
+        );
+        assert_eq!(
+            columns_of(conn, "ticket_stage_changes"),
+            [
+                "id",
+                "ticket_id",
+                "from_stage",
+                "to_stage",
+                "source",
+                "reason",
+                "changed_at"
+            ],
+            "the reason after the source"
+        );
+        let reasons: Vec<Option<String>> = conn
+            .prepare("SELECT reason FROM ticket_stage_changes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(reasons, vec![None; 8], "no reason in the history of before");
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM tickets ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let read: Vec<Option<String>> = ids
+            .iter()
+            .flat_map(|id| db.list_stage_changes(*id).unwrap())
+            .map(|c| c.reason)
+            .collect();
+        assert_eq!(read, vec![None; 8], "the reader of the history reads it");
+        assert_eq!(checks(conn), (0, "ok".to_string()), "no broken link");
+        assert_eq!(
+            triggers(conn),
+            before_triggers,
+            "the six triggers, with the text of the migration 9"
+        );
+        assert_eq!(foreign_keys(conn), 1);
+        // The epics keep their state.
+        let done: Vec<Option<String>> = conn
+            .prepare("SELECT done_at FROM epics ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            done.iter().filter(|d| d.is_some()).count(),
+            1,
+            "the done epic"
+        );
+
+        // The triggers still refuse.
+        let err = raw_ticket(conn, a, "EP-1", 0, "t").unwrap_err();
+        assert!(is_trigger_abort(&err, KEY_OF_AN_EPIC), "{err:?}");
+        let err = raw_epic(conn, a, "NS-1").unwrap_err();
+        assert!(is_trigger_abort(&err, KEY_OF_A_TICKET), "{err:?}");
+        let epic_of_b: i64 = conn
+            .query_row("SELECT id FROM epics WHERE project_id = ?1", [b], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let err = conn
+            .execute(
+                "UPDATE tickets SET epic_id = ?2 WHERE project_id = ?1",
+                params![a, epic_of_b],
+            )
+            .unwrap_err();
+        assert!(is_trigger_abort(&err, EPIC_OF_ANOTHER_PROJECT), "{err:?}");
+
+        // The cascade from the project still works, and takes only what is its own.
+        db.delete_project(a).unwrap();
+        let left = |table: &str| -> Vec<i64> {
+            conn.prepare(&format!(
+                "SELECT DISTINCT project_id FROM {table} ORDER BY project_id"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        assert_eq!(left("tickets"), [b]);
+        assert_eq!(left("epics"), [b]);
+        assert_eq!(count(conn, "agents"), 2);
+        assert_eq!(count(conn, "ticket_stage_changes"), 2, "the history of b");
+        assert_eq!(checks(conn), (0, "ok".to_string()));
+    }
+
+    /// A row of the history by hand, with a reason (the column of the migration 11).
+    fn raw_reasoned_change(
+        conn: &Connection,
+        ticket: i64,
+        from: &str,
+        to: &str,
+        reason: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO ticket_stage_changes (ticket_id, from_stage, to_stage, source, reason, \
+             changed_at) VALUES (?1, ?2, ?3, 'operator', ?4, 'now')",
+            params![ticket, from, to, reason],
+        )
+    }
+
+    #[test]
+    fn the_rejected_stage_and_the_reason_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        let conn = db.connection();
+        // An invalid stage, in both tables; `rejected` is accepted.
+        let set = |stage: &str| {
+            conn.execute(
+                "UPDATE tickets SET stage = ?2 WHERE id = ?1",
+                params![ticket, stage],
+            )
+        };
+        for bad in ["archived", "Rejected", "rejeitado", ""] {
+            assert!(set(bad).is_err(), "ticket stage {bad:?}");
+            assert!(raw_change(conn, ticket, bad, "po").is_err(), "from {bad:?}");
+            assert!(
+                raw_reasoned_change(conn, ticket, "po", bad, Some("x")).is_err(),
+                "to {bad:?}"
+            );
+        }
+        set("rejected").unwrap();
+        assert_eq!(stage_of(&db, ticket), "rejected");
+        set("open").unwrap();
+        // A change to `rejected` needs a reason; a change to another stage has none.
+        assert!(
+            raw_reasoned_change(conn, ticket, "open", "rejected", None).is_err(),
+            "rejected without a reason"
+        );
+        assert!(
+            raw_reasoned_change(conn, ticket, "open", "po", Some("motivo")).is_err(),
+            "a reason out of a rejection"
+        );
+        assert!(
+            raw_reasoned_change(conn, ticket, "rejected", "po", Some("motivo")).is_err(),
+            "a reason leaving rejected"
+        );
+        // The reason: not empty nor only spaces, up to 120 characters (accents count one). The
+        // `trim` of SQLite takes only spaces, as in the CHECK of the title: the other blanks (a
+        // tab) are refused by the code, which stores the reason trimmed (`tickets`).
+        for bad in ["", " ", "     ", &"a".repeat(121), &"é".repeat(121)] {
+            assert!(
+                raw_reasoned_change(conn, ticket, "open", "rejected", Some(bad)).is_err(),
+                "reason {bad:?}"
+            );
+        }
+        assert_eq!(stage_changes(conn), [], "nothing stored");
+        let longest = "é".repeat(120);
+        raw_reasoned_change(conn, ticket, "open", "rejected", Some(&longest)).unwrap();
+        raw_reasoned_change(conn, ticket, "rejected", "po", None).unwrap();
+        raw_reasoned_change(conn, ticket, "po", "rejected", Some("a")).unwrap();
+        assert!(
+            raw_change(conn, ticket, "rejected", "rejected").is_err(),
+            "same stage"
+        );
+        assert_eq!(stage_changes(conn).len(), 3);
+    }
+
+    #[test]
+    fn change_ticket_stage_stores_the_reason_of_a_rejection_and_none_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _, ticket) = with_ticket(&tmp);
+        assert_eq!(
+            db.change_ticket_stage(ticket, "open", "rejected", "operator", Some("não vale"))
+                .unwrap()
+                .0,
+            StageChange::Changed
+        );
+        assert_eq!(
+            db.change_ticket_stage(ticket, "rejected", "po", "operator", None)
+                .unwrap()
+                .0,
+            StageChange::Changed
+        );
+        let read: Vec<(String, String, Option<String>)> = db
+            .list_stage_changes(ticket)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.from_stage, c.to_stage, c.reason))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("open".into(), "rejected".into(), Some("não vale".into())),
+                ("rejected".into(), "po".into(), None),
+            ]
+        );
+        // The CHECK refuses a rejection without a reason: the stage is not written either.
+        let err = db
+            .change_ticket_stage(ticket, "po", "rejected", "operator", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{err}");
+        assert_eq!(stage_of(&db, ticket), "po", "all or nothing");
+        assert_eq!(db.list_stage_changes(ticket).unwrap().len(), 2);
+    }
+
+    // ---- a rejected ticket is closed for the epic (NS-61, D2 and D8) ----
+
+    #[test]
+    fn an_epic_with_its_tickets_rejected_or_done_and_rejected_is_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = with_epics(&tmp);
+        put_stage(&f.db, f.in_e1.id, "rejected");
+        assert_eq!(
+            f.db.complete_epic(f.e1.id).unwrap(),
+            EpicCompletion::Done,
+            "all rejected"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let f = with_epics(&tmp);
+        put_stage(&f.db, f.in_e1.id, "done");
+        let other =
+            f.db.insert_ticket(f.project, "NS-3", false, "t", Some(f.e1.id))
+                .unwrap();
+        put_stage(&f.db, other.id, "rejected");
+        assert_eq!(
+            f.db.complete_epic(f.e1.id).unwrap(),
+            EpicCompletion::Done,
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn a_hidden_rejected_ticket_is_not_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = with_epics(&tmp);
+        put_stage(&f.db, f.in_e1.id, "done");
+        let hidden =
+            f.db.insert_ticket(f.project, "NS-3", false, "t", Some(f.e1.id))
+                .unwrap();
+        f.db.set_ticket_hidden(hidden.id, true).unwrap();
+        put_stage(&f.db, hidden.id, "review");
+        assert_eq!(
+            f.db.complete_epic(f.e1.id).unwrap(),
+            EpicCompletion::Pending {
+                pending: 1,
+                hidden: 1
+            }
+        );
+        put_stage(&f.db, hidden.id, "rejected");
+        assert_eq!(f.db.complete_epic(f.e1.id).unwrap(), EpicCompletion::Done);
+    }
+
+    #[test]
+    fn between_done_and_rejected_a_done_epic_stays_done_and_leaving_rejected_reopens_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = with_done_epic(&tmp);
+        assert_eq!(
+            f.db.change_ticket_stage(f.in_e1.id, "done", "rejected", "operator", Some("não"))
+                .unwrap(),
+            (StageChange::Changed, None),
+            "Concluído → Rejeitado"
+        );
+        assert!(done_at_of(&f.db, f.e1.id).is_some());
+        assert_eq!(
+            f.db.change_ticket_stage(f.in_e1.id, "rejected", "done", "operator", None)
+                .unwrap(),
+            (StageChange::Changed, None),
+            "Rejeitado → Concluído"
+        );
+        assert!(done_at_of(&f.db, f.e1.id).is_some());
+        f.db.change_ticket_stage(f.in_e1.id, "done", "rejected", "operator", Some("não"))
+            .unwrap();
+        assert_eq!(
+            f.db.change_ticket_stage(f.in_e1.id, "rejected", "development", "operator", None)
+                .unwrap(),
+            (StageChange::Changed, Some("EPIC-1".to_string())),
+            "Rejeitado → Dev"
+        );
+        assert_eq!(done_at_of(&f.db, f.e1.id), None);
+    }
+
+    #[test]
+    fn moving_a_rejected_ticket_into_a_done_epic_does_not_reopen_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = with_done_epic(&tmp);
+        put_stage(&f.db, f.loose.id, "rejected");
+        assert_eq!(
+            f.db.set_ticket_epic(f.loose.id, Some(f.e1.id)).unwrap(),
+            (true, None)
+        );
+        assert!(done_at_of(&f.db, f.e1.id).is_some(), "the rule still holds");
+        // A new ticket (born open) still reopens it.
+        let (_, reopened) =
+            f.db.insert_ticket_reopening(f.project, "NS-3", false, "t", Some(f.e1.id))
+                .unwrap();
+        assert_eq!(reopened.as_deref(), Some("EPIC-1"));
+    }
+
+    #[test]
+    fn a_new_ticket_is_still_born_open_after_the_migration_11() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nick.db");
+        populated_v10(&path);
+        let db = Db::open(&path).unwrap();
+        let p = db.insert_project("auto_scrum", "novo", "/novo").unwrap().id;
+        let t = db.insert_ticket(p, "NS-1", false, "t", None).unwrap();
+        assert_eq!(t.stage, "open");
+        assert_eq!(stage_of(&db, t.id), "open");
     }
 }

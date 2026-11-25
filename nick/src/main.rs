@@ -618,22 +618,33 @@ impl Shell {
                 return Ok(true);
             }
             Action::RemoveProject { project, agents } => {
-                // Its live agents first, all their groups at once (a single grace of 2 s, as
-                // `end_all`), then their records and the project (NS-38). The Exited their
-                // waiters send afterwards finds no session and is ignored.
-                let mut sessions = Vec::new();
-                for id in &agents {
-                    if let Some(index) = self.sessions.iter().position(|(agent, _)| agent == id) {
-                        let (_, session) = self.sessions.remove(index);
-                        self.sizes.remove(id);
-                        sessions.push(session);
-                    }
-                }
-                agent_session::terminate_all(&mut sessions);
+                // Its live agents first, then their records and the project (NS-38).
+                self.terminate_sessions(&agents);
                 self.app.remove_project_ending_agents(&project, &agents);
+            }
+            Action::EndRejectedAgents { agents, message } => {
+                // NS-61, D6: the stage is already written; the live agents of the rejected ticket
+                // end as the ones of a removed project, then their records.
+                self.terminate_sessions(&agents);
+                self.app.end_agents_of_rejected(&agents, message);
             }
         }
         Ok(false)
+    }
+
+    /// Ends the sessions of the agents `ids` that run in this nick, all their groups at once (a
+    /// single grace of 2 s, as `end_all`), and takes them out of `sessions` and `sizes`. The
+    /// Exited their waiters send afterwards finds no session and is ignored.
+    fn terminate_sessions(&mut self, ids: &[i64]) {
+        let mut sessions = Vec::new();
+        for id in ids {
+            if let Some(index) = self.sessions.iter().position(|(agent, _)| agent == id) {
+                let (_, session) = self.sessions.remove(index);
+                self.sizes.remove(id);
+                sessions.push(session);
+            }
+        }
+        agent_session::terminate_all(&mut sessions);
     }
 
     /// The program of the agent `id` ended (the PTY closed and the child was reaped): its

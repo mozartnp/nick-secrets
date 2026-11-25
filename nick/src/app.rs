@@ -200,8 +200,18 @@ pub enum Dialog {
     CaptureShortcut { first: Option<Shortcut> },
     /// "Mudar etapa" (NS-36): the stages of `TicketStage::ALL`, `index` selected.
     ChooseTicketStage { ticket: Ticket, index: usize },
-    /// The `(s/N)` confirmation of changing the stage of the ticket to `to`.
-    ConfirmStageChange { ticket: Ticket, to: TicketStage },
+    /// The reason of rejecting the ticket (NS-61, D4), between "Mudar etapa" and the
+    /// confirmation: a refusal stays on the bar with the field open (the mold of `EditId`).
+    RejectReason { ticket: Ticket, input: String },
+    /// The `(s/N)` confirmation of changing the stage of the ticket to `to`; to Rejeitado (NS-61),
+    /// with the `reason` (trimmed) and the `live` agents of the ticket in this nick (id and name),
+    /// which the rejection ends.
+    ConfirmStageChange {
+        ticket: Ticket,
+        to: TicketStage,
+        reason: Option<String>,
+        live: Vec<(i64, String)>,
+    },
     /// "Editar ID" (NS-36): the new ID, starting with the current one.
     EditId { ticket: Ticket, input: String },
     /// The `(s/N)` confirmation of the new ID; `moves` when `.nick/docs/<old>/` exists now.
@@ -224,6 +234,7 @@ impl Dialog {
             | Dialog::EditEpicTitle { .. }
             | Dialog::EditEpicId { .. }
             | Dialog::EditId { .. }
+            | Dialog::RejectReason { .. }
             | Dialog::StageForm { .. } => true,
             Dialog::NeedsConfig { .. }
             | Dialog::ConfirmRemove { .. }
@@ -252,8 +263,9 @@ impl Dialog {
         match self {
             // Deletes the project from the database with its tickets, epics, agents and history.
             Dialog::ConfirmRemove { .. } => true,
-            // Hiding, archiving, editing an ID, ending an agent (resumable, NS-39) and quitting
-            // have a way back; the others are forms, choices and alerts.
+            // Hiding, archiving, editing an ID, ending an agent (resumable, NS-39), rejecting a
+            // ticket (it leaves Rejeitado by `m`, and its ended agents resume then: NS-61) and
+            // quitting have a way back; the others are forms, choices and alerts.
             Dialog::AddPath { .. }
             | Dialog::NeedsConfig { .. }
             | Dialog::NewTicket { .. }
@@ -274,6 +286,7 @@ impl Dialog {
             | Dialog::ConfirmQuit
             | Dialog::CaptureShortcut { .. }
             | Dialog::ChooseTicketStage { .. }
+            | Dialog::RejectReason { .. }
             | Dialog::ConfirmStageChange { .. }
             | Dialog::EditId { .. }
             | Dialog::ConfirmEditId { .. } => false,
@@ -335,6 +348,13 @@ pub enum Action {
     CheckResume {
         project: PathBuf,
         agent: Agent,
+    },
+    /// The ticket was rejected (its stage already written, NS-61, D6) and these live `agents` of it
+    /// run in this nick: the loop terminates their sessions and calls `end_agents_of_rejected`
+    /// with the `message` of the change.
+    EndRejectedAgents {
+        agents: Vec<i64>,
+        message: String,
     },
 }
 
@@ -827,7 +847,8 @@ impl App {
             | Action::ScrollLines(_)
             | Action::EndAgent(_)
             | Action::RemoveProject { .. }
-            | Action::CheckResume { .. } => false,
+            | Action::CheckResume { .. }
+            | Action::EndRejectedAgents { .. } => false,
         }
     }
 
@@ -950,15 +971,26 @@ impl App {
             Some(Dialog::ChooseTicketStage { ticket, index }) => {
                 self.key_choose_ticket_stage(key, ticket, index)
             }
-            Some(Dialog::ConfirmStageChange { ticket, to }) => {
+            Some(Dialog::ConfirmStageChange {
+                ticket, to, reason, ..
+            }) => {
                 // Only s/S confirm; any other key cancels. The only call of change_stage: the
-                // nick never changes the stage alone (plan D9 of NS-36).
-                if is_yes(key) {
-                    self.status = Some(match tickets::change_stage(&self.db, &ticket, to) {
-                        Ok(message) | Err(message) => message,
-                    });
+                // nick never changes the stage alone (plan D9 of NS-36). A rejection checks again
+                // the agents of another nick, and ends the live ones here only after the write
+                // (NS-61, D6).
+                if !is_yes(key) || self.rejection_refused(&ticket, to) {
+                    return Action::None;
                 }
-                Action::None
+                match tickets::change_stage(&self.db, &ticket, to, reason.as_deref()) {
+                    Ok(message) => self.stage_changed(&ticket, to, message),
+                    Err(message) => {
+                        self.status = Some(message);
+                        Action::None
+                    }
+                }
+            }
+            Some(Dialog::RejectReason { ticket, input }) => {
+                self.key_reject_reason(key, ticket, input)
             }
             Some(Dialog::EditId { ticket, input }) => self.key_edit_id(key, ticket, input),
             Some(Dialog::ConfirmEditId { ticket, new, .. }) => {
@@ -1526,7 +1558,9 @@ impl App {
     /// nick holds its lock (early, before the `--check`: the guarantee is `agents::resume`'s), or
     /// when its project is unavailable now (the refusal of `g`); otherwise the loop runs the
     /// check of the resume (`Action::CheckResume`). A hidden ticket does not refuse it: the
-    /// resume goes on a conversation that already exists (decision of the user in the NS-39).
+    /// resume goes on a conversation that already exists (decision of the user in the NS-39). A
+    /// rejected one does, read from the database before the `--check` (decision of the user in
+    /// the NS-61, D7).
     fn ask_resume(&mut self, id: i64) -> Action {
         let Some(cached) = self.agent_record(id).cloned() else {
             return Action::None;
@@ -1565,6 +1599,9 @@ impl App {
                 .is_some_and(|dir| agents::held_elsewhere(dir, &agent.session_id))
         {
             self.status = Some(agents::elsewhere_message(&agent));
+            return Action::None;
+        }
+        if self.rejected_now(agent.owner) {
             return Action::None;
         }
         let Some(project) = self
@@ -1929,6 +1966,29 @@ impl App {
             .then(|| epics::hidden_message(epic))
     }
 
+    /// NS-61, D7: whether the ticket of `owner`, read from the database now, is rejected; then the
+    /// bar says `tickets::REJECTED_AGENT_MESSAGE`, and no agent opens nor resumes. A database
+    /// error refuses too, with its message; a ticket gone does not (the steps after say so); an
+    /// epic never (its rejected tickets do not touch its agents). The last defense of the resume
+    /// (`ask_resume`) and of the opening (`open_agent`): another nick may have rejected it during
+    /// the flow.
+    fn rejected_now(&mut self, owner: Owner) -> bool {
+        let Owner::Ticket(id) = owner else {
+            return false;
+        };
+        match self.db.get_ticket(id) {
+            Ok(Some(ticket)) if tickets::is_rejected(&ticket) => {
+                self.status = Some(tickets::REJECTED_AGENT_MESSAGE.into());
+                true
+            }
+            Ok(_) => false,
+            Err(err) => {
+                self.status = Some(projects::db_error_message(&err));
+                true
+            }
+        }
+    }
+
     /// Shows the agent `id` on the right: being shown counts as seen, so its mark goes. The
     /// loop keeps the text of the one that stopped being shown (`left_shown`).
     fn show(&mut self, id: i64) {
@@ -2170,6 +2230,10 @@ impl App {
             self.status = Some(refusal);
             return Action::None;
         }
+        if holder.rejected {
+            self.status = Some(tickets::REJECTED_AGENT_MESSAGE.into());
+            return Action::None;
+        }
         let Some(project) = self.project_of_holder(&holder) else {
             return Action::None;
         };
@@ -2341,6 +2405,11 @@ impl App {
         let Some(holder) = self.holder_of_agent(agent) else {
             return;
         };
+        // NS-61, D7: the ticket read now (`holder_of_agent`); rejected, nothing is resumed.
+        if holder.rejected {
+            self.status = Some(tickets::REJECTED_AGENT_MESSAGE.into());
+            return;
+        }
         let Some(agents_dir) = self.agents_dir.as_deref() else {
             self.status = Some("Não consegui abrir o agente: sem a pasta das travas.".into());
             return;
@@ -2417,6 +2486,9 @@ impl App {
             }
             KeyCode::Char('n') if let Some(refusal) = self.hidden_refusal(&holder) => {
                 self.status = Some(refusal);
+            }
+            KeyCode::Char('n') if holder.rejected => {
+                self.status = Some(tickets::REJECTED_AGENT_MESSAGE.into());
             }
             KeyCode::Char('n') => {
                 let types: Vec<StageType> = StageType::menu(precheck.jira, precheck.sentry)
@@ -2715,6 +2787,10 @@ impl App {
         check: Precheck,
         launcher: &mut dyn AgentLauncher,
     ) {
+        // NS-61, D7: the ticket read now; rejected meanwhile, nothing is stored nor launched.
+        if self.rejected_now(holder.owner) {
+            return;
+        }
         let stage = kind.stage();
         let project_name = self
             .project_of_holder(holder)
@@ -2955,9 +3031,24 @@ impl App {
                 let to = TicketStage::ALL[index];
                 if to.key() == ticket.stage {
                     self.status = Some(tickets::same_stage_message(&ticket, to));
+                } else if to == TicketStage::Rejected {
+                    // NS-61, D4: the refusal of an agent of another nick first, then the reason.
+                    if !self.rejection_refused(&ticket, to) {
+                        self.status = None;
+                        self.dialog = Some(Dialog::RejectReason {
+                            ticket,
+                            input: String::new(),
+                        });
+                        return Action::None;
+                    }
                 } else {
                     self.status = None;
-                    self.dialog = Some(Dialog::ConfirmStageChange { ticket, to });
+                    self.dialog = Some(Dialog::ConfirmStageChange {
+                        ticket,
+                        to,
+                        reason: None,
+                        live: Vec::new(),
+                    });
                     return Action::None;
                 }
             }
@@ -2965,6 +3056,93 @@ impl App {
         }
         self.dialog = Some(Dialog::ChooseTicketStage { ticket, index });
         Action::None
+    }
+
+    /// The field of the reason of a rejection (NS-61, D4): Enter checks it
+    /// (`tickets::check_reject_reason`; a refusal stays on the bar with the field open), then the
+    /// confirmation, with the reason trimmed and the live agents of the ticket it will end.
+    fn key_reject_reason(&mut self, key: KeyEvent, ticket: Ticket, input: String) -> Action {
+        self.key_text_field(
+            key,
+            ticket,
+            input,
+            |app, ticket, input| {
+                let reason = tickets::check_reject_reason(input)?;
+                app.status = None;
+                Ok(Some(Dialog::ConfirmStageChange {
+                    live: app
+                        .live_of(Owner::Ticket(ticket.id))
+                        .into_iter()
+                        .map(|agent| (agent.id, agent.name.clone()))
+                        .collect(),
+                    ticket: ticket.clone(),
+                    to: TicketStage::Rejected,
+                    reason: Some(reason),
+                }))
+            },
+            |ticket, input| Dialog::RejectReason { ticket, input },
+        )
+    }
+
+    /// The live agents of `owner` in this nick, in the order they were opened.
+    fn live_of(&self, owner: Owner) -> Vec<&RunningAgent> {
+        self.agents.iter().filter(|a| a.owner == owner).collect()
+    }
+
+    /// NS-61, D6: whether rejecting the ticket (`to` is Rejeitado) is refused because it has an
+    /// `active` agent of another nick (this nick can't end it: the mold of `removal_refusal`),
+    /// read from the database now; then the bar says why. A database error refuses too. Any other
+    /// stage is never refused here.
+    fn rejection_refused(&mut self, ticket: &Ticket, to: TicketStage) -> bool {
+        if to != TicketStage::Rejected {
+            return false;
+        }
+        let refusal = match self.db.list_ticket_agents(ticket.id) {
+            Ok(agents) => self.active_elsewhere(&agents).then(|| {
+                format!(
+                    "O ticket {} tem agente ativo em outro nick. Encerre os agentes dele lá antes \
+                     de rejeitar o ticket.",
+                    ticket.key
+                )
+            }),
+            Err(err) => Some(projects::db_error_message(&err)),
+        };
+        let refused = refusal.is_some();
+        if refused {
+            self.status = refusal;
+        }
+        refused
+    }
+
+    /// After the stage of `ticket` was written (`message`): a rejection with live agents of it in
+    /// this nick asks the loop to end them (`Action::EndRejectedAgents`, NS-61, D6); otherwise the
+    /// message goes to the bar.
+    fn stage_changed(&mut self, ticket: &Ticket, to: TicketStage, message: String) -> Action {
+        let live: Vec<i64> = match to {
+            TicketStage::Rejected => self
+                .live_of(Owner::Ticket(ticket.id))
+                .into_iter()
+                .map(|agent| agent.id)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if live.is_empty() {
+            self.status = Some(message);
+            return Action::None;
+        }
+        Action::EndRejectedAgents {
+            agents: live,
+            message,
+        }
+    }
+
+    /// `Action::EndRejectedAgents` (NS-61, D6; the sessions of `ended` already terminated by the
+    /// loop): their records end and their locks go, as when the operator ends one (`x`), and the
+    /// bar says the change of the stage (`message`) and that they were ended.
+    pub fn end_agents_of_rejected(&mut self, ended: &[i64], message: String) {
+        let ended = self.end_records(ended);
+        self.status = Some(format!("{message}{ended}"));
+        self.refresh_tree();
     }
 
     /// The field of the new ID: Enter runs the checks 1 to 5 of plan D5 of NS-36, renaming
@@ -3118,18 +3296,24 @@ impl App {
         });
     }
 
-    /// The refusal of removing `project` when one of its `agents` is active in another nick.
-    fn removal_refusal(&self, project: &Project, agents: &[Agent]) -> Option<String> {
+    /// Whether one of `agents` is active in another nick: `active` in the database, with no
+    /// session in this one (this nick can't end it). The rule of the removal of a project (NS-38)
+    /// and of the rejection of a ticket (NS-61).
+    fn active_elsewhere(&self, agents: &[Agent]) -> bool {
         agents
             .iter()
             .any(|a| a.state == agents::AgentState::Active.key() && self.agent(a.id).is_none())
-            .then(|| {
-                format!(
-                    "O projeto {} tem agente ativo em outro nick. Encerre os agentes dele lá antes \
+    }
+
+    /// The refusal of removing `project` when one of its `agents` is active in another nick.
+    fn removal_refusal(&self, project: &Project, agents: &[Agent]) -> Option<String> {
+        self.active_elsewhere(agents).then(|| {
+            format!(
+                "O projeto {} tem agente ativo em outro nick. Encerre os agentes dele lá antes \
                      de remover o projeto.",
-                    project.name
-                )
-            })
+                project.name
+            )
+        })
     }
 
     fn key_confirm_remove(&mut self, key: KeyEvent, project: Project) -> Action {
@@ -3172,6 +3356,20 @@ impl App {
     /// records end and their locks go, as when the operator ends one (`x`), then the project is
     /// removed (its tickets and agents leave the database with it, by the cascade).
     pub fn remove_project_ending_agents(&mut self, project: &Project, ended: &[i64]) {
+        let ended = self.end_records(ended);
+        let message = match projects::remove(&self.db, project) {
+            Ok(message) | Err(message) => message,
+        };
+        self.status = Some(format!("{message}{ended}"));
+        self.refresh_tree();
+    }
+
+    /// Ends the records of the live agents `ended` (their sessions already terminated by the
+    /// loop) and releases their locks, as when the operator ends one (`x`), and gives what the bar
+    /// says of them after the message of the action: ` O agente <nome> foi encerrado.` or ` Os <N>
+    /// agentes vivos dele foram encerrados.`, and the first error, if any (empty when none was
+    /// live). Used by the removal of a project (NS-38) and by the rejection of a ticket (NS-61).
+    fn end_records(&mut self, ended: &[i64]) -> String {
         let mut names = Vec::new();
         let mut error = None;
         for id in ended {
@@ -3182,24 +3380,15 @@ impl App {
                 }
             }
         }
-        let mut message = match projects::remove(&self.db, project) {
-            Ok(message) | Err(message) => message,
+        let mut said = match names.as_slice() {
+            [] => String::new(),
+            [name] => format!(" O agente {name} foi encerrado."),
+            _ => format!(" Os {} agentes vivos dele foram encerrados.", names.len()),
         };
-        match names.as_slice() {
-            [] => {}
-            [name] => message = format!("{message} O agente {name} foi encerrado."),
-            _ => {
-                message = format!(
-                    "{message} Os {} agentes vivos dele foram encerrados.",
-                    names.len()
-                );
-            }
-        }
         if let Some(err) = error {
-            message = format!("{message} {err}");
+            said = format!("{said} {err}");
         }
-        self.status = Some(message);
-        self.refresh_tree();
+        said
     }
 
     /// After a registration: the status message and the new project selected.
@@ -6674,7 +6863,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn m_lists_the_six_stages_and_only_s_changes_the_stage() {
+    fn m_lists_the_seven_stages_and_only_s_changes_the_stage() {
         let (mut f, _) = with_agents();
         f.key(KeyCode::Enter);
         assert_eq!(f.ch('m'), Action::None);
@@ -6695,6 +6884,12 @@ pub(crate) mod tests {
         for _ in 0..9 {
             f.key(KeyCode::Down);
         }
+        // NS-61: Rejeitado is the last one; the indexes of before did not change.
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { index: 6, .. })
+        ));
+        f.key(KeyCode::Up);
         assert!(matches!(
             f.app.dialog,
             Some(Dialog::ChooseTicketStage { index: 5, .. })
@@ -6704,7 +6899,9 @@ pub(crate) mod tests {
             f.app.dialog,
             Some(Dialog::ConfirmStageChange {
                 ticket: f.detail().ticket.clone(),
-                to: TicketStage::Done
+                to: TicketStage::Done,
+                reason: None,
+                live: Vec::new(),
             })
         );
         // Any other key cancels, nothing stored.
@@ -6950,7 +7147,13 @@ pub(crate) mod tests {
     #[test]
     fn the_operator_moves_the_ticket_to_open_from_any_stage() {
         let (mut f, _) = with_agents();
-        for stage in TicketStage::ALL.into_iter().skip(1) {
+        // The six of before (NS-61: out of Rejeitado, with its reason, in
+        // `rejecting_by_m_asks_the_reason_then_the_confirmation`).
+        for stage in TicketStage::ALL
+            .into_iter()
+            .skip(1)
+            .filter(|s| *s != TicketStage::Rejected)
+        {
             f.operator_moves("NS-1", stage);
             f.choose_ticket_stage(TicketStage::Open);
             f.ch('s');
@@ -9485,6 +9688,12 @@ pub(crate) mod tests {
             Dialog::ConfirmStageChange {
                 ticket: ticket.clone(),
                 to: TicketStage::Done,
+                reason: None,
+                live: Vec::new(),
+            },
+            Dialog::RejectReason {
+                ticket: ticket.clone(),
+                input: String::new(),
             },
             Dialog::EditId {
                 ticket: ticket.clone(),
@@ -9508,7 +9717,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn only_the_seven_dialogs_with_a_text_field_take_text() {
+    fn only_the_eight_dialogs_with_a_text_field_take_text() {
         let dialogs = one_of_each_dialog();
         let text: Vec<String> = dialogs
             .iter()
@@ -9524,15 +9733,16 @@ pub(crate) mod tests {
                 "EditEpicTitle",
                 "EditEpicId",
                 "StageForm",
+                "RejectReason",
                 "EditId"
             ]
         );
-        // Every variant is in the list (the 24 of the enum), each once.
+        // Every variant is in the list (the 25 of the enum, NS-61), each once.
         let mut names: Vec<String> = dialogs.iter().map(variant).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 24);
-        assert_eq!(dialogs.len(), 24);
+        assert_eq!(names.len(), 25);
+        assert_eq!(dialogs.len(), 25);
     }
 
     #[test]
@@ -9544,12 +9754,12 @@ pub(crate) mod tests {
             .map(variant)
             .collect();
         assert_eq!(irreversible, ["ConfirmRemove"]);
-        // Every variant is in the list (the 24 of the enum), each once.
+        // Every variant is in the list (the 25 of the enum, NS-61), each once.
         let mut names: Vec<String> = dialogs.iter().map(variant).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 24);
-        assert_eq!(dialogs.len(), 24);
+        assert_eq!(names.len(), 25);
+        assert_eq!(dialogs.len(), 25);
     }
 
     /// A letter as the terminal sends it: Caps Lock gives the capital without modifiers, Shift
@@ -9629,7 +9839,8 @@ pub(crate) mod tests {
                     | Dialog::EditTitle { input, .. }
                     | Dialog::EditEpicTitle { input, .. }
                     | Dialog::EditEpicId { input, .. }
-                    | Dialog::EditId { input, .. },
+                    | Dialog::EditId { input, .. }
+                    | Dialog::RejectReason { input, .. },
                 ) => input.clone(),
                 Some(Dialog::NewTicket {
                     title,
@@ -9929,6 +10140,12 @@ pub(crate) mod tests {
             }
             f
         };
+        // NS-61: the reason of a rejection.
+        let reason: fn() -> Fixture = || {
+            let (mut f, _) = with_agents();
+            f.choose_ticket_stage(TicketStage::Rejected);
+            f
+        };
         let typings: [fn(&mut Fixture, &str); 2] = [Fixture::type_text, Fixture::type_shifted];
         for (setup, dialog) in [
             (add_path, "AddPath"),
@@ -9939,6 +10156,7 @@ pub(crate) mod tests {
             (epic_id, "EditEpicId"),
             (edit_id, "EditId"),
             (form_line, "StageForm"),
+            (reason, "RejectReason"),
         ] {
             for typing in typings {
                 let mut f = setup();
@@ -10402,7 +10620,7 @@ pub(crate) mod tests {
                 .get_ticket(self.ticket_of(key).id)
                 .unwrap()
                 .unwrap();
-            tickets::change_stage(&self.app.db, &ticket, to).unwrap();
+            tickets::change_stage(&self.app.db, &ticket, to, None).unwrap();
             self.app.refresh_tree();
         }
 
@@ -10727,5 +10945,490 @@ pub(crate) mod tests {
         f.choose_ticket_stage(TicketStage::Development);
         f.ch('s');
         assert_eq!(f.status(), Some("Etapa do ticket NS-5: Review → Dev."));
+    }
+
+    // ---- NS-61: no agent of a rejected ticket ----
+
+    impl Fixture {
+        /// Rejects the ticket `key` in the database, as another nick (or the operator before)
+        /// would, and reads the tree again.
+        fn reject_in_db(&mut self, key: &str) {
+            let ticket = self.app.db.get_ticket(self.tnode_id(key)).unwrap().unwrap();
+            tickets::change_stage(
+                &self.app.db,
+                &ticket,
+                TicketStage::Rejected,
+                Some("não vale"),
+            )
+            .unwrap();
+            self.app.refresh_tree();
+        }
+
+        /// Moves the ticket `key` in the database (out of Rejeitado, say), and reads the tree
+        /// again.
+        fn stage_in_db(&mut self, key: &str, to: TicketStage) {
+            let ticket = self.app.db.get_ticket(self.tnode_id(key)).unwrap().unwrap();
+            tickets::change_stage(&self.app.db, &ticket, to, None).unwrap();
+            self.app.refresh_tree();
+        }
+
+        /// How many lock files the state directory has.
+        fn lock_files(&self) -> usize {
+            fs::read_dir(self.agents_dir()).map_or(0, |dir| {
+                dir.filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "lock")
+                })
+                .count()
+            })
+        }
+    }
+
+    #[test]
+    fn the_holder_of_a_rejected_ticket_says_so_and_of_an_epic_never() {
+        let (mut f, _) = with_epic();
+        let ticket = f.app.db.get_ticket(f.tnode_id("NS-1")).unwrap().unwrap();
+        assert!(!Holder::from(&ticket).rejected);
+        f.reject_in_db("NS-1");
+        let ticket = f.app.db.get_ticket(f.tnode_id("NS-1")).unwrap().unwrap();
+        assert!(Holder::from(&ticket).rejected);
+        assert!(!Holder::from(&f.epic_of("EPIC-1")).rejected);
+    }
+
+    #[test]
+    fn g_on_a_rejected_ticket_is_refused_with_no_check() {
+        let (mut f, _) = with_agents();
+        f.reject_in_db("NS-1");
+        f.select(f.tnode("NS-1"));
+        assert_eq!(f.ch('g'), Action::None);
+        assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
+        assert_eq!(
+            tickets::REJECTED_AGENT_MESSAGE,
+            "ticket rejeitado: mude a etapa com m antes de abrir um agente"
+        );
+        assert_eq!(f.app.dialog, None);
+        // The other ticket still opens.
+        f.select(f.tnode("NS-2"));
+        assert!(matches!(f.ch('g'), Action::CheckAgent { .. }));
+    }
+
+    #[test]
+    fn r_on_a_stopped_agent_of_a_rejected_ticket_is_refused_before_the_check() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let checks = launcher.checks.len();
+        f.reject_in_db("NS-2");
+        f.select(Fixture::anode(id));
+        assert!(!f.r(&mut launcher), "no CheckResume");
+        assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
+        assert_eq!(launcher.checks.len(), checks, "no --check");
+        assert_eq!(launcher.conversations, Vec::<String>::new());
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    #[test]
+    fn n_on_the_lost_conversation_of_a_ticket_rejected_meanwhile_is_refused() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let Action::CheckResume { project, agent } = f.ch('r') else {
+            panic!("no CheckResume");
+        };
+        // Another nick rejects it during the check of the resume.
+        f.reject_in_db("NS-2");
+        launcher.conversation = Ok(false);
+        f.app.check_resume(&project, &agent, &mut launcher);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConversationLost { .. })
+        ));
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    #[test]
+    fn a_resume_of_a_ticket_rejected_meanwhile_is_refused_and_takes_no_lock() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let spawns = launcher.spawns.len();
+        let Action::CheckResume { project, agent } = f.ch('r') else {
+            panic!("no CheckResume");
+        };
+        f.reject_in_db("NS-2");
+        f.app.check_resume(&project, &agent, &mut launcher);
+        assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
+        assert_eq!(launcher.resumes, [], "nothing resumed");
+        assert_eq!(launcher.spawns.len(), spawns);
+        assert_eq!(f.state_of(id), "stopped");
+        assert!(!agents::lock_path(&f.agents_dir(), &f.session_of(id)).exists());
+        assert!(f.app.agent(id).is_none());
+    }
+
+    #[test]
+    fn an_opening_of_a_ticket_rejected_meanwhile_is_refused_and_stores_nothing() {
+        let (mut f, _) = with_agents();
+        let mut launcher = FakeLauncher::new(false);
+        f.select(f.tnode("NS-1"));
+        f.g(&mut launcher);
+        f.pick(StageType::PoDiscussion);
+        assert_eq!(f.fill_and_enter(), Action::RenderPrompt);
+        f.app.render_prompt(&mut launcher);
+        let Action::OpenAgent {
+            project,
+            holder,
+            kind,
+            log,
+            precheck,
+        } = f.ch('s')
+        else {
+            panic!("no OpenAgent");
+        };
+        // Another nick rejects it between the preview and the launch.
+        f.reject_in_db("NS-1");
+        f.app
+            .open_agent(&project, &holder, kind, &log, precheck, &mut launcher);
+        assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
+        assert_eq!(f.agent_rows(), [], "no row");
+        assert_eq!(launcher.spawns, [], "no spawn");
+        assert_eq!(f.lock_files(), 0, "no lock");
+        assert_eq!(f.stage_of("NS-1"), "rejected", "no advance");
+    }
+
+    #[test]
+    fn out_of_rejected_by_m_an_agent_opens_and_resumes_again() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        f.reject_in_db("NS-2");
+        f.select(Fixture::anode(id));
+        assert!(!f.r(&mut launcher));
+        f.stage_in_db("NS-2", TicketStage::TechLeader);
+        f.select(Fixture::anode(id));
+        assert!(f.r(&mut launcher), "r works again");
+        assert_eq!(f.state_of(id), "active");
+        assert_eq!(launcher.resumes.len(), 1);
+        f.shortcut();
+        f.reject_in_db("NS-1");
+        f.select(f.tnode("NS-1"));
+        assert_eq!(f.ch('g'), Action::None);
+        f.stage_in_db("NS-1", TicketStage::Open);
+        f.select(f.tnode("NS-1"));
+        assert!(
+            matches!(f.ch('g'), Action::CheckAgent { .. }),
+            "g works again"
+        );
+    }
+
+    #[test]
+    fn an_agent_of_an_epic_opens_with_a_rejected_ticket_in_the_epic() {
+        let (mut f, _) = with_epic();
+        let epic = f.epic_of("EPIC-1");
+        f.app
+            .db
+            .set_ticket_epic(f.tnode_id("NS-1"), Some(epic.id))
+            .unwrap();
+        f.reject_in_db("NS-1");
+        f.select(NodeId::Epic(epic.id));
+        let mut launcher = FakeLauncher::new(true);
+        f.open_kind(StageType::PoDiscussion, &mut launcher);
+        assert_eq!(launcher.spawns.len(), 1, "it opened");
+        assert_eq!(f.agent_rows().len(), 1);
+        assert_eq!(f.stage_of("NS-1"), "rejected");
+    }
+
+    // ---- NS-61: rejecting by m, with the reason and the confirmation ----
+
+    impl Fixture {
+        /// The history of the ticket `key` with the reason of each change (NS-61).
+        fn reasons_of(&self, key: &str) -> Vec<(String, String, Option<String>)> {
+            let id = self.tnode_id(key);
+            self.app
+                .db
+                .list_stage_changes(id)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.from_stage, c.to_stage, c.reason))
+                .collect()
+        }
+
+        /// From the node of the ticket `key`: `m`, Rejeitado, the reason typed and Enter (the
+        /// confirmation, when the reason passes).
+        fn ask_rejection(&mut self, key: &str, reason: &str) {
+            self.select(self.tnode(key));
+            self.choose_ticket_stage(TicketStage::Rejected);
+            assert!(
+                matches!(self.app.dialog, Some(Dialog::RejectReason { .. })),
+                "{:?}",
+                self.app.dialog
+            );
+            self.type_text(reason);
+            assert_eq!(self.key(KeyCode::Enter), Action::None);
+        }
+    }
+
+    #[test]
+    fn rejecting_by_m_asks_the_reason_then_the_confirmation() {
+        let (mut f, _) = with_agents();
+        f.select(f.tnode("NS-1"));
+        let ticket = f.detail().ticket.clone();
+        f.choose_ticket_stage(TicketStage::Rejected);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::RejectReason {
+                ticket: ticket.clone(),
+                input: String::new()
+            })
+        );
+        // Esc in the field changes nothing.
+        f.key(KeyCode::Esc);
+        assert_eq!(f.app.dialog, None);
+        // An empty reason, only blanks, and a long one: refused with the field open.
+        f.choose_ticket_stage(TicketStage::Rejected);
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Informe o motivo da rejeição."));
+        assert!(matches!(f.app.dialog, Some(Dialog::RejectReason { .. })));
+        f.type_text("   ");
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("Informe o motivo da rejeição."));
+        f.key(KeyCode::Esc);
+        f.ask_rejection("NS-1", &"x".repeat(121));
+        assert_eq!(
+            f.status(),
+            Some("O motivo tem 121 caracteres; o limite é 120.")
+        );
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::RejectReason {
+                ticket: ticket.clone(),
+                input: "x".repeat(121)
+            }),
+            "open, with what was typed"
+        );
+        f.key(KeyCode::Esc);
+        assert_eq!(f.stage_of("NS-1"), "open");
+        // The confirmation, with the reason trimmed; any key but s cancels.
+        f.ask_rejection("NS-1", "  fora do escopo  ");
+        assert_eq!(f.status(), None);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmStageChange {
+                ticket: ticket.clone(),
+                to: TicketStage::Rejected,
+                reason: Some("fora do escopo".into()),
+                live: Vec::new(),
+            })
+        );
+        assert_eq!(f.ch('n'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        f.ask_rejection("NS-1", "fora do escopo");
+        assert_eq!(f.key(KeyCode::Enter), Action::None);
+        assert_eq!(f.stage_of("NS-1"), "open");
+        assert_eq!(f.reasons_of("NS-1"), []);
+        // s stores it, with the reason in the history.
+        f.ask_rejection("NS-1", "  fora do escopo  ");
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("Etapa do ticket NS-1: Aberto → Rejeitado.")
+        );
+        assert_eq!(f.stage_of("NS-1"), "rejected");
+        assert_eq!(
+            f.reasons_of("NS-1"),
+            [(
+                "open".into(),
+                "rejected".into(),
+                Some("fora do escopo".into())
+            )]
+        );
+        // m starts on Rejeitado; Enter on it is the same stage.
+        f.ch('m');
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { index: 6, .. })
+        ));
+        f.key(KeyCode::Enter);
+        assert_eq!(f.status(), Some("O ticket NS-1 já está em Rejeitado."));
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ChooseTicketStage { .. })
+        ));
+        f.key(KeyCode::Esc);
+        // Out of Rejeitado by m, to any stage, with no reason.
+        f.choose_ticket_stage(TicketStage::Development);
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmStageChange {
+                ticket: f.detail().ticket.clone(),
+                to: TicketStage::Development,
+                reason: None,
+                live: Vec::new(),
+            })
+        );
+        f.ch('s');
+        assert_eq!(f.status(), Some("Etapa do ticket NS-1: Rejeitado → Dev."));
+        assert_eq!(
+            f.reasons_of("NS-1")[1],
+            ("rejected".into(), "development".into(), None)
+        );
+        // And back to Aberto, from Rejeitado.
+        f.ask_rejection("NS-1", "de novo");
+        f.ch('s');
+        f.choose_ticket_stage(TicketStage::Open);
+        f.ch('s');
+        assert_eq!(
+            f.status(),
+            Some("Etapa do ticket NS-1: Rejeitado → Aberto.")
+        );
+        assert_eq!(f.reasons_of("NS-1").len(), 4);
+    }
+
+    #[test]
+    fn rejecting_is_refused_with_an_agent_active_in_another_nick_at_the_choice_and_at_the_s() {
+        let (mut f, _) = with_agents();
+        let refusal = "O ticket NS-1 tem agente ativo em outro nick. Encerre os agentes dele lá \
+                       antes de rejeitar o ticket.";
+        let other = f.foreign_agent("NS-1", "s-other");
+        f.select(f.tnode("NS-1"));
+        f.choose_ticket_stage(TicketStage::Rejected);
+        assert_eq!(f.status(), Some(refusal));
+        assert!(
+            matches!(f.app.dialog, Some(Dialog::ChooseTicketStage { .. })),
+            "the dialog of the stages stays open"
+        );
+        f.key(KeyCode::Esc);
+        // A stopped agent does not matter.
+        f.app.db.stop_agent(other).unwrap();
+        f.ask_rejection("NS-1", "não vale");
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConfirmStageChange { .. })
+        ));
+        // Another nick opens one meanwhile: refused at the s, nothing stored.
+        f.app
+            .db
+            .insert_agent(
+                Owner::Ticket(f.tnode_id("NS-1")),
+                "po",
+                "s-other-2",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(f.status(), Some(refusal));
+        assert_eq!(f.stage_of("NS-1"), "open");
+        assert_eq!(f.reasons_of("NS-1"), []);
+        // The other stages do not check it.
+        f.choose_ticket_stage(TicketStage::Po);
+        f.ch('s');
+        assert_eq!(f.stage_of("NS-1"), "po");
+    }
+
+    #[test]
+    fn rejecting_with_live_agents_warns_writes_first_and_then_ends_them() {
+        let (mut f, mut launcher) = running();
+        let first = launcher.ids[0];
+        f.shortcut();
+        f.ask_rejection("NS-2", "não vale");
+        let ticket = f.app.db.get_ticket(f.tnode_id("NS-2")).unwrap().unwrap();
+        assert_eq!(
+            f.app.dialog,
+            Some(Dialog::ConfirmStageChange {
+                ticket,
+                to: TicketStage::Rejected,
+                reason: Some("não vale".into()),
+                live: vec![(first, TL_NAME.into())],
+            })
+        );
+        let message = "Etapa do ticket NS-2: Tech Leader → Rejeitado.";
+        assert_eq!(
+            f.ch('s'),
+            Action::EndRejectedAgents {
+                agents: vec![first],
+                message: message.into(),
+            }
+        );
+        // The stage is written before the loop ends the agent.
+        assert_eq!(f.stage_of("NS-2"), "rejected");
+        assert!(
+            f.app.agent(first).is_some(),
+            "still live until the loop ends it"
+        );
+        let session = f.session_of(first);
+        f.app.end_agents_of_rejected(&[first], message.into());
+        assert_eq!(
+            f.status(),
+            Some(
+                "Etapa do ticket NS-2: Tech Leader → Rejeitado. O agente proj · Tech Leader · \
+                 NS-2 foi encerrado."
+            )
+        );
+        assert!(f.app.agent(first).is_none());
+        assert_eq!(f.state_of(first), "stopped");
+        assert!(!agents::lock_path(&f.agents_dir(), &session).exists());
+        // The resume is refused while it is rejected.
+        f.select(Fixture::anode(first));
+        assert!(!f.r(&mut launcher));
+        assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
+    }
+
+    #[test]
+    fn rejecting_with_two_live_agents_ends_both_and_says_how_many() {
+        let (mut f, mut launcher) = running();
+        f.shortcut();
+        f.select(f.tnode("NS-2"));
+        f.open_kind(StageType::Review, &mut launcher);
+        let ids = launcher.ids.clone();
+        assert_eq!(ids.len(), 2);
+        f.shortcut();
+        f.ask_rejection("NS-2", "não vale");
+        let Some(Dialog::ConfirmStageChange { live, .. }) = &f.app.dialog else {
+            panic!("{:?}", f.app.dialog);
+        };
+        assert_eq!(
+            live.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ids,
+            "both, in the order they were opened"
+        );
+        let Action::EndRejectedAgents { agents, message } = f.ch('s') else {
+            panic!("no EndRejectedAgents");
+        };
+        assert_eq!(agents, ids);
+        f.app.end_agents_of_rejected(&agents, message);
+        assert_eq!(
+            f.status(),
+            Some(
+                "Etapa do ticket NS-2: Review → Rejeitado. Os 2 agentes vivos dele foram encerrados."
+            )
+        );
+        assert!(ids.iter().all(|id| f.app.agent(*id).is_none()));
+    }
+
+    #[test]
+    fn a_failing_write_of_the_rejection_ends_no_agent() {
+        let (mut f, launcher) = running();
+        let first = launcher.ids[0];
+        f.shortcut();
+        f.ask_rejection("NS-2", "não vale");
+        // Another nick moves the stage between the dialog and the s.
+        f.stage_in_db("NS-2", TicketStage::Development);
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(
+            f.status(),
+            Some("A etapa do ticket NS-2 mudou em outro nick. Nada foi gravado.")
+        );
+        assert!(f.app.agent(first).is_some(), "still live");
+        assert_eq!(f.stage_of("NS-2"), "development");
+    }
+
+    #[test]
+    fn another_stage_with_a_live_agent_ends_nothing() {
+        let (mut f, launcher) = running();
+        let first = launcher.ids[0];
+        f.shortcut();
+        f.select(f.tnode("NS-2"));
+        f.choose_ticket_stage(TicketStage::Done);
+        assert_eq!(f.ch('s'), Action::None);
+        assert_eq!(f.stage_of("NS-2"), "done");
+        assert!(f.app.agent(first).is_some());
     }
 }

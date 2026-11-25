@@ -16,7 +16,7 @@ use crate::agents::{self, Agent, AgentState, Holder, Owner};
 use crate::app::{
     App, Button, Dialog, EpicDetail, NewItem, Row, RunningAgent, Screen, TicketDetail, TicketField,
 };
-use crate::db::Epic;
+use crate::db::{Epic, StageChangeRow};
 use crate::docs;
 use crate::launch::{Precheck, Rendered};
 use crate::marquee;
@@ -46,6 +46,10 @@ pub const STAGE_BLUE: Color = Color::LightBlue;
 /// The orange of Dev and Review (NS-45): the 208 of the 256 palette (approximated with 16 colors).
 pub const STAGE_ORANGE: Color = Color::Indexed(208);
 
+/// The gray of a rejected ticket (NS-61, D9): the whole label on the tree, and the mark on the
+/// panel. The 8 of the 16 colors (`Idx(8)` in the vt100).
+pub const STAGE_GRAY: Color = Color::DarkGray;
+
 /// The color of the ID and of the title of an epic on the tree (NS-45).
 pub const EPIC_COLOR: Color = Color::Magenta;
 
@@ -56,6 +60,7 @@ pub fn stage_color(stage: TicketStage) -> Color {
         TicketStage::Po | TicketStage::TechLeader => STAGE_BLUE,
         TicketStage::Development | TicketStage::Review => STAGE_ORANGE,
         TicketStage::Done => Color::Green,
+        TicketStage::Rejected => STAGE_GRAY,
     }
 }
 
@@ -507,6 +512,11 @@ fn dialog_keys(dialog: &Dialog) -> &'static str {
         Dialog::ConfirmQuit => "s encerrar e sair · qualquer outra tecla cancela",
         Dialog::CaptureShortcut { .. } => "Esc cancelar",
         Dialog::ChooseTicketStage { .. } => "↑/↓ escolher · Enter escolher · Esc cancelar",
+        Dialog::RejectReason { .. } => "Enter confirmar · Esc cancelar",
+        Dialog::ConfirmStageChange {
+            to: TicketStage::Rejected,
+            ..
+        } => "s rejeitar · qualquer outra tecla cancela",
         Dialog::ConfirmStageChange { .. } => "s mudar · qualquer outra tecla cancela",
         Dialog::EditId { .. } => "Enter confirmar · Esc cancelar",
         Dialog::ConfirmEditId { .. } => "s trocar · qualquer outra tecla cancela",
@@ -750,8 +760,8 @@ fn stage_mark(key: &str) -> Span<'static> {
 }
 
 /// A stage in its color (`stage_color`, NS-45): `[<label>]` with `brackets` (the tree), the label
-/// alone without (the "Etapa atual:" of the panel); Done is always `[✓ Concluído]`. An unknown key
-/// shows raw, with no color.
+/// alone without (the "Etapa atual:" of the panel); Done is always `[✓ Concluído]`, and Rejected
+/// `[✗ Rejeitado]` (NS-61, D9). An unknown key shows raw, with no color.
 fn stage_span(key: &str, brackets: bool) -> Span<'static> {
     let Some(stage) = TicketStage::from_key(key) else {
         let raw = printable(key);
@@ -759,6 +769,7 @@ fn stage_span(key: &str, brackets: bool) -> Span<'static> {
     };
     let text = match stage {
         TicketStage::Done => format!("[✓ {}]", stage.label()),
+        TicketStage::Rejected => format!("[✗ {}]", stage.label()),
         _ if brackets => format!("[{}]", stage.label()),
         _ => stage.label().to_string(),
     };
@@ -793,7 +804,9 @@ fn project_spans(row: &Row) -> (Vec<Span<'static>>, Style) {
 }
 
 /// The label of a ticket: `<ID>  [<etapa>]  <título>  [provisório]  [oculto]` (the stage right
-/// after the ID: the end of the row is cut at 40 columns, NS-36); dimmed when hidden.
+/// after the ID: the end of the row is cut at 40 columns, NS-36); dimmed when hidden; a rejected
+/// one in `STAGE_GRAY`, the whole label (NS-61, D9: the style of the row, so the `…` and the
+/// window of the marquee keep it).
 fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
     let mut spans = vec![
         Span::raw(printable(&ticket.key)),
@@ -809,6 +822,9 @@ fn ticket_spans(ticket: &Ticket) -> (Vec<Span<'static>>, Style) {
     if ticket.hidden_at.is_some() {
         spans.push(Span::raw("  [oculto]"));
         style = style.add_modifier(Modifier::DIM);
+    }
+    if tickets::is_rejected(ticket) {
+        style = style.fg(STAGE_GRAY);
     }
     (spans, style)
 }
@@ -1285,12 +1301,25 @@ fn draw_ticket_detail(
         )));
     } else {
         let slots = usize::from(history_area.height.saturating_sub(1));
-        let mut shown = &detail.changes[..];
-        if shown.len() > slots {
-            let keep = slots.saturating_sub(1);
-            let older = shown.len() - keep;
+        let changes = &detail.changes[..];
+        // NS-61, D10: the cut counts rows (a rejection takes two, with its reason), and keeps the
+        // newest changes whole, with a row for the count of the older ones on top.
+        let rows = |change: &StageChangeRow| 1 + usize::from(change.reason.is_some());
+        let mut shown = changes;
+        if changes.iter().map(rows).sum::<usize>() > slots {
+            let room = slots.saturating_sub(1);
+            let mut used = 0;
+            let keep = changes
+                .iter()
+                .rev()
+                .take_while(|change| {
+                    used += rows(change);
+                    used <= room
+                })
+                .count();
+            let older = changes.len() - keep;
             history.push(Line::from(format!("(+{older} mudanças mais antigas)")));
-            shown = &shown[older..];
+            shown = &changes[older..];
         }
         for change in shown {
             // The source at the end (NS-45): the date and the stages are not cut at 40 columns.
@@ -1301,6 +1330,11 @@ fn draw_ticket_detail(
                 printable(&tickets::stage_label(&change.to_stage)),
                 printable(&tickets::source_label(&change.source))
             )));
+            // NS-61, D10: the reason of a rejection on its own line, right below (the cut at 40
+            // columns takes the end of the reason, not the date nor the stages).
+            if let Some(reason) = &change.reason {
+                history.push(Line::from(format!("    Motivo: {}", printable(reason))));
+            }
         }
     }
     frame.render_widget(Paragraph::new(history), history_area);
@@ -1428,33 +1462,88 @@ fn holder_line(holder: &Holder) -> String {
     )
 }
 
-/// The lines of the dialog of the title of a ticket or of an epic (review of the NS-40, P2.1: one
-/// drawing for both), with the cursor after `typed` (the field already cut to the box).
-fn title_lines(key: &str, typed: String) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
+/// The lines of a dialog with a one-line text field: the `header`, a blank line, the `label` and
+/// `typed` (the field already cut to the box), with the cursor after it.
+fn text_field_lines(
+    header: String,
+    label: String,
+    typed: String,
+) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
     let cursor = typed.chars().count();
     (
         vec![
-            Line::from(format!("ID: {}", printable(key))),
+            Line::from(header),
             Line::from(""),
-            Line::from("Título:"),
+            Line::from(label),
             Line::from(typed),
         ],
         Some((3, cursor)),
     )
 }
 
+/// The lines of the dialog of the title of a ticket or of an epic (review of the NS-40, P2.1: one
+/// drawing for both).
+fn title_lines(key: &str, typed: String) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
+    text_field_lines(format!("ID: {}", printable(key)), "Título:".into(), typed)
+}
+
 /// The lines of the dialog of the new ID of a ticket or of an epic (`noun`).
 fn id_lines(key: &str, noun: &str, typed: String) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
-    let cursor = typed.chars().count();
-    (
-        vec![
-            Line::from(format!("ID atual: {}", printable(key))),
-            Line::from(""),
-            Line::from(format!("Novo ID do {noun} (ex: SC-123):")),
-            Line::from(typed),
-        ],
-        Some((3, cursor)),
+    text_field_lines(
+        format!("ID atual: {}", printable(key)),
+        format!("Novo ID do {noun} (ex: SC-123):"),
+        typed,
     )
+}
+
+/// The lines of the dialog of the reason of a rejection (NS-61, D4).
+fn reason_lines(ticket: &Ticket, typed: String) -> (Vec<Line<'static>>, Option<(u16, usize)>) {
+    text_field_lines(
+        format!(
+            "Ticket {} — {}",
+            printable(&ticket.key),
+            printable(&ticket.title)
+        ),
+        format!(
+            "Motivo da rejeição (até {} caracteres):",
+            tickets::REJECT_REASON_MAX
+        ),
+        typed,
+    )
+}
+
+/// The confirmation of rejecting `ticket` (NS-61, D4): the stage it leaves and the `reason`, then,
+/// with `live` agents of it in this nick, the warning of which ones the rejection ends.
+fn rejection_lines(
+    ticket: &Ticket,
+    reason: Option<&str>,
+    live: &[(i64, String)],
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(format!(
+        "Rejeitar o ticket {} (de {})? Motivo: {} (s/N)",
+        printable(&ticket.key),
+        printable(&tickets::stage_label(&ticket.stage)),
+        printable(reason.unwrap_or_default())
+    ))];
+    let warning = match live {
+        [] => None,
+        [(_, name)] => Some(format!(
+            "Aviso: o agente {} será encerrado.",
+            printable(name)
+        )),
+        _ => Some(format!(
+            "Aviso: {} agentes vivos deste ticket serão encerrados: {}.",
+            live.len(),
+            live.iter()
+                .map(|(_, name)| printable(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    };
+    if let Some(warning) = warning {
+        lines.extend([Line::from(""), Line::from(warning)]);
+    }
+    lines
 }
 
 /// The question of the new ID of a ticket or of an epic (`whose`: `o ticket`, `o épico`, what the
@@ -1782,7 +1871,21 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             }
             (" Mudar etapa ", lines, None)
         }
-        Dialog::ConfirmStageChange { ticket, to } => (
+        Dialog::RejectReason { ticket, input } => {
+            let (lines, cursor) = reason_lines(ticket, field(input));
+            (" Rejeitar ticket ", lines, cursor)
+        }
+        Dialog::ConfirmStageChange {
+            ticket,
+            to: TicketStage::Rejected,
+            reason,
+            live,
+        } => (
+            " Rejeitar ticket ",
+            rejection_lines(ticket, reason.as_deref(), live),
+            None,
+        ),
+        Dialog::ConfirmStageChange { ticket, to, .. } => (
             " Mudar etapa ",
             vec![Line::from(format!(
                 "Mudar a etapa do ticket {} de {} para {}? (s/N)",
@@ -3365,6 +3468,7 @@ mod tests {
             from_stage: from.into(),
             to_stage: to.into(),
             source: source.into(),
+            reason: None,
             changed_at: at.into(),
         }
     }
@@ -3394,6 +3498,8 @@ mod tests {
         f.app.dialog = Some(Dialog::ConfirmStageChange {
             ticket: t.clone(),
             to: TicketStage::Done,
+            reason: None,
+            live: Vec::new(),
         });
         let buffer = render(&f.app);
         assert!(
@@ -5357,7 +5463,8 @@ mod tests {
                 STAGE_BLUE,
                 STAGE_ORANGE,
                 STAGE_ORANGE,
-                Color::Green
+                Color::Green,
+                STAGE_GRAY
             ]
         );
         for stage in TicketStage::ALL {
@@ -5384,7 +5491,12 @@ mod tests {
             unreachable!()
         };
         f.app.select(NodeId::Ticket(id));
-        for stage in TicketStage::ALL {
+        // The six of before (NS-61: Rejeitado is gray in the whole label, in
+        // `a_rejected_ticket_is_gray_with_its_mark_on_the_tree_and_on_the_panel`).
+        for stage in TicketStage::ALL
+            .into_iter()
+            .filter(|s| *s != TicketStage::Rejected)
+        {
             db.connection()
                 .execute(
                     "UPDATE tickets SET stage = ?2 WHERE id = ?1",
@@ -6042,6 +6154,284 @@ mod tests {
                         .collect::<Vec<_>>(),
                 );
                 assert_eq!(now, before, "{width}x{height}, column {k}");
+            }
+        }
+    }
+
+    // ---- NS-61: the stage Rejeitado ----
+
+    /// A change to Rejeitado with its reason.
+    fn rejection(from: &str, reason: &str, at: &str) -> StageChangeRow {
+        StageChangeRow {
+            reason: Some(reason.into()),
+            ..change(from, "rejected", at)
+        }
+    }
+
+    #[test]
+    fn the_mark_and_the_color_of_rejeitado() {
+        assert_eq!(STAGE_GRAY, Color::DarkGray);
+        assert_eq!(stage_color(TicketStage::Rejected), STAGE_GRAY);
+        for brackets in [true, false] {
+            let span = stage_span("rejected", brackets);
+            assert_eq!(span.content, "[✗ Rejeitado]", "always with the mark");
+            assert_eq!(span.style.fg, Some(STAGE_GRAY));
+        }
+        assert_eq!(stage_mark("rejected").content, "[✗ Rejeitado]");
+        // The six of before keep their marks.
+        assert_eq!(stage_span("done", false).content, "[✓ Concluído]");
+        assert_eq!(stage_span("review", false).content, "Review");
+        assert_eq!(stage_mark("review").content, "[Review]");
+    }
+
+    #[test]
+    fn the_label_of_a_rejected_ticket_is_gray_and_dimmed_when_hidden() {
+        let (spans, style) = ticket_spans(&staged(4, "NS-4", "Quatro", "rejected", false));
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "NS-4  [✗ Rejeitado]  Quatro");
+        assert_eq!(style.fg, Some(STAGE_GRAY), "the whole label");
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+        let mut hidden = staged(4, "NS-4", "Quatro", "rejected", true);
+        hidden.is_provisional = true;
+        let (spans, style) = ticket_spans(&hidden);
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "NS-4  [✗ Rejeitado]  Quatro  [provisório]  [oculto]");
+        assert_eq!(style.fg, Some(STAGE_GRAY));
+        assert!(
+            style.add_modifier.contains(Modifier::DIM),
+            "gray and dimmed"
+        );
+        // Another stage: the label with no color, as before.
+        let (_, style) = ticket_spans(&staged(4, "NS-4", "Quatro", "review", false));
+        assert_eq!(style.fg, None);
+    }
+
+    #[test]
+    fn a_rejected_ticket_is_gray_with_its_mark_on_the_tree_and_on_the_panel() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let NodeId::Ticket(id) = tnode(&f.app, "NS-1") else {
+            unreachable!()
+        };
+        db.connection()
+            .execute("UPDATE tickets SET stage = 'rejected' WHERE id = ?1", [id])
+            .unwrap();
+        // NS-1 not selected: its row, whole, in gray.
+        f.app.select(tnode(&f.app, "NS-2"));
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let row = "NS-1  [✗ Rejeitado]  Um";
+        let (y, x) = find(&buffer, row).unwrap();
+        for i in 0..row.chars().count() as u16 {
+            assert_eq!(buffer[(x + i, y)].fg, STAGE_GRAY, "column {i} of the row");
+        }
+        // Selected: still gray; the panel says the mark, gray.
+        f.app.select(NodeId::Ticket(id));
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 140, 30, None);
+        let (y, x) = find(&buffer, row).unwrap();
+        assert_eq!(buffer[(x, y)].fg, STAGE_GRAY, "the ID");
+        let (y, x) = find(&buffer, "Etapa atual: [✗ Rejeitado]").unwrap();
+        assert_eq!(buffer[(x + 13, y)].fg, STAGE_GRAY);
+        assert_eq!(buffer[(x, y)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn the_gray_of_a_rejected_ticket_holds_on_the_ellipsis_and_on_the_scrolling_row() {
+        let (mut f, root) = with_tree();
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let NodeId::Ticket(id) = tnode(&f.app, "NS-1") else {
+            unreachable!()
+        };
+        db.connection()
+            .execute(
+                "UPDATE tickets SET stage = 'rejected', title = ?2 WHERE id = ?1",
+                rusqlite::params![id, "Um título bem longo que não cabe na coluna da árvore"],
+            )
+            .unwrap();
+        // Not selected, at 40 columns: cut with the ellipsis, the ellipsis gray too.
+        f.app.select(tnode(&f.app, "NS-2"));
+        f.app.refresh_tree();
+        let buffer = render_at(&f.app, 60, 30, None);
+        let (y, x) = find(&buffer, "NS-1  [✗ Rejeitado]").unwrap();
+        let end = (x..buffer.area.width)
+            .find(|c| buffer[(*c, y)].symbol() == "…")
+            .expect("the ellipsis");
+        for c in x..=end {
+            assert_eq!(buffer[(c, y)].fg, STAGE_GRAY, "column {c}");
+        }
+        // Selected, scrolled: the window keeps the gray.
+        f.app.select(NodeId::Ticket(id));
+        f.app.refresh_tree();
+        let area = Rect::new(0, 0, 60, 30);
+        let overflow = marquee_overflow(&f.app, area);
+        assert!(overflow > 0, "it scrolls");
+        let t0 = std::time::Instant::now();
+        f.app.set_marquee(crate::marquee::Marquee::fast(t0));
+        f.app.tick_marquee(t0, overflow);
+        let buffer = draw_at_column(&mut f, t0, overflow, area);
+        let (y, x) = find(&buffer, "da árvore").unwrap_or_else(|| panic!("{}", text(&buffer)));
+        for c in x..x + 9 {
+            assert_eq!(buffer[(c, y)].fg, STAGE_GRAY, "column {c}");
+        }
+    }
+
+    #[test]
+    fn the_history_shows_the_reason_of_a_rejection_on_the_line_below() {
+        let (mut f, _) = with_tree();
+        f.app.select(tnode(&f.app, "NS-1"));
+        f.app.refresh_tree();
+        let detail = f.app.ticket_detail.as_mut().unwrap();
+        detail.changes = vec![
+            rejection("tech_leader", "fora do escopo\u{7}", "2026-11-21T10:19:00Z"),
+            change("rejected", "development", "2026-11-21T10:20:00Z"),
+        ];
+        let buffer = render_at(&f.app, 140, 30, None);
+        let (first, x) = find(
+            &buffer,
+            "  2026-11-21 10:19 UTC  Tech Leader → Rejeitado  (operador)",
+        )
+        .unwrap();
+        let (motivo, mx) = find(&buffer, "    Motivo: fora do escopo?").unwrap();
+        assert_eq!((motivo, mx), (first + 1, x), "right below, indented");
+        let (second, _) = find(
+            &buffer,
+            "  2026-11-21 10:20 UTC  Rejeitado → Dev  (operador)",
+        )
+        .unwrap();
+        assert_eq!(second, first + 2);
+        assert_eq!(
+            text(&buffer).matches("Motivo:").count(),
+            1,
+            "only the rejection has a reason"
+        );
+    }
+
+    #[test]
+    fn a_long_history_with_reasons_counts_rows_and_fits_the_area() {
+        let (mut f, _) = with_tree();
+        f.app.select(tnode(&f.app, "NS-1"));
+        f.app.refresh_tree();
+        f.app.ticket_detail.as_mut().unwrap().changes = (0..40)
+            .map(|i| {
+                let at = format!("2026-11-19T10:{i:02}:00Z");
+                if i % 2 == 0 {
+                    rejection("po", &format!("motivo {i}"), &at)
+                } else {
+                    change("rejected", "po", &at)
+                }
+            })
+            .collect();
+        for height in [30, 20, 14] {
+            let buffer = render_at(&f.app, 140, height, None);
+            assert_has(&buffer, "2026-11-19 10:39 UTC  Rejeitado → PO");
+            let shown = text(&buffer).matches("2026-11-19 10:").count();
+            assert_has(&buffer, &format!("(+{} mudanças mais antigas)", 40 - shown));
+            // Every change shown with its reason: no line of a reason without its change.
+            let reasons = text(&buffer).matches("Motivo: motivo").count();
+            let rejections = text(&buffer).matches("→ Rejeitado").count();
+            assert_eq!(reasons, rejections, "height {height}");
+            // Nothing past the bottom of the panel (above its border).
+            let (bottom, _) = find(&buffer, "10:39").unwrap();
+            let border = (bottom + 1..height)
+                .find(|y| buffer[(41, *y)].symbol() == "─" || buffer[(41, *y)].symbol() == "━")
+                .expect("the bottom border below the newest");
+            assert!(border > bottom, "height {height}");
+        }
+    }
+
+    #[test]
+    fn the_dialogs_of_the_rejection() {
+        let mut f = fixture();
+        let t = staged(1, "NS-12", "Título do ticket", "development", false);
+        f.app.dialog = Some(Dialog::ChooseTicketStage {
+            ticket: t.clone(),
+            index: 6,
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, "> Rejeitado");
+        assert_has(&buffer, "  Concluído");
+        f.app.dialog = Some(Dialog::ChooseTicketStage {
+            ticket: staged(1, "NS-12", "Título do ticket", "rejected", false),
+            index: 6,
+        });
+        assert_has(&render(&f.app), "> Rejeitado (atual)");
+        f.app.dialog = Some(Dialog::RejectReason {
+            ticket: t.clone(),
+            input: "fora".into(),
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Rejeitar ticket ");
+        assert_has(&buffer, "Ticket NS-12 — Título do ticket");
+        assert_has(&buffer, "Motivo da rejeição (até 120 caracteres):");
+        assert_has(&buffer, "fora");
+        assert_eq!(last_line(&buffer).trim(), "Enter confirmar · Esc cancelar");
+        f.app.dialog = Some(Dialog::ConfirmStageChange {
+            ticket: t.clone(),
+            to: TicketStage::Rejected,
+            reason: Some("fora do escopo".into()),
+            live: Vec::new(),
+        });
+        let buffer = render(&f.app);
+        assert_has(&buffer, " Rejeitar ticket ");
+        assert!(
+            flat(&buffer)
+                .contains("Rejeitar o ticket NS-12 (de Dev)? Motivo: fora do escopo (s/N)"),
+            "{}",
+            flat(&buffer)
+        );
+        assert!(!flat(&buffer).contains("Aviso:"));
+        assert_eq!(
+            last_line(&buffer).trim(),
+            "s rejeitar · qualquer outra tecla cancela"
+        );
+        f.app.dialog = Some(Dialog::ConfirmStageChange {
+            ticket: t.clone(),
+            to: TicketStage::Rejected,
+            reason: Some("fora do escopo".into()),
+            live: vec![(7, "proj · Dev · NS-12".into())],
+        });
+        assert!(
+            flat(&render(&f.app)).contains("Aviso: o agente proj · Dev · NS-12 será encerrado."),
+            "{}",
+            flat(&render(&f.app))
+        );
+        f.app.dialog = Some(Dialog::ConfirmStageChange {
+            ticket: t,
+            to: TicketStage::Rejected,
+            reason: Some("fora do escopo".into()),
+            live: vec![
+                (7, "proj · Dev · NS-12".into()),
+                (8, "proj · PO · NS-12".into()),
+            ],
+        });
+        assert!(
+            flat(&render(&f.app)).contains(
+                "Aviso: 2 agentes vivos deste ticket serão encerrados: proj · Dev · NS-12, \
+                 proj · PO · NS-12."
+            ),
+            "{}",
+            flat(&render(&f.app))
+        );
+    }
+
+    #[test]
+    fn the_dialog_of_the_stages_fits_its_seven_rows_in_a_short_terminal() {
+        let mut f = fixture();
+        let t = staged(1, "NS-12", "Título do ticket", "development", false);
+        f.app.dialog = Some(Dialog::ChooseTicketStage {
+            ticket: t,
+            index: 6,
+        });
+        // The lines of the dialog: the ticket, a blank, the question and the seven stages.
+        for height in [24, 20, 16] {
+            let buffer = render_at(&f.app, 80, height, None);
+            for stage in TicketStage::ALL {
+                assert!(
+                    find(&buffer, stage.label()).is_some(),
+                    "{} at {height} rows",
+                    stage.label()
+                );
             }
         }
     }

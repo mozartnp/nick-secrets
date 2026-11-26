@@ -252,15 +252,18 @@ jail_nick_hosts() {
 # jail_mcp_hosts <jira_enabled> <sentry_enabled>: prints (one line, space separated) the hosts
 # of the remote MCP servers a project relies on, for the caller to pass to jail_check,
 # jail_options and jail_exec with its own extra hosts: ai-jail's default allowlist has neither.
-# Only "true" exactly turns each one on: <jira_enabled> adds mcp.atlassian.com and
-# <sentry_enabled> adds mcp.sentry.dev (the hosted servers; a self-hosted one is a project's
-# own extra host), in that order. The values come by parameter (a tool passes its JIRA_ENABLED
-# and SENTRY_ENABLED), never read from the caller's globals. Every nick tool that launches an
+# Only "true" exactly turns each one on: <jira_enabled> adds mcp.atlassian.com, plus
+# auth.atlassian.com (the OAuth server of its v2 endpoint, where claude renews the token: without
+# it the MCP drops inside the jail when the token expires) and api.media.atlassian.com (the
+# attachments and media of the Jira), and <sentry_enabled> adds mcp.sentry.dev (the hosted
+# servers; a self-hosted one is a project's own extra host), in that order. The values come by
+# parameter (a tool passes its JIRA_ENABLED and SENTRY_ENABLED), never read from the caller's
+# globals. Every nick tool that launches an
 # agent calls it, so the hosts can't diverge between them (auto_scrum.sh, bin/nick-agent).
 jail_mcp_hosts() {
   local mcp_hosts=()
   if [ "$1" = "true" ]; then
-    mcp_hosts+=(mcp.atlassian.com)
+    mcp_hosts+=(mcp.atlassian.com auth.atlassian.com api.media.atlassian.com)
   fi
   if [ "$2" = "true" ]; then
     mcp_hosts+=(mcp.sentry.dev)

@@ -443,8 +443,9 @@ JAIL_ALLOW_HOSTS e da lista padrão do nick] [--forward-port do JAIL_FORWARD_POR
   `--no-docker` e `--no-inherit-env`: fecham as credenciais e o ambiente (acima), mesmo que a
   sua configuração global do ai-jail os abra. O socket do Docker daria ao agente root na
   máquina;
-- `--allow-host`: libera na rede da jail o MCP remoto que o projeto usa (`mcp.atlassian.com`
-  com `JIRA_ENABLED="true"` e `mcp.sentry.dev` com `SENTRY_ENABLED="true"`), os hosts do
+- `--allow-host`: libera na rede da jail o MCP remoto que o projeto usa (`mcp.atlassian.com`,
+  `auth.atlassian.com` e `api.media.atlassian.com` com `JIRA_ENABLED="true"`, e `mcp.sentry.dev`
+  com `SENTRY_ENABLED="true"`), os hosts do
   `JAIL_ALLOW_HOSTS` e a lista padrão do nick, somados à lista padrão do ai-jail, que segue
   valendo.
 
@@ -513,9 +514,11 @@ outro ticket.
   ticket no nick pra avaliar incluí-lo na lista.
 - **MCP (Jira, Sentry) sem conexão:** a rede da jail só libera, por padrão, a API do Claude,
   os registries de pacotes e o GitHub. Os MCPs remotos oficiais o nick já libera sozinho
-  (`mcp.atlassian.com` com `JIRA_ENABLED="true"`, `mcp.sentry.dev` com
-  `SENTRY_ENABLED="true"`); confira se a chave do projeto está em `"true"`. Faça o login
-  OAuth do MCP (`/mcp` no `claude`) fora da jail: lá dentro o navegador não abre. Outro
+  (`mcp.atlassian.com`, `auth.atlassian.com` e `api.media.atlassian.com` com
+  `JIRA_ENABLED="true"`, `mcp.sentry.dev` com `SENTRY_ENABLED="true"`); confira se a chave do
+  projeto está em `"true"`. Faça o login OAuth do MCP (`/mcp` no `claude`) fora da jail: lá
+  dentro o navegador não abre. A renovação do token, sozinha e sem novo login, funciona dentro
+  da jail. Outro
   servidor remoto (Jira ou Sentry self-hosted) você libera com o host dele em
   `JAIL_ALLOW_HOSTS`. Um MCP local que sobe via `npx`/`uvx` precisa também dos diretórios de
   cache dele (`rw_maps` na configuração global do ai-jail, `~/.config/ai-jail/config.toml`).

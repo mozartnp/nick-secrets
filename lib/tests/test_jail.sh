@@ -599,8 +599,10 @@ echo
 echo "== jail_mcp_hosts: os hosts dos MCPs remotos, por parâmetro (Jira, depois Sentry) =="
 # A mesma tabela do teste de mcp_jail_hosts em auto_scrum/tests/test_auto_scrum.sh (NS-33: a
 # função saiu do auto_scrum.sh pra cá, e o nome antigo virou chamada fina): só "true" exato
-# liga cada host.
-for mcp_case in "true|true|mcp.atlassian.com mcp.sentry.dev" "true||mcp.atlassian.com" "|true|mcp.sentry.dev" "||" "TRUE|sim|" "false|false|" "true|false|mcp.atlassian.com" "false|true|mcp.sentry.dev"; do
+# liga cada host. Com o Jira, também o auth.atlassian.com (o servidor OAuth do endpoint v2 do
+# MCP, onde o claude renova o token: sem ele, o MCP cai dentro da jail quando o token vence) e o
+# api.media.atlassian.com (os anexos e as mídias do Jira).
+for mcp_case in "true|true|mcp.atlassian.com auth.atlassian.com api.media.atlassian.com mcp.sentry.dev" "true||mcp.atlassian.com auth.atlassian.com api.media.atlassian.com" "|true|mcp.sentry.dev" "||" "TRUE|sim|" "false|false|" "true|false|mcp.atlassian.com auth.atlassian.com api.media.atlassian.com" "false|true|mcp.sentry.dev"; do
   IFS='|' read -r mcp_jira mcp_sentry mcp_expected <<< "$mcp_case"
   mcp_dir="$(new_case "mcp_hosts_${mcp_jira:-vazio}_${mcp_sentry:-vazio}")"
   run_jail "$mcp_dir" "jail_mcp_hosts '$mcp_jira' '$mcp_sentry'"
@@ -613,11 +615,11 @@ run_jail "$mcp_dir" "jail_mcp_hosts '' ''" "JIRA_ENABLED=true; SENTRY_ENABLED=tr
 assert_eq "|0" "$(file_of "$mcp_dir/out")|$(file_of "$mcp_dir/rc")" "jail_mcp_hosts com JIRA_ENABLED/SENTRY_ENABLED \"true\" no ambiente e parâmetros vazios: nenhum host"
 mcp_dir="$(new_case mcp_hosts_globals_control)"
 run_jail "$mcp_dir" "jail_mcp_hosts true true" "JIRA_ENABLED=true; SENTRY_ENABLED=true; export JIRA_ENABLED SENTRY_ENABLED"
-assert_eq "mcp.atlassian.com mcp.sentry.dev" "$(file_of "$mcp_dir/out")" "controle positivo: o mesmo ambiente com os parâmetros \"true\" dá os dois hosts"
+assert_eq "mcp.atlassian.com auth.atlassian.com api.media.atlassian.com mcp.sentry.dev" "$(file_of "$mcp_dir/out")" "controle positivo: o mesmo ambiente com os parâmetros \"true\" dá os dois hosts"
 # Os hosts passam na validação do jail_check (um host novo mal escrito pararia a jail).
 mcp_dir="$(new_case mcp_hosts_valid)"
 run_jail "$mcp_dir" "hosts=\"\$(jail_mcp_hosts true true)\"; for h in \$hosts; do jail_host_valid \"\$h\" && echo \"válido: \$h\" || echo \"inválido: \$h\"; done"
-assert_eq "válido: mcp.atlassian.com"$'\n'"válido: mcp.sentry.dev|0" "$(file_of "$mcp_dir/out")|$(file_of "$mcp_dir/rc")" "jail_mcp_hosts true true: todo host passa no jail_host_valid"
+assert_eq "válido: mcp.atlassian.com"$'\n'"válido: auth.atlassian.com"$'\n'"válido: api.media.atlassian.com"$'\n'"válido: mcp.sentry.dev|0" "$(file_of "$mcp_dir/out")|$(file_of "$mcp_dir/rc")" "jail_mcp_hosts true true: todo host passa no jail_host_valid"
 
 echo
 echo "== jail_exec: desligada lança o comando direto; ligada lança 'ai-jail <opções> -- <comando>' =="

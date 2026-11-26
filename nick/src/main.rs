@@ -316,6 +316,10 @@ impl Shell {
                 thread::park();
             }
             match event {
+                // An event of a session already ended (NS-57, D8: maybe one with the id of an
+                // agent resumed since then) changes nothing.
+                LoopEvent::Agent(event)
+                    if agent_session::event_session(&self.sessions, &event).is_none() => {}
                 LoopEvent::Signal(signal) => {
                     self.end_by_signal();
                     return Ok(Some(signal));
@@ -323,6 +327,7 @@ impl Shell {
                 LoopEvent::Agent(AgentEvent {
                     agent,
                     event: SessionEvent::Output,
+                    ..
                 }) => {
                     // The shown one redraws; a hidden one only when its mark changes (N agents
                     // at work would redraw for nothing), and only a hidden one not marked yet
@@ -345,6 +350,7 @@ impl Shell {
                 LoopEvent::Agent(AgentEvent {
                     agent,
                     event: SessionEvent::Clipboard(bytes),
+                    ..
                 }) => {
                     if Some(agent) == self.app.shown() {
                         let mut stdout = io::stdout();
@@ -355,6 +361,7 @@ impl Shell {
                 LoopEvent::Agent(AgentEvent {
                     agent,
                     event: SessionEvent::Exited(code),
+                    ..
                 }) => {
                     self.agent_exited(guard, gate, agent, code)?;
                     self.after_change(guard)?;
@@ -398,7 +405,7 @@ impl Shell {
     /// A launcher for the runs outside the PTY (`--check` and `--render`): the size of a PTY is
     /// never asked.
     fn offline_launcher(&self) -> TerminalAgentLauncher<LoopEvent> {
-        TerminalAgentLauncher::new(self.tx.clone(), Box::new(|_: &str, _: bool| (0, 0)))
+        TerminalAgentLauncher::new(self.tx.clone(), Box::new(|_: &str| (0, 0)))
     }
 
     /// The session of the agent `id`.
@@ -497,8 +504,8 @@ impl Shell {
         guard: &mut TerminalGuard,
     ) -> io::Result<TerminalAgentLauncher<LoopEvent>> {
         let panel = ui::new_agent_panel(&self.app, self.frame_area(guard)?);
-        let size_of = move |name: &str, jail: bool| {
-            let area = ui::terminal_in_panel(panel, name, jail);
+        let size_of = move |name: &str| {
+            let area = ui::terminal_in_panel(panel, name);
             (area.height, area.width)
         };
         Ok(TerminalAgentLauncher::new(
@@ -566,18 +573,16 @@ impl Shell {
                 log,
                 precheck,
             } => {
-                let mut launcher = self.pty_launcher(guard)?.with_jail(precheck.jail);
+                let mut launcher = self.pty_launcher(guard)?;
                 self.app
                     .open_agent(&project, &holder, kind, &log, precheck, &mut launcher);
                 self.adopt_session(&mut launcher);
             }
-            Action::CheckResume { project, agent } => {
-                // The check and the conversation out of the PTY, then the PTY of the resume
-                // (NS-39); the jail of the size comes from that check.
-                let mut launcher = self.pty_launcher(guard)?;
-                self.app.check_resume(&project, &agent, &mut launcher);
-                self.adopt_session(&mut launcher);
-            }
+            Action::CheckResume {
+                project,
+                agent,
+                jail,
+            } => self.check_resume(guard, &project, &agent, jail)?,
             Action::Send(bytes) => {
                 if let Some(session) = self.shown_session() {
                     // Any key sent goes back to the live screen.
@@ -604,14 +609,22 @@ impl Shell {
                 }
             }
             Action::EndAgent(id) => {
-                // Synchronous: up to TERM_GRACE when the group ignores SIGTERM (accepted). The
-                // Exited its waiter sends afterwards finds no session and is ignored.
-                if let Some(index) = self.sessions.iter().position(|(agent, _)| *agent == id) {
-                    let (_, mut session) = self.sessions.remove(index);
-                    self.sizes.remove(&id);
-                    session.terminate();
-                }
+                self.terminate_session(id);
                 self.app.agent_ended_by_operator(id);
+            }
+            Action::ToggleJail { id, release } => {
+                // NS-57: the end of the `x`, then the resume in the same conversation, out of
+                // the jail or back in it. The Exited of the old session, already in the channel,
+                // is of another generation: the new one with the same id ignores it (D8).
+                self.terminate_session(id);
+                if let Action::CheckResume {
+                    project,
+                    agent,
+                    jail,
+                } = self.app.agent_stopped_for_jail(id, release)
+                {
+                    self.check_resume(guard, &project, &agent, jail)?;
+                }
             }
             Action::QuitEndingAgents => {
                 self.end_all();
@@ -630,6 +643,33 @@ impl Shell {
             }
         }
         Ok(false)
+    }
+
+    /// The check and the conversation out of the PTY, then the PTY of the resume (NS-39), with
+    /// the `jail` of the resume (NS-57).
+    fn check_resume(
+        &mut self,
+        guard: &mut TerminalGuard,
+        project: &std::path::Path,
+        agent: &nick::db::Agent,
+        jail: nick::app::ResumeJail,
+    ) -> io::Result<()> {
+        let mut launcher = self.pty_launcher(guard)?;
+        self.app.check_resume(project, agent, jail, &mut launcher);
+        self.adopt_session(&mut launcher);
+        Ok(())
+    }
+
+    /// Ends the session of the agent `id` (`x`, and the stop of a release, NS-57) and takes it
+    /// out of `sessions` and `sizes`. Synchronous: up to TERM_GRACE when the group ignores
+    /// SIGTERM (accepted). The Exited its waiter sends afterwards is of no session of the loop
+    /// and is ignored (NS-57, D8: by its generation).
+    fn terminate_session(&mut self, id: i64) {
+        if let Some(index) = self.sessions.iter().position(|(agent, _)| *agent == id) {
+            let (_, mut session) = self.sessions.remove(index);
+            self.sizes.remove(&id);
+            session.terminate();
+        }
     }
 
     /// Ends the sessions of the agents `ids` that run in this nick, all their groups at once (a

@@ -1420,6 +1420,13 @@ mesma linha do launcher (`exec_claude`).
 
 ## Sandbox do agente com ai-jail (`JAIL_ENABLED`)
 
+> **Mudou no NS-57** (seção "Rust no projeto: liberar e prender a jail de um agente (NS-57)"): a
+> jail do projeto pode ser desligada **para um agente** pela TUI (`l` no nó dele), sempre com uma
+> confirmação de borda vermelha e só até ele fechar; nada é gravado. O `bin/nick-agent --resume`
+> ganhou o `--no-jail`, que roda o `jail_check` de sempre (com o `JAIL_ENABLED` do projeto) e só
+> depois desliga a jail: a decisão "Verificação na inicialização, sem fallback" continua valendo, e
+> uma jail quebrada falha também com o `--no-jail`.
+
 Com `--permission-mode auto` (etapa de Desenvolvimento), o agente aprova sozinho a maioria
 das ações e, sem jail, enxerga a máquina inteira. O prompt carrega conteúdo do projeto alvo
 (`.nick/nick.conf`, `CLAUDE.md`, tickets), então uma prompt injection ou um erro do agente poderia
@@ -1796,13 +1803,6 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   - limite: são os servidores hospedados oficiais. Jira ou Sentry self-hosted vão em
     `JAIL_ALLOW_HOSTS`; os caches de um MCP local, no `config.toml` global do ai-jail (README). O login OAuth do MCP é feito fora da jail (lá
     dentro o navegador não abre); o token fica em `~/.claude`, que a jail monta.
-  Mais um canal de saída por host liberado, como o README avisa em "O que a jail não
-  protege".
-- **Toolchains do home: lista fixa no nick, somente leitura** (decisão do usuário: nada no
-  `~/.ai-jail` de cada pessoa — se alguém esquece, o problema demora a ser descoberto; o
-  nick mantém e controla). `jail_toolchain_dirs` devolve, dos diretórios `.pyenv`, `.nvm`,
-  `.rbenv`, `.asdf`, `.local/share/mise`, `.local/share/uv/python`, `.sdkman` e `.volta` do
-  `$HOME`, os que existem, e `jail_options` passa um `--map` (somente leitura) por diretório.
   - **Mudou em 2026-11-26 (achado durante o NS-57):** com o Jira, a função (`jail_mcp_hosts`, em
     `lib/jail/jail.sh`, desde o NS-33) devolve também o `auth.atlassian.com` e o
     `api.media.atlassian.com`, nessa ordem, depois do `mcp.atlassian.com`. O endpoint v2 do MCP
@@ -1816,6 +1816,13 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
     anexos e as mídias do Jira) saiu da lista padrão (`lib/jail/allow_hosts.txt`) e veio para
     cá, por decisão do usuário: os dois só servem a projetos com o Jira, e cada host liberado é
     mais um canal de saída. O `developer.atlassian.com` (documentação) continua na lista padrão.
+  Mais um canal de saída por host liberado, como o README avisa em "O que a jail não
+  protege".
+- **Toolchains do home: lista fixa no nick, somente leitura** (decisão do usuário: nada no
+  `~/.ai-jail` de cada pessoa — se alguém esquece, o problema demora a ser descoberto; o
+  nick mantém e controla). `jail_toolchain_dirs` devolve, dos diretórios `.pyenv`, `.nvm`,
+  `.rbenv`, `.asdf`, `.local/share/mise`, `.local/share/uv/python`, `.sdkman` e `.volta` do
+  `$HOME`, os que existem, e `jail_options` passa um `--map` (somente leitura) por diretório.
   Só gerenciadores de versão: nunca diretório de configuração ou credencial. Do uv, só os
   interpretadores (`uv/python`, pra onde o `venv/bin/python` aponta), e não o
   `~/.local/share/uv` inteiro: lá o `uv auth login` guarda credenciais de índice em texto puro
@@ -2921,6 +2928,14 @@ dela.
 
 ## Rust no projeto: vários agentes na casca `nick` (NS-34)
 
+> **Mudou no NS-57** (seção "Rust no projeto: liberar e prender a jail de um agente (NS-57)"): a
+> altura do cabeçalho **não depende mais da jail** (decisão do usuário). Ela é o máximo entre as
+> linhas da versão na jail e as da versão fora dela, com o mesmo teto (um terço do painel); na
+> prática, a da versão fora da jail. Na jail, as linhas que sobram ficam em branco. O tamanho do
+> terminal continua dependendo do nome e da largura, só a jail saiu da conta:
+> `terminal_in_panel(panel, name)`, `header_rows(name, panel)`, e o `TerminalAgentLauncher` perdeu o
+> `jail` e o `with_jail`. O aviso fora da jail continua nunca cortado.
+
 > **Mudou no NS-38** (seção "Rust no projeto: navegação em árvore (NS-38)"): a tela é sempre lado a
 > lado, com ou sem agente vivo (a regra "sem agente vivo, as telas são as de antes, byte a byte"
 > deixou de valer); o agente exibido é o do nó selecionado; a visão "Agentes ativos" virou o filtro
@@ -3983,6 +3998,12 @@ atalho com um ticket selecionado indo ao último agente e voltando (com a borda 
 estão em `.nick/docs/NS-38/telas/`.
 
 ## Rust no projeto: retomar e arquivar agentes (NS-39)
+
+> **Mudou no NS-57** (seção "Rust no projeto: liberar e prender a jail de um agente (NS-57)"): o
+> `--resume` do `bin/nick-agent` aceita o `--no-jail` (flag sem valor, só nesse modo), e o
+> `Launch::Resume` ganhou o `jail_off`, que o acrescenta no fim do argv; sem ele, o argv é o de
+> antes, byte a byte. O `r` passou a ser o `ask_resume_with(id, ResumeJail::AsConfig)`, e o
+> `Action::CheckResume`, o `check_resume` e o `resume_agent` levam o `ResumeJail` da retomada.
 
 > **Mudou no NS-61** (seção "Rust no projeto: etapa Rejeitado (NS-61)"): o `r` de um
 > agente de ticket **rejeitado** é recusado antes do `--check` (`ticket rejeitado: mude a etapa com
@@ -5265,6 +5286,12 @@ PO de novo sem mudança). As sabotagens e as telas ficam em `.nick/docs/NS-45/`.
 
 ## Rust no projeto: borda de foco nos diálogos (NS-46)
 
+> **Mudou no NS-57** (seção "Rust no projeto: liberar e prender a jail de um agente (NS-57)"):
+> **agora são duas regras que dão a borda vermelha.** Além do `Dialog::irreversible` (só o
+> `ConfirmRemove`, sem mudança), o `Dialog::touches_jail` (`match` exaustivo, sem `_`, `true` só no
+> `ConfirmJailToggle`) também pinta o diálogo com o `IRREVERSIBLE_COLOR`, embora trocar a jail
+> tenha volta. O nome da constante ficou o mesmo. São 26 variantes de `Dialog` desde então.
+
 Bug filho do épico NS-28. O NS-37 deixou os diálogos fora da borda de foco ("diálogo não é painel
 de foco"). Com um diálogo aberto, as teclas vão para ele, mas a lista continuava desenhada com a
 borda grossa ciano, e o diálogo ficava com a borda simples.
@@ -6324,3 +6351,213 @@ dentro de um teste.
 - **P6:** a variável `_launcher` do teste `a_failing_write_of_the_rejection_ends_no_agent` era usada
   e virou `launcher`.
 - **P7:** `rejection_lines` recebe `Option<&str>` em vez de `&Option<String>`.
+
+## Rust no projeto: liberar e prender a jail de um agente (NS-57)
+
+História filha do épico NS-28. Até aqui a jail era decidida por projeto (`JAIL_ENABLED` no
+`.nick/nick.conf`) e valia para todos os agentes. A tecla `l`, no nó de um agente da árvore,
+troca a jail **só desse agente** e **só até ele fechar**, sempre depois de uma confirmação
+`(s/N)` de borda vermelha. Liberar e prender de novo é **fechar e retomar na mesma conversa**: a
+composição do fim pelo operador (`x`) com a retomada (`r`), mais uma opção do launcher que só
+desliga a jail.
+
+**Decisões, cada uma com o porquê:**
+- **Só por agente e só até fechar; nada é gravado** (D10). O override mora no `RunningAgent`
+  (memória) e no argv daquela retomada: nenhuma migração, coluna ou escrita no `.nick/nick.conf`.
+  Quando o agente fecha (fim do `claude`, `x`, saída do nick), o próximo `r` segue o `nick.conf`,
+  e os outros agentes do projeto nunca são tocados. Liberar a jail é exceção pontual do operador,
+  não configuração: gravar faria um agente esquecido continuar sem proteção em aberturas futuras.
+- **Sempre com confirmação vermelha** (D4/D5). `Dialog::ConfirmJailToggle { id, name, release }`
+  diz a ação (liberar ou prender), que o agente reinicia e, ao liberar, que ele fica **SEM a
+  proteção da jail até fechar**. A borda vermelha vem de `Dialog::touches_jail`, uma regra ao lado
+  do `Dialog::irreversible`, e não dele: trocar a jail tem volta, e o `irreversible` (e o teste
+  `only_the_removal_of_a_project_is_irreversible`) continua só da remoção. O vermelho existe para o
+  operador nunca confirmar uma liberação achando que é uma confirmação comum.
+- **Sem "ligar à revelia"** (D3). Não existe `--jail`: prender de novo é retomar **sem** o
+  `--no-jail`, e aí vale o `nick.conf`. Num projeto sem jail, o `l` não existe (o Rust nem manda o
+  `--no-jail`, que seria inócuo).
+- **Sem fallback para jail quebrada** (D3, confirmado pelo usuário no planejamento). O
+  `--no-jail` roda o `load_and_check` igual, com o `jail_check` do `JAIL_ENABLED` do projeto, e só
+  **depois** faz `JAIL_ENABLED="false"` (com `if`, não `[ ] &&`, por causa do `set -e` no fim da
+  função). Com a jail ligada e quebrada (ai-jail ausente, versão fora da faixa, sandbox que não
+  abre), o `--no-jail` falha junto, com a mensagem do `jail_check`: o `l` não é saída de emergência.
+  A troca é pela variável, e não por outro primeiro argumento do `jail_exec`, porque o estrutural
+  `claude_command_lines` só aceita `jail_exec "$JAIL_ENABLED" ...`. Com a variável desligada, o
+  `jail_print_status` diz "desligada", o `exec_claude` não põe o `jail_agent_notice` e o
+  `jail_exec` roda o `claude` direto.
+- **`--no-jail` só no `--resume`** (D2). Toda troca passa pela retomada, então o modo de lançamento
+  (`--session-id`) não muda e o recusa como argumento desconhecido. É uma flag sem valor, aceita em
+  qualquer posição, recusada quando repetida (o `seen`); o `launch_kind` não precisou mudar (ela não
+  está entre as opções que pulam um valor), e um `--name --no-jail` continua sendo um nome.
+
+**Como a tecla sabe se o projeto tem jail** (D1, decisão do usuário no planejamento):
+- **Agente vivo:** o `RunningAgent` ganhou o `project_jail` (o `jail=` do `--check` daquela
+  abertura), e o `jail` passou a ser a jail **efetiva** (`project_jail && !liberado`). O cabeçalho,
+  a árvore e o letreiro já liam o `jail`, então mostram o estado novo sem mudança.
+- **Agente parado:** o `Row` ganhou o `jail: Option<bool>`, gravado em **todo** `--check`
+  bem-sucedido do projeto (`check_agent`, o `g`, e `check_resume`, o `r` e a troca de jail), no
+  molde do `row.jira_url` do NS-53, e mantido pelo `refresh` nas mesmas condições (mesmo id, mesmo
+  caminho, disponível antes e agora). Projeto indisponível: `None`. Não há leitor ao entrar na
+  lista: o `--jira-url` não mudou (contrato de uma linha do NS-53).
+- **Consequência aceita:** com o `Row.jail` desconhecido (`None`), o agente parado **não mostra**
+  `l` na ajuda e o `l` **não faz nada** — a ajuda e a tecla sempre concordam (as duas leem o
+  `App::jail_toggle`). Isso acontece, por exemplo, logo depois de abrir o nick, antes de qualquer
+  `g`/`r` naquele projeto. Nesse caso, o operador retoma com `r` e depois usa `l`. Não existe tecla
+  escondida (confirmado pelo usuário). O parado sempre abre "liberar": a troca acabou quando ele
+  fechou, e ele segue o `nick.conf`, que tem a jail ligada.
+
+**O fluxo** (D6, no `key_node`): vivo com `project_jail` → `ConfirmJailToggle { release: jail }`;
+parado com `Row.jail == Some(true)` → `release: true`; qualquer outro caso (projeto sem jail, jail
+desconhecida, arquivado, ativo em outro nick) → nada, sem status. Ao confirmar: o vivo vira
+`Action::ToggleJail { id, release }`, e o `main.rs` faz o mesmo término do `x`
+(`Shell::terminate_session`, extraído do `Action::EndAgent`), chama o
+`App::agent_stopped_for_jail(id, release)` (o `take_agent` e o `agents::end` do
+`agent_ended_by_operator`, sem a mensagem de "foi encerrado") e executa o `CheckResume` que ele
+devolve pelo mesmo `Shell::check_resume` do ramo `CheckResume`. O parado vai direto ao
+`ask_resume_with(id, ResumeJail::Off)`. Todas as recusas do `r` (arquivado, outro nick, projeto
+indisponível, ticket rejeitado, linha sumida) continuam valendo, e a conversa perdida abre o
+`ConversationLost` de sempre. Cancelar não muda nada: a sessão continua, sem novo lançamento.
+
+**O `s` confere de novo a regra da tecla** (achado P1 do review). Com a caixa aberta, o agente
+pode mudar: o `claude` termina sozinho (o `Exited` é tratado em qualquer estado, e o
+`agent_ended` não fecha diálogos), ou um `--check` muda o `Row.jail`. A primeira versão decidia
+pelo estado no `s` e mandava todo parado ao `ResumeJail::Off`: um "prender" confirmado num agente
+liberado que tinha acabado de terminar virava uma retomada **fora** da jail. Agora o `s` só age
+quando o `App::jail_toggle(id)` ainda devolve o mesmo `Some(release)` da caixa. Senão, não faz
+nada e a barra diz "O estado do agente <nome> mudou enquanto a confirmação estava aberta. Nada foi
+feito; aperte l de novo.". Assim a caixa, a tecla e a ajuda sempre concordam, e prender nunca vira
+liberar. Um "liberar" aberto num vivo que termina continua valendo: o parado de um projeto com a
+jail ligada também é liberado pelo `l`.
+
+**A mensagem do "prender" segue a jail desta retomada** (achado P2 do review). Se o `nick.conf`
+desligou a jail entre a liberação e o "prender", o `--check` da retomada diz `jail=false`, e o
+agente volta sem jail. A barra diz então "foi retomado fora da jail: a jail do projeto está
+desligada agora.", e não "foi retomado na jail.".
+
+**O término do registro num helper só** (achado P3 do review, o que o plano pedia):
+`App::end_running(id)` faz o `take_agent` e o `agents::end` e devolve o nome, o aviso do check e
+o resultado. O `agent_ended`, o `agent_ended_by_operator` e o `agent_stopped_for_jail` montam cada
+um a sua mensagem a partir dele, e o comportamento do fim do `claude` e do `x` não mudou.
+
+**`ResumeJail` no lugar do `jail_off: bool` do plano** (decisão da implementação). O plano
+previa `ask_resume_with(id, jail_off: bool)` e `Action::CheckResume { jail_off }`, mas a barra de
+status precisa de três mensagens (D7): a de hoje no `r` (`foi retomado.`), `foi retomado fora da
+jail.` e `foi retomado na jail.` (prender de novo). Um `bool` não distingue o `r` do "prender",
+que têm o mesmo argv. Daí `ResumeJail { AsConfig, Off, BackIn }`: só o `Off` põe o `--no-jail`
+(`Launch::Resume { jail_off }`, que continua `bool`) e desliga a jail efetiva no `start_running`;
+os três escolhem a mensagem. O `r` é o `ask_resume_with(id, ResumeJail::AsConfig)`, sem mudar o
+comportamento.
+
+**Geração das sessões** (D8, risco técnico). O `AgentEvent` só levava o `agent: i64`. Na troca de
+jail, a sessão antiga é terminada (`terminate`, síncrono, até `TERM_GRACE`: o waiter dela já pôs o
+`Exited` no canal quando ele volta) e a nova, **com o mesmo id**, entra no laço logo em seguida.
+Sem correção, o `Exited` (ou um `Output`/`Clipboard`) atrasado da antiga seria atribuído à nova: o
+`agent_exited` encerraria o agente recém-retomado (e o `wait()` dele travaria o laço). Agora cada
+`AgentSession` tem uma geração única (um `u64` de um `AtomicU64` global, nunca reutilizado),
+carregada em todo `AgentEvent`, e o `agent_session::event_session(sessions, event)` só acha a
+sessão cujo id **e** geração batem. O laço descarta, num ramo antes dos outros, todo evento sem
+sessão atual. O mesmo risco existia em teoria no `x` seguido de `r` muito rápido; a correção cobre
+os dois casos, e o comportamento visível do `x`/`r` não mudou.
+
+**Cabeçalho de altura fixa quanto à jail** (D11, decisão do usuário): ver a nota "Mudou no NS-57"
+na seção do NS-34. O motivo: o aviso fora da jail é bem mais longo que `na jail`; com a altura
+dependendo da jail, o mesmo agente mudaria de tamanho ao ser liberado (e o spawn teria de seguir a
+jail efetiva). A linha fica reservada e pode servir a mais informação no futuro. **O custo, aceito
+pelo usuário:** um agente **na jail** perde para o cabeçalho as linhas que a versão fora da jail
+ocuparia (num painel de 58 colunas, uma linha).
+
+**Ajuda** (D9): `Place::LiveAgent` (projeto sem jail, a ajuda de antes), `LiveAgentInJail`
+(`... x encerrar · l liberar jail · {atalho} alternar`), `LiveAgentReleased` (`l prender na jail`),
+`StoppedAgent` (a de antes) e `StoppedAgentInJail` (`↑/↓ mover · r retomar · o arquivar · l
+liberar jail · ← subir`), todos pelo `App::jail_toggle`. O `HELP_STATES` foi de 65 para 89 estados
+(11 lugares da árvore × 8 combinações de filtros, mais as Configurações). Os textos novos são mais
+curtos que a ajuda mais longa (a do épico), então a reserva de linhas do rodapé e o tamanho dos
+terminais não mudaram (teste `the_longest_help_is_still_the_one_of_before`, de 20 a 200 colunas).
+
+**Testes novos:**
+- bash (`bin/tests/test_nick_agent.sh`, seção "--resume com --no-jail"): jail ligada + `--no-jail`
+  (rc 0, sem `jail.argv`, `order` = `ai-jail -- true` + `claude`, argv sem o aviso da jail,
+  `desligada`); o mesmo com o ID mudado; jail desligada + `--no-jail` (o mesmo argv que sem a flag);
+  o `--no-jail` antes, no meio e no fim das opções; `--name --no-jail` é um nome; recusas (repetido,
+  com valor, no lançamento, no `--check` e no `--jira-url`); jail quebrada + `--no-jail` (três
+  modos de falha do `jail_fail`, modo novo `resume_no_jail`); o uso cita a flag; estruturais (o
+  `--no-jail` só no `resume_mode`/`launch_kind`/`usage_error`, com controle positivo; o
+  `JAIL_ENABLED="false"` uma vez, no `resume_mode`, depois do `load_and_check`). O helper `resume`
+  aceita argumentos extras depois de um `--`, e as chamadas antigas ficaram iguais.
+- `agent_session`: `a_late_event_of_an_ended_session_is_not_the_new_one_s_with_the_same_id`
+  (falhou antes da correção, por asserção) e `a_resume_out_of_the_jail_passes_no_jail_to_the_launcher`
+  (PTY real, projeto com a jail ligada pelo ai-jail falso: com o `jail_off`, a jail desligada; sem
+  ele, o controle pelo ai-jail).
+- `launch`: `the_args_of_a_resume_out_of_the_jail_end_with_no_jail`.
+- `app`: `only_the_jail_toggle_touches_the_jail`; o cache do `Row.jail`
+  (`every_check_of_g_keeps_the_jail_of_the_project`,
+  `the_check_of_a_resume_keeps_the_jail_of_the_project`,
+  `the_refresh_keeps_the_jail_while_the_project_stays_available`); o `start_running` com e sem o
+  override (`a_resume_out_of_the_jail_runs_released_and_says_so`,
+  `an_opened_agent_runs_with_the_jail_of_its_check`); cada linha da tabela do D6 (`l_on_...`), o
+  cancelamento, o `agent_stopped_for_jail`, a troca só desse agente e a conversa perdida; do
+  review, `s_never_releases_an_agent_the_box_offered_to_jail_again` e
+  `s_rechecks_the_jail_of_a_stopped_agent` (P1), e um caso do `BackIn` num projeto sem jail no
+  `a_resume_out_of_the_jail_runs_released_and_says_so` (P2).
+- `ui`: `the_size_of_the_terminal_does_not_depend_on_the_jail`,
+  `the_header_in_the_jail_leaves_its_extra_rows_blank`,
+  `the_jail_toggle_dialogs_are_red_and_say_what_happens`, `the_help_has_l_only_where_it_works`,
+  `the_longest_help_is_still_the_one_of_before`.
+- PTY (`nick/tests/agent.rs`): `l_releases_a_live_agent_and_jails_it_again_in_the_same_conversation`
+  (o `┏` vermelho, retomado na mesma sessão, `FORA DA JAIL` em vermelho, o mesmo `SIZE` antes e
+  depois, prender de novo pelo ai-jail e, depois de `x` + `r`, de volta na jail),
+  `releasing_one_agent_leaves_the_other_of_the_project_in_the_jail`,
+  `without_the_jail_in_the_project_there_is_no_l`,
+  `cancelling_the_release_keeps_the_agent_running_in_the_same_process` e
+  `a_stopped_agent_of_a_project_in_the_jail_is_resumed_out_of_it_by_l`.
+
+**Testes existentes adaptados, com o motivo:**
+- pelo D11 (cabeçalho de altura fixa), todos com o agente **na jail** do `with_running(&["proj"])`
+  (`precheck(true)`), num painel de 58 colunas, em que o aviso fora da jail quebra em 2 linhas:
+  - `ui::with_an_agent_the_list_is_on_the_left_and_the_agent_on_the_right`: cabeçalho
+    `(41, 1, 58, 1)` → `(41, 1, 58, 2)`, terminal `(41, 2, 58, 23)` → `(41, 3, 58, 22)` (e o parser
+    de teste de 23 para 22 linhas, `primeira` na linha 3);
+  - `ui::the_warning_out_of_the_jail_wraps_in_the_header_and_the_terminal_shrinks`: o agente na
+    jail `(41, 2, 58, 23)` → `(41, 3, 58, 22)`, o mesmo do agente fora dela (os números do agente
+    fora da jail não mudaram);
+  - `ui::a_long_status_takes_rows_from_the_panel_too`: 1 → 2 linhas de cabeçalho na conta;
+  - `ui::the_cursor_of_the_program_is_inside_the_border`: o cursor `(41, 2)` → `(41, 3)`;
+  - `ui::the_mouse_over_the_border_goes_nowhere`: a primeira célula do programa `(41, 2)` →
+    `(41, 3)`, e a linha 2 (agora do cabeçalho) entrou nas que não vão a lugar nenhum;
+  - `ui::the_terminal_is_inside_the_border_of_the_panel`: `(41, 2, 58, 24)` → `(41, 3, 58, 23)`.
+  Nenhum teste com a jail desligada mudou de número: os de tamanho no PTY (`SIZE 22 58`/`SIZE 33
+  78` de `a_resize_reaches_claude_below_the_header` e os do NS-34/NS-38, todos com
+  `JAIL_ENABLED="false"`) passaram sem edição.
+- pelo D9 (ajuda): `ui::the_help_of_each_node_with_the_filters_and_the_count` (o agente do
+  `with_running(&["proj"])` está na jail, e a ajuda ganhou `l liberar jail`) e o total do
+  `HELP_STATES` (65 → 89) em `help_states_has_every_combination_of_the_three_filters` e
+  `the_project_help_has_n_and_the_epic_place_is_in_the_help_states`; o
+  `every_help_state_is_in_help_states` listou os 3 lugares novos (o `match` exaustivo dele cobra).
+- pelo D5 (variante nova): o total do catálogo `one_of_each_dialog` de 25 para 26 em
+  `only_the_eight_dialogs_with_a_text_field_take_text` e
+  `only_the_removal_of_a_project_is_irreversible` (o plano falava em 24 → 25, contado antes do
+  NS-61, que entrou antes); o `color_of` dos testes do `ui` passou a dar vermelho também com o
+  `touches_jail` (o `every_dialog_has_the_focus_border_and_only_it` passa com as 26). O
+  `the_removal_dialog_is_red_and_the_others_cyan` já pulava as variantes fora das duas que cobra.
+- o `USAGE` de `bin/tests/test_nick_agent.sh` ganhou o ` [--no-jail]` da retomada (o `Uso:` do
+  launcher cita a flag).
+- só a sintaxe da chamada (o mesmo comportamento, as mesmas asserções): o `jail_off: false` nos
+  `Launch::Resume` dos testes de `agent_session.rs` e `launch.rs`; o `ResumeJail::AsConfig` nos
+  `check_resume`/`CheckResume` dos testes do `app.rs`; o `terminal_in_panel`/`header_rows` sem o
+  `jail` nos testes do `ui`; o `jail: None` nos `Row` literais de `tree.rs` e `ui.rs`; o `..` nos
+  padrões de `AgentEvent` do `main.rs` e do `FakeLauncher`.
+
+Passaram sem edição: os testes de `--resume` do bash (inclusive o diferencial "retomada =
+lançamento até o `--`" e o estrutural `claude_command_lines`), os de `x`, de `r`, da conversa
+perdida, do `ConfirmRemove` vermelho, do cabeçalho (`the_agent_header_in_the_jail`,
+`the_agent_header_out_of_the_jail_is_red_and_bold`), do NS-53 (`jira_url`) e todos os de PTY de
+antes.
+
+Sabotagens numa cópia fora do repositório em `.nick/docs/NS-57/sabotagens.md`; telas (texto e
+ANSI) em `.nick/docs/NS-57/telas/`. Nenhuma dependência nova. O README não mudou: ele não lista as
+teclas da árvore (regra "README genérico").
+
+**Fora de escopo:** gravar a escolha no banco, trocar a jail do projeto pela TUI, liberar hosts ou
+caminhos isolados (`JAIL_ALLOW_HOSTS`), ligar a jail à revelia do `nick.conf`, um aviso novo ao
+agente de que a jail mudou (o ticket aceita o risco do histórico antigo, impacto "Contexto do
+agente") e mudar o `--jira-url`/`--check`.

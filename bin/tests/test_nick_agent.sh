@@ -39,7 +39,7 @@ BASH_BIN="$(command -v bash)"
 # Um UUID e um nome de exemplo, como a casca passa.
 SESSION_ID="0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60"
 AGENT_NAME="proj · Dev · NS-1"
-USAGE="Uso: nick-agent --check | --jira-url | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>"
+USAGE="Uso: nick-agent --check | --jira-url | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) [--no-jail] | --has-conversation <uuid>"
 # Os 8 tipos do choose_type do auto_scrum.sh, na ordem do menu com tudo ligado.
 ALL_TYPES=(po po_discussion po_jira po_sentry tech_leader tech_leader_jira development review)
 # O texto que o EDITOR falso grava (po e tech_leader) e a DESCRIPTION que sai dele ($(cat), sem
@@ -438,6 +438,8 @@ jail_fail() {
     run_agent "$case_dir" "$proj" "${env_args[@]}" -- --render po_discussion --title "assunto"
   elif [ "$mode" = "resume" ]; then
     run_agent "$case_dir" "$proj" "${env_args[@]}" -- --resume "$SESSION_ID" --name "$AGENT_NAME" --stage po --ticket-id NS-1
+  elif [ "$mode" = "resume_no_jail" ]; then
+    run_agent "$case_dir" "$proj" "${env_args[@]}" -- --resume "$SESSION_ID" --name "$AGENT_NAME" --stage po --ticket-id NS-1 --no-jail
   else
     launch "$case_dir" "$proj" "${env_args[@]}"
   fi
@@ -998,15 +1000,21 @@ expected_resume_argv() {
   args+=(--resume "$SESSION_ID" --name "$AGENT_NAME")
   printf '%s\n' "${args[@]}"
 }
-# resume <case_dir> <cwd> <stage> <opened> <ticket> [VAR=valor...]: run_agent com --resume (sem
-# --opened-id quando <opened> é vazio).
+# resume <case_dir> <cwd> <stage> <opened> <ticket> [VAR=valor...] [-- args...]: run_agent com
+# --resume (sem --opened-id quando <opened> é vazio); os [args] depois do -- vão no fim do argv do
+# launcher (NS-57: ex: --no-jail).
 resume() {
-  local case_dir="$1" cwd="$2" stage="$3" opened="$4" ticket="$5" args
+  local case_dir="$1" cwd="$2" stage="$3" opened="$4" ticket="$5" args env_args=()
   shift 5
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    env_args+=("$1")
+    shift
+  done
+  [ "$#" -gt 0 ] && shift
   args=(--resume "$SESSION_ID" --name "$AGENT_NAME" --stage "$stage")
   [ -n "$opened" ] && args+=(--opened-id "$opened")
-  args+=(--ticket-id "$ticket")
-  run_agent "$case_dir" "$cwd" "$@" -- "${args[@]}"
+  args+=(--ticket-id "$ticket" "$@")
+  run_agent "$case_dir" "$cwd" "${env_args[@]}" -- "${args[@]}"
 }
 # Jail ligada, o mesmo ID: o argv do ai-jail é o do lançamento, e o claude recebe só o aviso da
 # jail.
@@ -1105,6 +1113,98 @@ rm -f "$case_dir/order"
 run_agent "$case_dir" "$proj" -- --ticket-id NS-2 --stage review --opened-id NS-1 --name "$AGENT_NAME" --resume "$SESSION_ID"
 assert_eq "0" "$(file_of "$case_dir/rc")" "controle positivo: os argumentos da retomada em qualquer ordem também valem"
 assert_contains "$(file_of "$case_dir/claude.argv")" ".nick/docs/NS-2/" "controle positivo: em qualquer ordem, o aviso do ID novo"
+
+echo
+echo "== --resume com --no-jail: só desliga a jail nesta abertura, depois do jail_check (NS-57) =="
+# Jail ligada + --no-jail: o jail_check roda (a checagem pelo ai-jail), mas o claude sai direto,
+# sem o ai-jail e sem o aviso da jail.
+case_dir="$TEST_TMP/resume_no_jail_on"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+resume "$case_dir" "$proj" po NS-1 NS-1 -- --no-jail
+assert_eq "0" "$(file_of "$case_dir/rc")" "--no-jail com a jail ligada: sai com 0$(file_of "$case_dir/err")"
+assert_not_exists "$case_dir/jail.argv" "--no-jail com a jail ligada: o ai-jail não executa o claude"
+assert_eq "ai-jail -- true"$'\n'"claude" "$(file_of "$case_dir/order")" "--no-jail com a jail ligada: o jail_check ainda roda, e depois o claude direto"
+assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "")" "$(file_of "$case_dir/claude.argv")" \
+  "--no-jail com a jail ligada: o argv da retomada sem a jail (sem o aviso da jail)"
+assert_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): desligada" "--no-jail com a jail ligada: o jail_print_status diz desligada"
+assert_not_contains "$(file_of "$case_dir/out")" "Jail (ai-jail): ativa" "--no-jail com a jail ligada: o jail_print_status não diz ativa"
+assert_eq "PWD=$proj" "$(env_pwd "$case_dir")" "--no-jail: a retomada roda com o cwd no projeto"
+assert_exists "$proj/.nick/.gitignore" "--no-jail: a retomada roda o config_dir_prepare"
+# Jail ligada + --no-jail + ID mudado: só a instrução e o aviso do ID.
+case_dir="$TEST_TMP/resume_no_jail_on_id"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+resume "$case_dir" "$proj" review NS-1 NS-9 -- --no-jail
+assert_eq "$(expected_resume_argv "$case_dir" false "" "" review "$(id_notice NS-1 NS-9)")" "$(file_of "$case_dir/claude.argv")" \
+  "--no-jail com a jail ligada, ID mudou: a instrução e o aviso do ID, sem o aviso da jail"
+assert_not_exists "$case_dir/jail.argv" "--no-jail, ID mudou: o ai-jail não executa o claude"
+# Jail desligada + --no-jail: inócuo, o mesmo argv que sem a flag.
+case_dir="$TEST_TMP/resume_no_jail_off"
+proj="$(new_project "$case_dir" JAIL_ENABLED='"false"')"
+resume "$case_dir" "$proj" development NS-1 NS-1
+without_flag="$(file_of "$case_dir/claude.argv")"
+rm -f "$case_dir/claude.argv" "$case_dir/order"
+resume "$case_dir" "$proj" development NS-1 NS-1 -- --no-jail
+assert_eq "0" "$(file_of "$case_dir/rc")" "--no-jail com a jail desligada: sai com 0"
+assert_eq "$without_flag" "$(file_of "$case_dir/claude.argv")" "--no-jail com a jail desligada: o mesmo argv que sem a flag"
+assert_eq "$(expected_resume_argv "$case_dir" false "" "" development "")" "$(file_of "$case_dir/claude.argv")" "--no-jail com a jail desligada: o argv da retomada sem jail"
+assert_eq "claude" "$(file_of "$case_dir/order")" "--no-jail com a jail desligada: só o claude, sem checagem"
+# Em qualquer posição entre as opções: antes do --resume, no meio e no fim.
+for position in first middle last; do
+  case_dir="$TEST_TMP/resume_no_jail_pos_$position"
+  proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+  case "$position" in
+    first) run_agent "$case_dir" "$proj" -- --no-jail --resume "$SESSION_ID" --name "$AGENT_NAME" --stage po --ticket-id NS-1 ;;
+    middle) run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name "$AGENT_NAME" --no-jail --stage po --ticket-id NS-1 ;;
+    last) run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name "$AGENT_NAME" --stage po --ticket-id NS-1 --no-jail ;;
+  esac
+  assert_eq "0" "$(file_of "$case_dir/rc")" "--no-jail ($position): sai com 0$(file_of "$case_dir/err")"
+  assert_eq "$(expected_resume_argv "$case_dir" false "" "" po "")" "$(file_of "$case_dir/claude.argv")" "--no-jail ($position): o argv da retomada sem a jail"
+  assert_not_exists "$case_dir/jail.argv" "--no-jail ($position): o ai-jail não executa o claude"
+done
+# Um nome "--no-jail" é valor do --name, e não a flag: a jail continua.
+case_dir="$TEST_TMP/resume_no_jail_as_name"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+run_agent "$case_dir" "$proj" -- --resume "$SESSION_ID" --name --no-jail --stage po --ticket-id NS-1
+assert_eq "0" "$(file_of "$case_dir/rc")" "--name --no-jail: sai com 0$(file_of "$case_dir/err")"
+assert_exists "$case_dir/jail.argv" "--name --no-jail: é o nome, e a retomada vai pelo ai-jail"
+assert_eq "--name"$'\n'"--no-jail" "$(tail -n 2 "$case_dir/claude.argv" 2> /dev/null || true)" "--name --no-jail: o nome do agente é --no-jail"
+# Recusas: repetido, com valor, no lançamento e no --check.
+case_dir="$TEST_TMP/resume_no_jail_args"
+proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
+r="--resume $SESSION_ID --name x --stage po --ticket-id NS-1"
+for args in "$r --no-jail --no-jail" "--no-jail $r --no-jail" "$r --no-jail x"; do
+  rm -f "$case_dir/order"
+  # Lista de propósito: cada palavra é um argumento.
+  # shellcheck disable=SC2086
+  run_agent "$case_dir" "$proj" -- $args
+  assert_eq "1" "$(file_of "$case_dir/rc")" "argumentos '$args': sai com 1"
+  assert_contains "$(file_of "$case_dir/err")" "$USAGE" "argumentos '$args': o uso no stderr"
+  assert_eq "" "$(file_of "$case_dir/order")" "argumentos '$args': nada é chamado"
+done
+# Lista de propósito: cada palavra é um argumento.
+# shellcheck disable=SC2086
+run_agent "$case_dir" "$proj" -- $r --no-jail --no-jail
+assert_contains "$(file_of "$case_dir/err")" "o --no-jail foi repetido." "--no-jail repetido: a recusa diz por quê"
+rm -f "$case_dir/order"
+mapfile -t no_jail_launch < <(launch_args "$case_dir")
+run_agent "$case_dir" "$proj" -- "${no_jail_launch[@]}" --no-jail
+assert_eq "1" "$(file_of "$case_dir/rc")" "--no-jail no lançamento (--session-id): sai com 1"
+assert_contains "$(file_of "$case_dir/err")" "argumento desconhecido: '--no-jail'" "--no-jail no lançamento: argumento desconhecido (o modo de lançamento não muda)"
+assert_eq "" "$(file_of "$case_dir/order")" "--no-jail no lançamento: nada é chamado"
+for refused in "--check --no-jail" "--jira-url --no-jail"; do
+  # Lista de propósito: cada palavra é um argumento.
+  # shellcheck disable=SC2086
+  run_agent "$case_dir" "$proj" -- $refused
+  assert_eq "1" "$(file_of "$case_dir/rc")" "'$refused': sai com 1"
+  assert_contains "$(file_of "$case_dir/err")" "não aceita outros argumentos." "'$refused': recusado, como hoje"
+done
+assert_not_exists "$proj/.nick/.gitignore" "argumentos inválidos do --no-jail: nada criado no projeto"
+# Jail ligada e quebrada + --no-jail: a falha do jail_check, sem fallback (ABOUT.md, D3 do NS-57).
+jail_fail no_jail resume_no_jail "ai-jail não encontrado no PATH." PATH="$min_bin" -- JAIL_ENABLED='"true"'
+jail_fail old_version resume_no_jail "versão do ai-jail não suportada: encontrada 2.14.0" FAKE_JAIL_VERSION=2.14.0 -- JAIL_ENABLED='"true"'
+jail_fail bad_clipboard resume_no_jail "JAIL_CLIPBOARD=\"xyz\" em" -- JAIL_ENABLED='"true"' JAIL_CLIPBOARD='"xyz"'
+# O uso cita a flag.
+assert_contains "$USAGE" "(--ticket-id <id> | --epic-id <id>) [--no-jail]" "guarda: o uso desta suíte cita o --no-jail da retomada"
 
 echo
 echo "== --resume com --epic-id: o agente de um épico (NS-40) =="
@@ -1257,6 +1357,33 @@ assert_eq "config_register_nick_keys" "$(printf '%s\n' "$launcher_code" | grep -
   "config_register_nick_keys vem logo depois das linhas source, no topo (fora de função)"
 assert_eq "" "$(claude_command_lines "$LAUNCHER")" "nenhuma linha de código chama claude ou ai-jail fora do jail_exec \"\$JAIL_ENABLED\""
 assert_eq "1" "$(printf '%s\n' "$launcher_code" | grep -c 'jail_exec ' || true)" "uma única chamada de jail_exec"
+# NS-57: o --no-jail só existe na retomada (resume_mode), no despacho (launch_kind) e no uso
+# (usage_error); o JAIL_ENABLED="false" do override aparece uma única vez, no resume_mode, depois
+# do load_and_check.
+# code_lines_by_function <file>: cada linha de código de <file> como "<função>|<linha>" (a função
+# é a do bloco "nome() {" ... "}" em que a linha está; vazia fora de função).
+code_lines_by_function() {
+  awk '/^[[:space:]]*#/ { next } /^[a-z_]+\(\) \{/ { fn = $1; sub(/\(\)/, "", fn) } { print fn "|" $0 } /^\}/ { fn = "" }' "$1"
+}
+no_jail_functions="$(code_lines_by_function "$LAUNCHER" | grep -F -- '--no-jail' | cut -d'|' -f1 | sort -u | tr '\n' ' ')"
+assert_contains "$no_jail_functions" "resume_mode" "guarda: o --no-jail aparece no resume_mode"
+assert_eq "" "$(printf '%s' "$no_jail_functions" | tr ' ' '\n' | grep -vxE 'resume_mode|launch_kind|usage_error|' || true)" \
+  "o --no-jail só aparece no resume_mode, no launch_kind e no usage_error"
+printf '%s\n' 'resume_mode() {' '  x --no-jail' '}' 'launch_mode() {' '  y --no-jail' '}' > "$TEST_TMP/sample_fn.sh"
+assert_eq "launch_mode resume_mode " "$(code_lines_by_function "$TEST_TMP/sample_fn.sh" | grep -F -- '--no-jail' | cut -d'|' -f1 | sort -u | tr '\n' ' ')" \
+  "controle positivo: o filtro acha o --no-jail em cada função"
+override_lines="$(code_lines_by_function "$LAUNCHER" | grep -F 'JAIL_ENABLED="false"' || true)"
+assert_eq "1" "$(printf '%s' "$override_lines" | grep -c . || true)" "o JAIL_ENABLED=\"false\" do override aparece uma única vez no código"
+assert_eq "resume_mode" "$(printf '%s' "$override_lines" | cut -d'|' -f1)" "o JAIL_ENABLED=\"false\" fica no resume_mode"
+resume_body="$(code_lines_by_function "$LAUNCHER" | grep '^resume_mode|' | cut -d'|' -f2-)"
+load_line="$(printf '%s\n' "$resume_body" | grep -n '^[[:space:]]*load_and_check$' | cut -d: -f1)"
+override_line="$(printf '%s\n' "$resume_body" | grep -n 'JAIL_ENABLED="false"' | cut -d: -f1)"
+if [ -n "$load_line" ] && [ -n "$override_line" ] && [ "$override_line" -gt "$load_line" ]; then
+  echo "  OK: o JAIL_ENABLED=\"false\" vem depois do load_and_check (o jail_check roda com a jail do projeto)"
+else
+  echo "  FAIL: o JAIL_ENABLED=\"false\" vem depois do load_and_check (load_and_check: '$load_line', override: '$override_line')"
+  failures=$((failures + 1))
+fi
 sample="$TEST_TMP/sample.sh"
 # Aspas simples intencionais: é texto de código bash, comparado literalmente.
 # shellcheck disable=SC2016

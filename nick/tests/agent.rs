@@ -4005,3 +4005,249 @@ fn the_panel_of_an_epic_has_the_link_and_without_a_url_there_is_none() {
     nick.send("q");
     assert_eq!(nick.wait_exit(), Some(0));
 }
+
+// ---- NS-57: releasing and jailing an agent again (`l`) ----
+
+/// The red of the border of the confirmation and of the warning out of the jail.
+const RED: vt100::Color = vt100::Color::Idx(1);
+
+/// The line `SIZE <rows> <columns>` of the fake (mode `winsize`) in the panel now.
+fn size_line(nick: &Nick) -> String {
+    let panel = nick.panel();
+    let words: Vec<&str> = panel.split_whitespace().collect();
+    let at = words
+        .iter()
+        .position(|word| *word == "SIZE")
+        .unwrap_or_else(|| panic!("no SIZE in the panel:\n{panel}"));
+    words[at + 1..at + 3].join(" ")
+}
+
+/// `l` on the selected agent, the confirmation `title` with a red thick border (the only `┏` on
+/// the screen) and `text`, kept as `screen`, then `s`.
+fn confirm_jail_toggle(nick: &mut Nick, title: &str, text: &str, screen: &str) {
+    nick.send("l");
+    nick.wait_for(title);
+    wait_flat(nick, text);
+    wait_flat(nick, "qualquer outra tecla cancela");
+    let corners = nick.cells_of("┏");
+    assert_eq!(corners.len(), 1, "{}", nick.screen());
+    assert_eq!(corners[0].2, RED, "the red border of the jail");
+    nick.keep_screen(screen);
+    nick.send("s");
+}
+
+#[test]
+fn l_releases_a_live_agent_and_jails_it_again_in_the_same_conversation() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"true\""]);
+    let mut nick = spawn(&world, "winsize", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("proj · PO · NS-1 · na jail");
+    nick.wait_for_panel("SIZE");
+    let size = size_line(&nick);
+    let session = world.agents()[0].0.clone();
+    keep_conversation(&world, &proj, &session);
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "x encerrar · l liberar jail ·");
+    nick.keep_screen("NS-57: agente vivo na jail, com o l na ajuda");
+    fs::remove_file(logs(&world).jail).unwrap();
+    // Release: the same conversation, out of the jail, with the size of before (D11).
+    confirm_jail_toggle(
+        &mut nick,
+        " Liberar da jail ",
+        "Ele reinicia e fica SEM a proteção da jail até fechar. (s/N)",
+        "NS-57: confirmação vermelha de liberar da jail",
+    );
+    wait_flat(
+        &nick,
+        "O agente proj · PO · NS-1 foi retomado fora da jail.",
+    );
+    nick.wait_for_panel(&format!("proj · PO · NS-1 · {OFF_JAIL}"));
+    nick.wait_for_panel("SIZE");
+    assert_eq!(size_line(&nick), size, "the same size out of the jail");
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    assert!(!logs(&world).jail.exists(), "--no-jail: not by the ai-jail");
+    assert!(
+        !read(&logs(&world).claude).contains("ai-jail"),
+        "no notice of the jail"
+    );
+    assert_eq!(nick.color_at("FORA DA JAIL", 0), RED);
+    let agents = world.agents();
+    assert_eq!(agents.len(), 1, "the same agent, no new row");
+    assert_eq!(agents[0].3, "active");
+    nick.keep_screen("NS-57: agente liberado, FORA DA JAIL no cabeçalho");
+    // Jail it again: by the ai-jail, with the same size.
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "x encerrar · l prender na jail ·");
+    nick.keep_screen("NS-57: agente liberado, com o l prender na ajuda");
+    confirm_jail_toggle(
+        &mut nick,
+        " Prender na jail ",
+        "Ele reinicia e volta para a jail do projeto. (s/N)",
+        "NS-57: confirmação vermelha de prender na jail",
+    );
+    wait_flat(&nick, "O agente proj · PO · NS-1 foi retomado na jail.");
+    nick.wait_for_panel("proj · PO · NS-1 · na jail");
+    nick.wait_for_panel("SIZE");
+    assert_eq!(size_line(&nick), size, "the same size in the jail again");
+    let jail = read(&logs(&world).jail);
+    assert!(jail.contains(&format!("--resume\n{session}\n")), "{jail}");
+    assert!(!nick.screen().contains("FORA DA JAIL"));
+    // Released again, ended by x and resumed by r: back in the jail (until it closes, D10).
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "l liberar jail");
+    confirm_jail_toggle(
+        &mut nick,
+        " Liberar da jail ",
+        "SEM a proteção da jail",
+        "NS-57: liberar de novo",
+    );
+    nick.wait_for_panel(OFF_JAIL);
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "l prender na jail");
+    nick.send("x");
+    nick.wait_for("(s/N)");
+    nick.send("s");
+    wait_flat(&nick, "O agente proj · PO · NS-1 foi encerrado.");
+    wait_flat(&nick, "r retomar · o arquivar · l liberar jail · ← subir");
+    fs::remove_file(logs(&world).jail).unwrap();
+    nick.send("r");
+    wait_flat(&nick, "O agente proj · PO · NS-1 foi retomado.");
+    nick.wait_for_panel("proj · PO · NS-1 · na jail");
+    nick.wait_until("the resume by the ai-jail (the nick.conf)", || {
+        logs(&world).jail.exists()
+    });
+    nick.keep_screen("NS-57: depois do x e do r, de volta na jail");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn releasing_one_agent_leaves_the_other_of_the_project_in_the_jail() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"true\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    nick.select("NS-1");
+    open_agent(&mut nick, 1);
+    nick.wait_for_panel("proj · Tech Leader · NS-1 · na jail");
+    nick.wait_for_panel("READY");
+    let session = world.agents()[1].0.clone();
+    keep_conversation(&world, &proj, &session);
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "l liberar jail");
+    confirm_jail_toggle(
+        &mut nick,
+        " Liberar da jail ",
+        "SEM a proteção da jail",
+        "NS-57: liberar um de dois agentes",
+    );
+    wait_flat(
+        &nick,
+        "O agente proj · Tech Leader · NS-1 foi retomado fora da jail.",
+    );
+    nick.wait_for_panel(&format!("proj · Tech Leader · NS-1 · {OFF_JAIL}"));
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    nick.select("PO  ● vivo");
+    nick.wait_for_panel("proj · PO · NS-1 · na jail");
+    wait_flat(&nick, "l liberar jail");
+    nick.keep_screen("NS-57: o outro agente do projeto continua na jail");
+    nick.send("q");
+    nick.wait_for("Encerrar todos e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn without_the_jail_in_the_project_there_is_no_l() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"false\""]);
+    let mut nick = spawn(&world, "sleep", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("READY");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "Enter ir ao terminal");
+    assert!(
+        !nick.flat_screen().contains("l liberar"),
+        "{}",
+        nick.screen()
+    );
+    nick.send("l");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !nick.screen().contains("Liberar da jail"),
+        "{}",
+        nick.screen()
+    );
+    assert!(!nick.screen().contains("(s/N)"));
+    nick.keep_screen("NS-57: projeto sem jail, sem l na ajuda");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn cancelling_the_release_keeps_the_agent_running_in_the_same_process() {
+    let (world, _) = world_with(&["JAIL_ENABLED=\"true\""]);
+    let mut nick = spawn(&world, "winsize", &[]);
+    open_tickets(&mut nick, "proj");
+    open_agent(&mut nick, 0);
+    nick.wait_for_panel("SIZE");
+    nick.send(SHORTCUT);
+    wait_flat(&nick, "l liberar jail");
+    fs::remove_file(logs(&world).claude).unwrap();
+    nick.send("l");
+    nick.wait_for(" Liberar da jail ");
+    nick.send("n");
+    nick.wait_until("the dialog closed", || {
+        !nick.screen().contains("Liberar da jail")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!logs(&world).claude.exists(), "no second launch");
+    nick.wait_for_panel("proj · PO · NS-1 · na jail");
+    assert_eq!(nick.panel().matches("SIZE").count(), 1, "the same screen");
+    assert_eq!(world.agents()[0].3, "active");
+    nick.send("q");
+    nick.wait_for("Encerrar e sair?");
+    nick.send("s");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
+#[test]
+fn a_stopped_agent_of_a_project_in_the_jail_is_resumed_out_of_it_by_l() {
+    let (world, proj) = world_with(&["JAIL_ENABLED=\"true\""]);
+    let mut nick = spawn(&world, "echo", &[("FAKE_CLAUDE_READ_BYTES", "1")]);
+    let session = open_and_stop(&mut nick, &world);
+    // The g of the opening told the nick that the jail of the project is on.
+    wait_flat(&nick, "r retomar · o arquivar · l liberar jail · ← subir");
+    nick.keep_screen("NS-57: agente parado, com o l na ajuda");
+    keep_conversation(&world, &proj, &session);
+    fs::remove_file(logs(&world).jail).unwrap();
+    confirm_jail_toggle(
+        &mut nick,
+        " Liberar da jail ",
+        "SEM a proteção da jail",
+        "NS-57: liberar um agente parado",
+    );
+    nick.wait_for("READY");
+    wait_flat(
+        &nick,
+        "O agente proj · PO · NS-1 foi retomado fora da jail.",
+    );
+    nick.wait_for_panel(&format!("proj · PO · NS-1 · {OFF_JAIL}"));
+    assert_resumed(&world, &session, "proj · PO · NS-1");
+    assert!(!logs(&world).jail.exists(), "not by the ai-jail");
+    nick.send("z");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}

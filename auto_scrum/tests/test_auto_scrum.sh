@@ -2220,11 +2220,11 @@ echo "== main(): JIRA_ENABLED/SENTRY_ENABLED liberam na jail o host do MCP remot
 # lista padrão do ai-jail, que não tem nenhum dos dois.
 for jail_mcp in jira sentry ambos; do
   case "$jail_mcp" in
-    jira) jail_mcp_conf='JIRA_ENABLED="true"'; jail_mcp_except=JIRA_ENABLED; jail_mcp_hosts=(--allow-host mcp.atlassian.com) ;;
+    jira) jail_mcp_conf='JIRA_ENABLED="true"'; jail_mcp_except=JIRA_ENABLED; jail_mcp_hosts=(--allow-host mcp.atlassian.com --allow-host auth.atlassian.com --allow-host api.media.atlassian.com) ;;
     sentry) jail_mcp_conf='SENTRY_ENABLED="true"'; jail_mcp_except=SENTRY_ENABLED; jail_mcp_hosts=(--allow-host mcp.sentry.dev) ;;
     ambos) jail_mcp_conf='JIRA_ENABLED="true"'$'\n''SENTRY_ENABLED="true"'; jail_mcp_except="" ;;
   esac
-  [ "$jail_mcp" = "ambos" ] && jail_mcp_hosts=(--allow-host mcp.atlassian.com --allow-host mcp.sentry.dev)
+  [ "$jail_mcp" = "ambos" ] && jail_mcp_hosts=(--allow-host mcp.atlassian.com --allow-host auth.atlassian.com --allow-host api.media.atlassian.com --allow-host mcp.sentry.dev)
   # Os mesmos hosts, sem o --allow-host: a lista que o aviso ao agente cita.
   jail_mcp_names="$(printf '%s\n' "${jail_mcp_hosts[@]}" | grep -vxF -- --allow-host | paste -sd' ')"
   jail_mcp_base="$(config_keys_blank JAIL_ENABLED | grep -vE "^(${jail_mcp_except:-JIRA_ENABLED|SENTRY_ENABLED})=")"
@@ -2270,7 +2270,7 @@ assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail)" "$(cat "$jail_d
 assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "navegadores do Playwright" "jail com o Playwright no home: o aviso ao agente cita os navegadores"
 
 # mcp_jail_hosts: só "true" exato liga cada host; a ordem é Jira, depois Sentry.
-for mcp_case in "true|true|mcp.atlassian.com mcp.sentry.dev" "true||mcp.atlassian.com" "|true|mcp.sentry.dev" "||" "TRUE|sim|" "false|false|"; do
+for mcp_case in "true|true|mcp.atlassian.com auth.atlassian.com api.media.atlassian.com mcp.sentry.dev" "true||mcp.atlassian.com auth.atlassian.com api.media.atlassian.com" "|true|mcp.sentry.dev" "||" "TRUE|sim|" "false|false|"; do
   IFS='|' read -r mcp_jira mcp_sentry mcp_expected <<< "$mcp_case"
   assert_eq "$mcp_expected" "$(timeout 2 bash -c "source '$AUTO_SCRUM_SH'; JIRA_ENABLED='$mcp_jira'; SENTRY_ENABLED='$mcp_sentry'; mcp_jail_hosts" 2>&1)" "mcp_jail_hosts com JIRA_ENABLED=\"$mcp_jira\" e SENTRY_ENABLED=\"$mcp_sentry\": \"$mcp_expected\""
 done
@@ -2301,12 +2301,12 @@ echo
 echo "== main(): JAIL_ALLOW_HOSTS libera hosts na rede da jail (--allow-host), depois dos MCPs =="
 jail_dir="$TEST_TMP/jail_allow_hosts"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -vE '^(JIRA_ENABLED|JAIL_ALLOW_HOSTS)=')"$'\n''JAIL_ENABLED="true"'$'\n''JIRA_ENABLED="true"'$'\n''JAIL_ALLOW_HOSTS="docs.djangoproject.com tailwindcss.com"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir")")"
-jail_allow_opts=(--allow-host mcp.atlassian.com --allow-host docs.djangoproject.com --allow-host tailwindcss.com "${jail_docs_opts[@]}")
+jail_allow_opts=(--allow-host mcp.atlassian.com --allow-host auth.atlassian.com --allow-host api.media.atlassian.com --allow-host docs.djangoproject.com --allow-host tailwindcss.com "${jail_docs_opts[@]}")
 assert_eq "0" "$jail_rc" "JAIL_ALLOW_HOSTS com Jira: main() termina com código 0"
 assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_allow_opts[@]}" -- true)" "$(cat "$jail_dir/jail/call_1.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: a verificação libera o MCP, os hosts da chave e a documentação do Claude, nessa ordem"
 assert_eq "$(printf '%s\n' "${jail_base_opts[@]}" --terminal-passthrough "${jail_allow_opts[@]}" -- claude)" "$(head -n "$((${#jail_base_opts[@]} + ${#jail_allow_opts[@]} + 3))" "$jail_dir/jail/call_2.argv" 2>/dev/null || true)" "JAIL_ALLOW_HOSTS com Jira: o lançamento usa os mesmos hosts"
-assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "mcp.atlassian.com docs.djangoproject.com tailwindcss.com")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS com Jira: o aviso ao agente lista o MCP e os hosts da chave"
-assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "e também: mcp.atlassian.com, docs.djangoproject.com, tailwindcss.com" "JAIL_ALLOW_HOSTS com Jira: o aviso cita os hosts liberados"
+assert_eq "$(jail_expected_argv "$jail_dir" po_discussion jail "mcp.atlassian.com auth.atlassian.com api.media.atlassian.com docs.djangoproject.com tailwindcss.com")" "$(cat "$jail_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')" "JAIL_ALLOW_HOSTS com Jira: o aviso ao agente lista o MCP e os hosts da chave"
+assert_contains "$(cat "$jail_dir/claude/argv" 2>/dev/null || true)" "e também: mcp.atlassian.com, auth.atlassian.com, api.media.atlassian.com, docs.djangoproject.com, tailwindcss.com" "JAIL_ALLOW_HOSTS com Jira: o aviso cita os hosts liberados"
 jail_dir="$TEST_TMP/jail_allow_hosts_bad"
 jail_rc="$(run_main "$jail_dir" "$(config_keys_blank JAIL_ENABLED | grep -v '^JAIL_ALLOW_HOSTS=')"$'\n''JAIL_ENABLED="true"'$'\n''JAIL_ALLOW_HOSTS="https://docs.djangoproject.com"' "$(jail_input po_discussion)" "$(jail_case_setup "$jail_dir" "exec 2>'$jail_dir/err'")")"
 assert_eq "1" "$jail_rc" "JAIL_ALLOW_HOSTS \"https://...\": main() termina com código 1"
@@ -2354,7 +2354,7 @@ for settings_jail in false true; do
     settings_argv="$(cat "$settings_dir/claude/argv" 2>/dev/null || echo 'claude não chamado')"
     assert_eq "0" "$settings_rc" "$settings_label: main() termina com código 0"
     if [ "$settings_jail" = "true" ]; then
-      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type" jail "mcp.atlassian.com mcp.sentry.dev")" "$settings_argv" "$settings_label: o argv inteiro é --settings <regras>, o de sempre e a instrução mais o aviso da jail"
+      assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type" jail "mcp.atlassian.com auth.atlassian.com api.media.atlassian.com mcp.sentry.dev")" "$settings_argv" "$settings_label: o argv inteiro é --settings <regras>, o de sempre e a instrução mais o aviso da jail"
       assert_contains "$(cat "$settings_dir/jail/call_2.argv" 2>/dev/null || true)" $'\n--\nclaude\n--settings\n' "$settings_label: o lançamento é 'ai-jail <opções> -- claude --settings ...'"
     else
       assert_eq "$(jail_expected_argv "$settings_dir" "$settings_type")" "$settings_argv" "$settings_label: o argv inteiro é --settings <regras>, o de sempre e a instrução"

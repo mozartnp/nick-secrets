@@ -234,7 +234,7 @@ proj="$(new_project "$case_dir" "${jail_on_conf[@]}")"
 launch "$case_dir" "$proj"
 assert_eq "0" "$(file_of "$case_dir/rc")" "jail ligada: o launcher sai com 0 (o claude falso saiu com 0)"
 hosts="$(hosts_of "$case_dir" true true "$hosts_example")"
-assert_eq "mcp.atlassian.com mcp.sentry.dev $hosts_example" "$hosts" "guarda: os hosts saem de jail_mcp_hosts + JAIL_ALLOW_HOSTS"
+assert_eq "mcp.atlassian.com auth.atlassian.com api.media.atlassian.com mcp.sentry.dev $hosts_example" "$hosts" "guarda: os hosts saem de jail_mcp_hosts + JAIL_ALLOW_HOSTS"
 options_count="$(lib_call "$case_dir" jail_options brando "$hosts" "$ports_example" | grep -c .)"
 if [ "$options_count" -gt 13 ]; then
   echo "  OK: guarda: jail_options carregou da lib e gerou $options_count opções (mais que as 13 da base)"

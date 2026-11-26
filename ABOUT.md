@@ -1803,6 +1803,19 @@ todas as etapas rodar dentro do [ai-jail](https://github.com/akitaonrails/ai-jai
   nick mantém e controla). `jail_toolchain_dirs` devolve, dos diretórios `.pyenv`, `.nvm`,
   `.rbenv`, `.asdf`, `.local/share/mise`, `.local/share/uv/python`, `.sdkman` e `.volta` do
   `$HOME`, os que existem, e `jail_options` passa um `--map` (somente leitura) por diretório.
+  - **Mudou em 2026-11-26 (achado durante o NS-57):** com o Jira, a função (`jail_mcp_hosts`, em
+    `lib/jail/jail.sh`, desde o NS-33) devolve também o `auth.atlassian.com` e o
+    `api.media.atlassian.com`, nessa ordem, depois do `mcp.atlassian.com`. O endpoint v2 do MCP
+    (`https://mcp.atlassian.com/v2/mcp`) tem como servidor OAuth o `auth.atlassian.com`
+    (`/.well-known/oauth-protected-resource/v2/mcp`), e não o próprio `mcp.atlassian.com`, como
+    o v1. O login continua fora da jail, mas o `claude` **renova** o token sozinho (com o refresh
+    token) quando ele vence, e dentro da jail essa renovação era recusada (`CONNECT tunnel
+    failed, response 403`): o MCP caía no meio da sessão, e fora da jail seguia funcionando,
+    sem novo login. Conferido com `curl` dentro da jail: `mcp.atlassian.com` respondia 401, e
+    `auth.atlassian.com` e `api.atlassian.com`, 403 do proxy. O `api.media.atlassian.com` (os
+    anexos e as mídias do Jira) saiu da lista padrão (`lib/jail/allow_hosts.txt`) e veio para
+    cá, por decisão do usuário: os dois só servem a projetos com o Jira, e cada host liberado é
+    mais um canal de saída. O `developer.atlassian.com` (documentação) continua na lista padrão.
   Só gerenciadores de versão: nunca diretório de configuração ou credencial. Do uv, só os
   interpretadores (`uv/python`, pra onde o `venv/bin/python` aponta), e não o
   `~/.local/share/uv` inteiro: lá o `uv auth login` guarda credenciais de índice em texto puro

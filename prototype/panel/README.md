@@ -217,8 +217,9 @@ impressões; os dois estão pra refazer.
 - **`~/.config` dentro da jail (achado da `lib/jail`, fora do escopo do NS-29):** o
   `jail_agent_notice` diz ao agente que o `~/.config` não existe lá dentro, mas o próprio `claude`
   cria nele, ao subir, os manifests de native messaging da extensão do Chrome (um por navegador)
-  e há também um `mimeapps.list`. Não é perfil real, mas o agente estranhou a diferença. Vale um
-  ticket pra ajustar o texto do aviso.
+  e há também um `mimeapps.list`. Não é perfil real, mas o agente estranhou a diferença.
+  **Resolvido no NS-60:** o aviso passou a dizer que os diretórios do home da máquina não são
+  montados na jail e que o que aparecer neles foi criado lá dentro.
 - **Modo de permissão:** as sessões abrem em "auto mode", mas o painel não passa
   `--permission-mode` (a suíte bash confere). O modo vem da configuração do próprio `claude`
   do usuário.
@@ -300,7 +301,8 @@ O que a casca precisa resolver, e não é motivo pra trocar de pilha:
 - a dependência do `tui-term` no `vt100` 0.16: seguir a versão dele ou desenhar o
   `vt100::Screen` à mão;
 - a revisão da regra de linguagem do `ABOUT.md` ("Rust no projeto"), no ticket da casca;
-- o texto do `jail_agent_notice` sobre o `~/.config` (ticket à parte, da `lib/jail`);
+- o texto do `jail_agent_notice` sobre o `~/.config` (ticket à parte, da `lib/jail`):
+  **resolvido no NS-60**;
 - o que um emulador de terminal embutido tem de repassar ou filtrar: o OSC 52 (copiar), os
   controles do colar e, possivelmente, outras sequências que o `vt100` só entrega por callback
   (título, sino).

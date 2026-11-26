@@ -505,7 +505,7 @@ notice_text="$(file_of "$notice_dir/out")"
 assert_eq "0|" "$(file_of "$notice_dir/rc")|$(file_of "$notice_dir/err")" "jail_agent_notice: código 0 e nada no stderr"
 # O '~/.ssh' é texto do aviso, não caminho a expandir.
 # shellcheck disable=SC2088
-for notice_word in "sandbox ai-jail" "nick" 'JAIL_ENABLED="true"' "só o diretório do projeto aceita escrita" "somente leitura" "o home é privado" '~/.ssh' "não existem aqui, mesmo existindo na máquina" "API do Claude" "registries de pacotes" "GitHub" "localhost" "não consegue ver nem conferir nada fora da jail" "a primeira hipótese é a jail, não a máquina" "não conclua que algo foi removido" "avise o usuário"; do
+for notice_word in "sandbox ai-jail" "nick" 'JAIL_ENABLED="true"' "só o diretório do projeto aceita escrita" "somente leitura" "o home é privado" '~/.ssh' "não são montados aqui" "foi criado dentro da jail" "API do Claude" "registries de pacotes" "GitHub" "localhost" "não consegue ver nem conferir nada fora da jail" "a primeira hipótese é a jail, não a máquina" "não conclua que algo foi removido" "avise o usuário"; do
   assert_contains "$notice_text" "$notice_word" "o aviso cita: $notice_word"
 done
 # Credenciais: sem token do GitHub e sem SSH; o git local funciona; gh e push ficam com o
@@ -516,13 +516,21 @@ for notice_word in "token do GitHub" "SSH" "não estão disponíveis" "git local
 done
 assert_eq "true" "$(n1="$(grep -nF 'token do GitHub' <<< "$notice_text" | cut -d: -f1)"; n2="$(grep -nF 'não consegue ver nem conferir' <<< "$notice_text" | cut -d: -f1)"; [ -n "$n1" ] && [ -n "$n2" ] && [ "$n1" -lt "$n2" ] && echo true || echo false)" "a linha das credenciais vem antes de 'você não consegue ver nem conferir nada fora da jail'"
 # O --toolchains do ai-jail também monta coisas no home (caches graváveis, ~/.cargo/bin e
-# ~/.rustup somente leitura): o aviso cita isso, pra "não existem aqui" não ficar falso.
+# ~/.rustup somente leitura): o aviso cita isso, pra "não são montados aqui" não ficar falso.
 # shellcheck disable=SC2088 # o "~/" é texto do aviso, não caminho a expandir
 for notice_word in "caches de dependência" "graváveis" "~/.cargo/bin" "~/.rustup"; do
   assert_contains "$(grep -F 'o home é privado' <<< "$notice_text" || true)" "$notice_word" "a linha do home cita o que o --toolchains do ai-jail monta: $notice_word"
 done
 # shellcheck disable=SC2088 # o "~/" é texto do aviso, não caminho a expandir
 assert_not_contains "$notice_text" "~/.local etc." "o aviso não diz que ~/.local inteiro não existe (o ai-jail e o nick montam partes dele)"
+# O próprio claude cria o ~/.config no home privado da jail (achado do NS-29): o aviso não diz
+# que os diretórios do home não existem, e não cita arquivo do claude (uma versão nova dele
+# tornaria o texto falso de novo). Só na linha do home: a das credenciais diz, com razão, que
+# usuário e senha "não existem aqui".
+assert_not_contains "$(grep -F 'o home é privado' <<< "$notice_text" || true)" "não existem aqui" "o aviso não afirma que os diretórios do home não existem (o claude cria o ~/.config na jail)"
+for notice_word in "mimeapps" "NativeMessaging" "manifest"; do
+  assert_not_contains "$notice_text" "$notice_word" "o aviso não cita arquivo específico do claude: $notice_word"
+done
 assert_not_contains "$notice_text" "gerenciadores de versão" "sem toolchain no home: o aviso não lista gerenciadores de versão"
 assert_not_contains "$notice_text" "e também:" "sem hosts extras: o aviso não lista hosts extras"
 assert_eq "" "$(LC_ALL=C grep -n '[[:cntrl:]]' <<< "$notice_text" | grep -v $'\t' || true)" "o aviso não tem caracteres de controle"
@@ -531,6 +539,14 @@ mkdir -p "$notice_dir/home/.pyenv" "$notice_dir/home/.local/share/uv/python"
 run_jail "$notice_dir" "jail_agent_notice 'mcp.atlassian.com mcp.sentry.dev'"
 notice_text="$(file_of "$notice_dir/out")"
 assert_contains "$notice_text" "gerenciadores de versão desta máquina (~/.pyenv, ~/.local/share/uv/python)" "com toolchains: o aviso lista as montadas, com ~ no lugar do home"
+# A variante com toolchains da linha do home tem a mesma cláusula final da sem toolchains.
+for notice_word in "não são montados aqui" "foi criado dentro da jail"; do
+  assert_contains "$(grep -F 'o home é privado' <<< "$notice_text" || true)" "$notice_word" "com toolchains: a linha do home cita: $notice_word"
+done
+assert_not_contains "$(grep -F 'o home é privado' <<< "$notice_text" || true)" "não existem aqui" "com toolchains: o aviso não afirma que os diretórios do home não existem"
+for notice_word in "mimeapps" "NativeMessaging" "manifest"; do
+  assert_not_contains "$notice_text" "$notice_word" "com toolchains: o aviso não cita arquivo específico do claude: $notice_word"
+done
 assert_contains "$notice_text" "e também: mcp.atlassian.com, mcp.sentry.dev" "com hosts: o aviso lista os hosts extras liberados"
 assert_not_contains "$notice_text" "portas liberadas" "sem portas: o aviso não lista portas"
 assert_not_contains "$notice_text" "Playwright" "sem os navegadores do Playwright: o aviso não fala deles"

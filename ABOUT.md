@@ -2356,7 +2356,10 @@ pela verificação manual do `nick` no NS-31).
 - achado da `lib/jail`, fora do escopo do NS-29: o `jail_agent_notice` diz que o `~/.config` não
   existe dentro da jail, mas o próprio `claude` cria nele, ao subir, os manifests de native
   messaging da extensão do Chrome (e há um `mimeapps.list`). Não é perfil real de navegador,
-  mas o agente estranhou. Vale um ticket pra ajustar o texto;
+  mas o agente estranhou. **Resolvido no NS-60:** o aviso passou a dizer que os diretórios do
+  home da máquina não são montados na jail e que, se algum aparecer, foi criado lá dentro (pelo
+  próprio `claude`, por exemplo) e não tem nada da máquina. O texto é genérico de propósito, sem
+  citar arquivo do `claude`, pra uma versão nova dele não o tornar falso de novo;
 - o terminal integrado do VS Code não repassa o `Ctrl+\`: o VS Code fica com a tecla, que é
   atalho dele ("dividir editor"). Num terminal standalone, ela funciona (conferido pelo usuário).
   Decisão do usuário: manter o `Ctrl+\` no protótipo, com a regra do `keybindings.json` que

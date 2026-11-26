@@ -4687,6 +4687,10 @@ com ou sem suporte. O Alt+Enter funciona em qualquer terminal; mostrar o Shift+E
 passar o suporte até a UI só por um rótulo, e quem tem o Shift+Enter já o usa por hábito. O texto
 cabe nas linhas que o `help_rows` reserva: a troca de foco não redimensiona os PTYs (NS-34).
 
+> **Mudou no NS-56** (seção "Rust no projeto: Shift+clique na ajuda do terminal (NS-56)"): a ajuda
+> do terminal ganhou um terceiro item, `Shift+clique: copiar/colar`, e virou uma linha só, ajustada
+> à largura (os itens saem inteiros do fim para o começo, sem quebrar).
+
 **Por quê:** o operador usa o Shift+Enter o tempo todo e mandava mensagens incompletas ao `claude`.
 
 **Quando rever:** se outro terminal com suporte ao protocolo kitty quebrar alguma tecla (o teste
@@ -6561,3 +6565,77 @@ teclas da árvore (regra "README genérico").
 caminhos isolados (`JAIL_ALLOW_HOSTS`), ligar a jail à revelia do `nick.conf`, um aviso novo ao
 agente de que a jail mudou (o ticket aceita o risco do histórico antigo, impacto "Contexto do
 agente") e mudar o `--jira-url`/`--check`.
+
+## Rust no projeto: Shift+clique na ajuda do terminal (NS-56)
+
+Bug filho do épico NS-28. Com o foco no terminal do agente, o nick liga a captura do mouse
+(`terminal::enter_agent_modes`, `EnableMouseCapture`) para a roda e os cliques chegarem ao
+`claude`. Com a captura ligada, o terminal de fora (Konsole) entrega o clique direito e o arrasto
+ao nick, e o menu de copiar e colar e a seleção não funcionam. O terminal libera essas funções com
+o Shift (Shift+clique direito abre o menu, Shift+arrastar seleciona), mas o operador não tinha como
+descobrir isso. Agora a ajuda do terminal diz:
+
+```
+{atalho} voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar
+```
+
+Com o atalho padrão são 73 colunas. `{atalho}` é o `app.shortcut().label()`, como antes.
+
+**Decisões (os números são os do plano):**
+- **D1. Os itens** saem de uma função só, `ui::terminal_help_items(shortcut) -> [String; 3]`, em
+  ordem de prioridade: `"{atalho} voltar à lista"`, `"Alt+Enter nova linha"` e
+  `"Shift+clique: copiar/colar"` (com os dois-pontos). O ramo `on_terminal` de `help_text_for`
+  junta os três com ` · ` (a ajuda inteira, sem largura), e o ajuste do D2 usa a mesma lista, para
+  os textos não divergirem.
+- **D2. O ajuste à largura** (`ui::terminal_help_line(items, width)`, função pura): junta com ` · `
+  o **maior prefixo de itens inteiros** que cabe em `width` colunas de exibição
+  (`Span::raw(..).width()`). Os itens saem do fim para o começo: o último a sair é o `voltar à
+  lista`, depois o `Alt+Enter`, e o primeiro a sair é o `Shift+clique`. Um item nunca sai cortado
+  pela metade enquanto o primeiro couber. Quando nem o primeiro cabe, ele é cortado com
+  `marquee::ellipsize` (`…` no fim, no máximo `width` colunas); com `width == 0`, a linha é vazia.
+  **A linha nunca quebra.** Com o atalho padrão: de 73 colunas em diante, os três; de 44 a 72, os
+  dois primeiros; de 21 a 43, só o primeiro; abaixo de 21, o primeiro com `…`. A ajuda da árvore,
+  das Configurações e dos diálogos continua quebrando em palavras (`wrap_words`).
+- **D3. Uma linha só.** `ui::help_lines` devolve, com `app.on_terminal()`, só a linha do D2; fora
+  do terminal, o `wrap_words` de antes. O `help_rows` passou a receber a **quantidade** de linhas
+  da ajuda do momento, em vez do texto: o `layout_for` passa `help_lines(app, width).len()` e o
+  `new_agent_panel` passa `1` (a ajuda do terminal tem sempre uma linha). A reserva pelo maior texto
+  do `HELP_STATES` (NS-34) não mudou, e ela tem sempre uma linha ou mais: trocar o foco continua
+  sem redimensionar os PTYs, em qualquer largura.
+- **D4. Estilo:** o mesmo `Modifier::DIM` do `Paragraph` da ajuda. Nenhuma cor ou estilo novo.
+- **D5. Por que o Shift.** É a solução **provisória**: o nick precisa capturar o mouse para o
+  `claude`, e com a captura ligada o terminal de fora só trata o clique e o arrasto com o Shift
+  pressionado (o escape padrão dos terminais com os modos de mouse do xterm). A solução definitiva,
+  uma seleção e um menu do próprio nick (como no tmux), está no backlog.
+
+**Impactos aceitos:** a linha da ajuda do terminal ficou mais longa (e, em telas estreitas, perde
+itens em vez de quebrar), e o operador continua precisando do Shift para copiar e colar.
+
+**Ordem da refatoração (controle):** primeiro a extração (`terminal_help_items` com os dois itens
+antigos, `terminal_help_line`, `help_lines` e `help_rows`), com a suíte inteira verde sem editar
+nenhum teste (`.nick/docs/NS-56/baseline_refatoracao.log`); depois os testes novos, vermelhos, e o
+terceiro item.
+
+**Testes:**
+- unidade (`nick/src/ui.rs`): `the_terminal_help_drops_items_from_the_end_to_fit` (as fronteiras
+  exatas de cada item, com N e N-1 colunas, o `…` em 20 e 1 coluna, o vazio em 0, e os atalhos
+  `Ctrl+]` e `Ctrl+Alt+Shift+F12`); `the_terminal_help_never_wraps_and_keeps_the_reserved_rows` (a
+  tela desenhada em 100, 72, 60, 43 e 30 colunas: a primeira linha da ajuda é a do D2, as outras
+  ficam vazias, e a altura da ajuda e o terminal são os mesmos com o foco na lista e no terminal);
+  `a_new_agent_gets_its_panel_at_a_narrow_width` (o `new_agent_panel` em 43 e 30 colunas é o painel
+  do `layout` logo depois de abrir o agente).
+- PTY (`nick/tests/agent.rs`): `the_terminal_help_shows_shift_click_to_copy_and_paste` (o texto novo
+  na tela real, a 100 colunas).
+- adaptados (só a string esperada, com o terceiro item):
+  `ui::with_an_agent_the_list_is_on_the_left_and_the_agent_on_the_right`,
+  `ui::the_help_of_each_node_with_the_filters_and_the_count` (o plano citava o
+  `the_list_takes_at_most_half_of_a_narrow_window`, mas a asserção do `help_text` com o foco no
+  terminal fica neste) e `ui::the_terminal_help_shows_alt_enter_for_a_new_line`. O
+  `the_terminal_help_keeps_the_reserved_help_rows` e os `wait_for("Ctrl+\\ voltar à lista…")` do
+  PTY passaram sem edição.
+
+Sabotagens numa cópia fora do repositório em `.nick/docs/NS-56/sabotagens.md`; telas em
+`.nick/docs/NS-56/prints/`. Nenhuma dependência nova.
+
+**Fora de escopo:** mudar a captura do mouse, uma seleção ou um menu do próprio nick, ler a área de
+transferência, e a ajuda da árvore, das Configurações e dos diálogos.

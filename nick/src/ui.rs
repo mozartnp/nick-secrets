@@ -253,8 +253,8 @@ pub fn agent_area(app: &App, area: Rect, agent: &RunningAgent) -> Rect {
 /// the size of its PTY at the spawn (NS-57, D11: whatever the jail).
 pub fn new_agent_panel(app: &App, area: Rect) -> Rect {
     let running = app.agents().len() + 1;
-    let help = help_text_for(app, help_state(app), true, None, None);
-    let help_rows = help_rows(app, area.width, running, &help);
+    // The help of the terminal is always one row (NS-56, D3).
+    let help_rows = help_rows(app, area.width, running, 1);
     split(area, 1, help_rows).panel
 }
 
@@ -274,7 +274,12 @@ pub fn terminal_in_panel(panel: Rect, name: &str) -> Rect {
 
 fn layout_for(app: &App, area: Rect, agent: Option<&RunningAgent>) -> Areas {
     let status_rows = status_lines(app, area.width).len();
-    let help_rows = help_rows(app, area.width, app.agents().len(), &help_text(app));
+    let help_rows = help_rows(
+        app,
+        area.width,
+        app.agents().len(),
+        help_lines(app, area.width).len(),
+    );
     let mut areas = split(area, status_rows, help_rows);
     if let Some(agent) = agent.filter(|_| !areas.panel.is_empty()) {
         areas.terminal = terminal_in_panel(areas.panel, &agent.name);
@@ -332,7 +337,13 @@ fn status_lines(app: &App, width: u16) -> Vec<String> {
     )
 }
 
+/// The help of the moment in lines of at most `width` columns. With the focus on the terminal,
+/// one line fitted to the width (NS-56, D2: never wrapped); else word wrapped.
 fn help_lines(app: &App, width: u16) -> Vec<String> {
+    if app.on_terminal() {
+        let items = terminal_help_items(&app.shortcut().label());
+        return vec![terminal_help_line(&items, width)];
+    }
     wrap_words(&help_text(app), width.max(1))
 }
 
@@ -561,9 +572,7 @@ fn help_text_for(
 ) -> String {
     let shortcut = app.shortcut().label();
     if on_terminal {
-        // The Alt+Enter, always (NS-49): the new line of the `claude` on any terminal; the
-        // Shift+Enter only works with the kitty keyboard protocol, and isn't shown.
-        return format!("{shortcut} voltar à lista · Alt+Enter nova linha");
+        return terminal_help_items(&shortcut).join(" · ");
     }
     if let Some(dialog) = dialog {
         return dialog_keys(dialog).to_string();
@@ -622,6 +631,46 @@ fn help_text_for(
     format!("{keys} · {hidden} · {done} · {active}{count} · q sair")
 }
 
+/// The items of the help with the focus on the terminal, in the order of priority (NS-56, D1):
+/// the way back with the reserved `shortcut`, then the Alt+Enter, always (NS-49: the new line
+/// of the `claude` on any terminal; the Shift+Enter only works with the kitty keyboard protocol,
+/// and isn't shown), then the Shift+clique (NS-56, D5: the nick captures the mouse, so the
+/// outer terminal only selects and opens its menu with the Shift). `help_text_for` joins them
+/// all, `terminal_help_line` fits them.
+fn terminal_help_items(shortcut: &str) -> [String; 3] {
+    [
+        format!("{shortcut} voltar à lista"),
+        "Alt+Enter nova linha".to_string(),
+        "Shift+clique: copiar/colar".to_string(),
+    ]
+}
+
+/// The `items` joined with ` · ` in one line of at most `width` columns (NS-56, D2): the longest
+/// prefix of whole items that fits, so the last ones go first and the line never wraps. When
+/// not even the first one fits, it is cut with `…` (`marquee::ellipsize`).
+fn terminal_help_line(items: &[String], width: u16) -> String {
+    let width = usize::from(width);
+    let mut line = String::new();
+    for item in items {
+        let next = if line.is_empty() {
+            item.clone()
+        } else {
+            format!("{line} · {item}")
+        };
+        if Span::raw(next.as_str()).width() > width {
+            break;
+        }
+        line = next;
+    }
+    match items.first() {
+        Some(first) if line.is_empty() => marquee::ellipsize(&[Span::raw(first.clone())], width)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect(),
+        _ => line,
+    }
+}
+
 /// The places of the tree, each with every combination of the three filters in `HELP_STATES`.
 const TREE_PLACES: [Place; 11] = [
     Place::Module,
@@ -662,10 +711,9 @@ const fn help_states() -> [HelpState; 89] {
 /// the longest help of the tree (`HELP_STATES`), with the longest count (`N, N com saída
 /// nova`), whatever the node, the filters, the focus, the dialog or the marks. So moving on
 /// the tree, toggling the focus or a new mark does not resize every terminal (each resize
-/// redraws every claude and marks the hidden ones). The shorter help of the moment is drawn in
-/// the same rows. Without agents, the rows of the help itself.
-fn help_rows(app: &App, width: u16, running: usize, help: &str) -> usize {
-    let rows = wrap_words(help, width.max(1)).len();
+/// redraws every claude and marks the hidden ones). The shorter help of the moment (`rows`, from
+/// `help_lines`) is drawn in the same rows. Without agents, the rows of the help itself.
+fn help_rows(app: &App, width: u16, running: usize, rows: usize) -> usize {
     if running == 0 {
         return rows;
     }
@@ -3207,7 +3255,7 @@ mod tests {
         let lines: Vec<String> = text(&buffer).lines().map(str::to_string).collect();
         assert_eq!(
             lines[27].trim(),
-            "Ctrl+\\ voltar à lista · Alt+Enter nova linha",
+            "Ctrl+\\ voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar",
             "in the first row"
         );
     }
@@ -4556,13 +4604,14 @@ mod tests {
             help_text(&f.app),
             "t trocar · p voltar ao padrão · Esc voltar · q sair"
         );
-        // With the focus on the terminal: only the way back and the new line (NS-49).
+        // With the focus on the terminal: the way back, the new line (NS-49) and the
+        // Shift+clique (NS-56).
         f.app.screen = Screen::Tree;
         f.app.select(live);
         f.app.focus = Focus::Terminal;
         assert_eq!(
             help_text(&f.app),
-            "Ctrl+\\ voltar à lista · Alt+Enter nova linha"
+            "Ctrl+\\ voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar"
         );
     }
 
@@ -4575,12 +4624,12 @@ mod tests {
         assert!(f.app.on_terminal());
         assert_eq!(
             help_text(&f.app),
-            "Ctrl+\\ voltar à lista · Alt+Enter nova linha"
+            "Ctrl+\\ voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar"
         );
         f.app.shortcut = Shortcut::from_db("ctrl+]").unwrap();
         assert_eq!(
             help_text(&f.app),
-            "Ctrl+] voltar à lista · Alt+Enter nova linha"
+            "Ctrl+] voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar"
         );
     }
 
@@ -4598,6 +4647,143 @@ mod tests {
             let terminal = layout(&f.app, area);
             assert_eq!(list.help.height, terminal.help.height, "{width}");
             assert_eq!(list.terminal, terminal.terminal, "{width}");
+        }
+    }
+
+    /// NS-56, D2: the help of the terminal fits the width by dropping whole items from the end
+    /// (the way back, then the Alt+Enter, then the Shift+clique stay, in that order); when not
+    /// even the first fits, it is cut with `…`. Each boundary is exact: it fits with N columns,
+    /// not with N-1.
+    #[test]
+    fn the_terminal_help_drops_items_from_the_end_to_fit() {
+        let items = terminal_help_items("Ctrl+\\");
+        let all = "Ctrl+\\ voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar";
+        let two = "Ctrl+\\ voltar à lista · Alt+Enter nova linha";
+        let one = "Ctrl+\\ voltar à lista";
+        assert_eq!(
+            [all, two, one].map(|text| Span::raw(text).width()),
+            [73, 44, 21]
+        );
+        assert_eq!(terminal_help_line(&items, 200), all);
+        assert_eq!(terminal_help_line(&items, 73), all);
+        assert_eq!(terminal_help_line(&items, 72), two);
+        assert_eq!(terminal_help_line(&items, 44), two);
+        assert_eq!(terminal_help_line(&items, 43), one);
+        assert_eq!(terminal_help_line(&items, 21), one);
+        let cut = terminal_help_line(&items, 20);
+        assert_eq!(cut, "Ctrl+\\ voltar à lis…");
+        assert_eq!(Span::raw(cut.as_str()).width(), 20);
+        assert_eq!(terminal_help_line(&items, 1), "…");
+        assert_eq!(terminal_help_line(&items, 0), "");
+        // Another shortcut of the same size: the same boundaries, with its label.
+        let items = terminal_help_items("Ctrl+]");
+        assert_eq!(
+            terminal_help_line(&items, 73),
+            "Ctrl+] voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar"
+        );
+        assert_eq!(
+            terminal_help_line(&items, 72),
+            "Ctrl+] voltar à lista · Alt+Enter nova linha"
+        );
+        // A longer label (12 columns more) moves every boundary: the count uses the label.
+        let label = Shortcut::from_db("ctrl+alt+shift+f12").unwrap().label();
+        assert_eq!(label, "Ctrl+Alt+Shift+F12");
+        let items = terminal_help_items(&label);
+        let all = "Ctrl+Alt+Shift+F12 voltar à lista · Alt+Enter nova linha · \
+                   Shift+clique: copiar/colar";
+        assert_eq!(terminal_help_line(&items, 85), all);
+        assert_eq!(
+            terminal_help_line(&items, 84),
+            "Ctrl+Alt+Shift+F12 voltar à lista · Alt+Enter nova linha"
+        );
+        assert_eq!(
+            terminal_help_line(&items, 56),
+            "Ctrl+Alt+Shift+F12 voltar à lista · Alt+Enter nova linha"
+        );
+        assert_eq!(
+            terminal_help_line(&items, 55),
+            "Ctrl+Alt+Shift+F12 voltar à lista"
+        );
+        assert_eq!(
+            terminal_help_line(&items, 33),
+            "Ctrl+Alt+Shift+F12 voltar à lista"
+        );
+        assert_eq!(
+            terminal_help_line(&items, 32),
+            "Ctrl+Alt+Shift+F12 voltar à lis…"
+        );
+    }
+
+    /// NS-56, D2 and D3: on the screen, the help of the terminal is one line fitted to the
+    /// width (the rows below it stay empty), and toggling the focus keeps the rows of the help
+    /// and the size of the terminal (NS-34) at narrow widths too.
+    #[test]
+    fn the_terminal_help_never_wraps_and_keeps_the_reserved_rows() {
+        let (mut f, _) = with_running(&["proj"]);
+        for width in [100, 72, 60, 43, 30] {
+            let area = Rect::new(0, 0, width, 30);
+            f.app.focus = Focus::List;
+            let list = layout(&f.app, area);
+            f.app.focus = Focus::Terminal;
+            assert!(f.app.on_terminal());
+            let terminal = layout(&f.app, area);
+            assert_eq!(list.help.height, terminal.help.height, "{width}");
+            assert_eq!(list.terminal, terminal.terminal, "{width}");
+            let expected = terminal_help_line(&terminal_help_items("Ctrl+\\"), width);
+            let screen = text(&render_at(&f.app, width, 30, None));
+            let rows: Vec<&str> = screen
+                .lines()
+                .skip(usize::from(terminal.help.y))
+                .take(usize::from(terminal.help.height))
+                .map(str::trim_end)
+                .collect();
+            assert_eq!(rows[0], expected, "{width}");
+            assert!(
+                rows[1..].iter().all(|row| row.is_empty()),
+                "{width}: {rows:?}"
+            );
+            let first = rows[0];
+            match width {
+                100 => assert!(first.ends_with("Shift+clique: copiar/colar"), "{first}"),
+                60 => assert!(
+                    !first.contains("Shift") && !first.contains("copiar"),
+                    "{first}"
+                ),
+                30 => assert!(!first.contains("Alt+Enter"), "{first}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// NS-56, D3: at a narrow width (the help of the terminal in one row, cut), the panel of a
+    /// new agent is the one `layout` gives it once it is open with the focus on its terminal.
+    #[test]
+    fn a_new_agent_gets_its_panel_at_a_narrow_width() {
+        for width in [43, 30] {
+            let (mut f, root) = with_running(&[]);
+            let area = Rect::new(0, 0, width, 30);
+            let panel = new_agent_panel(&f.app, area);
+            let db = Db::open(&root.join("nick.db")).unwrap();
+            let dir = root.join("proj");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = db
+                .insert_project("auto_scrum", "proj", dir.to_str().unwrap())
+                .unwrap();
+            let t = db.insert_ticket(p.id, "NS-1", false, "t", None).unwrap();
+            f.app.refresh_tree();
+            f.app.open_agent(
+                &dir,
+                &(&t).into(),
+                StageType::Development,
+                Path::new("/log.md"),
+                precheck(true),
+                &mut NoSpawn,
+            );
+            assert!(f.app.on_terminal(), "{width}");
+            // `new_agent_panel` counts the state without a status message; the message of the
+            // stage that advanced wraps at these widths and is not the subject here.
+            f.app.status = None;
+            assert_eq!(layout(&f.app, area).panel, panel, "{width}");
         }
     }
 

@@ -3460,6 +3460,21 @@ fn assert_claude_gets(keyboard: Keyboard, keys: &str, bytes: &[u8]) {
     assert_eq!(nick.wait_exit(), Some(0), "{keys:?}");
 }
 
+/// NS-56: with the focus on the terminal of the agent, the help shows the Shift+clique (the
+/// nick captures the mouse, so the outer terminal only selects and opens its menu with the
+/// Shift), after the Alt+Enter, on the real screen at 100 columns.
+#[test]
+fn the_terminal_help_shows_shift_click_to_copy_and_paste() {
+    let (_world, mut nick) = echo_agent(Keyboard::Legacy, "1");
+    nick.wait_for("Ctrl+\\ voltar à lista · Alt+Enter nova linha · Shift+clique: copiar/colar");
+    nick.keep_screen("o terminal do agente, com o Shift+clique (copiar e colar) na ajuda");
+    nick.send("x");
+    nick.wait_for("GOT 78");
+    nick.wait_for("O agente proj · PO · NS-1 terminou.");
+    nick.send("q");
+    assert_eq!(nick.wait_exit(), Some(0));
+}
+
 #[test]
 fn shift_enter_reaches_claude_as_alt_enter() {
     let (_world, mut nick) = echo_agent(Keyboard::Kitty, "2");

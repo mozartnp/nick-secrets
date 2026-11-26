@@ -52,11 +52,14 @@ pub enum Launch<'a> {
     /// `--stage <stage> [--opened-id <opened_key>] --ticket-id <key>` (or `--epic-id <key>`, an
     /// agent of an epic: NS-40): the stage of the agent (its type is not stored), the key it was
     /// opened with, when known (`agents::opened_key`), and the key of its ticket or epic now; when
-    /// they differ, the launcher tells the agent the new folder.
+    /// they differ, the launcher tells the agent the new folder. `jail_off` (NS-57) adds
+    /// `--no-jail` at the end: the jail of the project off for this opening only (the operator
+    /// released the agent, with `l`).
     Resume {
         stage: Stage,
         opened_key: Option<&'a str>,
         holder_key: HolderKey<'a>,
+        jail_off: bool,
     },
 }
 
@@ -83,6 +86,7 @@ impl Launch<'_> {
                 stage,
                 opened_key,
                 holder_key,
+                jail_off,
             } => {
                 push(&["--resume".as_ref(), session_id.as_ref()]);
                 push(&["--name".as_ref(), name.as_ref()]);
@@ -93,6 +97,9 @@ impl Launch<'_> {
                 match holder_key {
                     HolderKey::Ticket(key) => push(&["--ticket-id".as_ref(), key.as_ref()]),
                     HolderKey::Epic(key) => push(&["--epic-id".as_ref(), key.as_ref()]),
+                }
+                if jail_off {
+                    push(&["--no-jail".as_ref()]);
                 }
             }
         }
@@ -463,19 +470,16 @@ pub trait AgentLauncher {
     ) -> Result<(), String>;
 }
 
-/// The size (rows, columns) of the PTY of an agent, from its name and whether it runs in the
-/// jail (its header, which wraps, takes rows from its terminal: ui.rs).
-pub type SizeOf = Box<dyn Fn(&str, bool) -> (u16, u16)>;
+/// The size (rows, columns) of the PTY of an agent, from its name (its header, which wraps,
+/// takes rows from its terminal: ui.rs; NS-57, D11: whatever the jail).
+pub type SizeOf = Box<dyn Fn(&str) -> (u16, u16)>;
 
 /// The real launcher: the check by `run_check`, the render by `run_render`, and the launch in an
-/// `AgentSession` whose events go to `tx`, of the size `size_of` gives for its name and the jail
-/// (review NS-34, P2: the PTY is born with its final size): the jail of the last check, or the one
-/// `with_jail` gives (the launch does not run the check again: NS-35). The loop takes the session
-/// from `session`.
+/// `AgentSession` whose events go to `tx`, of the size `size_of` gives for its name (review
+/// NS-34, P2: the PTY is born with its final size). The loop takes the session from `session`.
 pub struct TerminalAgentLauncher<E> {
     tx: Sender<E>,
     size_of: SizeOf,
-    jail: bool,
     pub session: Option<AgentSession>,
 }
 
@@ -484,23 +488,14 @@ impl<E> TerminalAgentLauncher<E> {
         TerminalAgentLauncher {
             tx,
             size_of,
-            jail: false,
             session: None,
         }
-    }
-
-    /// The jail of the agent, known from its check (the size of its header depends on it).
-    pub fn with_jail(mut self, jail: bool) -> TerminalAgentLauncher<E> {
-        self.jail = jail;
-        self
     }
 }
 
 impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLauncher<E> {
     fn check(&mut self, launcher: &Path, project: &Path) -> Result<Precheck, String> {
-        let check = run_check(launcher, project)?;
-        self.jail = check.jail;
-        Ok(check)
+        run_check(launcher, project)
     }
 
     fn render(
@@ -537,7 +532,7 @@ impl<E: From<AgentEvent> + Send + 'static> AgentLauncher for TerminalAgentLaunch
             session_id,
             name,
             launch,
-            (self.size_of)(name, self.jail),
+            (self.size_of)(name),
             self.tx.clone(),
         )
         .map_err(|err| err.to_string())?;
@@ -1230,6 +1225,7 @@ mod tests {
                 stage: Stage::TechLeader,
                 opened_key: Some("E-1"),
                 holder_key,
+                jail_off: false,
             }
             .args("s-1", "p · Tech Leader · E-1")
             .into_iter()
@@ -1252,5 +1248,40 @@ mod tests {
         let mut epic = head.to_vec();
         epic.extend(["--epic-id", "E-2"]);
         assert_eq!(args(HolderKey::Epic("E-2")), epic);
+    }
+
+    /// NS-57: `jail_off` adds `--no-jail`, once and at the end; without it, the argv of before.
+    #[test]
+    fn the_args_of_a_resume_out_of_the_jail_end_with_no_jail() {
+        let args = |jail_off| {
+            Launch::Resume {
+                stage: Stage::Development,
+                opened_key: None,
+                holder_key: HolderKey::Ticket("NS-9"),
+                jail_off,
+            }
+            .args("s-1", "p · Dev · NS-9")
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>()
+        };
+        let today = [
+            "--resume",
+            "s-1",
+            "--name",
+            "p · Dev · NS-9",
+            "--stage",
+            "development",
+            "--ticket-id",
+            "NS-9",
+        ];
+        assert_eq!(args(false), today);
+        let mut off = today.to_vec();
+        off.push("--no-jail");
+        assert_eq!(args(true), off);
+        assert_eq!(
+            args(true).iter().filter(|arg| *arg == "--no-jail").count(),
+            1
+        );
     }
 }

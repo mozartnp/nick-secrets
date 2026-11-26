@@ -40,7 +40,7 @@
 #       notice, --session-id, --name and the content of <file> (the log of --render) as the last
 #       argument.
 #   nick-agent --resume <uuid> --name <name> --stage <stage> [--opened-id <id>]
-#              (--ticket-id <id> | --epic-id <id>)
+#              (--ticket-id <id> | --epic-id <id>) [--no-jail]
 #       (NS-39) resumes the conversation <uuid> of a stopped agent, by the same path as the launch
 #       (the same checks, config_dir_prepare, jail_print_status and jail_exec, with the config of
 #       now): claude --settings <rules> [--permission-mode auto only with --stage development]
@@ -51,6 +51,13 @@
 #       (auto_scrum/prompt.sh): the folder of the ticket changed. The stage, and
 #       not the type, because the type of an agent is not stored. An agent of an epic (NS-40) gets
 #       --epic-id in the place of --ticket-id (exactly one of the two), and the notice of an epic.
+#       --no-jail (NS-57, a flag with no value, only here) turns the jail off for this opening
+#       only: the checks run the same, jail_check with the JAIL_ENABLED of the project included (a
+#       broken jail still fails: it is an explicit choice of the operator, not a fallback), and
+#       only after them JAIL_ENABLED becomes "false", so jail_print_status says off, there is no
+#       jail notice and jail_exec runs claude directly. There is no flag that turns the jail on:
+#       resuming without --no-jail follows the config. With the jail off in the project it changes
+#       nothing.
 #   nick-agent --has-conversation <uuid>
 #       (NS-39) whether claude keeps the conversation <uuid> of a session run with the cwd at this
 #       project (claude_conversation_file of lib/claude/, under ${CLAUDE_CONFIG_DIR:-$HOME/.claude}),
@@ -114,7 +121,7 @@ AGENT_STAGES=(po tech_leader development review)
 # usage_error <message>: the error and the usage on stderr, exit 1 (the pattern of bin/nick-init).
 usage_error() {
   echo "Erro: $1" >&2
-  echo "Uso: nick-agent --check | --jira-url | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) | --has-conversation <uuid>" >&2
+  echo "Uso: nick-agent --check | --jira-url | --render <tipo> [respostas] | --session-id <uuid> --name <nome> --type <tipo> --prompt-file <arquivo> | --resume <uuid> --name <nome> --stage <etapa> [--opened-id <id>] (--ticket-id <id> | --epic-id <id>) [--no-jail] | --has-conversation <uuid>" >&2
   exit 1
 }
 
@@ -326,9 +333,17 @@ stage_known() {
 
 # resume_mode <args...>: the resume (see the header), its options in any order.
 resume_mode() {
-  local session_id="" name="" stage="" opened_id="" holder_id="" holder="" seen=" " notice=""
+  local session_id="" name="" stage="" opened_id="" holder_id="" holder="" seen=" " notice="" no_jail=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --no-jail)
+        case "$seen" in
+          *" $1 "*) usage_error "o $1 foi repetido." ;;
+        esac
+        seen="$seen$1 "
+        no_jail="true"
+        shift
+        ;;
       --resume | --name | --stage | --opened-id | --ticket-id | --epic-id)
         [ "$#" -ge 2 ] || usage_error "falta o valor de $1."
         case "$seen" in
@@ -370,6 +385,11 @@ resume_mode() {
   esac
 
   load_and_check
+  # NS-57: the jail off for this opening only, after jail_check ran with the one of the project
+  # (an if, not [ ] &&: a false test as the last command would fail the function under set -e).
+  if [ "$no_jail" = "true" ]; then
+    JAIL_ENABLED="false"
+  fi
   config_dir_prepare || exit 1
   jail_print_status "$JAIL_ENABLED" "$JAIL_CLIPBOARD"
   if [ -n "$opened_id" ] && [ "$opened_id" != "$holder_id" ]; then
@@ -400,7 +420,8 @@ has_conversation_mode() {
 }
 
 # launch_kind <args...>: "resume" when --resume is one of the options (the values of the options
-# that take one are skipped, so a name "--resume" is a value), "launch" otherwise.
+# that take one are skipped, so a name "--resume" is a value), "launch" otherwise. --no-jail
+# (NS-57) takes no value, so it is not skipped with one.
 launch_kind() {
   while [ "$#" -gt 0 ]; do
     case "$1" in

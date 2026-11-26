@@ -451,6 +451,7 @@ mod tests {
                 Availability::DirMissing
             },
             jira_url: None,
+            jail: None,
         }
     }
 

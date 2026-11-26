@@ -10,6 +10,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -54,12 +55,18 @@ pub enum SessionEvent {
 }
 
 /// An event of the session of the agent `agent` (the `id` of its row): several sessions share
-/// the channel of the loop (NS-34).
+/// the channel of the loop (NS-34). `generation` is the one of the session that sent it (NS-57,
+/// D8): an agent ended and resumed has a new session with the same id, and an event of the old
+/// one still in the channel must not be taken for the new one's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentEvent {
     pub agent: i64,
+    pub generation: u64,
     pub event: SessionEvent,
 }
+
+/// The generation of the next session (NS-57, D8): unique in the process, never reused.
+static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// The vt100 callbacks: keeps the copy requests (OSC 52) the parser sees, for the reader to hand
 /// them to the loop. vt100 only calls `copy_to_clipboard` for a valid selector and base64 data,
@@ -111,6 +118,8 @@ pub struct AgentSession {
     pid: Option<u32>,
     exit: Arc<Mutex<Option<u32>>>,
     waiter: Option<JoinHandle<()>>,
+    /// Unique to this session (NS-57, D8): its events carry it.
+    generation: u64,
 }
 
 impl AgentSession {
@@ -182,9 +191,11 @@ impl AgentSession {
         let writer = pair.master.take_writer()?;
         let reader_parser = Arc::clone(&parser);
         let reader_tx = tx.clone();
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         let event = move |event| {
             AgentEvent {
                 agent: agent_id,
+                generation,
                 event,
             }
             .into()
@@ -232,7 +243,13 @@ impl AgentSession {
             pid,
             exit,
             waiter: Some(waiter),
+            generation,
         })
+    }
+
+    /// The generation of this session (NS-57, D8): the one its events carry.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The pid of the child, which is also its process group (the PTY child is a session
@@ -339,6 +356,16 @@ pub fn terminate_all(sessions: &mut [AgentSession]) {
     for session in sessions {
         session.wait();
     }
+}
+
+/// The index in `sessions` (the sessions of the loop, by the id of the row of each agent) of the
+/// session `event` came from, or None when it is from no session there: an agent already ended,
+/// or (NS-57, D8) an older session of an agent resumed since then, with the same id and another
+/// generation.
+pub fn event_session(sessions: &[(i64, AgentSession)], event: &AgentEvent) -> Option<usize> {
+    sessions.iter().position(|(agent, session)| {
+        *agent == event.agent && session.generation == event.generation
+    })
 }
 
 /// Ends the groups of every agent not reaped yet, from anywhere (the panic hook): the same
@@ -864,6 +891,42 @@ mod tests {
         }
     }
 
+    /// NS-57, D8: the session of an agent is ended and another one, with the same id, starts
+    /// before the loop reads the end of the first (the `Exited` its waiter sends is already in
+    /// the channel when `terminate` returns). That late event is of no session of the loop: taken
+    /// for the new one, it would end the agent just resumed.
+    #[test]
+    fn a_late_event_of_an_ended_session_is_not_the_new_one_s_with_the_same_id() {
+        let (a, b) = (Case::new(), Case::new());
+        let (tx, rx) = mpsc::channel();
+        let mut old = a.spawn_on(7, "sleep", &[], (24, 80), tx.clone());
+        wait_for_text(&old, "READY");
+        old.terminate();
+        let late: Vec<AgentEvent> = rx.try_iter().collect();
+        assert!(
+            late.iter()
+                .any(|e| e.agent == 7 && matches!(e.event, SessionEvent::Exited(_))),
+            "control: the end of the old session is in the channel: {late:?}"
+        );
+        let new = b.spawn_on(7, "sleep", &[], (24, 80), tx);
+        wait_for_text(&new, "READY");
+        let mut sessions = vec![(7, new)];
+        for event in &late {
+            assert_eq!(
+                event_session(&sessions, event),
+                None,
+                "an event of the ended session: {event:?}"
+            );
+        }
+        let own: Vec<AgentEvent> = rx.try_iter().collect();
+        assert!(!own.is_empty(), "control: the new session sent its output");
+        for event in &own {
+            assert_eq!(event_session(&sessions, event), Some(0), "{event:?}");
+        }
+        assert_eq!(sessions[0].1.exit_code(), None, "the new agent still runs");
+        sessions[0].1.terminate();
+    }
+
     /// Review NS-34, P3: the fake claude runs in a project whose name is not a variable name
     /// (FAKE_CLAUDE_MODE_<name> only applies to the valid ones), and the mode by project works.
     #[test]
@@ -893,6 +956,7 @@ mod tests {
             stage: Stage::Development,
             opened_key: Some("NS-1"),
             holder_key: HolderKey::Ticket("NS-9"),
+            jail_off: false,
         };
         let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
         assert_eq!(wait_exit(&session), 0);
@@ -927,6 +991,7 @@ mod tests {
             stage: Stage::Po,
             opened_key: None,
             holder_key: HolderKey::Ticket("NS-9"),
+            jail_off: false,
         };
         let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
         assert_eq!(wait_exit(&session), 0);
@@ -952,6 +1017,7 @@ mod tests {
             stage: Stage::TechLeader,
             opened_key: Some("EPIC-1"),
             holder_key: HolderKey::Epic("EPIC-2"),
+            jail_off: false,
         };
         let mut session = case.spawn_launch(AGENT_ID, "", &[], (24, 80), tx, launch);
         assert_eq!(wait_exit(&session), 0);
@@ -966,5 +1032,48 @@ mod tests {
             argv.ends_with("--name\nproj · Dev · NS-1\n"),
             "no prompt: {argv}"
         );
+    }
+
+    /// NS-57: a resume out of the jail reaches the real launcher with `--no-jail`. The project has
+    /// the jail on (the fake ai-jail of the fixtures, in front of the PATH): the check of the jail
+    /// runs, and then claude runs directly, without the notice of the jail. The control, without
+    /// `jail_off`, goes through the fake ai-jail with the notice.
+    #[test]
+    fn a_resume_out_of_the_jail_passes_no_jail_to_the_launcher() {
+        for jail_off in [true, false] {
+            let case = Case::new();
+            fs::write(case.path("proj/.nick/nick.conf"), "JAIL_ENABLED=\"true\"\n").unwrap();
+            let jail_log = case.path("jail.argv").display().to_string();
+            let (tx, _rx) = mpsc::channel();
+            let launch = Launch::Resume {
+                stage: Stage::Po,
+                opened_key: None,
+                holder_key: HolderKey::Ticket("NS-9"),
+                jail_off,
+            };
+            let extra = [("FAKE_JAIL_LOG", jail_log.as_str())];
+            let mut session = case.spawn_launch(AGENT_ID, "", &extra, (24, 80), tx, launch);
+            assert_eq!(wait_exit(&session), 0, "{jail_off}: {}", contents(&session));
+            session.wait();
+            let argv = fs::read_to_string(case.path("claude.argv")).expect("the fake claude ran");
+            if jail_off {
+                wait_for_text(&session, "Jail (ai-jail): desligada");
+                assert!(!case.path("jail.argv").exists(), "no launch by the ai-jail");
+                assert!(!argv.contains("ai-jail"), "no notice of the jail: {argv}");
+            } else {
+                wait_for_text(&session, "Jail (ai-jail): ativa");
+                assert!(case.path("jail.argv").exists(), "control: by the ai-jail");
+                assert!(
+                    argv.contains("ai-jail"),
+                    "control: the notice of the jail: {argv}"
+                );
+            }
+            assert!(
+                argv.ends_with(
+                    "--resume\n0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a60\n--name\nproj · Dev · NS-1\n"
+                ),
+                "{argv}"
+            );
+        }
     }
 }

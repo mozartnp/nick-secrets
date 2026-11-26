@@ -83,10 +83,11 @@ fn pane_block(focused: bool) -> Block<'static> {
 pub const IRREVERSIBLE_COLOR: Color = Color::Red;
 
 /// The block of an open dialog (NS-46): it has the focus, so `pane_block(true)`; in
-/// `IRREVERSIBLE_COLOR` when its action has no way back (`Dialog::irreversible`).
+/// `IRREVERSIBLE_COLOR` when its action has no way back (`Dialog::irreversible`) or when it
+/// changes the jail of an agent (`Dialog::touches_jail`, NS-57: two rules give the red).
 fn dialog_block(dialog: &Dialog) -> Block<'static> {
     let block = pane_block(true);
-    if dialog.irreversible() {
+    if dialog.irreversible() || dialog.touches_jail() {
         block.border_style(Style::new().fg(IRREVERSIBLE_COLOR))
     } else {
         block
@@ -248,8 +249,8 @@ pub fn agent_area(app: &App, area: Rect, agent: &RunningAgent) -> Rect {
 
 /// The panel an agent about to open gets on the screen `area` (review NS-34, P2): the same
 /// count as `layout`, in the state right after the opening (one more agent, the focus on its
-/// terminal, no status message). `terminal_in_panel` gives its terminal once its name and
-/// whether it runs in the jail are known: the size of its PTY at the spawn.
+/// terminal, no status message). `terminal_in_panel` gives its terminal once its name is known:
+/// the size of its PTY at the spawn (NS-57, D11: whatever the jail).
 pub fn new_agent_panel(app: &App, area: Rect) -> Rect {
     let running = app.agents().len() + 1;
     let help = help_text_for(app, help_state(app), true, None, None);
@@ -259,10 +260,11 @@ pub fn new_agent_panel(app: &App, area: Rect) -> Rect {
 
 /// The terminal of the agent `name` in `panel`: inside the border of the panel (NS-37, one cell
 /// on each side, whatever the focus), below its header (`header_rows`). The one count of the
-/// size of each PTY: the drawing, the mouse and the spawn take it from here.
-pub fn terminal_in_panel(panel: Rect, name: &str, jail: bool) -> Rect {
+/// size of each PTY: the drawing, the mouse and the spawn take it from here. NS-57, D11: the
+/// same in the jail and out of it, so releasing or jailing an agent keeps its size.
+pub fn terminal_in_panel(panel: Rect, name: &str) -> Rect {
     let inner = Block::bordered().inner(panel);
-    let rows = header_rows(name, jail, inner);
+    let rows = header_rows(name, inner);
     Rect {
         y: inner.y + rows,
         height: inner.height - rows,
@@ -275,7 +277,7 @@ fn layout_for(app: &App, area: Rect, agent: Option<&RunningAgent>) -> Areas {
     let help_rows = help_rows(app, area.width, app.agents().len(), &help_text(app));
     let mut areas = split(area, status_rows, help_rows);
     if let Some(agent) = agent.filter(|_| !areas.panel.is_empty()) {
-        areas.terminal = terminal_in_panel(areas.panel, &agent.name, agent.jail);
+        areas.terminal = terminal_in_panel(areas.panel, &agent.name);
         areas.header = header_in_panel(areas.panel, areas.terminal);
     } else {
         areas.terminal = areas.panel;
@@ -430,9 +432,17 @@ pub(crate) enum Place {
     /// The node of an epic (NS-40).
     Epic,
     Ticket,
+    /// A live agent of a project without the jail (NS-57: no `l`).
     LiveAgent,
+    /// A live agent of a project with the jail (NS-57): in it (`l liberar jail`) or released by
+    /// the operator (`l prender na jail`).
+    LiveAgentInJail,
+    LiveAgentReleased,
     /// An agent not live (NS-39): stopped (resumable), archived, or active in another nick.
     StoppedAgent,
+    /// A stopped agent whose project the last check said has the jail on (NS-57: `Row.jail`,
+    /// `l liberar jail`).
+    StoppedAgentInJail,
     ArchivedAgent,
     ElsewhereAgent,
     Settings,
@@ -452,12 +462,21 @@ fn help_state(app: &App) -> HelpState {
             NodeId::Project(_) => Place::Project,
             NodeId::Epic(_) => Place::Epic,
             NodeId::Ticket(_) => Place::Ticket,
-            NodeId::Agent(id) if app.agent(id).is_some() => Place::LiveAgent,
+            // NS-57: by `App::jail_toggle`, the rule of the key itself, so the help and the key
+            // always agree.
+            NodeId::Agent(id) if app.agent(id).is_some() => match app.jail_toggle(id) {
+                None => Place::LiveAgent,
+                Some(true) => Place::LiveAgentInJail,
+                Some(false) => Place::LiveAgentReleased,
+            },
             NodeId::Agent(id) => {
                 match app
                     .agent_record(id)
                     .and_then(|agent| AgentState::from_key(&agent.state))
                 {
+                    Some(AgentState::Stopped) if app.jail_toggle(id).is_some() => {
+                        Place::StoppedAgentInJail
+                    }
                     Some(AgentState::Stopped) => Place::StoppedAgent,
                     Some(AgentState::Archived) => Place::ArchivedAgent,
                     _ => Place::ElsewhereAgent,
@@ -505,6 +524,12 @@ fn dialog_keys(dialog: &Dialog) -> &'static str {
         Dialog::ConfirmPrompt { .. } => PROMPT_KEYS,
         Dialog::AgentError { .. } => "Enter/Esc fechar",
         Dialog::ConfirmEndAgent { .. } => "s encerrar · qualquer outra tecla cancela",
+        Dialog::ConfirmJailToggle { release: true, .. } => {
+            "s liberar · qualquer outra tecla cancela"
+        }
+        Dialog::ConfirmJailToggle { release: false, .. } => {
+            "s prender · qualquer outra tecla cancela"
+        }
         Dialog::ConversationLost { .. } => {
             "a arquivar · n abrir novo agente nesta etapa · Esc cancelar"
         }
@@ -562,7 +587,18 @@ fn help_text_for(
         Place::LiveAgent => {
             format!("↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · {shortcut} alternar")
         }
+        Place::LiveAgentInJail => format!(
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · l liberar jail · \
+             {shortcut} alternar"
+        ),
+        Place::LiveAgentReleased => format!(
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · l prender na jail · \
+             {shortcut} alternar"
+        ),
         Place::StoppedAgent => "↑/↓ mover · r retomar · o arquivar · ← subir".to_string(),
+        Place::StoppedAgentInJail => {
+            "↑/↓ mover · r retomar · o arquivar · l liberar jail · ← subir".to_string()
+        }
         Place::ArchivedAgent => "↑/↓ mover · o desarquivar · ← subir".to_string(),
         Place::ElsewhereAgent => "↑/↓ mover · ← subir".to_string(),
     };
@@ -587,26 +623,29 @@ fn help_text_for(
 }
 
 /// The places of the tree, each with every combination of the three filters in `HELP_STATES`.
-const TREE_PLACES: [Place; 8] = [
+const TREE_PLACES: [Place; 11] = [
     Place::Module,
     Place::Project,
     Place::Epic,
     Place::Ticket,
     Place::LiveAgent,
+    Place::LiveAgentInJail,
+    Place::LiveAgentReleased,
     Place::StoppedAgent,
+    Place::StoppedAgentInJail,
     Place::ArchivedAgent,
     Place::ElsewhereAgent,
 ];
 
 /// Every state of the help without a dialog: each kind of node with the 8 combinations of the
-/// three filters (NS-54: 8 × 8), and the settings. `help_rows` reserves rows for the longest of
-/// them.
-const HELP_STATES: [HelpState; 65] = help_states();
+/// three filters (NS-54: 8 × 8; NS-57: 11 kinds), and the settings. `help_rows` reserves rows
+/// for the longest of them.
+const HELP_STATES: [HelpState; 89] = help_states();
 
-const fn help_states() -> [HelpState; 65] {
-    let mut states = [(Place::Settings, false, false, false); 65];
+const fn help_states() -> [HelpState; 89] {
+    let mut states = [(Place::Settings, false, false, false); 89];
     let mut at = 0;
-    while at < 64 {
+    while at < 88 {
         let filters = at % 8;
         states[at] = (
             TREE_PLACES[at / 8],
@@ -691,9 +730,16 @@ fn header_lines(name: &str, jail: bool, width: u16) -> Vec<Line<'static>> {
 }
 
 /// The rows of the header of an agent in `panel`: the lines it wraps into, up to a third of
-/// the panel (at least one).
-fn header_rows(name: &str, jail: bool, panel: Rect) -> u16 {
-    let lines = header_lines(name, jail, panel.width).len();
+/// the panel (at least one). NS-57, D11 (decision of the user): the most of its version in the
+/// jail and of its version out of it (in practice, the one out of it), so the height does not
+/// depend on the jail; in the jail, the rows to spare stay blank (and may serve more
+/// information some day).
+fn header_rows(name: &str, panel: Rect) -> u16 {
+    let lines = [true, false]
+        .map(|jail| header_lines(name, jail, panel.width).len())
+        .into_iter()
+        .max()
+        .unwrap_or(1);
     u16::try_from(lines)
         .unwrap_or(u16::MAX)
         .min((panel.height / 3).max(1))
@@ -712,7 +758,7 @@ pub fn draw_agent(
     terminal: Option<&vt100::Screen>,
 ) {
     frame.render_widget(pane_block(focused), area);
-    let below = terminal_in_panel(area, name, jail);
+    let below = terminal_in_panel(area, name);
     let header = header_in_panel(area, below);
     let lines: Vec<Line> = header_lines(name, jail, header.width)
         .into_iter()
@@ -1815,6 +1861,32 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect) {
             ))],
             None,
         ),
+        Dialog::ConfirmJailToggle {
+            name,
+            release: true,
+            ..
+        } => (
+            " Liberar da jail ",
+            vec![Line::from(format!(
+                "Liberar o agente {} da jail? Ele reinicia e fica SEM a proteção da jail até \
+                 fechar. (s/N)",
+                printable(name)
+            ))],
+            None,
+        ),
+        Dialog::ConfirmJailToggle {
+            name,
+            release: false,
+            ..
+        } => (
+            " Prender na jail ",
+            vec![Line::from(format!(
+                "Prender o agente {} na jail de novo? Ele reinicia e volta para a jail do \
+                 projeto. (s/N)",
+                printable(name)
+            ))],
+            None,
+        ),
         Dialog::ConversationLost { agent, .. } => (
             " Conversa não encontrada ",
             vec![Line::from(format!(
@@ -2633,6 +2705,7 @@ mod tests {
             project: project(1, "a\x1b[2Jb", "/w/a\x1b[2Jb"),
             availability: Availability::DirMissing,
             jira_url: None,
+            jail: None,
         }];
         f.app.tree.open(MODULE);
         f.app.relayout();
@@ -2719,8 +2792,8 @@ mod tests {
         // The header takes one row when it fits, and the terminal the rest (in a panel of one
         // row, nothing).
         let name = "proj · PO · NS-1";
-        assert_eq!(header_rows(name, true, Rect::new(0, 0, 100, 30)), 1);
-        assert_eq!(header_rows(name, true, Rect::new(0, 0, 10, 1)), 1);
+        assert_eq!(header_rows(name, Rect::new(0, 0, 100, 30)), 1);
+        assert_eq!(header_rows(name, Rect::new(0, 0, 10, 1)), 1);
         // Inside the border (NS-37): 98x28, the header on its first row.
         let mut parser = vt100::Parser::new(27, 98, 0);
         parser.process(b"\x1b[31mlinha um\x1b[0m\r\nlinha dois\x1b[27;1Hfim");
@@ -3110,17 +3183,19 @@ mod tests {
         assert_eq!(areas.list, Rect::new(0, 0, 40, 26));
         // The panel keeps its border (NS-37): the header and the terminal are inside it.
         assert_eq!(areas.panel, Rect::new(40, 0, 60, 26));
-        assert_eq!(areas.header, Rect::new(41, 1, 58, 1));
-        assert_eq!(areas.terminal, Rect::new(41, 2, 58, 23));
+        // NS-57, D11: the header of an agent in the jail has the rows of its version out of
+        // it (two at 58 columns), the second one blank; one row each before.
+        assert_eq!(areas.header, Rect::new(41, 1, 58, 2));
+        assert_eq!(areas.terminal, Rect::new(41, 3, 58, 22));
         assert_eq!(areas.status, Rect::new(0, 26, 100, 1));
         assert_eq!(areas.help, Rect::new(0, 27, 100, 3));
         let agent = f.app.shown_agent().unwrap();
         assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
-        let mut parser = vt100::Parser::new(23, 58, 0);
-        parser.process(b"primeira\x1b[23;1Hultima");
+        let mut parser = vt100::Parser::new(22, 58, 0);
+        parser.process(b"primeira\x1b[22;1Hultima");
         let buffer = render_at(&f.app, 100, 30, Some(parser.screen()));
         assert_eq!(find(&buffer, "proj · Dev · NS-1 · na jail"), Some((1, 41)));
-        assert_eq!(find(&buffer, "primeira"), Some((2, 41)));
+        assert_eq!(find(&buffer, "primeira"), Some((3, 41)));
         assert_eq!(
             find(&buffer, "ultima"),
             Some((24, 41)),
@@ -3168,9 +3243,10 @@ mod tests {
         );
         // One row less since the NS-54 (the help keeps three rows at 100 columns).
         assert_eq!(areas.terminal, Rect::new(41, 3, 58, 22));
-        // Each agent has the size of its own header: the one in the jail, one row.
+        // NS-57, D11: the one in the jail has the same size (its header keeps the rows of the
+        // warning, blank); it had one row more before.
         let in_jail = &f.app.agents()[0];
-        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(41, 2, 58, 23));
+        assert_eq!(agent_area(&f.app, area, in_jail), Rect::new(41, 3, 58, 22));
         let buffer = render_at(&f.app, 100, 30, None);
         let header: Vec<String> = text(&buffer)
             .lines()
@@ -3212,8 +3288,9 @@ mod tests {
         let area = Rect::new(0, 0, 100, 30);
         let areas = layout(&f.app, area);
         assert_eq!(areas.status.height, 3);
-        // 2 rows of the border (NS-37), 1 of the header and 3 of the status.
-        assert_eq!(areas.terminal.height, 30 - 2 - 1 - 3 - areas.help.height);
+        // 2 rows of the border (NS-37), 2 of the header (NS-57, D11: the rows of the warning out
+        // of the jail, in the jail too; 1 before) and 3 of the status.
+        assert_eq!(areas.terminal.height, 30 - 2 - 2 - 3 - areas.help.height);
         let agent = f.app.shown_agent().unwrap();
         assert_eq!(agent_area(&f.app, area, agent), areas.terminal);
         let buffer = render_at(&f.app, 100, 30, None);
@@ -3313,6 +3390,57 @@ mod tests {
             first: Shortcut::from_db("ctrl+]"),
         });
         assert_has(&render(&f.app), "Aperte Ctrl+] de novo para confirmar.");
+    }
+
+    /// NS-57, D4/D5: releasing and jailing again ask `(s/N)` in a red thick border, with no cyan
+    /// cell; the text says the action, that the agent restarts and, to release, that it goes
+    /// without the protection of the jail.
+    #[test]
+    fn the_jail_toggle_dialogs_are_red_and_say_what_happens() {
+        let (mut f, _) = with_running(&["alfa"]);
+        f.app.focus = Focus::List;
+        for (release, text, keys) in [
+            (
+                true,
+                "Liberar o agente alfa · Dev · NS-1 da jail? Ele reinicia e fica SEM a proteção \
+                 da jail até fechar. (s/N)",
+                "s liberar · qualquer outra tecla cancela",
+            ),
+            (
+                false,
+                "Prender o agente alfa · Dev · NS-1 na jail de novo? Ele reinicia e volta para a \
+                 jail do projeto. (s/N)",
+                "s prender · qualquer outra tecla cancela",
+            ),
+        ] {
+            f.app.dialog = Some(Dialog::ConfirmJailToggle {
+                id: 1,
+                name: "alfa · Dev · NS-1".into(),
+                release,
+            });
+            let buffer = render(&f.app);
+            assert!(flat(&buffer).contains(text), "{release}: {}", flat(&buffer));
+            assert_eq!(last_line(&buffer).trim(), keys, "{release}");
+            let corners = all_of(&buffer, "┏");
+            assert_eq!(corners.len(), 1, "{release}");
+            let (x, y) = corners[0];
+            assert_border_color(&buffer, (x, y), "┏", Some(IRREVERSIBLE_COLOR));
+            assert_border_color(&buffer, (x, y + 1), "┃", Some(IRREVERSIBLE_COLOR));
+            assert!(
+                buffer.content.iter().all(|cell| cell.fg != FOCUS_COLOR),
+                "{release}: no cyan cell"
+            );
+        }
+        let mut title = |release| {
+            f.app.dialog = Some(Dialog::ConfirmJailToggle {
+                id: 1,
+                name: "a".into(),
+                release,
+            });
+            flat(&render(&f.app))
+        };
+        assert!(title(true).contains(" Liberar da jail "));
+        assert!(title(false).contains(" Prender na jail "));
     }
 
     #[test]
@@ -3422,7 +3550,7 @@ mod tests {
             let last = names[names.len() - 1];
             let jail = !last.starts_with("fora");
             let name = format!("{last} · Dev · NS-1");
-            let expected = terminal_in_panel(panel, &name, jail);
+            let expected = terminal_in_panel(panel, &name);
             // Open it as with_running does.
             let db = Db::open(&root.join("nick.db")).unwrap();
             let dir = root.join(last);
@@ -3683,10 +3811,9 @@ mod tests {
     fn the_terminal_is_inside_the_border_of_the_panel() {
         let name = "proj · Dev · NS-1";
         let panel = Rect::new(40, 0, 60, 27);
-        assert_eq!(
-            terminal_in_panel(panel, name, true),
-            Rect::new(41, 2, 58, 24)
-        );
+        // NS-57, D11: below the two rows of the header (the warning out of the jail wraps at 58
+        // columns), whatever the jail; (41, 2, 58, 24) in the jail before.
+        assert_eq!(terminal_in_panel(panel, name), Rect::new(41, 3, 58, 23));
         for panel in [
             Rect::new(40, 0, 60, 27),
             Rect::new(5, 3, 20, 10),
@@ -3698,7 +3825,7 @@ mod tests {
         ] {
             for jail in [true, false] {
                 let inner = Block::bordered().inner(panel);
-                let terminal = terminal_in_panel(panel, name, jail);
+                let terminal = terminal_in_panel(panel, name);
                 assert_eq!(terminal.union(inner), inner, "{panel:?} {jail}");
                 assert_eq!((terminal.x, terminal.width), (inner.x, inner.width));
                 assert_eq!(terminal.bottom(), inner.bottom(), "{panel:?} {jail}");
@@ -3711,9 +3838,67 @@ mod tests {
         for agent in f.app.agents() {
             assert_eq!(
                 agent_area(&f.app, area, agent),
-                terminal_in_panel(panel, &agent.name, agent.jail)
+                terminal_in_panel(panel, &agent.name)
             );
         }
+    }
+
+    /// NS-57, D11: the header has the height of its version out of the jail, in the jail too
+    /// (capped as before: a third of the panel, at least 1), so the terminal of an agent has the
+    /// same size in the jail and out of it, for the same name and panel. At 40 columns inside the
+    /// border, the warning wraps in 2 rows; at 20, in 4 (capped at 3 in a panel of 9 rows).
+    #[test]
+    fn the_size_of_the_terminal_does_not_depend_on_the_jail() {
+        let name = "proj · Dev · NS-1";
+        let mut wrapped = Vec::new();
+        for width in [12, 22, 32, 42, 60, 80, 100, 140] {
+            for height in [1, 3, 9, 27, 40] {
+                let panel = Rect::new(40, 0, width, height);
+                let terminal = terminal_in_panel(panel, name);
+                let inner = Block::bordered().inner(panel);
+                let off = header_lines(name, false, inner.width).len();
+                let on = header_lines(name, true, inner.width).len();
+                assert!(on <= off, "the warning is the longer: {panel:?}");
+                let cap = usize::from((inner.height / 3).max(1).min(inner.height));
+                assert_eq!(
+                    usize::from(terminal.y - inner.y),
+                    off.max(on).min(cap),
+                    "the height out of the jail, capped, in the jail too: {panel:?}"
+                );
+                wrapped.push(off);
+            }
+        }
+        for rows in [2, 3, 4] {
+            assert!(wrapped.contains(&rows), "control: {rows} rows: {wrapped:?}");
+        }
+    }
+
+    /// NS-57, D11: in the jail, the rows the header has to spare are blank, below the first one,
+    /// with `na jail`; the terminal starts below them, where it starts out of the jail.
+    #[test]
+    fn the_header_in_the_jail_leaves_its_extra_rows_blank() {
+        let name = "proj · Dev · NS-1";
+        let draw = |jail: bool| {
+            let mut terminal = Terminal::new(TestBackend::new(42, 30)).unwrap();
+            let parser = vt100::Parser::new(30, 40, 0);
+            terminal
+                .draw(|frame| {
+                    draw_agent(frame, frame.area(), name, jail, true, Some(parser.screen()))
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let (jailed, off) = (draw(true), draw(false));
+        assert_eq!(inside_row(&jailed, 1), "proj · Dev · NS-1 · na jail");
+        assert_eq!(inside_row(&jailed, 2), "", "a blank row in the jail");
+        assert!(
+            inside_row(&off, 2).contains("direto no seu shell."),
+            "control"
+        );
+        assert_eq!(terminal_in_panel(Rect::new(0, 0, 42, 30), name).y, 3);
+        // The cursor of the program, at (0, 0) of the terminal, on the same row in both.
+        assert_eq!(jailed[(1, 3)].symbol(), "█");
+        assert_eq!(off[(1, 3)].symbol(), "█");
     }
 
     /// The program's cursor at (0, 0) is drawn on the first cell of the terminal, inside the
@@ -3725,7 +3910,8 @@ mod tests {
         let parser = vt100::Parser::new(areas.terminal.height, areas.terminal.width, 0);
         let buffer = render_at(&f.app, 100, 30, Some(parser.screen()));
         assert_eq!(buffer[(areas.terminal.x, areas.terminal.y)].symbol(), "█");
-        assert_eq!((areas.terminal.x, areas.terminal.y), (41, 2));
+        // NS-57, D11: below the two rows of the header (one in the jail before).
+        assert_eq!((areas.terminal.x, areas.terminal.y), (41, 3));
         assert_eq!(buffer[(40, 2)].symbol(), "┃", "the border stays");
     }
 
@@ -3745,8 +3931,9 @@ mod tests {
         };
         let click = |column, row| event(MouseEventKind::Down(MouseButton::Left), column, row);
         let wheel = |column, row| event(MouseEventKind::ScrollUp, column, row);
-        // Without the mouse asked by the program, the wheel scrolls only over the terminal.
-        assert_ne!(f.app.handle_mouse(&wheel(41, 2), terminal), Action::None);
+        // Without the mouse asked by the program, the wheel scrolls only over the terminal (NS-57,
+        // D11: from the row 3, below the two rows of the header; the row 2 before).
+        assert_ne!(f.app.handle_mouse(&wheel(41, 3), terminal), Action::None);
         for (column, row) in [(40, 5), (99, 5), (60, 0), (60, 26)] {
             assert_eq!(
                 f.app.handle_mouse(&wheel(column, row), terminal),
@@ -3759,11 +3946,11 @@ mod tests {
             ..AgentTerm::default()
         };
         assert_eq!(
-            f.app.handle_mouse(&click(41, 2), terminal),
+            f.app.handle_mouse(&click(41, 3), terminal),
             Action::Send(b"\x1b[<0;1;1M".to_vec()),
-            "the first cell inside the border is the program's (1, 1)"
+            "the first cell below the header is the program's (1, 1)"
         );
-        for (column, row) in [(40, 5), (99, 5), (60, 0), (60, 1), (60, 26)] {
+        for (column, row) in [(40, 5), (99, 5), (60, 0), (60, 1), (60, 2), (60, 26)] {
             assert_eq!(
                 f.app.handle_mouse(&click(column, row), terminal),
                 Action::None,
@@ -3788,9 +3975,9 @@ mod tests {
             .collect()
     }
 
-    /// The color of the border of `dialog`.
+    /// The color of the border of `dialog` (NS-57: red also for the one that touches the jail).
     fn color_of(dialog: &Dialog) -> Color {
-        if dialog.irreversible() {
+        if dialog.irreversible() || dialog.touches_jail() {
             IRREVERSIBLE_COLOR
         } else {
             FOCUS_COLOR
@@ -4343,10 +4530,12 @@ mod tests {
         f.app.focus = Focus::List;
         let live = f.app.selected;
         assert!(matches!(live, NodeId::Agent(_)));
+        // NS-57, D9: the agent of `proj` runs in the jail, so the help has `l liberar jail`.
         assert_eq!(
             help_text(&f.app),
-            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · Ctrl+\\ alternar · \
-             f mostrar ocultos · d esconder concluídos · v agentes ativos (1) · q sair"
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · l liberar jail · \
+             Ctrl+\\ alternar · f mostrar ocultos · d esconder concluídos · v agentes ativos (1) \
+             · q sair"
         );
         f.app.tree.show_hidden = true;
         f.app.tree.only_active = true;
@@ -4422,7 +4611,10 @@ mod tests {
             Place::Epic,
             Place::Ticket,
             Place::LiveAgent,
+            Place::LiveAgentInJail,
+            Place::LiveAgentReleased,
             Place::StoppedAgent,
+            Place::StoppedAgentInJail,
             Place::ArchivedAgent,
             Place::ElsewhereAgent,
             Place::Settings,
@@ -4434,7 +4626,10 @@ mod tests {
                 | Place::Epic
                 | Place::Ticket
                 | Place::LiveAgent
+                | Place::LiveAgentInJail
+                | Place::LiveAgentReleased
                 | Place::StoppedAgent
+                | Place::StoppedAgentInJail
                 | Place::ArchivedAgent
                 | Place::ElsewhereAgent
                 | Place::Settings => {}
@@ -4450,6 +4645,99 @@ mod tests {
                     "{place:?} {hidden} {active}"
                 );
             }
+        }
+    }
+
+    /// NS-57, D9: `l` is in the help only where it works: a live agent of a project with the jail
+    /// (to release it, or to jail it again), a stopped one whose project the last check said has
+    /// the jail on.
+    #[test]
+    fn the_help_has_l_only_where_it_works() {
+        let (mut f, root) = with_running(&["proj"]);
+        f.app.focus = Focus::List;
+        let keys = |f: &Fixture| help_text(&f.app).split(" · f ").next().unwrap().to_string();
+        assert_eq!(
+            keys(&f),
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · l liberar jail · \
+             Ctrl+\\ alternar"
+        );
+        f.app.agents[0].jail = false;
+        assert_eq!(
+            keys(&f),
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · l prender na jail · \
+             Ctrl+\\ alternar"
+        );
+        f.app.agents[0].project_jail = false;
+        assert_eq!(
+            keys(&f),
+            "↑/↓ mover · Enter ir ao terminal · ← subir · x encerrar · Ctrl+\\ alternar",
+            "the help of before"
+        );
+        // A stopped agent of the same project.
+        let db = Db::open(&root.join("nick.db")).unwrap();
+        let Owner::Ticket(ticket) = f.app.agents[0].owner else {
+            panic!("a ticket agent")
+        };
+        let ended = db
+            .insert_agent(
+                Owner::Ticket(ticket),
+                "po",
+                "s-x",
+                "proj · PO · NS-1",
+                "NS-1",
+            )
+            .unwrap();
+        db.stop_agent(ended.id).unwrap();
+        f.app.refresh_tree();
+        f.app.select(NodeId::Agent(ended.id));
+        for (jail, expected) in [
+            (None, "↑/↓ mover · r retomar · o arquivar · ← subir"),
+            (Some(false), "↑/↓ mover · r retomar · o arquivar · ← subir"),
+            (
+                Some(true),
+                "↑/↓ mover · r retomar · o arquivar · l liberar jail · ← subir",
+            ),
+        ] {
+            f.app.rows[0].jail = jail;
+            assert_eq!(keys(&f), expected, "{jail:?}");
+            assert_eq!(
+                f.app.jail_toggle(ended.id).is_some(),
+                expected.contains("l liberar"),
+                "the help and the key agree: {jail:?}"
+            );
+        }
+    }
+
+    /// NS-57, D9: the helps with `l` are shorter than the longest one of before, so the rows the
+    /// help reserves (and the size of every terminal) stay the same at any width.
+    #[test]
+    fn the_longest_help_is_still_the_one_of_before() {
+        let f = fixture();
+        let before = [
+            Place::Module,
+            Place::Project,
+            Place::Epic,
+            Place::Ticket,
+            Place::LiveAgent,
+            Place::StoppedAgent,
+            Place::ArchivedAgent,
+            Place::ElsewhereAgent,
+            Place::Settings,
+        ];
+        let count = Some("9, 9 com saída nova".to_string());
+        for width in 20..=200 {
+            let rows = |all: bool| {
+                HELP_STATES
+                    .into_iter()
+                    .filter(|state| all || before.contains(&state.0))
+                    .map(|state| {
+                        let text = help_text_for(&f.app, state, false, None, count.clone());
+                        wrap_words(&text, width).len()
+                    })
+                    .max()
+                    .unwrap()
+            };
+            assert_eq!(rows(true), rows(false), "at {width} columns");
         }
     }
 
@@ -5031,7 +5319,8 @@ mod tests {
             "↑/↓ mover · →/Enter abrir · ← fechar/subir · a novo ticket · n novo épico · \
              r remover · f mostrar ocultos · d esconder concluídos · v agentes ativos · q sair"
         );
-        assert_eq!(HELP_STATES.len(), 65);
+        // NS-57: 89 (the 3 places of the `l`); 65 before.
+        assert_eq!(HELP_STATES.len(), 89);
         assert_eq!(
             HELP_STATES
                 .iter()
@@ -5699,17 +5988,21 @@ mod tests {
         );
     }
 
-    /// The 8 places of the tree with the 8 combinations of the three filters, and the settings.
+    /// The 11 places of the tree (NS-57: 8 before) with the 8 combinations of the three filters,
+    /// and the settings.
     #[test]
     fn help_states_has_every_combination_of_the_three_filters() {
-        assert_eq!(HELP_STATES.len(), 65);
+        assert_eq!(HELP_STATES.len(), 89);
         let tree = [
             Place::Module,
             Place::Project,
             Place::Epic,
             Place::Ticket,
             Place::LiveAgent,
+            Place::LiveAgentInJail,
+            Place::LiveAgentReleased,
             Place::StoppedAgent,
+            Place::StoppedAgentInJail,
             Place::ArchivedAgent,
             Place::ElsewhereAgent,
         ];
@@ -5726,7 +6019,7 @@ mod tests {
             }
         }
         assert!(HELP_STATES.contains(&(Place::Settings, false, false, false)));
-        // 65 states, the 65 combinations above among them: no state twice.
+        // 89 states, the 89 combinations above among them: no state twice.
     }
 
     // --- NS-55: the marquee of the selected node, and the `…` of the others. ---

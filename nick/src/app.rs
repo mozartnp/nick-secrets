@@ -182,6 +182,14 @@ pub enum Dialog {
     AgentError { message: String },
     /// The `(s/N)` confirmation of ending the agent `id` (`x` on its node, NS-38).
     ConfirmEndAgent { id: i64, name: String },
+    /// The `(s/N)` confirmation of releasing the agent `id` from the jail (`release`) or jailing
+    /// it again (`l` on its node, NS-57): it restarts in the same conversation, out of the jail
+    /// or back in the jail of the project, until it closes.
+    ConfirmJailToggle {
+        id: i64,
+        name: String,
+        release: bool,
+    },
     /// The conversation of `agent` is no longer in claude (NS-39): nothing was opened. `a`
     /// archives it (the dialog is the question), `n` opens the menu of a new agent of its stage
     /// for its ticket or epic (`holder`) with the `precheck` of the resume, Esc closes it.
@@ -246,6 +254,7 @@ impl Dialog {
             | Dialog::ConfirmPrompt { .. }
             | Dialog::AgentError { .. }
             | Dialog::ConfirmEndAgent { .. }
+            | Dialog::ConfirmJailToggle { .. }
             | Dialog::ConversationLost { .. }
             | Dialog::ConfirmArchive { .. }
             | Dialog::ConfirmQuit
@@ -264,10 +273,47 @@ impl Dialog {
             // Deletes the project from the database with its tickets, epics, agents and history.
             Dialog::ConfirmRemove { .. } => true,
             // Hiding, archiving, editing an ID, ending an agent (resumable, NS-39), rejecting a
-            // ticket (it leaves Rejeitado by `m`, and its ended agents resume then: NS-61) and
-            // quitting have a way back; the others are forms, choices and alerts.
+            // ticket (it leaves Rejeitado by `m`, and its ended agents resume then: NS-61),
+            // releasing or jailing an agent (NS-57: red by `touches_jail`) and quitting have a
+            // way back; the others are forms, choices and alerts.
             Dialog::AddPath { .. }
             | Dialog::NeedsConfig { .. }
+            | Dialog::NewTicket { .. }
+            | Dialog::EditTitle { .. }
+            | Dialog::ConfirmHide { .. }
+            | Dialog::EditEpicTitle { .. }
+            | Dialog::ConfirmHideEpic { .. }
+            | Dialog::EditEpicId { .. }
+            | Dialog::ConfirmEditEpicId { .. }
+            | Dialog::MoveTicket { .. }
+            | Dialog::ChooseType { .. }
+            | Dialog::StageForm { .. }
+            | Dialog::ConfirmPrompt { .. }
+            | Dialog::AgentError { .. }
+            | Dialog::ConfirmEndAgent { .. }
+            | Dialog::ConfirmJailToggle { .. }
+            | Dialog::ConversationLost { .. }
+            | Dialog::ConfirmArchive { .. }
+            | Dialog::ConfirmQuit
+            | Dialog::CaptureShortcut { .. }
+            | Dialog::ChooseTicketStage { .. }
+            | Dialog::RejectReason { .. }
+            | Dialog::ConfirmStageChange { .. }
+            | Dialog::EditId { .. }
+            | Dialog::ConfirmEditId { .. } => false,
+        }
+    }
+
+    /// Whether the action the dialog confirms changes the jail of an agent (NS-57, D4): its
+    /// border is red too (`ui::IRREVERSIBLE_COLOR`), though it has a way back, so the operator
+    /// never takes a release for a common confirmation. Exhaustive, without `_`: a new dialog
+    /// must decide.
+    pub fn touches_jail(&self) -> bool {
+        match self {
+            Dialog::ConfirmJailToggle { .. } => true,
+            Dialog::AddPath { .. }
+            | Dialog::NeedsConfig { .. }
+            | Dialog::ConfirmRemove { .. }
             | Dialog::NewTicket { .. }
             | Dialog::EditTitle { .. }
             | Dialog::ConfirmHide { .. }
@@ -292,6 +338,17 @@ impl Dialog {
             | Dialog::ConfirmEditId { .. } => false,
         }
     }
+}
+
+/// The jail of a resume (NS-57): the one of the config of now (`r`), off for this opening (the
+/// operator released the agent with `l`: `--no-jail`), or back in the jail of the config after
+/// a release (`l` again). Only the launcher's argv differs between `Off` and the other two; the
+/// three differ in the message of the bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeJail {
+    AsConfig,
+    Off,
+    BackIn,
 }
 
 /// What the loop must do after a key.
@@ -334,6 +391,13 @@ pub enum Action {
     /// End the agent with this id (confirmed on its node): the loop terminates its
     /// session and calls `agent_ended_by_operator`.
     EndAgent(i64),
+    /// Release the live agent `id` from the jail (`release`) or jail it again (confirmed on its
+    /// node, NS-57): the loop terminates its session as for `EndAgent`, calls
+    /// `agent_stopped_for_jail` and carries out the `CheckResume` it gives.
+    ToggleJail {
+        id: i64,
+        release: bool,
+    },
     /// Quit, ending every agent (confirmed): the loop terminates every session and calls
     /// `end_all_records`.
     QuitEndingAgents,
@@ -343,11 +407,13 @@ pub enum Action {
         project: Project,
         agents: Vec<i64>,
     },
-    /// Resume the stopped `agent`, with the cwd at `project` (`r` on its node, NS-39): the loop
-    /// calls `check_resume`.
+    /// Resume the stopped `agent`, with the cwd at `project` (`r` on its node, NS-39), with the
+    /// `jail` of the resume (NS-57: released or jailed again by `l`): the loop calls
+    /// `check_resume`.
     CheckResume {
         project: PathBuf,
         agent: Agent,
+        jail: ResumeJail,
     },
     /// The ticket was rejected (its stage already written, NS-61, D6) and these live `agents` of it
     /// run in this nick: the loop terminates their sessions and calls `end_agents_of_rejected`
@@ -389,9 +455,13 @@ pub struct RunningAgent {
     /// Where it is in the tree (NS-38): its ticket or epic (NS-40) and their project.
     pub owner: Owner,
     pub project_id: i64,
-    /// Whether it runs in the jail (the `jail=` of the check). Only in memory: every running
-    /// agent is of this process (NS-34, not a column).
+    /// Whether it runs in the jail: the effective one (NS-57), the `jail=` of the check unless the
+    /// operator released it (`l`), the one the header, the tree and the marquee show. Only in
+    /// memory: every running agent is of this process (NS-34, not a column).
     pub jail: bool,
+    /// The jail of its project (the `jail=` of the check of this opening, NS-57): whether `l`
+    /// can release it (or jail it again).
+    pub project_jail: bool,
     /// What the check wrote on stderr, shown when the agent ends.
     warning: Option<String>,
     /// The text of its screen when it stopped being shown (`hidden_output`).
@@ -438,6 +508,11 @@ pub struct Row {
     /// available (decision of the user in the NS-53: the refresh runs after every key, and a
     /// bash per project per key would slow the tree down); kept from the row of before otherwise.
     pub jira_url: Option<String>,
+    /// The jail of its config (NS-57), from the last successful `--check` of this nick in the
+    /// project (`g` or `r`), kept as the `jira_url`; None when unknown (no check yet, or the
+    /// project not available). There is no reader on the list: a stopped agent has the `l` only
+    /// when this is `Some(true)`.
+    pub jail: Option<bool>,
 }
 
 /// Reads the JIRA_URL of a project (NS-53): `(launcher, project dir)`, as `launch::run_jira_url`.
@@ -845,6 +920,7 @@ impl App {
             | Action::ScrollPageUp
             | Action::ScrollPageDown
             | Action::ScrollLines(_)
+            | Action::ToggleJail { .. }
             | Action::EndAgent(_)
             | Action::RemoveProject { .. }
             | Action::CheckResume { .. }
@@ -950,6 +1026,27 @@ impl App {
             }) => self.key_confirm_prompt(key, project, holder, precheck, kind, rendered, scroll),
             Some(Dialog::AgentError { message }) => self.key_agent_error(key, message),
             Some(Dialog::ConfirmEndAgent { id, .. }) => confirmed(key, Action::EndAgent(id)),
+            Some(Dialog::ConfirmJailToggle { id, name, release }) => {
+                // Only s/S confirm; any other key cancels. Review NS-57, P1: the `s` does what
+                // the box promised only when the rule of now (`jail_toggle`) still gives the
+                // same `release`: the agent may have ended, or its project changed, with the
+                // box open, and a "prender" confirmed must never become a release.
+                if !is_yes(key) {
+                    Action::None
+                } else if self.jail_toggle(id) != Some(release) {
+                    self.status = Some(format!(
+                        "O estado do agente {} mudou enquanto a confirmação estava aberta. Nada \
+                         foi feito; aperte l de novo.",
+                        printable(&name)
+                    ));
+                    Action::None
+                } else if self.agent(id).is_some() {
+                    Action::ToggleJail { id, release }
+                } else {
+                    // A stopped one is only released (`jail_toggle` gives it only `true`).
+                    self.ask_resume_with(id, ResumeJail::Off)
+                }
+            }
             Some(Dialog::ConversationLost {
                 project,
                 agent,
@@ -1549,6 +1646,7 @@ impl App {
                 return self.ask_resume(id);
             }
             (NodeId::Agent(id), KeyCode::Char('o')) => self.archive_key(id),
+            (NodeId::Agent(id), KeyCode::Char('l')) => self.jail_key(id),
             _ => {}
         }
         Action::None
@@ -1562,6 +1660,12 @@ impl App {
     /// rejected one does, read from the database before the `--check` (decision of the user in
     /// the NS-61, D7).
     fn ask_resume(&mut self, id: i64) -> Action {
+        self.ask_resume_with(id, ResumeJail::AsConfig)
+    }
+
+    /// `ask_resume` with the `jail` of the resume (NS-57: `l` releases or jails again), with
+    /// every refusal of the `r`.
+    fn ask_resume_with(&mut self, id: i64, jail: ResumeJail) -> Action {
         let Some(cached) = self.agent_record(id).cloned() else {
             return Action::None;
         };
@@ -1622,7 +1726,43 @@ impl App {
         Action::CheckResume {
             project: project.path,
             agent,
+            jail,
         }
+    }
+
+    /// Whether `l` works on the agent `id` (NS-57, D6), and then the `release` of its
+    /// confirmation: a live one of a project with the jail on (to release it, or to jail it again
+    /// when released); a stopped one when the last check of its project said the jail is on
+    /// (`Row.jail`), always to release it (it follows the config again since it closed). None
+    /// otherwise: a project without the jail, the jail unknown, archived, active in another nick.
+    /// The help shows `l` by the same rule (ui.rs).
+    pub(crate) fn jail_toggle(&self, id: i64) -> Option<bool> {
+        if let Some(agent) = self.agent(id) {
+            return agent.project_jail.then_some(agent.jail);
+        }
+        let agent = self.agent_record(id)?;
+        let stopped = AgentState::from_key(&agent.state) == Some(AgentState::Stopped);
+        let jail = self
+            .project_id_of_owner(agent.owner)
+            .and_then(|id| self.project_row(id))
+            .and_then(|row| row.jail);
+        (stopped && jail == Some(true)).then_some(true)
+    }
+
+    /// `l` on the node of an agent (NS-57): the red `(s/N)` confirmation when `jail_toggle` allows
+    /// it; nothing otherwise, not even a status (the help has no `l` then).
+    fn jail_key(&mut self, id: i64) {
+        let Some(release) = self.jail_toggle(id) else {
+            return;
+        };
+        let Some(name) = self
+            .agent(id)
+            .map(|agent| agent.name.clone())
+            .or_else(|| self.agent_record(id).map(|agent| agent.name.clone()))
+        else {
+            return;
+        };
+        self.dialog = Some(Dialog::ConfirmJailToggle { id, name, release });
     }
 
     /// `o` on the node of an agent (NS-39): a stopped one asks `(s/N)` and is archived; an
@@ -2272,6 +2412,8 @@ impl App {
                     .find(|r| r.project.id == holder.project_id)
                 {
                     row.jira_url = precheck.jira_url.clone();
+                    // NS-57: the jail of the project, for the `l` of its stopped agents.
+                    row.jail = Some(precheck.jail);
                 }
                 let types = match holder.owner {
                     Owner::Ticket(_) => StageType::menu(precheck.jira, precheck.sentry),
@@ -2319,11 +2461,13 @@ impl App {
     /// the PTY): a missing one opens the warning of the lost conversation and nothing is opened;
     /// a found one is resumed (`resume_agent`), with the jail and the warning of this check, and
     /// the session the conversation went on in (NS-50). The check asks by the effective session
-    /// of the agent (`Agent::effective_session`).
+    /// of the agent (`Agent::effective_session`). NS-57: the check gives the jail of the project
+    /// to its row (`Row.jail`), and `jail` is the one of this resume.
     pub fn check_resume(
         &mut self,
         project: &Path,
         agent: &Agent,
+        jail: ResumeJail,
         launcher: &mut dyn AgentLauncher,
     ) {
         if !self.claude_found() || !self.launcher_found() {
@@ -2333,9 +2477,16 @@ impl App {
             Ok(precheck) => precheck,
             Err(message) => return self.agent_failed(&message),
         };
+        if let Some(id) = self.project_id_of_owner(agent.owner)
+            && let Some(row) = self.rows.iter_mut().find(|r| r.project.id == id)
+        {
+            row.jail = Some(precheck.jail);
+        }
         match launcher.has_conversation(&self.launcher, project, agent.effective_session()) {
             Err(message) => self.agent_failed(&message),
-            Ok(Some(latest)) => self.resume_agent(project, agent, &latest, precheck, launcher),
+            Ok(Some(latest)) => {
+                self.resume_agent(project, agent, &latest, precheck, jail, launcher);
+            }
             Ok(None) => {
                 if let Some(holder) = self.holder_of_agent(agent) {
                     self.dialog = Some(Dialog::ConversationLost {
@@ -2385,13 +2536,15 @@ impl App {
     /// (`start_running`). NS-50: `latest` is the session the conversation went on in; the resume
     /// stores it (the lock stays the one of the session of the opening) and the PTY resumes the
     /// effective session of the row read again. The bar says when it changed, or when another
-    /// agent has it already.
+    /// agent has it already. NS-57: `jail` is the jail of this resume (`Off`: `--no-jail`, and the
+    /// agent runs released); the bar says when it was released or jailed again.
     pub fn resume_agent(
         &mut self,
         project: &Path,
         agent: &Agent,
         latest: &str,
         check: Precheck,
+        jail: ResumeJail,
         launcher: &mut dyn AgentLauncher,
     ) {
         let Some(stage) = agents::Stage::from_key(&agent.stage) else {
@@ -2429,6 +2582,7 @@ impl App {
                 Owner::Ticket(_) => HolderKey::Ticket(&holder.key),
                 Owner::Epic(_) => HolderKey::Epic(&holder.key),
             },
+            jail_off: jail == ResumeJail::Off,
         };
         let id = record.agent.id;
         let name = record.agent.name.clone();
@@ -2441,8 +2595,25 @@ impl App {
             self.status = Some(message);
             return;
         }
-        self.start_running(record, name.clone(), &holder, check);
-        let mut message = format!("O agente {name} foi retomado.");
+        // Review NS-57, P2: the message of the jail it runs in now (the check of this resume),
+        // not the one asked: back in a project whose jail is off now, it runs out of it.
+        let project_jail = check.jail;
+        self.start_running(
+            record,
+            name.clone(),
+            &holder,
+            check,
+            jail == ResumeJail::Off,
+        );
+        let mut message = match jail {
+            ResumeJail::AsConfig => format!("O agente {name} foi retomado."),
+            ResumeJail::Off => format!("O agente {name} foi retomado fora da jail."),
+            ResumeJail::BackIn if project_jail => format!("O agente {name} foi retomado na jail."),
+            ResumeJail::BackIn => format!(
+                "O agente {name} foi retomado fora da jail: a jail do projeto está desligada \
+                 agora."
+            ),
+        };
         match swap {
             SessionSwap::Same => {}
             SessionSwap::Swapped => message.push_str(&format!(
@@ -2844,7 +3015,7 @@ impl App {
             }
             Owner::Epic(_) => Ok(None),
         };
-        self.start_running(record, name, holder, check);
+        self.start_running(record, name, holder, check, false);
         self.status = match advance {
             Ok(message) => message,
             Err(message) => Some(message),
@@ -2854,8 +3025,16 @@ impl App {
     /// An agent whose PTY started (opened, or resumed: NS-39) joins the running ones, with the
     /// jail and the warning of its `check`; its node is selected (its branches open: reading
     /// only; the stage changes only in `open_agent`, NS-45), and it is shown with the focus on its
-    /// terminal.
-    fn start_running(&mut self, record: OpenAgent, name: String, holder: &Holder, check: Precheck) {
+    /// terminal. NS-57: `jail_off` (the operator released it) turns its effective jail off; the
+    /// jail of its project stays the one of the check.
+    fn start_running(
+        &mut self,
+        record: OpenAgent,
+        name: String,
+        holder: &Holder,
+        check: Precheck,
+        jail_off: bool,
+    ) {
         let id = record.agent.id;
         let project = self
             .project_of_holder(holder)
@@ -2867,7 +3046,8 @@ impl App {
             project,
             owner: holder.owner,
             project_id: holder.project_id,
-            jail: check.jail,
+            jail: check.jail && !jail_off,
+            project_jail: check.jail,
             warning: check.warning,
             seen_text: String::new(),
             unseen: false,
@@ -2906,37 +3086,73 @@ impl App {
     /// (plus the warning of the check, when there was one). The screen on the left stays, with
     /// the tickets read again.
     pub fn agent_ended(&mut self, id: i64, code: u32) {
-        let Some(agent) = self.take_agent(id) else {
+        let Some((name, warning, ended)) = self.end_running(id) else {
             return;
         };
         let mut message = if code == 0 {
-            format!("O agente {} terminou.", agent.name)
+            format!("O agente {name} terminou.")
         } else {
-            format!("O agente {} terminou com o código {code}.", agent.name)
+            format!("O agente {name} terminou com o código {code}.")
         };
-        if let Some(warning) = &agent.warning {
+        if let Some(warning) = &warning {
             let joined: Vec<&str> = warning.split_whitespace().collect();
             message = format!("{message} Aviso da verificação: {}", joined.join(" "));
         }
-        if let Err(err) = agents::end(&self.db, agent.record) {
+        if let Err(err) = ended {
             message = format!("{message} {err}");
         }
         self.status = Some(message);
         self.refresh_tree();
     }
 
+    /// The end of the record of the running agent `id`, common to the end of its claude, the `x`
+    /// and the stop for the jail (review NS-57, P3): it leaves the running ones (`take_agent`)
+    /// and its row becomes `stopped` with the lock released (`agents::end`). Gives its name, the
+    /// warning of its check and the result of `agents::end`, for each caller's message; None when
+    /// it was not running.
+    fn end_running(&mut self, id: i64) -> Option<(String, Option<String>, Result<(), String>)> {
+        let agent = self.take_agent(id)?;
+        let ended = agents::end(&self.db, agent.record);
+        Some((agent.name, agent.warning, ended))
+    }
+
     /// The operator ended the agent `id` (`Action::EndAgent`, its session already terminated
     /// by the loop): as `agent_ended`, with the message of an end by the operator.
     pub fn agent_ended_by_operator(&mut self, id: i64) {
-        let Some(agent) = self.take_agent(id) else {
+        let Some((name, _, ended)) = self.end_running(id) else {
             return;
         };
-        let mut message = format!("O agente {} foi encerrado.", agent.name);
-        if let Err(err) = agents::end(&self.db, agent.record) {
+        let mut message = format!("O agente {name} foi encerrado.");
+        if let Err(err) = ended {
             message = format!("{message} {err}");
         }
         self.status = Some(message);
         self.refresh_tree();
+    }
+
+    /// The live agent `id` was stopped to release it from the jail or to jail it again
+    /// (`Action::ToggleJail`, NS-57, its session already terminated by the loop): its record ends
+    /// as by `agent_ended_by_operator` (`stopped`, the lock released), without its message, and
+    /// the resume is asked at once (`ask_resume_with`: every refusal of the `r`), out of the jail
+    /// when `release`, back in the jail of the config otherwise. The loop carries out the
+    /// `CheckResume`.
+    pub fn agent_stopped_for_jail(&mut self, id: i64, release: bool) -> Action {
+        let Some((_, _, ended)) = self.end_running(id) else {
+            return Action::None;
+        };
+        if let Err(err) = ended {
+            self.status = Some(err);
+            self.refresh_tree();
+            return Action::None;
+        }
+        self.status = None;
+        self.refresh_tree();
+        let jail = if release {
+            ResumeJail::Off
+        } else {
+            ResumeJail::BackIn
+        };
+        self.ask_resume_with(id, jail)
     }
 
     /// Ends the records of every running agent (the nick is leaving, its sessions already
@@ -3409,20 +3625,23 @@ impl App {
                 let mut rows = Vec::with_capacity(list.len());
                 for project in list {
                     let availability = projects::availability(&project.path);
-                    let jira_url = if availability != Availability::Available {
-                        None
-                    } else if let Some(old) = before.iter().find(|row| {
+                    let old = before.iter().find(|row| {
                         row.project.id == project.id
                             && row.project.path == project.path
                             && row.availability == Availability::Available
-                    }) {
-                        old.jira_url.clone()
+                    });
+                    let (jira_url, jail) = if availability != Availability::Available {
+                        (None, None)
+                    } else if let Some(old) = old {
+                        (old.jira_url.clone(), old.jail)
                     } else {
-                        self.read_jira_url(&project.path)
+                        // NS-57: the jail has no reader; it waits for a check.
+                        (self.read_jira_url(&project.path), None)
                     };
                     rows.push(Row {
                         availability,
                         jira_url,
+                        jail,
                         project,
                     });
                 }
@@ -4657,6 +4876,8 @@ pub(crate) mod tests {
         resumes: Vec<(Stage, Option<String>, String)>,
         /// Whether each resume named an epic (`--epic-id`, NS-40) and not a ticket.
         resume_epics: Vec<bool>,
+        /// The `jail_off` of each resume (NS-57: `--no-jail`).
+        jail_offs: Vec<bool>,
         /// The sessions whose conversation was asked for (NS-39).
         conversations: Vec<String>,
         check: Result<Precheck, String>,
@@ -4690,6 +4911,7 @@ pub(crate) mod tests {
                 kinds: Vec::new(),
                 resumes: Vec::new(),
                 resume_epics: Vec::new(),
+                jail_offs: Vec::new(),
                 conversations: Vec::new(),
                 check: Ok(Precheck {
                     jail,
@@ -4761,7 +4983,9 @@ pub(crate) mod tests {
                     opened_key,
                     holder_key:
                         holder @ (HolderKey::Ticket(ticket_key) | HolderKey::Epic(ticket_key)),
+                    jail_off,
                 } => {
+                    self.jail_offs.push(jail_off);
                     self.resume_epics.push(matches!(holder, HolderKey::Epic(_)));
                     self.resumes.push((
                         stage,
@@ -8135,8 +8359,12 @@ pub(crate) mod tests {
         /// of the resume carried out with `launcher`, as the loop does.
         fn r(&mut self, launcher: &mut FakeLauncher) -> bool {
             match self.ch('r') {
-                Action::CheckResume { project, agent } => {
-                    self.app.check_resume(&project, &agent, launcher);
+                Action::CheckResume {
+                    project,
+                    agent,
+                    jail,
+                } => {
+                    self.app.check_resume(&project, &agent, jail, launcher);
                     true
                 }
                 Action::None => false,
@@ -8189,7 +8417,8 @@ pub(crate) mod tests {
             f.ch('r'),
             Action::CheckResume {
                 project: p.clone(),
-                agent: agent.clone()
+                agent: agent.clone(),
+                jail: ResumeJail::AsConfig,
             }
         );
         assert_eq!(
@@ -8197,7 +8426,8 @@ pub(crate) mod tests {
             1,
             "no check before the loop carries it out"
         );
-        f.app.check_resume(&p, &agent, &mut launcher);
+        f.app
+            .check_resume(&p, &agent, ResumeJail::AsConfig, &mut launcher);
         assert_eq!(launcher.checks.len(), 2, "the check of the resume");
         assert_eq!(
             launcher.conversations,
@@ -8230,6 +8460,369 @@ pub(crate) mod tests {
         );
         // Its end stops it again, as any agent.
         f.app.agent_ended(id, 0);
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    // ---- NS-57: the jail of the project known from each check, and the released agent ----
+
+    impl Fixture {
+        /// The `Row.jail` of the only project.
+        fn row_jail(&self) -> Option<bool> {
+            self.app.rows[0].jail
+        }
+    }
+
+    #[test]
+    fn every_check_of_g_keeps_the_jail_of_the_project() {
+        let (mut f, _) = with_agents();
+        assert_eq!(f.row_jail(), None, "unknown before any check");
+        f.g(&mut FakeLauncher::new(true));
+        assert_eq!(f.row_jail(), Some(true));
+        f.key(KeyCode::Esc);
+        f.g(&mut FakeLauncher::new(false));
+        assert_eq!(f.row_jail(), Some(false));
+        f.key(KeyCode::Esc);
+        // A failing check says nothing about the jail: the value stays.
+        let mut failing = FakeLauncher::new(true);
+        failing.check = Err("Erro: jail quebrada".into());
+        f.g(&mut failing);
+        assert_eq!(f.row_jail(), Some(false));
+    }
+
+    #[test]
+    fn the_check_of_a_resume_keeps_the_jail_of_the_project() {
+        for jail in [true, false] {
+            let (mut f, _, _) = stopped_agent();
+            f.app.rows[0].jail = None;
+            assert!(f.r(&mut FakeLauncher::new(jail)));
+            assert_eq!(f.row_jail(), Some(jail));
+        }
+    }
+
+    #[test]
+    fn the_refresh_keeps_the_jail_while_the_project_stays_available() {
+        let (mut f, p) = with_agents();
+        f.g(&mut FakeLauncher::new(true));
+        f.key(KeyCode::Esc);
+        for _ in 0..3 {
+            f.key(KeyCode::Down);
+            f.key(KeyCode::Up);
+        }
+        assert_eq!(f.row_jail(), Some(true), "kept by the refresh of each key");
+        // Unavailable: unknown; available again: still unknown, until the next check (no
+        // reader of the jail on the list: the --jira-url does not change).
+        fs::remove_file(projects::config_file(&p)).unwrap();
+        f.key(KeyCode::Down);
+        assert_eq!(f.row_jail(), None);
+        fs::write(projects::config_file(&p), "").unwrap();
+        f.key(KeyCode::Up);
+        assert_eq!(f.row_jail(), None);
+    }
+
+    #[test]
+    fn a_resume_out_of_the_jail_runs_released_and_says_so() {
+        let (mut f, mut launcher, id) = stopped_agent();
+        let p = f.app.selected_project().unwrap().path.clone();
+        let agent = f.app.agent_record(id).unwrap().clone();
+        f.app
+            .check_resume(&p, &agent, ResumeJail::Off, &mut launcher);
+        assert_eq!(launcher.jail_offs, [true], "--no-jail");
+        let running = f.app.agent(id).expect("running again");
+        assert!(!running.jail, "the effective jail: off");
+        assert!(running.project_jail, "the jail of the project: on");
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado fora da jail.")
+        );
+        assert_eq!(f.row_jail(), Some(true));
+        // Back in the jail: the resume follows the config, with the message of the toggle.
+        f.app.agent_ended(id, 0);
+        f.app
+            .check_resume(&p, &agent, ResumeJail::BackIn, &mut launcher);
+        assert_eq!(launcher.jail_offs, [true, false]);
+        let running = f.app.agent(id).unwrap();
+        assert!(running.jail && running.project_jail);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado na jail.")
+        );
+        // A plain resume: the message of before.
+        f.app.agent_ended(id, 0);
+        f.app
+            .check_resume(&p, &agent, ResumeJail::AsConfig, &mut launcher);
+        assert_eq!(launcher.jail_offs, [true, false, false]);
+        assert_eq!(
+            f.status(),
+            Some("O agente proj · Tech Leader · NS-2 foi retomado.")
+        );
+        // Review NS-57, P2: back in the jail of a project whose jail is off now (the nick.conf
+        // changed): it runs out of the jail, and the bar says so.
+        f.app.agent_ended(id, 0);
+        f.app.check_resume(
+            &p,
+            &agent,
+            ResumeJail::BackIn,
+            &mut FakeLauncher::new(false),
+        );
+        assert!(!f.app.agent(id).unwrap().jail);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O agente proj · Tech Leader · NS-2 foi retomado fora da jail: a jail do projeto \
+                 está desligada agora."
+            )
+        );
+        // In a project without the jail, both are off.
+        f.app.agent_ended(id, 0);
+        f.app.check_resume(
+            &p,
+            &agent,
+            ResumeJail::AsConfig,
+            &mut FakeLauncher::new(false),
+        );
+        let running = f.app.agent(id).unwrap();
+        assert!(!running.jail && !running.project_jail);
+    }
+
+    #[test]
+    fn an_opened_agent_runs_with_the_jail_of_its_check() {
+        let (f, _) = running();
+        let agent = &f.app.agents()[0];
+        assert!(agent.jail && agent.project_jail);
+    }
+
+    // ---- NS-57: the key `l` (the table of the D6) ----
+
+    impl Fixture {
+        /// The action of `s` on the confirmation the `l` opened, checking its `release`.
+        fn l_then_s(&mut self, release: bool) -> Action {
+            assert_eq!(self.ch('l'), Action::None);
+            assert!(
+                matches!(
+                    self.app.dialog,
+                    Some(Dialog::ConfirmJailToggle { release: r, .. }) if r == release
+                ),
+                "{:?}",
+                self.app.dialog
+            );
+            self.ch('s')
+        }
+    }
+
+    #[test]
+    fn l_on_a_live_agent_in_the_jail_asks_to_release_it() {
+        let mut f = live_agent();
+        let id = f.app.agents()[0].id;
+        assert_eq!(f.l_then_s(true), Action::ToggleJail { id, release: true });
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn l_on_a_released_live_agent_asks_to_jail_it_again() {
+        let mut f = live_agent();
+        let id = f.app.agents()[0].id;
+        f.app.agents[0].jail = false;
+        assert_eq!(f.l_then_s(false), Action::ToggleJail { id, release: false });
+    }
+
+    #[test]
+    fn l_on_a_live_agent_of_a_project_without_the_jail_does_nothing() {
+        let mut f = live_agent();
+        f.app.agents[0].jail = false;
+        f.app.agents[0].project_jail = false;
+        f.app.status = Some("antes".into());
+        assert_eq!(f.ch('l'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.status(), Some("antes"), "no status either");
+    }
+
+    #[test]
+    fn l_on_a_stopped_agent_of_a_project_in_the_jail_asks_to_release_and_resumes_off() {
+        let (mut f, _, id) = stopped_agent();
+        assert_eq!(f.row_jail(), Some(true), "known from the g of the opening");
+        let p = f.app.selected_project().unwrap().path.clone();
+        let agent = f.app.agent_record(id).unwrap().clone();
+        assert_eq!(
+            f.l_then_s(true),
+            Action::CheckResume {
+                project: p,
+                agent,
+                jail: ResumeJail::Off,
+            }
+        );
+    }
+
+    #[test]
+    fn l_on_a_stopped_agent_without_the_jail_known_on_does_nothing() {
+        for jail in [None, Some(false)] {
+            let (mut f, _, _) = stopped_agent();
+            f.app.rows[0].jail = jail;
+            assert_eq!(f.ch('l'), Action::None, "{jail:?}");
+            assert_eq!(f.app.dialog, None, "{jail:?}");
+        }
+    }
+
+    #[test]
+    fn l_on_an_archived_or_a_foreign_agent_does_nothing() {
+        let (mut f, _, id) = stopped_agent();
+        f.ch('o');
+        f.ch('s');
+        assert_eq!(f.state_of(id), "archived");
+        f.ch('f');
+        f.select(Fixture::anode(id));
+        assert_eq!(f.ch('l'), Action::None);
+        assert_eq!(f.app.dialog, None);
+        let foreign = f.foreign_agent("NS-1", "0f8e4c2a-9b1d-4e6f-a3c5-7d9e1b2f4a69");
+        assert_eq!(f.app.selected, Fixture::anode(foreign));
+        assert_eq!(f.ch('l'), Action::None);
+        assert_eq!(f.app.dialog, None);
+    }
+
+    #[test]
+    fn any_key_but_s_cancels_the_toggle_and_nothing_changes() {
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Char('l'),
+            KeyCode::Enter,
+        ] {
+            let mut f = live_agent();
+            let id = f.app.agents()[0].id;
+            assert_eq!(f.ch('l'), Action::None);
+            assert_eq!(f.key(key), Action::None, "{key:?}");
+            assert_eq!(f.app.dialog, None, "{key:?}");
+            assert!(f.app.agent(id).is_some_and(|a| a.jail), "{key:?}");
+            assert_eq!(f.state_of(id), "active", "{key:?}");
+        }
+        let (mut f, _, id) = stopped_agent();
+        assert_eq!(f.ch('l'), Action::None);
+        assert_eq!(f.ch('n'), Action::None, "no CheckResume");
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(f.state_of(id), "stopped");
+    }
+
+    /// Review NS-57, P1: the `s` does what the box promised, by the rule of now. A released
+    /// agent whose claude ends with "prender" open is never resumed out of the jail.
+    #[test]
+    fn s_never_releases_an_agent_the_box_offered_to_jail_again() {
+        let mut f = live_agent();
+        let id = f.app.agents()[0].id;
+        f.app.agents[0].jail = false;
+        assert_eq!(f.ch('l'), Action::None);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConfirmJailToggle { release: false, .. })
+        ));
+        // Its claude ends with the box open (the loop handles the Exited in any state).
+        f.app.agent_ended(id, 0);
+        assert_eq!(f.state_of(id), "stopped");
+        assert_eq!(f.ch('s'), Action::None, "no CheckResume, above all not Off");
+        assert_eq!(f.app.dialog, None);
+        assert_eq!(
+            f.status(),
+            Some(
+                "O estado do agente proj · Tech Leader · NS-2 mudou enquanto a confirmação estava \
+                 aberta. Nada foi feito; aperte l de novo."
+            )
+        );
+    }
+
+    /// Review NS-57, P1: a stopped one whose project the check said, with the box open, has the
+    /// jail off any more is not resumed by the `s` either.
+    #[test]
+    fn s_rechecks_the_jail_of_a_stopped_agent() {
+        let (mut f, _, id) = stopped_agent();
+        assert_eq!(f.ch('l'), Action::None);
+        f.app.rows[0].jail = Some(false);
+        assert_eq!(f.ch('s'), Action::None);
+        assert!(f.status().is_some_and(|s| s.contains("Nada foi feito")));
+        assert_eq!(f.state_of(id), "stopped");
+        // A live one in the jail that ends with "liberar" open: the box and the rule of now
+        // agree (a stopped one of a project in the jail is released), so it is resumed off.
+        let mut f = live_agent();
+        let id = f.app.agents()[0].id;
+        assert_eq!(f.ch('l'), Action::None);
+        f.app.agent_ended(id, 0);
+        assert!(matches!(
+            f.ch('s'),
+            Action::CheckResume {
+                jail: ResumeJail::Off,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_stop_for_the_jail_ends_the_agent_as_x_and_asks_for_the_resume() {
+        for (release, jail) in [(true, ResumeJail::Off), (false, ResumeJail::BackIn)] {
+            let (mut f, _) = running();
+            let id = f.app.agents()[0].id;
+            let session = f.session_of(id);
+            f.app.status = None;
+            let p = f.app.selected_project().unwrap().path.clone();
+            let action = f.app.agent_stopped_for_jail(id, release);
+            let agent = f.app.agent_record(id).unwrap().clone();
+            assert_eq!(
+                action,
+                Action::CheckResume {
+                    project: p,
+                    agent,
+                    jail
+                },
+                "{release}"
+            );
+            assert!(f.app.agent(id).is_none(), "out of the running ones");
+            assert_eq!(f.state_of(id), "stopped");
+            assert!(!agents::lock_path(&f.agents_dir(), &session).exists());
+            assert_eq!(f.status(), None, "no \"foi encerrado\"");
+        }
+    }
+
+    #[test]
+    fn a_toggle_releases_only_that_agent() {
+        let (mut f, mut launcher) = running();
+        f.shortcut();
+        f.open_agent(0, &mut launcher);
+        let (first, second) = (launcher.ids[0], launcher.ids[1]);
+        assert_ne!(first, second);
+        let Action::CheckResume {
+            project,
+            agent,
+            jail,
+        } = f.app.agent_stopped_for_jail(first, true)
+        else {
+            panic!("no CheckResume");
+        };
+        f.app.check_resume(&project, &agent, jail, &mut launcher);
+        assert_eq!(launcher.jail_offs, [true]);
+        assert!(!f.app.agent(first).unwrap().jail, "released");
+        assert!(
+            f.app.agent(second).unwrap().jail,
+            "the other one stays in the jail"
+        );
+    }
+
+    #[test]
+    fn a_conversation_lost_during_the_toggle_opens_nothing() {
+        let (mut f, mut launcher) = running();
+        let id = launcher.ids[0];
+        let spawns = launcher.spawns.len();
+        let Action::CheckResume {
+            project,
+            agent,
+            jail,
+        } = f.app.agent_stopped_for_jail(id, true)
+        else {
+            panic!("no CheckResume");
+        };
+        launcher.conversation = Ok(false);
+        f.app.check_resume(&project, &agent, jail, &mut launcher);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::ConversationLost { .. })
+        ));
+        assert_eq!(launcher.spawns.len(), spawns, "nothing opened");
+        assert!(f.app.agent(id).is_none());
         assert_eq!(f.state_of(id), "stopped");
     }
 
@@ -8846,7 +9439,8 @@ pub(crate) mod tests {
         let p = f.app.selected_project().unwrap().path.clone();
         let agent = f.app.agent_record(id).unwrap().clone();
         f.app.db.archive_agent(id).unwrap();
-        f.app.check_resume(&p, &agent, &mut launcher);
+        f.app
+            .check_resume(&p, &agent, ResumeJail::AsConfig, &mut launcher);
         assert_eq!(
             f.status(),
             Some(
@@ -9672,6 +10266,11 @@ pub(crate) mod tests {
                 id,
                 name: agent.name.clone(),
             },
+            Dialog::ConfirmJailToggle {
+                id,
+                name: agent.name.clone(),
+                release: true,
+            },
             Dialog::ConversationLost {
                 project: path,
                 agent: agent.clone(),
@@ -9737,12 +10336,12 @@ pub(crate) mod tests {
                 "EditId"
             ]
         );
-        // Every variant is in the list (the 25 of the enum, NS-61), each once.
+        // Every variant is in the list (the 26 of the enum, NS-57; 25 since the NS-61), each once.
         let mut names: Vec<String> = dialogs.iter().map(variant).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 25);
-        assert_eq!(dialogs.len(), 25);
+        assert_eq!(names.len(), 26);
+        assert_eq!(dialogs.len(), 26);
     }
 
     #[test]
@@ -9754,12 +10353,31 @@ pub(crate) mod tests {
             .map(variant)
             .collect();
         assert_eq!(irreversible, ["ConfirmRemove"]);
-        // Every variant is in the list (the 25 of the enum, NS-61), each once.
+        // Every variant is in the list (the 26 of the enum, NS-57; 25 since the NS-61), each once.
         let mut names: Vec<String> = dialogs.iter().map(variant).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 25);
-        assert_eq!(dialogs.len(), 25);
+        assert_eq!(names.len(), 26);
+        assert_eq!(dialogs.len(), 26);
+    }
+
+    /// NS-57, D4: the border of the dialog that releases or jails an agent is red too, by a rule
+    /// of its own (it has a way back: `irreversible` stays only the removal's).
+    #[test]
+    fn only_the_jail_toggle_touches_the_jail() {
+        let dialogs = one_of_each_dialog();
+        let jail: Vec<String> = dialogs
+            .iter()
+            .filter(|dialog| dialog.touches_jail())
+            .map(variant)
+            .collect();
+        assert_eq!(jail, ["ConfirmJailToggle"]);
+        assert!(
+            dialogs
+                .iter()
+                .filter(|dialog| dialog.touches_jail())
+                .all(|dialog| !dialog.irreversible() && !dialog.takes_text())
+        );
     }
 
     /// A letter as the terminal sends it: Caps Lock gives the capital without modifiers, Shift
@@ -11031,13 +11649,14 @@ pub(crate) mod tests {
     #[test]
     fn n_on_the_lost_conversation_of_a_ticket_rejected_meanwhile_is_refused() {
         let (mut f, mut launcher, id) = stopped_agent();
-        let Action::CheckResume { project, agent } = f.ch('r') else {
+        let Action::CheckResume { project, agent, .. } = f.ch('r') else {
             panic!("no CheckResume");
         };
         // Another nick rejects it during the check of the resume.
         f.reject_in_db("NS-2");
         launcher.conversation = Ok(false);
-        f.app.check_resume(&project, &agent, &mut launcher);
+        f.app
+            .check_resume(&project, &agent, ResumeJail::AsConfig, &mut launcher);
         assert!(matches!(
             f.app.dialog,
             Some(Dialog::ConversationLost { .. })
@@ -11052,11 +11671,12 @@ pub(crate) mod tests {
     fn a_resume_of_a_ticket_rejected_meanwhile_is_refused_and_takes_no_lock() {
         let (mut f, mut launcher, id) = stopped_agent();
         let spawns = launcher.spawns.len();
-        let Action::CheckResume { project, agent } = f.ch('r') else {
+        let Action::CheckResume { project, agent, .. } = f.ch('r') else {
             panic!("no CheckResume");
         };
         f.reject_in_db("NS-2");
-        f.app.check_resume(&project, &agent, &mut launcher);
+        f.app
+            .check_resume(&project, &agent, ResumeJail::AsConfig, &mut launcher);
         assert_eq!(f.status(), Some(tickets::REJECTED_AGENT_MESSAGE));
         assert_eq!(launcher.resumes, [], "nothing resumed");
         assert_eq!(launcher.spawns.len(), spawns);
